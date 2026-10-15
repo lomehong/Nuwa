@@ -119,8 +119,15 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let delivered =
-        deliver::deliver(&cli.repo, &prob, &report, cli.push, cli.create_pr, &cli.sessions_dir)?;
+    let delivered = deliver::deliver(
+        &cli.repo,
+        &prob,
+        &report,
+        cli.push,
+        cli.create_pr,
+        &cli.sessions_dir,
+    )
+    .await?;
     println!(
         "\nbranch    : {}\nbase      : {}\ncommit    : {}\npr        : {}",
         delivered.branch,

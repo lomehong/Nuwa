@@ -68,7 +68,78 @@ fn root_cause_excerpt(text: &str, max_chars: usize) -> String {
     format!("{cut}…")
 }
 
-pub fn deliver(
+/// `owner/repo` from a git remote URL (ssh / https, with or without `.git`).
+fn parse_github_slug(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    for prefix in [
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "https://github.com/",
+        "http://github.com/",
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return normalize_slug(rest);
+        }
+    }
+    None
+}
+
+fn normalize_slug(rest: &str) -> Option<String> {
+    let mut parts = rest.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Create the PR through the GitHub REST API. Per ADR-004 the server holds
+/// minimal credentials: one fine-grained token with `pulls:write` scoped to
+/// the registered repos — no interactive `gh` login, no CLI dependency.
+/// Push itself stays on git (deploy key), separate from this token.
+async fn create_pr_via_api(
+    slug: &str,
+    base: &str,
+    branch: &str,
+    title: &str,
+    body: &str,
+) -> anyhow::Result<String> {
+    let token = std::env::var("NUWA_GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .context(
+            "NUWA_GITHUB_TOKEN (or GITHUB_TOKEN) not set — PR creation needs a fine-grained token with pulls:write",
+        )?;
+    let resp = reqwest::Client::new()
+        .post(format!("https://api.github.com/repos/{slug}/pulls"))
+        .bearer_auth(&token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "nuwa")
+        .json(&serde_json::json!({
+            "title": title,
+            "head": branch,
+            "base": base,
+            "body": body,
+        }))
+        .send()
+        .await
+        .context("POST https://api.github.com/repos/../pulls")?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        bail!(
+            "GitHub API {status}: {}",
+            payload["message"].as_str().unwrap_or("(no message)")
+        );
+    }
+    payload["html_url"]
+        .as_str()
+        .map(str::to_string)
+        .context("PR response missing html_url")
+}
+
+pub async fn deliver(
     repo: &Path,
     issue: &Issue,
     report: &RepairReport,
@@ -139,6 +210,10 @@ pub fn deliver(
     if push {
         git(repo, &["push", "-u", "origin", &branch])?;
         if create_pr {
+            let origin = git(repo, &["remote", "get-url", "origin"])
+                .context("read origin remote (PR creation needs a GitHub remote)")?;
+            let slug = parse_github_slug(&origin)
+                .with_context(|| format!("parse GitHub owner/repo from origin `{origin}`"))?;
             let body = format!(
                 "## 问题单\n\n- fingerprint: `{}`\n- severity: {}, seen {}x\n- link: 山海经 issue `{}`\n\n## 根因\n\n{}\n\n## 改动清单\n\n```text\n{}```\n\n## 验证证据\n\n```text\n{}```\n\n## 会话\n\n- run: `{}`\n- transcript: `{}`\n\n> 交付面护栏：分支 `agent/fix/*`；验证门通过后才提交；同指纹不重复开 PR。CI 与人工合并是最终闸门。\n",
                 issue.fingerprint,
@@ -153,19 +228,17 @@ pub fn deliver(
             );
             let body_path = repo.join(".git").join("nuwa-pr-body.md");
             std::fs::write(&body_path, body).context("write PR body")?;
-            let out = std::process::Command::new("gh")
-                .args(["pr", "create"])
-                .arg("--base").arg(&base)
-                .arg("--head").arg(&branch)
-                .arg("--title").arg(format!("fix: {}", issue.title))
-                .arg("--body-file").arg(&body_path)
-                .current_dir(repo)
-                .output()
-                .context("gh pr create")?;
-            if !out.status.success() {
-                bail!("gh pr create failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-            }
-            pr_url = Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
+            let body = std::fs::read_to_string(&body_path).context("read PR body")?;
+            pr_url = Some(
+                create_pr_via_api(
+                    &slug,
+                    &base,
+                    &branch,
+                    &format!("fix: {}", issue.title),
+                    &body,
+                )
+                .await?,
+            );
         }
     }
 
@@ -175,4 +248,40 @@ pub fn deliver(
         commit,
         pr_url,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_github_slug;
+
+    #[test]
+    fn parses_ssh_remote() {
+        assert_eq!(
+            parse_github_slug("git@github.com:acme/spike-target.git"),
+            Some("acme/spike-target".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_https_remote() {
+        assert_eq!(
+            parse_github_slug("https://github.com/acme/spike-target.git"),
+            Some("acme/spike-target".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_ssh_protocol_remote() {
+        assert_eq!(
+            parse_github_slug("ssh://git@github.com/acme/spike-target"),
+            Some("acme/spike-target".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_non_github_and_malformed() {
+        assert_eq!(parse_github_slug("https://gitlab.com/acme/spike-target"), None);
+        assert_eq!(parse_github_slug("git@github.com:acme"), None);
+        assert_eq!(parse_github_slug("/some/local/path"), None);
+    }
 }

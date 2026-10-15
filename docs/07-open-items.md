@@ -47,7 +47,7 @@
 
 **脊柱 spike（B4/B5 部分落地）**
 - `crates/nuwa` bin：问题单 JSON → rpi-harness（JSONL session 每 fingerprint 一目录，crash-resumable）→ 工具带（read/edit/write/bash/grep/find/ls）→ 修复 → 独立验证门 → `agent/fix/<fp>` 分支 → 提交。
-- 离线 faux 路径全链路已验证：真实 edit 工具落盘、验证门 `go test ./...` 通过、分支/提交/护栏（空改动拒绝、重复分支待验）全部工作。真实 LLM 路径待 `ANTHROPIC_API_KEY`；真实 PR 待 `gh auth login`。
+- 离线 faux 路径全链路已验证：真实 edit 工具落盘、验证门 `go test ./...` 通过、分支/提交/护栏（空改动拒绝、重复分支待验）全部工作。真实 LLM 路径待 `ANTHROPIC_API_KEY`；真实 PR 待 origin remote + `NUWA_GITHUB_TOKEN`（细粒度，仅 `pulls:write`）。
 - 护栏（ADR-003 五件套其三）：禁改路径 + git/gh 命令否决（`before_tool_call` 钩子，9 个单元测试）；分支命名空间 `agent/fix/*`；turn 级预算（`RPI_MAX_TURNS_PER_RUN`）。token 级预算随运行器池调度做（A-3）。
-- **设计演进（相对 A-2）**：`open_pull_request` 不做成 AgentTool——PR 由 run 后的交付步骤（`deliver.rs`）执行，护栏禁止 agent 运行 `gh`。理由：自主开 PR 的闸门不应在同一 agent 循环内，交付面独立是五件套的更严格实现。
-- 下一步：真实 LLM + 真实 PR 闭环（等 gh auth）→ 山海经（A-1 SQLite 状态机）→ 试点系统接入。
+- **设计演进（相对 A-2）**：`open_pull_request` 不做成 AgentTool，也不用 gh CLI——PR 由 run 后的交付步骤（`deliver.rs`）经 GitHub REST API + 细粒度 token（`NUWA_GITHUB_TOKEN`，仅 `pulls:write`）创建；push 走 git/deploy key。护栏禁止 agent 运行 `gh`/`git push`。理由：自主开 PR 的闸门不应在同一 agent 循环内，凭证最小化符合 ADR-004。
+- 下一步：真实 LLM + 真实 PR 闭环（等 token/remote）→ 山海经（A-1 SQLite 状态机）→ 试点系统接入。
