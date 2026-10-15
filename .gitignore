@@ -1,0 +1,10 @@
+# Local upstream clone for cherry-pick reference — never part of the Nuwa tree
+/.upstream/
+
+/target
+Cargo.lock.bak
+*.local
+
+# Secrets / local env — never in the repo
+.env
+.env.*

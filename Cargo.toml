@@ -1,0 +1,79 @@
+# Nuwa（女娲）— self-healing repair agent.
+#
+# Vendored from bigfish1913/pi-rust @ 7210550 (v0.3.24): rpi-telemetry,
+# rpi-ai, rpi-agent, rpi-tools, rpi-harness. Cut: rpi-tui, rpi-cli,
+# rpi-extensions, rpi-plugin-sdk, rpi-telemetry was kept (hard dep of the
+# three core crates). rpi-plugin-sdk's two env-var constants are inlined in
+# crates/rpi-tools/src/os_env.rs; tests/host_private_env.rs pins them.
+# Selective cherry-picks: `git remote add upstream https://github.com/bigfish1913/pi-rust`
+[workspace]
+members = [
+    "crates/rpi-telemetry",
+    "crates/rpi-ai",
+    "crates/rpi-agent",
+    "crates/rpi-tools",
+    "crates/rpi-harness",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+repository = "https://github.com/bigfish1913/pi-rust"
+homepage = "https://rpi.laofu.online/"
+version = "0.3.24"
+authors = ["BigFish <bigfish1913@gmail.com>"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "process", "sync", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization / schemas
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+yaml_serde = "=0.10.2"
+schemars = { version = "0.8", features = ["preserve_order"] }
+jsonschema = "0.18"
+
+# HTTP / SSE (real providers, behind rpi-ai's `providers` feature)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+bytes = "1"
+eventsource-stream = "0.2"
+
+# Errors / logging
+thiserror = "1"
+tracing = "0.1"
+
+# Misc
+uuid = { version = "1", features = ["v4", "v7"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+base64 = "0.22"
+tempfile = "3"
+regex = "1"
+globset = "=0.4.15"
+
+# Vendored upstream crates (path deps; exact versions pinned by Cargo.lock)
+rpi-telemetry = { path = "crates/rpi-telemetry", version = "0.3.24" }
+rpi-ai = { path = "crates/rpi-ai", version = "0.3.24" }
+rpi-agent = { path = "crates/rpi-agent", version = "0.3.24" }
+rpi-tools = { path = "crates/rpi-tools", version = "0.3.24" }
+rpi-harness = { path = "crates/rpi-harness", version = "0.3.24" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+strip = "symbols"
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Upstream ships ≈730 production unwraps (docs/02, docs/06). Warn keeps them
+# visible for the reduction work without breaking vendored builds; the future
+# `nuwa` crate denies them.
+unwrap_used = "warn"
