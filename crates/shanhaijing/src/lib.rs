@@ -162,7 +162,9 @@ CREATE TABLE IF NOT EXISTS issues (
     last_seen     INTEGER NOT NULL,
     cooldown_until INTEGER NOT NULL DEFAULT 0,
     repo          TEXT NOT NULL,
-    stack_sample  TEXT NOT NULL
+    stack_sample  TEXT NOT NULL,
+    pr_url        TEXT,
+    pr_opened_at  INTEGER
 );
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,10 +176,18 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_fp ON events(fingerprint);
 ";
 
+/// Claim cooldown: while a run is in flight, further reports of the same
+/// fingerprint only count occurrences (ADR-002 — no re-triggering).
+pub const DEFAULT_COOLDOWN_MS: i64 = 6 * 60 * 60 * 1000;
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> ShanResult<Self> {
         let conn = Connection::open(path.as_ref())?;
         conn.execute_batch(SCHEMA)?;
+        // Older databases (pre pr-columns): add missing columns idempotently.
+        for column in ["pr_url TEXT", "pr_opened_at INTEGER"] {
+            let _ = conn.execute(&format!("ALTER TABLE issues ADD COLUMN {column}"), []);
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -333,6 +343,21 @@ impl Store {
         Ok(())
     }
 
+    /// Record the delivered PR on the issue (delivery step calls this right
+    /// after the API returns the URL).
+    pub fn set_pr(&self, fingerprint: &str, pr_url: &str, now_ms: i64) -> ShanResult<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE issues SET pr_url = ?2, pr_opened_at = ?3 WHERE fingerprint = ?1",
+            rusqlite::params![fingerprint, pr_url, now_ms],
+        )?;
+        drop(conn);
+        if changed == 0 {
+            return Err(ShanError::UnknownIssue(fingerprint.to_string()));
+        }
+        self.record_event(fingerprint, now_ms, "pr_opened", Some(pr_url))
+    }
+
     pub fn get(&self, fingerprint: &str) -> ShanResult<Option<IssueSnapshot>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -462,6 +487,32 @@ mod tests {
             .set_state(&fp, State::PrOpen, 2, None)
             .expect_err("new -> pr_open must fail");
         assert!(matches!(err, ShanError::InvalidTransition { .. }));
+    }
+
+    /// Wire contract: a 青鸟 (qingniao) envelope JSON must parse as a Signal —
+    /// unknown envelope fields (schema/service/host/ts) are ignored, missing
+    /// optional fields default. This pins the A-5 collector contract.
+    #[test]
+    fn qingniao_envelope_parses_as_signal() {
+        let envelope = r#"{"schema":"qingniao/v1","repo":"example.com/spike-target","language":"go","service":"reporter","host":"host-1","title":"panic: boom","severity":"high","message":"boom","stack_trace":"panic: boom\ngoroutine 1 [running]:\n","ts_unix_ms":123}"#;
+        let signal: Signal = serde_json::from_str(envelope).expect("envelope must parse as Signal");
+        assert_eq!(signal.repo, "example.com/spike-target");
+        assert_eq!(signal.severity, "high");
+
+        // Optional fields fall back to defaults.
+        let minimal: Signal = serde_json::from_str(
+            r#"{"repo":"r","language":"go","title":"t","stack_trace":"panic: x"}"#,
+        )
+        .expect("minimal envelope must parse");
+        assert_eq!(minimal.severity, "medium");
+
+        // And the parsed signal fingerprints end-to-end.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        match store.report_signal(&signal, 1).expect("report") {
+            ReportOutcome::NewIssue { fingerprint } => assert!(!fingerprint.is_empty()),
+            other => panic!("expected NewIssue, got {other:?}"),
+        }
     }
 
     #[test]

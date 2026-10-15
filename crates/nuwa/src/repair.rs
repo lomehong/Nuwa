@@ -44,6 +44,8 @@ pub struct RepairJob {
     pub provider: ProviderKind,
     pub max_turns: u32,
     pub guards: Arc<Guards>,
+    /// Repo-instruction notes appended to the runner system prompt.
+    pub notes: String,
 }
 
 pub struct RepairReport {
@@ -182,11 +184,21 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
     });
 
     // ---- harness + run ----
+    let notes = job.notes.trim();
+    let system_prompt = if notes.is_empty() {
+        job.issue.system_prompt(&repo_str)
+    } else {
+        format!(
+            "{}\n\nREPO NOTES:\n{}",
+            job.issue.system_prompt(&repo_str),
+            notes
+        )
+    };
     let options = AgentHarnessOptions {
         model,
         active_tool_names,
         tools: harness_tools,
-        system_prompt: Some(job.issue.system_prompt(&repo_str)),
+        system_prompt: Some(system_prompt),
         session,
         models: providers,
         agent_emitter: Some(emitter),
