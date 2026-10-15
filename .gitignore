@@ -14,3 +14,4 @@ Cargo.lock.bak
 # Secrets / local env — never in the repo
 .env
 .env.*
+job-logs.txt
