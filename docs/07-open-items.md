@@ -52,3 +52,16 @@
 - **山海经 A-1 落地（`crates/shanhaijing`）**：SQLite 存储 + 指纹算法（Go goroutine trace / Java 异常链 / Rust panic 三种 parser + 归一化：数字/地址折叠，栈帧剥行号，跳过 runtime/JDK 噪音帧）+ 去重/冷却/回归重开 + 状态机（new→triggered→fixing→pr_open→merged/rejected/escalated，非法迁移拒绝）+ 优先级（severity × occurrences）。11 个单元测试 + 真实 panic 信号 ingest 实测（首报 new、二报 dedup）。入口 `nuwa ingest --signal <json>`。
 - **设计演进（相对 A-2）**：`open_pull_request` 不做成 AgentTool，也不用 gh CLI——PR 由 run 后的交付步骤（`deliver.rs`）经 GitHub REST API + 细粒度 token（`NUWA_GITHUB_TOKEN`，仅 `pulls:write`）创建；push 走 git/deploy key。护栏禁止 agent 运行 `gh`/`git push`。理由：自主开 PR 的闸门不应在同一 agent 循环内，凭证最小化符合 ADR-004。
 - 下一步：runner 领单接线（山海经 `ready_issue` → 应龙调度，A-3）→ 真实 LLM + 真实 PR 闭环 → 青鸟 SDK（A-5）。
+
+## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
+
+| crate | warnings | 其中 unwrap_used | 说明 |
+|---|---|---|---|
+| rpi-harness | 226 | 148 | **削减主战场**；热点 agent_harness.rs（5771 行） |
+| rpi-tools | 69 | 23 | os_env.rs 已改动区保持干净 |
+| rpi-agent | 47 | 20 | 核心循环，改动需行为级测试护航 |
+| rpi-ai | 38 | 18 | provider 适配层 |
+| rpi-telemetry | 5 | 3 | 最小 |
+| shanhaijing / nuwa | 0 | 0 | 自有代码零 warning 基线，CI 门槛按此执行 |
+
+削减策略（B2 待办执行时用）：自建 crate `deny`；vendored crate 按 crate 分批把 `unwrap_used` 从 warn 收紧为 deny，热点先行（harness），每批必须过上游测试套（1662 测试是安全网）。

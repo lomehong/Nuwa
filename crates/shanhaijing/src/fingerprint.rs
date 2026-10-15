@@ -88,7 +88,7 @@ fn push_frame(frames: &mut Vec<String>, func: &str, file_part: &str) {
 ///
 /// goroutine 1 [running]:
 /// example.com/spike-target.Average(...)
-/// 	/app/calc.go:17 +0x8c
+///     /app/calc.go:17 +0x8c
 /// created by testing.(*T).Run in goroutine 1
 /// ```
 fn parse_go(stack: &str) -> (String, Vec<String>) {
