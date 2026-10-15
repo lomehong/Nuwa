@@ -89,9 +89,10 @@ async fn main() -> anyhow::Result<()> {
         Some("work") => run_work(argv.collect()).await,
         Some("serve") => run_serve(argv.collect()).await,
         Some("status") => run_status(argv.collect()),
+        Some("sync") => run_sync(argv.collect()).await,
         Some("reopen") => run_reopen(argv.collect()),
         other => bail!(
-            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa reopen --db <path> --fingerprint <fp>   (owner reviewed an escalation)\n        (got {other:?})"
+            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp>   (owner reviewed an escalation)\n        (got {other:?})"
         ),
     }
 }
@@ -490,11 +491,12 @@ async fn work_once(
                 "ci gate   : polling checks for {} (timeout {ci_timeout_secs}s)…",
                 &delivered.commit[..12.min(delivered.commit.len())]
             );
-            match ci::wait_for_checks(&token, slug, &delivered.commit, ci_timeout_secs).await? {
-                ci::Verdict::Success => {
+            let checks = ci::wait_for_checks(&token, slug, &delivered.commit, ci_timeout_secs).await;
+            match checks {
+                Ok(ci::Verdict::Success) => {
                     println!("ci gate   : all checks green — PR open, awaiting human merge");
                 }
-                ci::Verdict::Failure => {
+                Ok(ci::Verdict::Failure) => {
                     ci::close_pr(&token, slug, number).await?;
                     store.set_state(
                         &fp,
@@ -504,9 +506,18 @@ async fn work_once(
                     )?;
                     bail!("CI red — PR #{number} closed, issue rejected (regression signal will reopen it)");
                 }
-                ci::Verdict::TimedOut => {
+                Ok(ci::Verdict::TimedOut) => {
                     println!(
                         "ci gate   : checks unfinished in {ci_timeout_secs}s — PR left open, check manually"
+                    );
+                }
+                Err(e) => {
+                    // Checks unreadable (fine-grained PAT missing Actions/Checks
+                    // read on this repo): the PR stays open, the issue stays
+                    // pr_open — merging remains the human decision.
+                    println!(
+                        "ci gate   : checks unavailable ({e:#}) — PR left open; \
+                         grant the PAT Actions:Read-only + Contents:Read-only on this repo"
                     );
                 }
             }
@@ -520,6 +531,53 @@ async fn work_once(
         delivered.pr_url.as_deref().unwrap_or("-"),
     );
     Ok(true)
+}
+
+/// 对账：pr_open 问题单 ↔ GitHub 实际状态。merged → `merged`；
+/// closed 且未合并 → `rejected`；仍 open → 不动。
+async fn run_sync(args: Vec<String>) -> anyhow::Result<()> {
+    let mut db_path = std::path::PathBuf::from("shanhaijing.db");
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--db" => db_path = PathBuf::from(it.next().context("--db needs a value")?),
+            other => bail!("unknown sync flag {other}"),
+        }
+    }
+    let token = std::env::var("NUWA_GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .context("NUWA_GITHUB_TOKEN not set — sync needs to read PR state")?;
+    let store =
+        shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    let now = now_ms();
+    for row in store.list_issues()? {
+        if row.state != "pr_open" {
+            continue;
+        }
+        let Some(url) = &row.pr_url else { continue };
+        let Some((slug, number)) = ci::parse_pr_url(url) else {
+            println!("skip       : {} — unparsable PR url {url}", row.fingerprint);
+            continue;
+        };
+        let state = ci::pr_merge_state(&token, &slug, number).await?;
+        match state.as_str() {
+            "merged" => {
+                store.set_state(&row.fingerprint, shanhaijing::State::Merged, now, Some(url))?;
+                println!("merged     : {} → {url}", row.fingerprint);
+            }
+            "closed" => {
+                store.set_state(
+                    &row.fingerprint,
+                    shanhaijing::State::Rejected,
+                    now,
+                    Some("PR closed without merge"),
+                )?;
+                println!("rejected   : {} (PR #{number} closed without merge)", row.fingerprint);
+            }
+            _ => println!("still open : {} — PR #{number}", row.fingerprint),
+        }
+    }
+    Ok(())
 }
 
 fn now_ms() -> i64 {

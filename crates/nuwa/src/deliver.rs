@@ -228,7 +228,21 @@ pub async fn deliver(
     let mut slug_out = None;
     let mut pr_number = None;
     if push {
-        git(repo, &["push", "-u", "origin", &branch])?;
+        // GitHub connectivity from CN networks flakes — retry transient resets.
+        let mut push_result = Err(anyhow::anyhow!("unreachable"));
+        for attempt in 1..=3 {
+            push_result = git(repo, &["push", "-u", "origin", &branch]);
+            if push_result.is_ok() {
+                break;
+            }
+            if attempt < 3 {
+                eprintln!(
+                    "push retry {attempt}/3 (transient network error), waiting 5s…"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+        push_result?;
         if create_pr {
             let origin = git(repo, &["remote", "get-url", "origin"])
                 .context("read origin remote (PR creation needs a GitHub remote)")?;

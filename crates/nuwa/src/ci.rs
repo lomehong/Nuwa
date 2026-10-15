@@ -112,3 +112,40 @@ pub async fn close_pr(token: &str, slug: &str, number: u64) -> anyhow::Result<()
     }
     Ok(())
 }
+
+/// `(slug, number)` from a `…/github.com/{owner}/{repo}/pull/{n}` URL.
+pub fn parse_pr_url(url: &str) -> Option<(String, u64)> {
+    let marker = "github.com/";
+    let idx = url.find(marker)?;
+    let rest = &url[idx + marker.len()..];
+    let mut parts = rest.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    let kind = parts.next()?.trim();
+    let number = parts.next()?.trim().parse::<u64>().ok()?;
+    if kind != "pull" || owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((format!("{owner}/{repo}"), number))
+}
+
+/// PR 的合并态：merged / open / closed(未合并).
+pub async fn pr_merge_state(token: &str, slug: &str, number: u64) -> anyhow::Result<String> {
+    let resp = reqwest::Client::new()
+        .get(format!("https://api.github.com/repos/{slug}/pulls/{number}"))
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "nuwa")
+        .send()
+        .await
+        .context("GET pulls/../{number}")?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("pulls/{number} {status}: {}", payload["message"].as_str().unwrap_or("(no message)"));
+    }
+    if payload["merged"].as_bool() == Some(true) {
+        return Ok("merged".to_string());
+    }
+    Ok(payload["state"].as_str().unwrap_or("unknown").to_string())
+}
