@@ -4,7 +4,7 @@ mod instructions;
 mod issue;
 mod repair;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 
@@ -166,9 +166,10 @@ fn report_one(
     Ok(())
 }
 
-/// 应龙领单 — claim the highest-priority ready issue from 山海经 and drive it
-/// to a verified branch/PR. Failure anywhere after the claim escalates the
-/// issue (docs/07 A-1 回炉升级; attempt limits are A-3 runner-pool work).
+/// 应龙 runner v0 — claim the highest-priority ready issue from 山海经 and
+/// drive it to a verified branch/PR. Failure anywhere after the claim
+/// escalates the issue (docs/07 A-1 回炉升级). `--loop` keeps polling
+/// (serial runner; the concurrent pool is A-3's remaining half).
 async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let mut db_path = std::path::PathBuf::from("shanhaijing.db");
     let mut instructions_path = None;
@@ -177,6 +178,13 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let mut max_turns = 30u32;
     let mut push = false;
     let mut create_pr = false;
+    let mut loop_run = false;
+    let mut interval_secs = 30u64;
+    let mut daily_pr_limit = 5u64;
+    let mut max_tokens: u64 = std::env::var("NUWA_MAX_TOKENS_PER_ISSUE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_500_000);
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
         let mut value =
@@ -197,6 +205,10 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
                 push = true;
                 create_pr = true;
             }
+            "--loop" => loop_run = true,
+            "--interval" => interval_secs = value("--interval")?.parse()?,
+            "--daily-pr-limit" => daily_pr_limit = value("--daily-pr-limit")?.parse()?,
+            "--max-tokens" => max_tokens = value("--max-tokens")?.parse()?,
             other => bail!("unknown work flag {other}"),
         }
     }
@@ -205,12 +217,68 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let store = shanhaijing::Store::open(&db_path)
         .with_context(|| format!("open db {}", db_path.display()))?;
     let (repo_config, repo_dir) = instructions::RepoInstructions::load(&instructions_path)?;
+
+    loop {
+        let worked = work_once(
+            &store,
+            &repo_config,
+            &repo_dir,
+            sessions_dir.clone(),
+            provider.clone(),
+            max_turns,
+            push,
+            create_pr,
+            daily_pr_limit,
+            max_tokens,
+        )
+        .await?;
+        if !loop_run {
+            break;
+        }
+        if !worked {
+            // Idle poll: back off. A worked issue may have a successor ready.
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+        }
+    }
+    Ok(())
+}
+
+/// One pickup attempt. `Ok(true)` = an issue was claimed and driven to a
+/// terminal state this pass; `Ok(false)` = nothing pickable.
+#[allow(clippy::too_many_arguments)]
+async fn work_once(
+    store: &shanhaijing::Store,
+    repo_config: &instructions::RepoInstructions,
+    repo_dir: &Path,
+    sessions_dir: PathBuf,
+    provider: repair::ProviderKind,
+    max_turns: u32,
+    push: bool,
+    create_pr: bool,
+    daily_pr_limit: u64,
+    max_tokens: u64,
+) -> anyhow::Result<bool> {
     let now = now_ms();
+
+    // ---- frequency gate: stand down when today's PR quota is spent ----
+    // Checked BEFORE claiming so the issue stays `new` and is picked up
+    // after the UTC window rolls over — no escalation noise for a full quota.
+    if create_pr {
+        let day_start = now - now.rem_euclid(86_400_000);
+        let opened = store.prs_opened_since(&repo_config.repo, day_start)?;
+        if opened >= daily_pr_limit {
+            println!(
+                "quota      : {opened}/{daily_pr_limit} PRs today for {} — standing down until the window rolls",
+                repo_config.repo
+            );
+            return Ok(false);
+        }
+    }
 
     // ---- claim ----
     let Some(snapshot) = store.ready_issue(now)? else {
         println!("nothing ready for pickup");
-        return Ok(());
+        return Ok(false);
     };
     if snapshot.repo != repo_config.repo {
         bail!(
@@ -256,7 +324,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     };
     let guards = std::sync::Arc::new(guard::Guards::new(repo_config.forbidden_paths.clone()));
     let job = repair::RepairJob {
-        repo: repo_dir,
+        repo: repo_dir.to_path_buf(),
         issue: prob,
         sessions_dir,
         provider,
@@ -279,6 +347,17 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         .find(|l| l.trim_start().starts_with("ROOT CAUSE"))
         .unwrap_or("(no ROOT CAUSE line)");
     println!("root cause : {cause}");
+
+    // ---- budget gate: per-issue token ceiling ----
+    // The turn cap bounds the loop mid-run (RPI_MAX_TURNS_PER_RUN); this gate
+    // is the spend ceiling — an over-budget run never reaches delivery.
+    let spent = report.uncached_tokens + report.cached_tokens;
+    if spent > max_tokens {
+        let detail = format!("token budget exceeded: {spent} > {max_tokens}");
+        store.set_state(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()))?;
+        bail!("{detail} — issue escalated");
+    }
+    println!("tokens     : {spent} (cap {max_tokens})");
 
     // ---- deliver ----
     let delivered = match deliver::deliver(
@@ -314,7 +393,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         &delivered.commit[..12.min(delivered.commit.len())],
         delivered.pr_url.as_deref().unwrap_or("-"),
     );
-    Ok(())
+    Ok(true)
 }
 
 fn now_ms() -> i64 {

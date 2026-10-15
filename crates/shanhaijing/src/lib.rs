@@ -358,6 +358,18 @@ impl Store {
         self.record_event(fingerprint, now_ms, "pr_opened", Some(pr_url))
     }
 
+    /// PRs opened for `repo` since `since_ms` — the counter behind the
+    /// per-repo daily PR limit (ADR-003 频控).
+    pub fn prs_opened_since(&self, repo: &str, since_ms: i64) -> ShanResult<u64> {
+        let conn = self.lock();
+        let count: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM issues WHERE repo = ?1 AND pr_opened_at IS NOT NULL AND pr_opened_at >= ?2",
+            rusqlite::params![repo, since_ms],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     pub fn get(&self, fingerprint: &str) -> ShanResult<Option<IssueSnapshot>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -513,6 +525,41 @@ mod tests {
             ReportOutcome::NewIssue { fingerprint } => assert!(!fingerprint.is_empty()),
             other => panic!("expected NewIssue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn daily_pr_count_is_per_repo_and_time_windowed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let mut b = signal();
+        b.stack_trace = TRACE.replace("Average", "Submit");
+        b.repo = "other/repo".to_string();
+        store.report_signal(&signal(), 1).expect("a");
+        store.report_signal(&b, 2).expect("b");
+        let fp_a = fingerprint::compute("go", None, &signal().stack_trace);
+        let fp_c: String;
+        let mut c = signal();
+        c.stack_trace = TRACE.replace("Average", "Load");
+        fp_c = fingerprint::compute("go", None, &c.stack_trace);
+        store.report_signal(&c, 3).expect("c");
+
+        store.set_pr(&fp_a, "https://x/pr/1", 10).expect("pr1");
+        assert_eq!(
+            store.prs_opened_since("example.com/spike-target", 0).expect("count"),
+            1
+        );
+        assert_eq!(store.prs_opened_since("other/repo", 0).expect("count"), 0);
+
+        store.set_pr(&fp_c, "https://x/pr/2", 20).expect("pr2");
+        assert_eq!(
+            store.prs_opened_since("example.com/spike-target", 0).expect("count"),
+            2
+        );
+        assert_eq!(
+            store.prs_opened_since("example.com/spike-target", 15).expect("count"),
+            1,
+            "window starts at since_ms"
+        );
     }
 
     #[test]

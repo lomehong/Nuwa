@@ -179,7 +179,10 @@ pub async fn deliver(
 
     // ---- 3. branch + commit ----
     git(repo, &["checkout", "-b", &branch])?;
-    git(repo, &["add", "-A"])?;
+    // Exclude the Nuwa instruction file from the delivered patch: it is
+    // runner configuration, not a fix. Otherwise `add -A` commits it onto
+    // the agent branch and a rejected branch takes the repo's config with it.
+    git(repo, &["add", "-A", "--", ":(exclude)nuwa.repo.json"])?;
     let commit_msg = format!(
         "fix: {}\n\nNuwa issue {} (seen {}x, severity {}).\n\n{}\n\nVerification: `{}` passes (evidence: {}).",
         issue.title,
