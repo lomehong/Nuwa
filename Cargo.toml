@@ -68,6 +68,7 @@ shanhaijing = { path = "crates/shanhaijing", version = "0.1.0" }
 
 # Misc additions
 sha2 = "0.10"
+axum = "0.8"
 
 [profile.release]
 lto = "thin"

@@ -150,6 +150,21 @@ pub struct IssueSnapshot {
     pub stack_sample: String,
 }
 
+/// Full issue row — the `nuwa status` / ops view.
+#[derive(Debug, Clone, Serialize)]
+pub struct IssueRow {
+    pub fingerprint: String,
+    pub title: String,
+    pub language: String,
+    pub repo: String,
+    pub severity: String,
+    pub state: String,
+    pub occurrences: u64,
+    pub pr_url: Option<String>,
+    pub first_seen: i64,
+    pub last_seen: i64,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -446,6 +461,33 @@ impl Store {
             })),
             None => Ok(None),
         }
+    }
+
+    /// All issues, newest-sighting first — the `nuwa status` view.
+    pub fn list_issues(&self) -> ShanResult<Vec<IssueRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT fingerprint, title, language, repo, severity, state, occurrences,
+                    pr_url, first_seen, last_seen
+             FROM issues ORDER BY last_seen DESC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(IssueRow {
+                fingerprint: row.get(0)?,
+                title: row.get(1)?,
+                language: row.get(2)?,
+                repo: row.get(3)?,
+                severity: row.get(4)?,
+                state: row.get(5)?,
+                occurrences: row.get(6)?,
+                pr_url: row.get(7)?,
+                first_seen: row.get(8)?,
+                last_seen: row.get(9)?,
+            });
+        }
+        Ok(out)
     }
 
     fn record_event(

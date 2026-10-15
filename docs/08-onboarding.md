@@ -60,7 +60,9 @@ nuwa work --db shanhaijing.db \
 
 | 命令 | 用途 |
 |---|---|
-| `nuwa ingest --signal s.jsonl [--db p]` | 投喂采集信号（单对象或 JSONL） |
+| `nuwa serve --db p [--listen 127.0.0.1:7321]` | HTTP ingest 服务端：`POST /ingest`（单信封或 JSONL，`application/json`），`GET /health`。青鸟 `HTTPSink` 直连 |
+| `nuwa ingest --signal s.jsonl [--db p]` | 投喂采集信号（单对象或 JSONL，离线/文件形态） |
+| `nuwa status [--db p]` | 全部问题单：状态/严重度/频次/PR 链接 |
 | `nuwa work …` | 领单 → 修复 → 验证 → 交付（`--no-deliver` 只修不交） |
 | `nuwa reopen --db p --fingerprint FP` | 人工复核升级单后重新入队（清冷却） |
 | `nuwa fix --issue … --repo …` | 手工指定问题单跑一次（调试用） |

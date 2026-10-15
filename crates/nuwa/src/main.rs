@@ -73,10 +73,29 @@ async fn main() -> anyhow::Result<()> {
         Some("fix") => run_fix().await,
         Some("ingest") => run_ingest(argv.collect()),
         Some("work") => run_work(argv.collect()).await,
+        Some("serve") => run_serve(argv.collect()).await,
+        Some("status") => run_status(argv.collect()),
         Some("reopen") => run_reopen(argv.collect()),
         other => bail!(
-            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--push] [--pr] [--loop --interval N]\n            nuwa reopen --db <path> --fingerprint <fp>   (owner reviewed an escalation)\n        (got {other:?})"
+            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa reopen --db <path> --fingerprint <fp>   (owner reviewed an escalation)\n        (got {other:?})"
         ),
+    }
+}
+
+/// Shared by `ingest` (file) and `serve` (HTTP body): one JSON object or
+/// JSONL — the 青鸟 FileSink/HTTPSink wire formats.
+fn parse_signals(raw: &str) -> anyhow::Result<Vec<shanhaijing::Signal>> {
+    match serde_json::from_str::<shanhaijing::Signal>(raw) {
+        Ok(signal) => Ok(vec![signal]),
+        Err(first_error) => raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).with_context(|| {
+                    format!("not a Signal object ({first_error}) and line is not JSONL: {line:.80}")
+                })
+            })
+            .collect(),
     }
 }
 
@@ -127,24 +146,12 @@ fn run_ingest(args: Vec<String>) -> anyhow::Result<()> {
         shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
     let now = now_ms();
 
-    // A collector file is either one JSON object or JSONL (青鸟 FileSink).
-    let signals: Vec<shanhaijing::Signal> = match serde_json::from_str::<shanhaijing::Signal>(&raw) {
-        Ok(signal) => vec![signal],
-        Err(first_error) => raw
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|line| {
-                serde_json::from_str(line).with_context(|| {
-                    format!("not a Signal object ({first_error}) and line is not JSONL: {line:.80}")
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?,
-    };
+    let signals = parse_signals(&raw)?;
     if signals.is_empty() {
         bail!("no signals in {}", signal_path.display());
     }
     for signal in &signals {
-        report_one(&store, signal, now)?;
+        println!("{}", report_one(&store, signal, now)?);
     }
     if let Some(issue) = store.ready_issue(now)? {
         println!(
@@ -159,36 +166,37 @@ fn run_ingest(args: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One report → the human/HTTP response line.
 fn report_one(
     store: &shanhaijing::Store,
     signal: &shanhaijing::Signal,
     now: i64,
-) -> anyhow::Result<()> {
-    match store.report_signal(signal, now)? {
+) -> anyhow::Result<String> {
+    let line = match store.report_signal(signal, now)? {
         shanhaijing::ReportOutcome::NewIssue { fingerprint } => {
-            println!("new issue  : {fingerprint} — ready for pickup");
+            format!("new issue  : {fingerprint} — ready for pickup")
         }
         shanhaijing::ReportOutcome::Deduped {
             fingerprint,
             occurrences,
         } => {
-            println!("dedup      : {fingerprint} (occurrences={occurrences})");
+            format!("dedup      : {fingerprint} (occurrences={occurrences})")
         }
         shanhaijing::ReportOutcome::CooldownActive {
             fingerprint,
             retry_after_ms,
             ..
         } => {
-            println!("cooldown   : {fingerprint} — retry in {retry_after_ms}ms");
+            format!("cooldown   : {fingerprint} — retry in {retry_after_ms}ms")
         }
         shanhaijing::ReportOutcome::Regression {
             fingerprint,
             occurrences,
         } => {
-            println!("REGRESSION : {fingerprint} reopened (occurrences={occurrences})");
+            format!("REGRESSION : {fingerprint} reopened (occurrences={occurrences})")
         }
-    }
-    Ok(())
+    };
+    Ok(line)
 }
 
 /// 应龙 runner v0 — claim the highest-priority ready issue from 山海经 and
@@ -449,6 +457,104 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// HTTP ingest 服务端 — the online half of the 青鸟 path (HTTPSink → here).
+/// POST /ingest with one envelope JSON or JSONL body; GET /health for checks.
+/// v0 binds localhost by default: the collector runs on the same trust domain.
+async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    use std::sync::Arc;
+
+    let mut db_path = std::path::PathBuf::from("shanhaijing.db");
+    let mut listen = String::from("127.0.0.1:7321");
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--db" => db_path = PathBuf::from(it.next().context("--db needs a value")?),
+            "--listen" => listen = it.next().context("--listen needs a value")?,
+            other => bail!("unknown serve flag {other}"),
+        }
+    }
+    let store = Arc::new(
+        shanhaijing::Store::open(&db_path)
+            .with_context(|| format!("open db {}", db_path.display()))?,
+    );
+
+    let app = axum::Router::new()
+        .route(
+            "/ingest",
+            // Bytes, not String: the String extractor enforces a text/plain
+            // Content-Type and would 415 the collector's application/json.
+            post(|State(store): State<Arc<shanhaijing::Store>>, body: axum::body::Bytes| async move {
+                let raw = match std::str::from_utf8(&body) {
+                    Ok(s) => s,
+                    Err(e) => return (StatusCode::BAD_REQUEST, format!("bad utf8: {e}")),
+                };
+                let signals = match parse_signals(raw) {
+                    Ok(s) if !s.is_empty() => s,
+                    Ok(_) => return (StatusCode::BAD_REQUEST, "empty payload".to_string()),
+                    Err(e) => return (StatusCode::BAD_REQUEST, format!("bad payload: {e:#}")),
+                };
+                let now = now_ms();
+                let mut lines = Vec::with_capacity(signals.len());
+                for signal in &signals {
+                    match report_one(&store, signal, now) {
+                        Ok(line) => lines.push(line),
+                        Err(e) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {e:#}"))
+                        }
+                    }
+                }
+                (StatusCode::OK, lines.join("\n"))
+            }),
+        )
+        .route(
+            "/health",
+            get(|| async { "nuwa serve ok" }),
+        )
+        .with_state(store);
+
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("bind {listen}"))?;
+    println!("serve      : listening on http://{listen} (POST /ingest, GET /health)");
+    axum::serve(listener, app).await.context("serve")
+}
+
+/// Ops view: every issue, newest sighting first.
+fn run_status(args: Vec<String>) -> anyhow::Result<()> {
+    let mut db_path = std::path::PathBuf::from("shanhaijing.db");
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--db" => db_path = PathBuf::from(it.next().context("--db needs a value")?),
+            other => bail!("unknown status flag {other}"),
+        }
+    }
+    let store =
+        shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    println!(
+        "{:<34} {:<10} {:<8} {:>4}  {}",
+        "fingerprint", "state", "sev", "seen", "title / pr"
+    );
+    for row in store.list_issues()? {
+        println!(
+            "{:<34} {:<10} {:<8} {:>4}  {}{}",
+            &row.fingerprint[..16.min(row.fingerprint.len())],
+            row.state,
+            row.severity,
+            row.occurrences,
+            row.title,
+            row.pr_url
+                .as_deref()
+                .map(|u| format!("  → {u}"))
+                .unwrap_or_default(),
+        );
+    }
+    Ok(())
 }
 
 async fn run_fix() -> anyhow::Result<()> {
