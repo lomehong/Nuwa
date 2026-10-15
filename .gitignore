@@ -4,6 +4,9 @@
 # Spike working area: toy target repo + issue fixtures + session transcripts
 /spike/
 
+# Runtime store (山海经 SQLite) — environment-local
+/shanhaijing.db*
+
 /target
 Cargo.lock.bak
 *.local

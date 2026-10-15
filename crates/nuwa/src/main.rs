@@ -19,12 +19,8 @@ struct Cli {
     no_deliver: bool,
 }
 
-fn parse_args() -> anyhow::Result<Cli> {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("fix") => {}
-        other => bail!("usage: nuwa fix --issue <path> --repo <path> --sessions <dir> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver] (got {other:?})"),
-    }
+fn parse_args(args: Vec<String>) -> anyhow::Result<Cli> {
+    let mut args = args.into_iter();
     let mut cli = Cli {
         issue_path: PathBuf::new(),
         repo: PathBuf::new(),
@@ -71,7 +67,82 @@ fn parse_args() -> anyhow::Result<Cli> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = parse_args()?;
+    let mut argv = std::env::args().skip(1);
+    match argv.next().as_deref() {
+        Some("fix") => run_fix().await,
+        Some("ingest") => run_ingest(argv.collect()),
+        other => bail!(
+            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n        (got {other:?})"
+        ),
+    }
+}
+
+/// 山海经 ingest — the collector-facing entry (`nuwa ingest --signal s.json`).
+/// Fingerprint + dedup + cooldown decision happens here, per docs/07 A-1.
+fn run_ingest(args: Vec<String>) -> anyhow::Result<()> {
+    let mut signal_path = None;
+    let mut db_path = std::path::PathBuf::from("shanhaijing.db");
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--signal" => {
+                signal_path =
+                    Some(std::path::PathBuf::from(it.next().context("--signal needs a value")?))
+            }
+            "--db" => db_path = std::path::PathBuf::from(it.next().context("--db needs a value")?),
+            other => bail!("unknown ingest flag {other}"),
+        }
+    }
+    let signal_path = signal_path.context("--signal <path> is required")?;
+    let raw =
+        std::fs::read_to_string(&signal_path).with_context(|| format!("read {}", signal_path.display()))?;
+    let signal: shanhaijing::Signal = serde_json::from_str(&raw).context("parse signal JSON")?;
+    let store =
+        shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    match store.report_signal(&signal, now)? {
+        shanhaijing::ReportOutcome::NewIssue { fingerprint } => {
+            println!("new issue  : {fingerprint} — ready for pickup");
+        }
+        shanhaijing::ReportOutcome::Deduped {
+            fingerprint,
+            occurrences,
+        } => {
+            println!("dedup      : {fingerprint} (occurrences={occurrences})");
+        }
+        shanhaijing::ReportOutcome::CooldownActive {
+            fingerprint,
+            retry_after_ms,
+            ..
+        } => {
+            println!("cooldown   : {fingerprint} — retry in {retry_after_ms}ms");
+        }
+        shanhaijing::ReportOutcome::Regression {
+            fingerprint,
+            occurrences,
+        } => {
+            println!("REGRESSION : {fingerprint} reopened (occurrences={occurrences})");
+        }
+    }
+    if let Some(issue) = store.ready_issue(now)? {
+        println!(
+            "next up    : {} [{}] {} — {}x, repo {}",
+            issue.fingerprint,
+            issue.severity,
+            issue.title,
+            issue.occurrences,
+            issue.repo
+        );
+    }
+    Ok(())
+}
+
+async fn run_fix() -> anyhow::Result<()> {
+    let cli = parse_args(std::env::args().skip(2).collect())?;
     let prob = issue::Issue::load(&cli.issue_path).context("load issue")?;
 
     if !cli.repo.join(".git").exists() {

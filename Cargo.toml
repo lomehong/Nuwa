@@ -14,6 +14,7 @@ members = [
     "crates/rpi-tools",
     "crates/rpi-harness",
     "crates/nuwa",
+    "crates/shanhaijing",
 ]
 resolver = "2"
 
@@ -63,6 +64,10 @@ rpi-ai = { path = "crates/rpi-ai", version = "0.3.24" }
 rpi-agent = { path = "crates/rpi-agent", version = "0.3.24" }
 rpi-tools = { path = "crates/rpi-tools", version = "0.3.24" }
 rpi-harness = { path = "crates/rpi-harness", version = "0.3.24" }
+shanhaijing = { path = "crates/shanhaijing", version = "0.1.0" }
+
+# Misc additions
+sha2 = "0.10"
 
 [profile.release]
 lto = "thin"
