@@ -73,10 +73,35 @@ async fn main() -> anyhow::Result<()> {
         Some("fix") => run_fix().await,
         Some("ingest") => run_ingest(argv.collect()),
         Some("work") => run_work(argv.collect()).await,
+        Some("reopen") => run_reopen(argv.collect()),
         other => bail!(
-            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--push] [--pr]\n        (got {other:?})"
+            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--push] [--pr] [--loop --interval N]\n            nuwa reopen --db <path> --fingerprint <fp>   (owner reviewed an escalation)\n        (got {other:?})"
         ),
     }
+}
+
+/// Owner-reviewed reopen: escalated → new, cooldown cleared so the runner can
+/// pick it up immediately. Escalated issues never auto-reopen on reports.
+fn run_reopen(args: Vec<String>) -> anyhow::Result<()> {
+    let mut db_path = std::path::PathBuf::from("shanhaijing.db");
+    let mut fingerprint = None;
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--db" => db_path = PathBuf::from(it.next().context("--db needs a value")?),
+            "--fingerprint" => {
+                fingerprint = Some(it.next().context("--fingerprint needs a value")?)
+            }
+            other => bail!("unknown reopen flag {other}"),
+        }
+    }
+    let fp = fingerprint.context("--fingerprint is required")?;
+    let store =
+        shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    store.set_state(&fp, shanhaijing::State::New, now_ms(), Some("reopened by owner"))?;
+    store.set_cooldown(&fp, 0)?;
+    println!("reopened   : {fp} — ready for pickup");
+    Ok(())
 }
 
 /// 山海经 ingest — the collector-facing entry (`nuwa ingest --signal s.json`).
@@ -275,8 +300,33 @@ async fn work_once(
         }
     }
 
-    // ---- claim ----
-    let Some(snapshot) = store.ready_issue(now)? else {
+    // ---- repo preflight: a dirty or off-main checkout wastes a run ----
+    // These are environment faults (a previous run left the checkout behind),
+    // not issue faults — bail loudly instead of claiming and escalating.
+    let head = deliver::git(repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if head != "main" && head != "master" {
+        bail!(
+            "repo {} is on branch `{}` — runner only works from main/master; reset the checkout",
+            repo_dir.display(),
+            head
+        );
+    }
+    let dirty = deliver::git(
+        repo_dir,
+        &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
+    )?;
+    if !dirty.trim().is_empty() {
+        bail!(
+            "repo {} has an unclean working tree — reset before running:\n{}",
+            repo_dir.display(),
+            dirty.trim()
+        );
+    }
+
+    // ---- claim (atomic: N runners can never share an issue) ----
+    let Some(snapshot) =
+        store.claim_ready_issue(now, now + shanhaijing::DEFAULT_COOLDOWN_MS)?
+    else {
         println!("nothing ready for pickup");
         return Ok(false);
     };
@@ -304,8 +354,6 @@ async fn work_once(
             },
         },
     );
-    store.set_state(&fp, shanhaijing::State::Triggered, now, Some("claimed by runner"))?;
-    store.set_cooldown(&fp, now + shanhaijing::DEFAULT_COOLDOWN_MS)?;
     store.set_state(&fp, shanhaijing::State::Fixing, now, Some("repair run started"))?;
 
     // ---- repair ----

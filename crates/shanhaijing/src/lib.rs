@@ -86,6 +86,9 @@ impl State {
 
 /// Allowed transitions. `(Merged|Rejected, New)` is the regression-reopen
 /// path: a fixed bug reporting again is a new cycle, same fingerprint.
+/// `(Escalated, New)` is the human path — only via the explicit `nuwa reopen`
+/// command after an owner reviews the escalation; reports never auto-reopen
+/// an escalated issue.
 pub fn can_transition(from: State, to: State) -> bool {
     use State::*;
     matches!(
@@ -100,6 +103,7 @@ pub fn can_transition(from: State, to: State) -> bool {
             | (Rejected, Escalated)
             | (Merged, New)
             | (Rejected, New)
+            | (Escalated, New)
     )
 }
 
@@ -293,6 +297,59 @@ impl Store {
             })),
             None => Ok(None),
         }
+    }
+
+    /// Atomically claim the highest-priority pickable issue: flips it to
+    /// `triggered` and starts its cooldown in the same statement that returns
+    /// it, so N concurrent runners can never pick up the same issue
+    /// (ready_issue is only an observation; this is the checkout).
+    pub fn claim_ready_issue(
+        &self,
+        now_ms: i64,
+        cooldown_until_ms: i64,
+    ) -> ShanResult<Option<IssueSnapshot>> {
+        let conn = self.lock();
+        let claimed: Option<IssueSnapshot> = conn
+            .query_row(
+                "UPDATE issues SET state = 'triggered', cooldown_until = ?2
+                 WHERE fingerprint = (
+                     SELECT fingerprint FROM issues
+                     WHERE state = 'new' AND cooldown_until <= ?1
+                     ORDER BY (CASE severity
+                         WHEN 'critical' THEN 10 WHEN 'high' THEN 5 WHEN 'medium' THEN 2 ELSE 1 END)
+                         * occurrences DESC,
+                         last_seen ASC
+                     LIMIT 1
+                 )
+                 RETURNING fingerprint, title, language, repo, severity, occurrences, stack_sample",
+                rusqlite::params![now_ms, cooldown_until_ms],
+                |row| {
+                    Ok(IssueSnapshot {
+                        fingerprint: row.get(0)?,
+                        title: row.get(1)?,
+                        language: row.get(2)?,
+                        repo: row.get(3)?,
+                        severity: row.get(4)?,
+                        occurrences: row.get(5)?,
+                        stack_sample: row.get(6)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        drop(conn);
+        if let Some(snapshot) = &claimed {
+            self.record_event(
+                &snapshot.fingerprint,
+                now_ms,
+                "state_changed",
+                Some("claimed by runner"),
+            )?;
+        }
+        Ok(claimed)
     }
 
     /// Validate + apply a state transition, journaling the event.
@@ -525,6 +582,42 @@ mod tests {
             ReportOutcome::NewIssue { fingerprint } => assert!(!fingerprint.is_empty()),
             other => panic!("expected NewIssue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn claim_is_atomic_exclusive_and_ordered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let mut critical = signal();
+        critical.severity = "critical".to_string();
+        critical.stack_trace = TRACE.replace("Average", "Submit");
+        let mut low = signal();
+        low.severity = "low".to_string();
+        low.stack_trace = TRACE.replace("Average", "Load");
+
+        store.report_signal(&low, 1).expect("low");
+        store.report_signal(&critical, 2).expect("critical");
+
+        // First claim takes the critical issue (priority order), flipping it
+        // to triggered inside the claim itself.
+        let first = store
+            .claim_ready_issue(10, 1_000_000)
+            .expect("claim 1")
+            .expect("some issue");
+        assert_eq!(first.severity, "critical");
+
+        // The claimed issue is not pickable by a second runner.
+        let second = store
+            .claim_ready_issue(11, 1_000_000)
+            .expect("claim 2")
+            .expect("remaining issue");
+        assert_eq!(second.severity, "low");
+
+        // Queue drained.
+        assert!(store.claim_ready_issue(12, 1_000_000).expect("claim 3").is_none());
+
+        // No observer view either: claimed issues left the ready set.
+        assert!(store.ready_issue(13).expect("ready").is_none());
     }
 
     #[test]

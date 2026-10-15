@@ -16,6 +16,7 @@
 | [05-naming.md](05-naming.md) | 命名宇宙（女娲/青鸟/山海经/五色石/应龙）与 Logo |
 | [06-requirements.md](06-requirements.md) | 约束与要求（语言无关性、运行器工具链、仓库指令文件） |
 | [07-open-items.md](07-open-items.md) | 待详细设计与待办清单 |
+| [08-onboarding.md](08-onboarding.md) | 接入手册：四步接入一个系统 |
 
 ## 关键事实速览
 

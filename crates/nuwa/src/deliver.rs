@@ -20,7 +20,7 @@ pub struct DeliverReport {
     pub pr_url: Option<String>,
 }
 
-fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .args(args)
         .current_dir(repo)
@@ -167,7 +167,7 @@ pub async fn deliver(
     .context("write evidence")?;
 
     // ---- 2. preconditions ----
-    let status = git(repo, &["status", "--porcelain"])?;
+    let status = git(repo, &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"])?;
     if status.trim().is_empty() {
         bail!("agent made no changes — refusing to open an empty PR");
     }

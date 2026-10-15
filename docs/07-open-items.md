@@ -52,8 +52,10 @@
 - **山海经 A-1 落地（`crates/shanhaijing`）**：SQLite 存储 + 指纹算法（Go goroutine trace / Java 异常链 / Rust panic 三种 parser + 归一化：数字/地址折叠，栈帧剥行号，跳过 runtime/JDK 噪音帧）+ 去重/冷却/回归重开 + 状态机（new→triggered→fixing→pr_open→merged/rejected/escalated，非法迁移拒绝）+ 优先级（severity × occurrences）。11 个单元测试 + 真实 panic 信号 ingest 实测（首报 new、二报 dedup）。入口 `nuwa ingest --signal <json>`。
 - **设计演进（相对 A-2）**：`open_pull_request` 不做成 AgentTool，也不用 gh CLI——PR 由 run 后的交付步骤（`deliver.rs`）经 GitHub REST API + 细粒度 token（`NUWA_GITHUB_TOKEN`，仅 `pulls:write`）创建；push 走 git/deploy key。护栏禁止 agent 运行 `gh`/`git push`。理由：自主开 PR 的闸门不应在同一 agent 循环内，凭证最小化符合 ADR-004。
 - **运行器调度 v0（A-3 首半）**：`nuwa work` 支撑三道闸——①每问题单 token 上限（`NUWA_MAX_TOKENS_PER_ISSUE`/`--max-tokens`，交付前硬闸，超限升级；turn 级上限继续在 run 内兜底）②每仓库每日 PR 上限（`--daily-pr-limit`，UTC 窗口，配额耗尽 runner **不领单**原地待命，问题单保持 `new` 次日自愈）③turn 级预算（run 内）。`--loop --interval N` 常驻轮询（串行 runner；并发池与 runner 镜像矩阵是 A-3 后半）。实测：配额闸 standing-down、循环轮询、修复分支已排除指令文件（修复过 `git add -A` 吞 `nuwa.repo.json` 的交付面缺陷）。
+- **并发安全领单 + 现场预检**：`claim_ready_issue()` 用单条 `UPDATE…RETURNING` 原子翻转 triggered+冷却（多 runner 进程永不同领一单，双进程实测互斥）；领单前预检目标仓库（必须在 main/master、工作区净）——实测抓到"工作区停在旧 agent 分支导致空跑"的缺陷并修复。`nuwa reopen --fingerprint` 补上 escalated 的人工复核入口（escalated→new，清冷却；报告永不自动重开 escalated）。
 - **青鸟 Go SDK 端到端**：真实 panic → `runtime.Stack()` 全 goroutine 捕获 → FileSink JSONL → ingest 指纹 `7acff4a2…` → work 领单修复 → 验证门 → 分支。采集到修复无人干预贯通（faux provider）。
-- 下一步：真实 LLM + 真实 PR 闭环（等凭证）→ 并发池/runner 镜像矩阵（A-3 后半）→ 接入手册 → 验证探针协议（A-4，等第一个环境特定 bug 出现再设计）。
+- **接入手册落地**：docs/08（B6 接入指南部分）——四步接入 + 命令速查 + 护栏代码位置表。
+- 下一步：真实 LLM + 真实 PR 闭环（等凭证）→ 并发池/runner 镜像矩阵（A-3 后半）→ ingest HTTP 服务端 → 验证探针协议（A-4，等第一个环境特定 bug 出现再设计）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 
