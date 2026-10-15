@@ -13,6 +13,7 @@ use rpi_agent::AgentTool;
 use rpi_ai::providers::anthropic::models::anthropic_models;
 use rpi_ai::providers::anthropic::AnthropicProvider;
 use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+use rpi_ai::providers::openai_completions::OpenAiCompletionsProvider;
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_harness::session::jsonl::{
@@ -35,6 +36,13 @@ use crate::issue::Issue;
 pub enum ProviderKind {
     Anthropic { model: Option<String> },
     Faux,
+    /// OpenAI-completions-compatible endpoint (智谱 coding plan 等)。
+    /// Base URL keeps its `/v4`-style version segment; the provider appends
+    /// `/chat/completions` (rpi-ai chat_completions_url rules).
+    Zai {
+        base_url: Option<String>,
+        model: Option<String>,
+    },
 }
 
 pub struct RepairJob {
@@ -133,6 +141,34 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
             let provider = FauxProvider::new(script);
             let model = provider.default_model().clone();
             (model, vec![provider as Arc<dyn Provider>])
+        }
+        ProviderKind::Zai { base_url, model } => {
+            let key = std::env::var("ZAI_API_KEY")
+                .context("ZAI_API_KEY not set (智谱 coding plan 的 API key)")?;
+            let base = base_url.clone().unwrap_or_else(|| {
+                "https://open.bigmodel.cn/api/coding/paas/v4".to_string()
+            });
+            let model_id = model.clone().unwrap_or_else(|| "glm-5.3-flash".to_string());
+            let provider_id = "zai-coding-cn";
+            let mut picked = rpi_ai::Model::new(
+                model_id.clone(),
+                model_id.clone(),
+                rpi_ai::Api::OpenaiCompletions,
+                provider_id,
+                base,
+            );
+            // Model::new zeroes these; OpenAI-compat omits max_tokens at 0
+            // (server default), but compaction math needs a real window.
+            picked.context_window = 128_000;
+            let http = rpi_ai::http::build_client(&picked.base_url, None, None)
+                .unwrap_or_else(|_| reqwest::Client::new());
+            let provider = OpenAiCompletionsProvider::with_models_without_env_api_key(
+                provider_id,
+                Some(key),
+                http,
+                vec![picked.clone()],
+            );
+            (picked, vec![Arc::new(provider) as Arc<dyn Provider>])
         }
         ProviderKind::Anthropic { model } => {
             let key = std::env::var("ANTHROPIC_API_KEY")

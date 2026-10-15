@@ -44,11 +44,24 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<Cli> {
             "--provider" => match value("--provider")?.as_str() {
                 "anthropic" => cli.provider = repair::ProviderKind::Anthropic { model: None },
                 "faux" => cli.provider = repair::ProviderKind::Faux,
-                other => bail!("unknown provider {other} (anthropic|faux)"),
+                "zai" => {
+                    cli.provider = repair::ProviderKind::Zai { base_url: None, model: None }
+                }
+                other => bail!("unknown provider {other} (anthropic|faux|zai)"),
+            },
+            "--base-url" => match &mut cli.provider {
+                repair::ProviderKind::Zai { base_url, .. } => {
+                    *base_url = Some(value("--base-url")?)
+                }
+                _ => bail!("--base-url only applies to --provider zai"),
             },
             "--model" => {
                 let model = value("--model")?;
-                cli.provider = repair::ProviderKind::Anthropic { model: Some(model) };
+                match &mut cli.provider {
+                    repair::ProviderKind::Anthropic { model: m } => *m = Some(model),
+                    repair::ProviderKind::Zai { model: m, .. } => *m = Some(model),
+                    repair::ProviderKind::Faux => bail!("--model does not apply to faux"),
+                }
             }
             "--max-turns" => cli.max_turns = value("--max-turns")?.parse()?,
             "--push" => cli.push = true,
@@ -229,9 +242,23 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             "--provider" => match value("--provider")?.as_str() {
                 "anthropic" => provider = repair::ProviderKind::Anthropic { model: None },
                 "faux" => provider = repair::ProviderKind::Faux,
+                "zai" => provider = repair::ProviderKind::Zai { base_url: None, model: None },
                 other => bail!("unknown provider {other}"),
             },
-            "--model" => provider = repair::ProviderKind::Anthropic { model: Some(value("--model")?) },
+            "--base-url" => match &mut provider {
+                repair::ProviderKind::Zai { base_url, .. } => {
+                    *base_url = Some(value("--base-url")?)
+                }
+                _ => bail!("--base-url only applies to --provider zai"),
+            },
+            "--model" => {
+                let model = value("--model")?;
+                match &mut provider {
+                    repair::ProviderKind::Anthropic { model: m } => *m = Some(model),
+                    repair::ProviderKind::Zai { model: m, .. } => *m = Some(model),
+                    repair::ProviderKind::Faux => bail!("--model does not apply to faux"),
+                }
+            }
             "--max-turns" => max_turns = value("--max-turns")?.parse()?,
             "--push" => push = true,
             "--pr" => {
@@ -359,6 +386,10 @@ async fn work_once(
             repair::ProviderKind::Anthropic { model } => match model {
                 Some(m) => format!("anthropic:{m}"),
                 None => "anthropic:<catalog default>".to_string(),
+            },
+            repair::ProviderKind::Zai { model, .. } => match model {
+                Some(m) => format!("zai:{m}"),
+                None => "zai:glm-5.3-flash".to_string(),
             },
         },
     );
@@ -574,6 +605,10 @@ async fn run_fix() -> anyhow::Result<()> {
             repair::ProviderKind::Anthropic { model } => match model {
                 Some(m) => format!("anthropic:{m}"),
                 None => "anthropic:<catalog default>".to_string(),
+            },
+            repair::ProviderKind::Zai { model, .. } => match model {
+                Some(m) => format!("zai:{m}"),
+                None => "zai:glm-5.3-flash".to_string(),
             },
         },
         cli.max_turns,
