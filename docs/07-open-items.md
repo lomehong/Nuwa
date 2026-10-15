@@ -60,7 +60,8 @@
 - **真实 LLM 闭环达成（2026-10-16，智谱 coding plan）**：`--provider zai`（OpenAI-completions 兼容，base `…/paas/v4` 自动拼 `/chat/completions`）+ `glm-5.3-flash` 全自动：领单 `f2144b83` → 读代码定位 → 编辑（首次绝对路径被护栏否决后**自行改正为相对路径**）→ 修复 → `go test -count=1 -v` 自验 → 验证门 → **[PR #3](https://github.com/lomehong/nuwa-spike-target/pull/3)**（state=open）→ 回写。修复耗时 ~65s 全程无人干预。
 - **usage 接线修复**：上游 rpi 的 `AgentLane::record_usage` 无生产调用方（移植缺口），session 统计恒 0、预算闸失明。nuwa 侧在事件汇把每 `TurnEnd` 的 assistant usage 喂回 harness；实测 glm-5.3-flash 单问题单 **17475 tokens** 真实计费入账（智谱流式 usage 含 cached_tokens 细分，parse_usage 直接兼容）。
 - **GitHub CI 编排（2026-10-16）**：①主仓 Actions（`.github/workflows/ci.yml`）——rust：自建 crate `clippy --no-deps -D warnings` 零警告 + 全量测试；go：qingniao vet+test。首跑踩坑：clippy 命令行 `-D` 会**波及 vendored workspace 成员**（rpi-telemetry 的 unwrap 在新工具链升 error）→ `--no-deps` 圈定范围；附带清掉跨平台/`--all-targets` 下自建代码的 6 个 lint（含 workspace MSRV 升 1.79）。两 job 双绿（`06e7da0`）。②target 仓 ci.yml（go test）就绪，待 PR #3 人工合并落 main 后生效——PR 的 workflow 文件取自 base 分支。③`nuwa ci.rs` + `work --ci-timeout`：交付后轮询 check-runs，绿→留人工合并；**红→自动关 PR + 问题单 rejected**（回归信号自动重开）；超时→保持 open 报警。aggregate 纯函数可测。
-- 下一步：用户合并 PR #3 → target main 落 ci.yml → e2e 验证"PR 触发 Actions → nuwa ci gate 消费"全链路 → 接入第一个真实系统。
+- **CI 闸门消费 e2e 达成（2026-10-16）**：`work --pr --ci-timeout` 全自动——领单 `9287e35a` → glm-5.3-flash 修复（17099 tokens）→ 验证门 → [PR #5](https://github.com/lomehong/nuwa-spike-target/pull/5)（state=open）→ **触发 target Actions（ci.yml go test）→ nuwa ci gate 轮询 actions/runs → all checks green → 留人工合并**。99 秒无人干预。**权限实操修正**：细粒度 PAT 下拉里**没有 "Checks" 权限项**（此前记错目录）；check-runs 端点对私有仓需 Checks 权限（403），而 `Actions: Read-only` + `actions/runs?head_sha=` 端点即等价数据源（workflow_runs 的 status/conclusion）——已切换，不再依赖 check-runs。另：push 网络瞬断（CN→GitHub）加 3 次重试；`nuwa sync` 对账命令落地（pr_open ↔ GitHub 实态：merged→merged、closed→rejected、open 不动，实测三态全对）。
+- 下一步：接入第一个真实系统（产品化）→ 并发池/runner 镜像矩阵（A-3 后半）→ 验证探针协议（A-4）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 

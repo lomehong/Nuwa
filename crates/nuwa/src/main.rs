@@ -491,7 +491,7 @@ async fn work_once(
                 "ci gate   : polling checks for {} (timeout {ci_timeout_secs}s)…",
                 &delivered.commit[..12.min(delivered.commit.len())]
             );
-            let checks = ci::wait_for_checks(&token, slug, &delivered.commit, ci_timeout_secs).await;
+            let checks = ci::wait_for_ci(&token, slug, &delivered.commit, ci_timeout_secs).await;
             match checks {
                 Ok(ci::Verdict::Success) => {
                     println!("ci gate   : all checks green — PR open, awaiting human merge");

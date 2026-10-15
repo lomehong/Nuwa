@@ -45,9 +45,12 @@ pub fn aggregate(total: u64, runs: &[(bool, Option<&str>)]) -> Option<Verdict> {
     None
 }
 
-/// Poll check-runs for `sha` until all complete, one fails, or the budget is
-/// spent. `total == 0` is a transient state (Actions registers runs lazily).
-pub async fn wait_for_checks(
+/// Poll Actions workflow runs for `sha` until all complete, one fails, or the
+/// budget is spent. Uses the `Actions: read` permission (the fine-grained PAT
+/// dropdown has no "Checks" entry; check-runs 403s on private repos without
+/// it). `total_count == 0` is a transient state (Actions registers runs
+/// lazily after the PR event).
+pub async fn wait_for_ci(
     token: &str,
     slug: &str,
     sha: &str,
@@ -58,21 +61,21 @@ pub async fn wait_for_checks(
     loop {
         let resp = http
             .get(format!(
-                "https://api.github.com/repos/{slug}/commits/{sha}/check-runs"
+                "https://api.github.com/repos/{slug}/actions/runs?head_sha={sha}"
             ))
             .bearer_auth(token)
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "nuwa")
             .send()
             .await
-            .context("poll check-runs")?;
+            .context("poll actions runs")?;
         let status = resp.status();
         let payload: serde_json::Value = resp.json().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("check-runs {status}: {}", payload["message"].as_str().unwrap_or("(no message)"));
+            bail!("actions runs {status}: {}", payload["message"].as_str().unwrap_or("(no message)"));
         }
         let total = payload["total_count"].as_u64().unwrap_or(0);
-        let runs: Vec<(bool, Option<&str>)> = payload["check_runs"]
+        let runs: Vec<(bool, Option<&str>)> = payload["workflow_runs"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -148,4 +151,47 @@ pub async fn pr_merge_state(token: &str, slug: &str, number: u64) -> anyhow::Res
         return Ok("merged".to_string());
     }
     Ok(payload["state"].as_str().unwrap_or("unknown").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aggregate;
+    use super::Verdict;
+
+    fn run(completed: bool, conclusion: Option<&str>) -> (bool, Option<&str>) {
+        (completed, conclusion)
+    }
+
+    #[test]
+    fn all_green_is_success() {
+        let runs = [run(true, Some("success")), run(true, Some("neutral"))];
+        assert_eq!(aggregate(2, &runs), Some(Verdict::Success));
+    }
+
+    #[test]
+    fn any_failure_is_failure() {
+        let runs = [
+            run(true, Some("success")),
+            run(true, Some("failure")),
+            run(false, None),
+        ];
+        assert_eq!(aggregate(3, &runs), Some(Verdict::Failure));
+    }
+
+    #[test]
+    fn pending_runs_keep_polling() {
+        let runs = [run(true, Some("success")), run(false, None)];
+        assert_eq!(aggregate(2, &runs), None);
+    }
+
+    #[test]
+    fn no_registered_runs_keep_polling() {
+        assert_eq!(aggregate(0, &[]), None);
+    }
+
+    #[test]
+    fn conclusion_missing_counts_unfinished() {
+        let runs = [run(true, None)];
+        assert_eq!(aggregate(1, &runs), None);
+    }
 }

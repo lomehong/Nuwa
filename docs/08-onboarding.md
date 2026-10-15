@@ -9,7 +9,7 @@
 | 项 | 说明 |
 |---|---|
 | 工具链 | Rust（cargo 1.93+，构建 nuwa）、Git；每个目标仓库的技术栈工具链（runner 要能跑它的测试命令） |
-| `NUWA_GITHUB_TOKEN` | 细粒度 PAT：目标仓勾 **Pull requests: Read and write** + **Contents: Read-only**（开 PR 需读 head/base commit；push 走 deploy key，token 无需写内容）。缺 Contents:Read 时 API 422 `not all refs are readable` |
+| `NUWA_GITHUB_TOKEN` | 细粒度 PAT：目标仓勾 **Pull requests: Read and write** + **Contents: Read-only** + **Actions: Read-only**（CI 结果轮询走 `actions/runs` 端点；细粒度 PAT 无 "Checks" 权限项，check-runs 端点对私有仓 403 不可用）。push 走本机 Git 凭证，token 无需写内容 |
 | deploy key | 目标仓库的只读+写分支 deploy key，配进 runner 的 ssh-agent（ADR-004：服务端持有，最小权限） |
 | `ANTHROPIC_API_KEY` | 可选；不配则只能 `--provider faux`（离线验证管道，不产生真实修复） |
 | `ZAI_API_KEY` | 智谱 coding plan（`--provider zai`）：base 默认 `https://open.bigmodel.cn/api/coding/paas/v4`，默认模型 `glm-5.3-flash`；`--model`/`--base-url` 可覆盖 |
