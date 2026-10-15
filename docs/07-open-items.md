@@ -37,3 +37,17 @@
 - 现场生产进程内运行 LLM 循环或 shell 执行
 - 面向第三方的多租户 SaaS
 - 监控指标采集与告警路由（消费既有可观测性设施的问题信号）
+
+## D · 进度快照（2026-10-15 · 阶段 0+1 完成）
+
+**骨架（B1-B3 落地）**
+- vendored 五 crate：rpi-telemetry/ai/agent/tools/harness @ pi-rust 0.3.24（7210550），commit `3446a82`，tag `vendored/pi-rust-0.3.24`。ADR-008 清单两处修正：rpi-telemetry 是三个保留 crate 的硬依赖（593 行，一并保留）；rpi-tools 硬依赖 rpi-plugin-sdk 的两个 env 常量，SDK 整体砍除、常量内联进 `crates/rpi-tools/src/os_env.rs`（`tests/host_private_env.rs` 钉住拼写）。
+- `[workspace.lints]` + clippy 全绿（0 error）；上游 ≈730 unwrap 以 `unwrap_used=warn` 保持可见，削减未动。
+- **上游已知问题**：`rpi-tools` `execution_env_conformance::os_cancel_interrupts_even_when_timeout_is_set` 在本机 Windows 失败（进程取消时序），上游原树同样失败——预存问题，非裁剪引入。
+
+**脊柱 spike（B4/B5 部分落地）**
+- `crates/nuwa` bin：问题单 JSON → rpi-harness（JSONL session 每 fingerprint 一目录，crash-resumable）→ 工具带（read/edit/write/bash/grep/find/ls）→ 修复 → 独立验证门 → `agent/fix/<fp>` 分支 → 提交。
+- 离线 faux 路径全链路已验证：真实 edit 工具落盘、验证门 `go test ./...` 通过、分支/提交/护栏（空改动拒绝、重复分支待验）全部工作。真实 LLM 路径待 `ANTHROPIC_API_KEY`；真实 PR 待 `gh auth login`。
+- 护栏（ADR-003 五件套其三）：禁改路径 + git/gh 命令否决（`before_tool_call` 钩子，9 个单元测试）；分支命名空间 `agent/fix/*`；turn 级预算（`RPI_MAX_TURNS_PER_RUN`）。token 级预算随运行器池调度做（A-3）。
+- **设计演进（相对 A-2）**：`open_pull_request` 不做成 AgentTool——PR 由 run 后的交付步骤（`deliver.rs`）执行，护栏禁止 agent 运行 `gh`。理由：自主开 PR 的闸门不应在同一 agent 循环内，交付面独立是五件套的更严格实现。
+- 下一步：真实 LLM + 真实 PR 闭环（等 gh auth）→ 山海经（A-1 SQLite 状态机）→ 试点系统接入。

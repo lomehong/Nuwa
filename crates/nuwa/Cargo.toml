@@ -1,0 +1,27 @@
+[package]
+name = "nuwa"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Nuwa（女娲）— issue in, PR out. Repair runner over the vendored rpi harness."
+
+[[bin]]
+name = "nuwa"
+path = "src/main.rs"
+
+[dependencies]
+rpi-agent = { workspace = true }
+rpi-ai = { workspace = true, features = ["providers"] }
+rpi-tools = { workspace = true }
+rpi-harness = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = "1"
+reqwest = { workspace = true }
+
+[lints]
+workspace = true

@@ -13,6 +13,7 @@ members = [
     "crates/rpi-agent",
     "crates/rpi-tools",
     "crates/rpi-harness",
+    "crates/nuwa",
 ]
 resolver = "2"
 

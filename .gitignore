@@ -1,6 +1,9 @@
 # Local upstream clone for cherry-pick reference — never part of the Nuwa tree
 /.upstream/
 
+# Spike working area: toy target repo + issue fixtures + session transcripts
+/spike/
+
 /target
 Cargo.lock.bak
 *.local

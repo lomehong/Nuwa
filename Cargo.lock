@@ -1487,6 +1487,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuwa"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "reqwest",
+ "rpi-agent",
+ "rpi-ai",
+ "rpi-harness",
+ "rpi-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
