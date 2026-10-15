@@ -128,9 +128,19 @@ async fn create_pr_via_api(
     let status = resp.status();
     let payload: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
+        let details = payload["errors"]
+            .as_array()
+            .map(|errs| {
+                errs.iter()
+                    .filter_map(|e| e["message"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_default();
         bail!(
-            "GitHub API {status}: {}",
-            payload["message"].as_str().unwrap_or("(no message)")
+            "GitHub API {status}: {}{}",
+            payload["message"].as_str().unwrap_or("(no message)"),
+            if details.is_empty() { String::new() } else { format!(" — {details}") }
         );
     }
     payload["html_url"]

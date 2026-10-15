@@ -56,7 +56,8 @@
 - **青鸟 Go SDK 端到端**：真实 panic → `runtime.Stack()` 全 goroutine 捕获 → FileSink JSONL → ingest 指纹 `7acff4a2…` → work 领单修复 → 验证门 → 分支。采集到修复无人干预贯通（faux provider）。
 - **ingest HTTP 服务端（`nuwa serve`）**：axum，`POST /ingest`（单信封或 JSONL）+ `GET /health`；与文件 ingest 共享解析。实测：青鸟 `HTTPSink`（application/json）直连入库 3/3、curl dedup、status 可见。**修复 axum String extractor 强制 text/plain 导致 415 的坑**（改用 Bytes）。v0 仅绑 localhost（采集器同信任域）。
 - **接入手册落地**：docs/08（B6 接入指南部分）——四步接入 + 命令速查 + 护栏代码位置表。
-- 下一步：真实 LLM + 真实 PR 闭环（等凭证）→ 并发池/runner 镜像矩阵（A-3 后半）→ 验证探针协议（A-4，等第一个环境特定 bug 出现再设计）。
+- **真实 PR 闭环达成（2026-10-16）**：`nuwa work --pr` 全自动——领单 a7ca566f（escalated→reopen→claimed）→ faux 修复 → 验证门 → push `agent/fix/a7ca566fcf76d91a` → REST API 开出 [nuwa-spike-target#1](https://github.com/lomehong/nuwa-spike-target/pull/1)（state=open，标题/正文含指纹与验证证据）→ `pr_open` + `pr_url` 回写（`nuwa status` 可见）。细粒度 PAT 权限实操结论：**Pull requests: RW + Contents: R**（缺 Contents:Read 时 API 422 "not all refs are readable"；push 走本机 Git 凭证不需要 token 写内容）。接入手册凭证表同步。
+- 下一步：真实 LLM 修复质量验证（等 ANTHROPIC_API_KEY）→ 接入第一个真实系统 → 并发池/runner 镜像矩阵（A-3 后半）→ 验证探针协议（A-4）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 
