@@ -57,7 +57,9 @@
 - **ingest HTTP 服务端（`nuwa serve`）**：axum，`POST /ingest`（单信封或 JSONL）+ `GET /health`；与文件 ingest 共享解析。实测：青鸟 `HTTPSink`（application/json）直连入库 3/3、curl dedup、status 可见。**修复 axum String extractor 强制 text/plain 导致 415 的坑**（改用 Bytes）。v0 仅绑 localhost（采集器同信任域）。
 - **接入手册落地**：docs/08（B6 接入指南部分）——四步接入 + 命令速查 + 护栏代码位置表。
 - **真实 PR 闭环达成（2026-10-16）**：`nuwa work --pr` 全自动——领单 a7ca566f（escalated→reopen→claimed）→ faux 修复 → 验证门 → push `agent/fix/a7ca566fcf76d91a` → REST API 开出 [nuwa-spike-target#1](https://github.com/lomehong/nuwa-spike-target/pull/1)（state=open，标题/正文含指纹与验证证据）→ `pr_open` + `pr_url` 回写（`nuwa status` 可见）。细粒度 PAT 权限实操结论：**Pull requests: RW + Contents: R**（缺 Contents:Read 时 API 422 "not all refs are readable"；push 走本机 Git 凭证不需要 token 写内容）。接入手册凭证表同步。
-- 下一步：真实 LLM 修复质量验证（等 ANTHROPIC_API_KEY）→ 接入第一个真实系统 → 并发池/runner 镜像矩阵（A-3 后半）→ 验证探针协议（A-4）。
+- **真实 LLM 闭环达成（2026-10-16，智谱 coding plan）**：`--provider zai`（OpenAI-completions 兼容，base `…/paas/v4` 自动拼 `/chat/completions`）+ `glm-5.3-flash` 全自动：领单 `f2144b83` → 读代码定位 → 编辑（首次绝对路径被护栏否决后**自行改正为相对路径**）→ 修复 → `go test -count=1 -v` 自验 → 验证门 → **[PR #3](https://github.com/lomehong/nuwa-spike-target/pull/3)**（state=open）→ 回写。修复耗时 ~65s 全程无人干预。
+- **usage 接线修复**：上游 rpi 的 `AgentLane::record_usage` 无生产调用方（移植缺口），session 统计恒 0、预算闸失明。nuwa 侧在事件汇把每 `TurnEnd` 的 assistant usage 喂回 harness；实测 glm-5.3-flash 单问题单 **17475 tokens** 真实计费入账（智谱流式 usage 含 cached_tokens 细分，parse_usage 直接兼容）。
+- 下一步：接入第一个真实系统（产品化）→ 并发池/runner 镜像矩阵（A-3 后半）→ 验证探针协议（A-4）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 

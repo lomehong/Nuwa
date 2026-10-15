@@ -12,6 +12,7 @@
 | `NUWA_GITHUB_TOKEN` | 细粒度 PAT：目标仓勾 **Pull requests: Read and write** + **Contents: Read-only**（开 PR 需读 head/base commit；push 走 deploy key，token 无需写内容）。缺 Contents:Read 时 API 422 `not all refs are readable` |
 | deploy key | 目标仓库的只读+写分支 deploy key，配进 runner 的 ssh-agent（ADR-004：服务端持有，最小权限） |
 | `ANTHROPIC_API_KEY` | 可选；不配则只能 `--provider faux`（离线验证管道，不产生真实修复） |
+| `ZAI_API_KEY` | 智谱 coding plan（`--provider zai`）：base 默认 `https://open.bigmodel.cn/api/coding/paas/v4`，默认模型 `glm-5.3-flash`；`--model`/`--base-url` 可覆盖 |
 
 ## 1 · 现场装采集 SDK（青鸟）
 

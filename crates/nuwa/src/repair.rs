@@ -187,37 +187,10 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         }
     };
 
-    // ---- event drain (console visibility) ----
+    // ---- events ----
     let (broadcast, mut rx) = BroadcastEmitter::new(1024);
     let emitter: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(broadcast);
     let turns = Arc::new(AtomicU32::new(0));
-    let turn_counter = Arc::clone(&turns);
-    let drain = tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) => match ev {
-                    AgentEvent::ToolExecutionStart { tool_name, ref args, .. } => {
-                        eprintln!("  [tool] {tool_name} {args}");
-                    }
-                    AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } => {
-                        eprintln!("  [tool→] {tool_name} err={is_error}");
-                    }
-                    AgentEvent::TurnEnd { .. } => {
-                        eprintln!("  -- turn end --");
-                        turn_counter.fetch_add(1, Ordering::Relaxed);
-                    }
-                    AgentEvent::RetryScheduled { attempt, max_retries, ref error, .. } => {
-                        eprintln!("  [retry {attempt}/{max_retries}] {error}");
-                    }
-                    _ => {}
-                },
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    eprintln!("  [events] lagged by {n}");
-                }
-                Err(_) => break,
-            }
-        }
-    });
 
     // ---- harness + run ----
     let notes = job.notes.trim();
@@ -241,9 +214,46 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         before_tool_call: Some(crate::guard::before_tool_hook(Arc::clone(&job.guards))),
         ..AgentHarnessOptions::default()
     };
-    let harness = AgentHarness::create(options)
-        .await
-        .context("harness create")?;
+    let harness = Arc::new(AgentHarness::create(options).await.context("harness create")?);
+
+    // ---- event drain: console visibility + usage write-back ----
+    // Upstream rpi leaves `AgentLane::record_usage` unwired (no production
+    // caller), so session stats never see tokens. The drain observes each
+    // TurnEnd's assistant usage and feeds it back — this is the nuwa-side
+    // wiring that makes the token budget gate real.
+    let turn_counter = Arc::clone(&turns);
+    let drain_harness = harness.clone();
+    let drain = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => match ev {
+                    AgentEvent::ToolExecutionStart { tool_name, ref args, .. } => {
+                        eprintln!("  [tool] {tool_name} {args}");
+                    }
+                    AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } => {
+                        eprintln!("  [tool→] {tool_name} err={is_error}");
+                    }
+                    AgentEvent::TurnEnd { ref message, .. } => {
+                        eprintln!("  -- turn end --");
+                        turn_counter.fetch_add(1, Ordering::Relaxed);
+                        if let rpi_agent::AgentMessage::Assistant(assistant) = message {
+                            let usage = assistant.usage.clone();
+                            let _ = drain_harness.record_usage(usage, None, None).await;
+                        }
+                    }
+                    AgentEvent::RetryScheduled { attempt, max_retries, ref error, .. } => {
+                        eprintln!("  [retry {attempt}/{max_retries}] {error}");
+                    }
+                    _ => {}
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("  [events] lagged by {n}");
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let result = harness
         .prompt_text(&job.issue.user_prompt(), vec![])
         .await
