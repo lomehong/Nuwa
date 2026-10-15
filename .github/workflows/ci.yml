@@ -15,7 +15,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: clippy (self-owned crates — zero-warning bar)
-        run: cargo clippy -p nuwa -p shanhaijing --all-targets -- -D warnings
+        # --no-deps: the command-line -D would otherwise propagate into the
+        # vendored workspace members and flag their known unwraps.
+        run: cargo clippy --no-deps -p nuwa -p shanhaijing --all-targets -- -D warnings
       - name: tests
         run: cargo test --workspace
 

@@ -672,10 +672,9 @@ mod tests {
         store.report_signal(&signal(), 1).expect("a");
         store.report_signal(&b, 2).expect("b");
         let fp_a = fingerprint::compute("go", None, &signal().stack_trace);
-        let fp_c: String;
         let mut c = signal();
         c.stack_trace = TRACE.replace("Average", "Load");
-        fp_c = fingerprint::compute("go", None, &c.stack_trace);
+        let fp_c = fingerprint::compute("go", None, &c.stack_trace);
         store.report_signal(&c, 3).expect("c");
 
         store.set_pr(&fp_a, "https://x/pr/1", 10).expect("pr1");

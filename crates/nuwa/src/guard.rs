@@ -123,10 +123,10 @@ mod tests {
 
     #[test]
     fn edit_of_forbidden_path_is_blocked() {
-        let err = guards()
-            .check("edit", &json!({"path": ".github/workflows/ci.yml"}))
-            .unwrap_err();
-        assert!(err.contains(".github/"));
+        match guards().check("edit", &json!({"path": ".github/workflows/ci.yml"})) {
+            Err(err) => assert!(err.contains(".github/")),
+            Ok(()) => panic!("forbidden-path edit must be blocked"),
+        }
     }
 
     #[test]
@@ -150,10 +150,10 @@ mod tests {
 
     #[test]
     fn git_push_is_blocked_in_shell() {
-        let err = guards()
-            .check("bash", &json!({"command": "git push origin main"}))
-            .unwrap_err();
-        assert!(err.contains("delivery step"));
+        match guards().check("bash", &json!({"command": "git push origin main"})) {
+            Err(err) => assert!(err.contains("delivery step")),
+            Ok(()) => panic!("git push must be blocked"),
+        }
     }
 
     #[test]

@@ -18,6 +18,9 @@ pub struct DeliverReport {
     pub base: String,
     pub commit: String,
     pub pr_url: Option<String>,
+    /// GitHub owner/repo of the delivery remote (None when no PR was created).
+    pub slug: Option<String>,
+    pub pr_number: Option<u64>,
 }
 
 pub(crate) fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
@@ -104,7 +107,7 @@ async fn create_pr_via_api(
     branch: &str,
     title: &str,
     body: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, u64)> {
     let token = std::env::var("NUWA_GITHUB_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
         .context(
@@ -143,10 +146,12 @@ async fn create_pr_via_api(
             if details.is_empty() { String::new() } else { format!(" — {details}") }
         );
     }
-    payload["html_url"]
+    let url = payload["html_url"]
         .as_str()
         .map(str::to_string)
-        .context("PR response missing html_url")
+        .context("PR response missing html_url")?;
+    let number = payload["number"].as_u64().context("PR response missing number")?;
+    Ok((url, number))
 }
 
 pub async fn deliver(
@@ -220,6 +225,8 @@ pub async fn deliver(
 
     // ---- 4. push + PR ----
     let mut pr_url = None;
+    let mut slug_out = None;
+    let mut pr_number = None;
     if push {
         git(repo, &["push", "-u", "origin", &branch])?;
         if create_pr {
@@ -235,23 +242,24 @@ pub async fn deliver(
                 issue.fingerprint,
                 root_cause_excerpt(&report.root_cause_text, 800),
                 stat,
-                format!("$ {}\n{}", issue.failing_check.command, check.output),
+                format_args!("$ {}\n{}", issue.failing_check.command, check.output),
                 report.run_id,
                 sessions_dir.join(issue.short_fingerprint()).display(),
             );
             let body_path = repo.join(".git").join("nuwa-pr-body.md");
             std::fs::write(&body_path, body).context("write PR body")?;
             let body = std::fs::read_to_string(&body_path).context("read PR body")?;
-            pr_url = Some(
-                create_pr_via_api(
-                    &slug,
-                    &base,
-                    &branch,
-                    &format!("fix: {}", issue.title),
-                    &body,
-                )
-                .await?,
-            );
+            let (url, number) = create_pr_via_api(
+                &slug,
+                &base,
+                &branch,
+                &format!("fix: {}", issue.title),
+                &body,
+            )
+            .await?;
+            pr_url = Some(url);
+            slug_out = Some(slug);
+            pr_number = Some(number);
         }
     }
 
@@ -260,6 +268,8 @@ pub async fn deliver(
         base,
         commit,
         pr_url,
+        slug: slug_out,
+        pr_number,
     })
 }
 

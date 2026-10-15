@@ -1,3 +1,4 @@
+mod ci;
 mod deliver;
 mod guard;
 mod instructions;
@@ -231,6 +232,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1_500_000);
+    let mut ci_timeout_secs = 600u64;
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
         let mut value =
@@ -269,6 +271,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             "--interval" => interval_secs = value("--interval")?.parse()?,
             "--daily-pr-limit" => daily_pr_limit = value("--daily-pr-limit")?.parse()?,
             "--max-tokens" => max_tokens = value("--max-tokens")?.parse()?,
+            "--ci-timeout" => ci_timeout_secs = value("--ci-timeout")?.parse()?,
             other => bail!("unknown work flag {other}"),
         }
     }
@@ -290,6 +293,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             create_pr,
             daily_pr_limit,
             max_tokens,
+            ci_timeout_secs,
         )
         .await?;
         if !loop_run {
@@ -317,6 +321,7 @@ async fn work_once(
     create_pr: bool,
     daily_pr_limit: u64,
     max_tokens: u64,
+    ci_timeout_secs: u64,
 ) -> anyhow::Result<bool> {
     let now = now_ms();
 
@@ -474,6 +479,40 @@ async fn work_once(
     if let Some(url) = &delivered.pr_url {
         store.set_pr(&fp, url, now_ms())?;
     }
+
+    // ---- CI 闸门消费（docs/03 末段）：红 → 自动关 PR + rejected；绿/超时 → 留给人工合并 ----
+    if create_pr {
+        if let (Some(slug), Some(number)) = (&delivered.slug, delivered.pr_number) {
+            let token = std::env::var("NUWA_GITHUB_TOKEN")
+                .or_else(|_| std::env::var("GITHUB_TOKEN"))
+                .context("NUWA_GITHUB_TOKEN not set — cannot poll CI checks")?;
+            println!(
+                "ci gate   : polling checks for {} (timeout {ci_timeout_secs}s)…",
+                &delivered.commit[..12.min(delivered.commit.len())]
+            );
+            match ci::wait_for_checks(&token, slug, &delivered.commit, ci_timeout_secs).await? {
+                ci::Verdict::Success => {
+                    println!("ci gate   : all checks green — PR open, awaiting human merge");
+                }
+                ci::Verdict::Failure => {
+                    ci::close_pr(&token, slug, number).await?;
+                    store.set_state(
+                        &fp,
+                        shanhaijing::State::Rejected,
+                        now_ms(),
+                        Some(&format!("CI red — PR #{number} closed, back to owner")),
+                    )?;
+                    bail!("CI red — PR #{number} closed, issue rejected (regression signal will reopen it)");
+                }
+                ci::Verdict::TimedOut => {
+                    println!(
+                        "ci gate   : checks unfinished in {ci_timeout_secs}s — PR left open, check manually"
+                    );
+                }
+            }
+        }
+    }
+
     println!(
         "delivered  : branch {} commit {} pr {}",
         delivered.branch,
@@ -568,10 +607,15 @@ fn run_status(args: Vec<String>) -> anyhow::Result<()> {
     let store =
         shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
     println!(
-        "{:<34} {:<10} {:<8} {:>4}  {}",
-        "fingerprint", "state", "sev", "seen", "title / pr"
+        "{:<34} {:<10} {:<8} {:>4}  title / pr",
+        "fingerprint", "state", "sev", "seen"
     );
     for row in store.list_issues()? {
+        let pr_suffix = row
+            .pr_url
+            .as_deref()
+            .map(|u| format!("  → {u}"))
+            .unwrap_or_default();
         println!(
             "{:<34} {:<10} {:<8} {:>4}  {}{}",
             &row.fingerprint[..16.min(row.fingerprint.len())],
@@ -579,10 +623,7 @@ fn run_status(args: Vec<String>) -> anyhow::Result<()> {
             row.severity,
             row.occurrences,
             row.title,
-            row.pr_url
-                .as_deref()
-                .map(|u| format!("  → {u}"))
-                .unwrap_or_default(),
+            pr_suffix,
         );
     }
     Ok(())
