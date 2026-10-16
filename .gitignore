@@ -15,3 +15,11 @@ Cargo.lock.bak
 .env
 .env.*
 job-logs.txt
+
+# local serve/probe logs
+/fg*.log
+/fg*e.log
+/serve-fg.log
+/rel-logs.txt
+/job-logs.txt
+/run2.json

@@ -36,9 +36,10 @@ go test ./...                            # 在 sdk/qingniao-go 下
 3. **凭证红线**：token/key 只从环境变量读（`NUWA_GITHUB_TOKEN`、`ANTHROPIC_API_KEY`）；永不入库、永不写进文档或示例的真实值。
 4. **交付面契约**：staging 与变更判定都用 `:(exclude)nuwa.repo.json` pathspec——这是修过的真实缺陷（runner 曾把仓库配置提交上 agent 分支），别"简化"掉。
 5. **已知环境问题，不是你的 bug，别"修"**：`rpi-tools` 的 `execution_env_conformance::os_cancel_interrupts_even_when_timeout_is_set` 在 Windows 失败——上游原树同样失败（预存问题）。
-6. **Go 代码**：Go 1.22+，整数循环用 `for i := range n`；唯一例外是 `spike/target-repo` 的 seeded bug（那是被修的对象，改了它 spike 就废了）。
-7. **提交前**：clippy + test 全绿；一次提交一个完整变更，message 写清 what + why + 验证证据。
-8. **文档同步**：行为改动更新 docs/07 §D 进度快照；接入操作变化更新 docs/08；新决策走 docs/04 ADR。
+6. **本机 cargo 环境专有坑**：全局 `~/.cargo/config.toml` 把 `target-dir` 重定向到 `C:\Users\lome\.cargo\shared-target`（为省 E 盘空间）。后果：① `E:\...\target\debug\nuwa.exe` 是陈旧遗留，**验证/执行一律用 shared-target 下的产物**；② 运行中的 serve/work 会锁定 exe 导致 cargo 重链接静默跳过——**构建/验证前先 `taskkill /F /IM nuwa.exe`**；③ E 盘写入 mtime 停滞（`touch` 无效），改码后增量构建可能空转——用 `cargo clean -p <crate>` 强制，或直接跑 shared-target 产物看行为。
+7. **Go 代码**：Go 1.22+，整数循环用 `for i := range n`；唯一例外是 `spike/target-repo` 的 seeded bug（那是被修的对象，改了它 spike 就废了）。
+8. **提交前**：clippy + test 全绿；一次提交一个完整变更，message 写清 what + why + 验证证据。
+9. **文档同步**：行为改动更新 docs/07 §D 进度快照；接入操作变化更新 docs/08；新决策走 docs/04 ADR。
 
 ## 领土
 
