@@ -6,8 +6,14 @@ mod issue;
 mod repair;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 
 #[derive(Debug)]
 struct Cli {
@@ -591,11 +597,6 @@ fn now_ms() -> i64 {
 /// POST /ingest with one envelope JSON or JSONL body; GET /health for checks.
 /// v0 binds localhost by default: the collector runs on the same trust domain.
 async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
-    use axum::extract::State;
-    use axum::http::StatusCode;
-    use axum::routing::{get, post};
-    use std::sync::Arc;
-
     let mut db_path = std::path::PathBuf::from("shanhaijing.db");
     let mut listen = String::from("127.0.0.1:7321");
     let mut it = args.into_iter();
@@ -610,46 +611,80 @@ async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         shanhaijing::Store::open(&db_path)
             .with_context(|| format!("open db {}", db_path.display()))?,
     );
+    // Shared collector token (NUWA_INGEST_TOKEN). Set it when serving beyond
+    // localhost: without it anyone can spam the issue store. This is a
+    // report-only token — leak consequence is junk signals, rotate freely;
+    // it is NOT an LLM key or repo credential (ADR: 现场无密钥红线不破).
+    let ingest_token = Arc::new(std::env::var("NUWA_INGEST_TOKEN").ok().filter(|t| !t.is_empty()));
 
+    let token_mode = if ingest_token.is_some() { "required" } else { "DISABLED (local mode)" };
+    let auth = axum::middleware::from_fn_with_state(
+        (Arc::clone(&store), Arc::clone(&ingest_token)),
+        check_auth,
+    );
     let app = axum::Router::new()
-        .route(
-            "/ingest",
-            // Bytes, not String: the String extractor enforces a text/plain
-            // Content-Type and would 415 the collector's application/json.
-            post(|State(store): State<Arc<shanhaijing::Store>>, body: axum::body::Bytes| async move {
-                let raw = match std::str::from_utf8(&body) {
-                    Ok(s) => s,
-                    Err(e) => return (StatusCode::BAD_REQUEST, format!("bad utf8: {e}")),
-                };
-                let signals = match parse_signals(raw) {
-                    Ok(s) if !s.is_empty() => s,
-                    Ok(_) => return (StatusCode::BAD_REQUEST, "empty payload".to_string()),
-                    Err(e) => return (StatusCode::BAD_REQUEST, format!("bad payload: {e:#}")),
-                };
-                let now = now_ms();
-                let mut lines = Vec::with_capacity(signals.len());
-                for signal in &signals {
-                    match report_one(&store, signal, now) {
-                        Ok(line) => lines.push(line),
-                        Err(e) => {
-                            return (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {e:#}"))
-                        }
-                    }
-                }
-                (StatusCode::OK, lines.join("\n"))
-            }),
-        )
+        .route("/ingest", post(ingest_endpoint).route_layer(auth))
         .route(
             "/health",
             get(|| async { "nuwa serve ok" }),
         )
-        .with_state(store);
+        .with_state((store, ingest_token));
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
-    println!("serve      : listening on http://{listen} (POST /ingest, GET /health)");
+    println!(
+        "serve      : listening on http://{listen} (POST /ingest, GET /health) — token {token_mode}"
+    );
     axum::serve(listener, app).await.context("serve")
+}
+
+/// Shared-token gate. `401` unless NUWA_INGEST_TOKEN is unset (local mode)
+/// or the `X-NUWA-Token` header matches.
+async fn check_auth(
+    State((_, expected)): State<(Arc<shanhaijing::Store>, Arc<Option<String>>)>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(expected) = expected.as_deref() {
+        let got = headers
+            .get("x-nuwa-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if got != expected {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "missing or wrong X-NUWA-Token header".to_string(),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+async fn ingest_endpoint(
+    State((store, _)): State<(Arc<shanhaijing::Store>, Arc<Option<String>>)>,
+    body: axum::body::Bytes,
+) -> (StatusCode, String) {
+    let raw = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, format!("bad utf8: {e}")),
+    };
+    let signals = match parse_signals(raw) {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => return (axum::http::StatusCode::BAD_REQUEST, "empty payload".to_string()),
+        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, format!("bad payload: {e:#}")),
+    };
+    let now = now_ms();
+    let mut lines = Vec::with_capacity(signals.len());
+    for signal in &signals {
+        match report_one(&store, signal, now) {
+            Ok(line) => lines.push(line),
+            Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("store: {e:#}")),
+        }
+    }
+    (axum::http::StatusCode::OK, lines.join("\n"))
 }
 
 /// Ops view: every issue, newest sighting first.
@@ -759,3 +794,4 @@ async fn run_fix() -> anyhow::Result<()> {
     );
     Ok(())
 }
+pub const NUWA_BUILD_MARKER: &str = "MARKER-XYZ-9L";

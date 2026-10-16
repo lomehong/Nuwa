@@ -167,7 +167,10 @@ func appendAll(file *os.File, data []byte) error {
 // HTTPSink POSTs each envelope as one JSON document.
 type HTTPSink struct {
 	Endpoint string
-	Client   *http.Client
+	// Token is sent as the X-NUWA-Token header when the ingest server
+	// requires one (NUWA_INGEST_TOKEN on the serve side). Report-only.
+	Token string
+	Client *http.Client
 }
 
 func (h HTTPSink) Send(e Envelope) error {
@@ -185,6 +188,9 @@ func (h HTTPSink) Send(e Envelope) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "qingniao-go/"+Schema)
+	if h.Token != "" {
+		req.Header.Set("X-NUWA-Token", h.Token)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

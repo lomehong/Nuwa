@@ -130,6 +130,23 @@ func TestHTTPSinkSurfacesHTTPError(t *testing.T) {
 	}
 }
 
+func TestHTTPSinkSendsTokenHeader(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("X-NUWA-Token")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	sink := HTTPSink{Endpoint: srv.URL, Token: "s3cret"}
+	if err := sink.Send(PanicEnvelope(testMeta, "x", nil, time.Now())); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if got != "s3cret" {
+		t.Errorf("X-NUWA-Token = %q, want s3cret", got)
+	}
+}
+
 // collectFunc adapts a closure into a Sink.
 type collectFunc func(Envelope) error
 
