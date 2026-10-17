@@ -122,6 +122,8 @@ pub enum ShanError {
     UnknownRunner(String),
     #[error("unknown run {0}")]
     UnknownRun(String),
+    #[error("issue {0} is not stuck")]
+    NotStuck(String),
 }
 
 pub type ShanResult<T> = Result<T, ShanError>;
@@ -553,6 +555,86 @@ impl Store {
 
         let last_progress = state_changed_at.max(owner_heartbeat.unwrap_or(0));
         Ok(now_ms - last_progress > stuck_after_ms)
+    }
+
+    /// Requeue a `triggered`/`fixing` issue as `new` so the pool can claim it
+    /// again. Without `force`, the issue must first be [`Store::stuck`].
+    pub fn requeue_stuck(
+        &self,
+        fingerprint: &str,
+        force: bool,
+        now_ms: i64,
+        stuck_after_ms: i64,
+    ) -> ShanResult<()> {
+        if !force && !self.stuck(fingerprint, now_ms, stuck_after_ms)? {
+            return Err(ShanError::NotStuck(fingerprint.to_string()));
+        }
+        let conn = self.lock();
+        let (state, repo): (String, String) = conn
+            .query_row(
+                "SELECT state, repo FROM issues WHERE fingerprint=?1",
+                [fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    ShanError::UnknownIssue(fingerprint.to_string())
+                }
+                other => ShanError::Db(other),
+            })?;
+        let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state))?;
+        if !matches!(from, State::Triggered | State::Fixing) {
+            return Err(ShanError::InvalidTransition { from, to: State::New });
+        }
+        conn.execute(
+            "UPDATE issues SET state='new', cooldown_until=0, owner_runner_id=NULL,
+                state_changed_at=?2 WHERE fingerprint=?1",
+            rusqlite::params![fingerprint, now_ms],
+        )?;
+        drop(conn);
+        self.record_event(
+            fingerprint,
+            now_ms,
+            Some(&repo),
+            "owner",
+            "requeued",
+            if force { "forced by owner" } else { "stuck requeued by owner" },
+        )
+    }
+
+    /// Reopen an `escalated`/`rejected` issue as `new` (owner decision).
+    pub fn reopen_issue(&self, fingerprint: &str, now_ms: i64) -> ShanResult<()> {
+        let conn = self.lock();
+        let (state, repo): (String, String) = conn
+            .query_row(
+                "SELECT state, repo FROM issues WHERE fingerprint=?1",
+                [fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    ShanError::UnknownIssue(fingerprint.to_string())
+                }
+                other => ShanError::Db(other),
+            })?;
+        let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state))?;
+        if !matches!(from, State::Escalated | State::Rejected) {
+            return Err(ShanError::InvalidTransition { from, to: State::New });
+        }
+        conn.execute(
+            "UPDATE issues SET state='new', cooldown_until=0, owner_runner_id=NULL,
+                state_changed_at=?2 WHERE fingerprint=?1",
+            rusqlite::params![fingerprint, now_ms],
+        )?;
+        drop(conn);
+        self.record_event(
+            fingerprint,
+            now_ms,
+            Some(&repo),
+            "owner",
+            "state_changed",
+            "reopened by owner",
+        )
     }
 
     /// Validate + apply a state transition, journaling the event as `system`.
@@ -1441,6 +1523,116 @@ mod tests {
             .expect("heartbeat");
         assert!(!store.stuck(&fp, old + 500_001, 300_000).expect("not yet"));
         assert!(store.stuck(&fp, old + 800_001, 300_000).expect("stuck"));
+    }
+
+    /// A fresh claim has no owner heartbeat yet; the claim-time
+    /// `state_changed_at` stamp is its only progress marker, so it must not
+    /// count as stuck merely for lacking a runner.
+    #[test]
+    fn freshly_claimed_issue_is_not_stuck() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let now = 1_000_000;
+        store.report_signal(&signal(), now).expect("report");
+        let fp = store
+            .claim_ready_issue(now, now + 10_000)
+            .expect("claim")
+            .expect("issue")
+            .fingerprint;
+        assert!(!store.stuck(&fp, now + 100_000, 300_000).expect("stuck"));
+    }
+
+    #[test]
+    fn requeue_blocks_healthy_and_forces_when_requested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let old = 1_000_000;
+        store.report_signal(&signal(), old).expect("report");
+        let fp = store
+            .claim_ready_issue(old, old + 10_000)
+            .expect("claim")
+            .expect("issue")
+            .fingerprint;
+        store
+            .set_state_as(&fp, State::Fixing, old + 10, Some("repair"), "runner")
+            .expect("fixing");
+        // owner 尚未建立：超过阈值后才允许非 force requeue。
+        assert!(store.requeue_stuck(&fp, false, old + 20, 300_000).is_err());
+        assert!(store.requeue_stuck(&fp, false, old + 400_000, 300_000).is_ok());
+        assert!(store.ready_issue(old + 400_001).expect("ready").is_some());
+
+        // 重新领取并建立一个健康 owner。
+        let fp = store
+            .claim_ready_issue(old + 400_002, old + 500_000)
+            .expect("claim2")
+            .expect("issue")
+            .fingerprint;
+        store
+            .set_state_as(&fp, State::Fixing, old + 400_010, Some("repair"), "runner")
+            .expect("fixing2");
+        store
+            .start_run(&RunStart {
+                id: "run2".into(),
+                fingerprint: fp.clone(),
+                runner_id: "host:repo".into(),
+                repo: "example.com/spike-target".into(),
+                started_at: old + 400_011,
+                provider: None,
+                model: None,
+            })
+            .expect("run");
+        store
+            .upsert_runner(&RunnerUpsert {
+                id: "host:repo".into(),
+                repo: "example.com/spike-target".into(),
+                host: "host".into(),
+                pid: Some(1),
+                started_at: old,
+                heartbeat_at: old + 400_020,
+                status: "working".into(),
+                provider: None,
+                model: None,
+                daily_pr_limit: Some(5),
+                repo_path: None,
+                service_unit: None,
+                config_json: "{}".into(),
+            })
+            .expect("runner");
+        store
+            .heartbeat_runner(
+                "host:repo",
+                &RunnerHeartbeat {
+                    heartbeat_at: old + 400_020,
+                    status: "working".into(),
+                    current_fingerprint: Some(fp.clone()),
+                    phase: Some("repair".into()),
+                    config_json: None,
+                    last_error: None,
+                },
+            )
+            .expect("heartbeat");
+        assert!(store.requeue_stuck(&fp, false, old + 400_021, 300_000).is_err());
+        store
+            .requeue_stuck(&fp, true, old + 400_022, 300_000)
+            .expect("force");
+        assert!(store.ready_issue(old + 400_023).expect("ready").is_some());
+        let events = store.events_for(&fp, 20).expect("events");
+        assert!(events.iter().any(|e| e.kind == "requeued"));
+    }
+
+    #[test]
+    fn reopen_issue_allows_escalated_and_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t = 1_000_000;
+        store.report_signal(&signal(), t).expect("report");
+        let fp = store.ready_issue(t).expect("ready").expect("issue").fingerprint;
+        store.set_state(&fp, State::Triggered, t, None).expect("t");
+        store.set_state(&fp, State::Fixing, t, None).expect("f");
+        store.set_state(&fp, State::Escalated, t, None).expect("e");
+        store.reopen_issue(&fp, t + 1).expect("reopen");
+        assert!(store.ready_issue(t + 2).expect("ready").is_some());
+        assert!(store.reopen_issue(&fp, t + 3).is_err(), "new is not reopenable");
     }
 
     #[test]
