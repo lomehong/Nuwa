@@ -26,9 +26,17 @@ base64 = { workspace = true }
 anyhow = "1"
 reqwest = { workspace = true }
 uuid = { workspace = true }
+hmac = { workspace = true }
+subtle = { workspace = true }
+sha2 = { workspace = true }
+axum-extra = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [lints]
 workspace = true

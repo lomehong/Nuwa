@@ -4,6 +4,7 @@ mod guard;
 mod instructions;
 mod issue;
 mod repair;
+mod session;
 mod settings;
 mod ui;
 

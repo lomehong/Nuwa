@@ -70,6 +70,13 @@ shanhaijing = { path = "crates/shanhaijing", version = "0.1.0" }
 sha2 = "0.10"
 axum = "0.8"
 
+# Web console auth / static assets (M2a)
+hmac = "0.12"
+subtle = "2"
+axum-extra = { version = "0.10", features = ["cookie"] }
+rust-embed = "8"
+mime_guess = "2"
+
 [profile.release]
 lto = "thin"
 codegen-units = 16
