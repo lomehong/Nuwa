@@ -55,6 +55,9 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
+    }
     // Consumed by the issue/deliver endpoints in M2b/M2c.
     #[allow(dead_code)]
     pub fn invalid_state(message: impl Into<String>) -> Self {

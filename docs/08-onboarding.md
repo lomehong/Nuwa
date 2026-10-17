@@ -79,9 +79,9 @@ nuwa work --db shanhaijing.db \
 
 ## 4 · 日常运维命令
 
-**Web 控制台**：`http://<server>:7321/ui`（Basic 鉴权，用户名任意，**密码 = NUWA_INGEST_TOKEN**）——问题单总览（状态徽章/PR 链接，60s 自刷）、escalated 一键 reopen、sync 对账按钮、serve/work 活性。服务端渲染，无 JS 框架；鉴权复用上报令牌（泄露后果同级、可轮换）。
+**Web 控制台**：`http://<server>:7321/ui`（Basic 鉴权，用户名任意，**密码 = 有效 UI 令牌：`NUWA_UI_TOKEN`，未设置时回退 `NUWA_INGEST_TOKEN`**）——问题单总览（状态徽章/PR 链接，60s 自刷）、escalated 一键 reopen、sync 对账按钮、serve/work 活性。服务端渲染，无 JS 框架；鉴权复用 UI 令牌（未配置 UI 令牌时即上报令牌，泄露后果同级、可轮换）。
 
-**API 登录（v3 控制台）**：`POST /api/v1/auth/login`，body `{"token":"<NUWA_UI_TOKEN>"}`；成功 204 并设置 `nuwa_session`（HttpOnly）与 `nuwa_csrf`。后续非 GET 请求带 `X-NUWA-CSRF` 头。旧 `/ui` Basic 鉴权保留至 M6。
+**API 登录（v3 控制台）**：`POST /api/v1/auth/login`，必须带 `Content-Type: application/json`，body `{"token":"<NUWA_UI_TOKEN>"}`；成功 204 并设置 `nuwa_session`（HttpOnly）与 `nuwa_csrf`。后续非 GET 请求必须带 `X-NUWA-CSRF` 头，且其值须与 `nuwa_csrf` cookie 值一致（双提交校验，仅"带头"不够）。会话与 CSRF cookie 的 `Max-Age` 由 `NUWA_SESSION_TTL_SECS` 控制（默认 86400，允许 300–2592000）；`NUWA_COOKIE_SECURE=always` 强制加 `Secure`（TLS 代理下也可由 `X-Forwarded-Proto: https` 自动触发）。旧 `/ui` Basic 鉴权保留至 M6。
 
 | 命令 | 用途 |
 |---|---|

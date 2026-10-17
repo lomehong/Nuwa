@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -84,16 +85,35 @@ pub async fn login(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(req): Json<LoginRequest>,
+    payload: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Response {
+    // Keep extractor rejections inside the JSON error contract: axum's default
+    // rejection is plain text, which the SPA cannot parse.
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => {
+            let status = rejection.status();
+            let message = rejection.body_text();
+            return if status == StatusCode::UNSUPPORTED_MEDIA_TYPE {
+                ApiError::new(status, "unsupported_media_type", message)
+            } else {
+                ApiError::invalid_request(message)
+            }
+            .into_response();
+        }
+    };
     let now = now_ms();
     if let Err(retry) = state.limiter.check(peer.ip(), now) {
         return rate_limited_response(retry);
     }
-    let expected = state.ui_token.as_deref().unwrap_or("");
-    if !expected.is_empty() && !SessionManager::token_eq(&req.token, expected) {
-        state.limiter.failure(peer.ip(), now);
-        return ApiError::unauthorized("invalid token").into_response();
+    // Local mode (token unset or empty) accepts any login token, matching the
+    // session middleware and `me` (F5).
+    if !state.local_mode() {
+        let expected = state.ui_token.as_deref().unwrap_or("");
+        if !SessionManager::token_eq(&req.token, expected) {
+            state.limiter.failure(peer.ip(), now);
+            return ApiError::unauthorized("invalid token").into_response();
+        }
     }
     state.limiter.success(peer.ip());
     let issued = state.session.issue(now);
@@ -119,7 +139,7 @@ pub async fn logout(
 
 pub async fn me(State(state): State<AppState>, headers: HeaderMap, jar: CookieJar) -> Response {
     let now = now_ms();
-    let local_mode = state.ui_token.is_none();
+    let local_mode = state.local_mode();
     let expires_at_ms = if local_mode {
         None
     } else {
@@ -132,7 +152,12 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap, jar: CookieJa
         }
     };
     let mut jar = jar;
-    if jar.get(CSRF_COOKIE).is_none() {
+    // A present-but-empty cookie is as useless as a missing one (the CSRF
+    // guard rejects empty), so reissue it.
+    if jar
+        .get(CSRF_COOKIE)
+        .map_or(true, |cookie| cookie.value().is_empty())
+    {
         let secure = secure_cookie(&state, &headers);
         jar = jar.add(csrf_cookie(
             uuid::Uuid::new_v4().simple().to_string(),

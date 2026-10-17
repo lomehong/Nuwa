@@ -30,6 +30,15 @@ pub async fn serve(method: Method, uri: Uri) -> Response {
     if raw == "api" || raw.starts_with("api/") {
         return crate::api::api_not_found().into_response();
     }
+    // Legacy backend namespaces are not SPA routes: a browser GET (or a proxy
+    // typo) must 404 instead of receiving the shell with a 200.
+    if raw == "ingest" || raw == "health" || raw.starts_with("health/") {
+        return not_found(&method);
+    }
+    // Dotfiles (e.g. `web/dist/.gitkeep`) are build artifacts, never assets.
+    if raw.starts_with('.') {
+        return not_found(&method);
+    }
     // Static serving is read-only. This gate sits before the asset lookup so
     // a write to an existing file (or to `/` once `index.html` exists) can
     // never answer 200.
@@ -187,7 +196,23 @@ mod tests {
 
     #[tokio::test]
     async fn missing_file_like_paths_are_404() {
-        for path in ["/favicon.ico", "/robots.txt", "/assets/"] {
+        for path in ["/missing-asset-xyz.js", "/missing-file-xyz.xyz", "/assets/"] {
+            let response = serve_request(Method::GET, path).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_backend_paths_never_fall_back_to_the_spa() {
+        for path in ["/ingest", "/health/unknown"] {
+            let response = serve_request(Method::GET, path).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dotfiles_are_never_served() {
+        for path in ["/.gitkeep", "/.hidden"] {
             let response = serve_request(Method::GET, path).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }

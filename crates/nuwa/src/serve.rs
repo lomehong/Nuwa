@@ -20,6 +20,11 @@ const CSP_STRICT: &str = "default-src 'self'; script-src 'self'; style-src 'self
 /// The legacy console keeps inline styles until it is replaced in M6.
 const CSP_LEGACY: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'";
 
+/// Session TTL bounds and default from docs/09 (`NUWA_SESSION_TTL_SECS`).
+const SESSION_TTL_DEFAULT_SECS: i64 = 86_400;
+const SESSION_TTL_MIN_SECS: i64 = 300;
+const SESSION_TTL_MAX_SECS: i64 = 2_592_000;
+
 /// State shared by the legacy console routes and the `/api/v1` surface.
 #[derive(Clone)]
 pub struct AppState {
@@ -33,6 +38,15 @@ pub struct AppState {
     #[allow(dead_code)]
     pub started_at_ms: i64,
     pub cookie_secure: bool,
+}
+
+impl AppState {
+    /// Local mode = no console token configured. An empty token is treated as
+    /// unset everywhere so a hand-built state cannot accept any login while
+    /// the session middleware still demands a cookie.
+    pub fn local_mode(&self) -> bool {
+        self.ui_token.as_deref().map_or(true, str::is_empty)
+    }
 }
 
 /// Full app assembly: legacy console + `/api/v1` + static fallback.
@@ -62,7 +76,14 @@ pub fn build_app(state: AppState) -> Router {
         .route_layer(ui_auth)
         .route_layer(axum::middleware::from_fn(crate::ui::origin_guard));
     let legacy = Router::new()
-        .route("/ingest", post(ingest_endpoint).route_layer(ingest_auth))
+        .route(
+            "/ingest",
+            // Non-POST methods are a plain 404, never the SPA shell (the
+            // fallback below also guards this path).
+            post(ingest_endpoint)
+                .route_layer(ingest_auth)
+                .fallback(|| async { StatusCode::NOT_FOUND }),
+        )
         .route("/health", get(|| async { "nuwa serve ok" }))
         .merge(legacy_ui)
         .with_state(legacy_state);
@@ -79,9 +100,13 @@ pub fn build_app(state: AppState) -> Router {
 /// `/settings`) keeps `style-src 'unsafe-inline'` until M6 replaces it; the
 /// JSON API and the SPA get the strict policy.
 pub async fn security_headers(req: Request, next: Next) -> Response {
-    let legacy = req.uri().path().starts_with("/ui")
-        || req.uri().path().starts_with("/issue/")
-        || req.uri().path().starts_with("/settings");
+    let path = req.uri().path();
+    let legacy = path.starts_with("/ui")
+        || path.starts_with("/issue/")
+        || path.starts_with("/settings");
+    // API payloads (session state, M2b read data) must never be cached. Static
+    // responses keep the cache policy their handler set.
+    let api = path == "/api" || path.starts_with("/api/");
     let mut res = next.run(req).await;
     let h = res.headers_mut();
     h.insert(
@@ -102,6 +127,9 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(csp),
     );
+    if api {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     res
 }
 
@@ -145,10 +173,7 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         .filter(|t| !t.is_empty())
         .map(|t| Arc::new(Some(t)) as Arc<Option<String>>)
         .unwrap_or_else(|| Arc::clone(&ingest_token));
-    let ttl_secs: i64 = std::env::var("NUWA_SESSION_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(86_400);
+    let ttl_ms = session_ttl_ms(std::env::var("NUWA_SESSION_TTL_SECS").ok().as_deref());
     let cookie_secure = std::env::var("NUWA_COOKIE_SECURE").ok().as_deref() == Some("always");
     let state = AppState {
         store: Arc::clone(&store),
@@ -156,12 +181,13 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         ingest_token: Arc::clone(&ingest_token),
         session: Arc::new(crate::session::SessionManager::new(
             ui_token.as_deref().unwrap_or(""),
-            ttl_secs * 1000,
+            ttl_ms,
         )),
         limiter: Arc::new(crate::session::LoginLimiter::new()),
         started_at_ms: now_ms(),
         cookie_secure,
     };
+    let local_mode = state.local_mode();
     let app = build_app(state);
 
     let token_mode = if ingest_token.is_some() { "required" } else { "DISABLED (local mode)" };
@@ -171,10 +197,40 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
     println!(
         "serve      : listening on http://{listen} (POST /ingest, GET /health) — token {token_mode}"
     );
+    println!(
+        "api auth   : {}",
+        if local_mode { "LOCAL MODE" } else { "session" }
+    );
+    if local_mode && !listen_is_local(&listen) {
+        eprintln!(
+            "warning    : API auth is in LOCAL MODE while listening on {listen}; anyone who can reach the port has full console API access"
+        );
+    }
     // ConnectInfo is required by the Task 4 login rate limiter (peer IP).
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .context("serve")
+}
+
+/// Parse `NUWA_SESSION_TTL_SECS`, clamp it to the documented 5 min – 30 day
+/// range, and convert to milliseconds without overflow.
+fn session_ttl_ms(raw: Option<&str>) -> i64 {
+    raw.and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(SESSION_TTL_DEFAULT_SECS)
+        .clamp(SESSION_TTL_MIN_SECS, SESSION_TTL_MAX_SECS)
+        .saturating_mul(1000)
+}
+
+/// Whether the configured listen address stays on this host. Used only for
+/// the local-mode startup warning; bind behavior is unchanged.
+fn listen_is_local(listen: &str) -> bool {
+    if listen.starts_with("localhost:") {
+        return true;
+    }
+    listen
+        .parse::<SocketAddr>()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false)
 }
 
 /// Shared-token gate. `401` unless NUWA_INGEST_TOKEN is unset (local mode)
@@ -464,6 +520,11 @@ mod tests {
             !csp.contains("unsafe-inline"),
             "API CSP must stay strict: {csp}"
         );
+        assert_eq!(
+            header_str(&response, header::CACHE_CONTROL),
+            "no-store",
+            "API responses must never be cached"
+        );
     }
 
     // The legacy console keeps inline styles until M6, and headers must be
@@ -559,7 +620,7 @@ mod tests {
     #[tokio::test]
     async fn missing_static_asset_is_404_with_strict_security_headers() {
         let (_dir, app) = test_app();
-        for path in ["/assets/missing-abc123.js", "/favicon.ico"] {
+        for path in ["/assets/missing-abc123.js", "/missing-file-xyz.xyz"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -602,6 +663,35 @@ mod tests {
         );
         let value = json_body(response).await;
         assert_eq!(value["error"]["code"], "not_found");
+    }
+
+    // Legacy backend namespaces must never answer the SPA shell with a 200:
+    // `/ingest` is POST-only and `/health/...` has no routes.
+    #[tokio::test]
+    async fn legacy_backend_paths_are_404_not_spa() {
+        let (_dir, app) = test_app();
+        for path in ["/ingest", "/health/unknown"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                !content_type.starts_with("text/html"),
+                "{path} must not serve the SPA: {content_type}"
+            );
+        }
     }
 
     // The legacy /ingest gate is the ingest token, not Basic auth: the refactor
@@ -703,8 +793,46 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            header_str(&response, header::CACHE_CONTROL),
+            "no-store",
+            "API 401 responses must never be cached"
+        );
         let value = json_body(response).await;
         assert_eq!(value["error"]["code"], "unauthorized");
+    }
+
+    // A present-but-empty `nuwa_csrf` cookie cannot pass the CSRF guard, so
+    // `/auth/me` must treat it as absent and reissue a usable token.
+    #[tokio::test]
+    async fn me_reissues_an_empty_csrf_cookie() {
+        let (_dir, app) = test_app();
+        let login_response = login(&app, "secret").await;
+        assert_eq!(login_response.status(), StatusCode::NO_CONTENT);
+        let session_pair = cookie_pair(&set_cookie(&login_response, "nuwa_session"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .extension(peer())
+                    .header(header::COOKIE, format!("{session_pair}; nuwa_csrf="))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let csrf = set_cookie(&response, "nuwa_csrf");
+        let csrf_pair = cookie_pair(&csrf);
+        let reissued = cookie_token(&csrf_pair);
+        assert!(
+            !reissued.is_empty(),
+            "empty csrf cookie must be replaced: {csrf}"
+        );
+        let value = json_body(response).await;
+        assert_eq!(value["authenticated"], true);
+        assert_eq!(value["local_mode"], false);
     }
 
     #[tokio::test]
@@ -825,6 +953,45 @@ mod tests {
         assert_eq!(value["error"]["code"], "rate_limited");
     }
 
+    // Extractor rejections must use the JSON error contract, not axum's
+    // plain-text default: the SPA can only render `{"error": ...}`.
+    #[tokio::test]
+    async fn api_login_maps_json_rejections_to_the_error_contract() {
+        let (_dir, app) = test_app();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .extension(peer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"token":"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "invalid_request");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .extension(peer())
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(r#"{"token":"secret"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "unsupported_media_type");
+    }
+
     #[tokio::test]
     async fn api_local_mode_is_authenticated_but_still_requires_csrf() {
         let (_dir, state) = test_state(None);
@@ -888,6 +1055,36 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    // `Some("")` must mean local mode everywhere: previously login accepted
+    // any token while the middleware still demanded a session.
+    #[tokio::test]
+    async fn empty_ui_token_is_local_mode() {
+        let (_dir, state) = test_state(Some(""));
+        let app = build_app(state);
+        let response = login(&app, "anything").await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "local mode login accepts any token"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .extension(peer())
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["authenticated"], true);
+        assert_eq!(value["local_mode"], true);
+        assert!(value["expires_at_ms"].is_null(), "got {value}");
     }
 
     #[tokio::test]
@@ -962,5 +1159,28 @@ mod tests {
             StatusCode::FORBIDDEN,
             "an empty Host header must not satisfy the origin check"
         );
+    }
+
+    #[test]
+    fn session_ttl_is_clamped_and_converted_to_ms() {
+        assert_eq!(session_ttl_ms(None), 86_400_000, "default 24h");
+        assert_eq!(session_ttl_ms(Some("garbage")), 86_400_000);
+        assert_eq!(session_ttl_ms(Some("60")), 300_000, "clamped to 5 min");
+        assert_eq!(session_ttl_ms(Some("600")), 600_000);
+        assert_eq!(
+            session_ttl_ms(Some("999999999999")),
+            2_592_000_000,
+            "clamped to 30 days"
+        );
+    }
+
+    #[test]
+    fn listen_is_local_accepts_loopback_and_localhost_only() {
+        for listen in ["127.0.0.1:7321", "localhost:7321", "[::1]:7321"] {
+            assert!(listen_is_local(listen), "{listen}");
+        }
+        for listen in ["0.0.0.0:7321", "192.168.1.10:7321", "example.com:7321"] {
+            assert!(!listen_is_local(listen), "{listen}");
+        }
     }
 }

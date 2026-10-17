@@ -96,12 +96,15 @@ impl LoginLimiter {
 
     pub fn check(&self, ip: IpAddr, now_ms: i64) -> Result<(), i64> {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Drop buckets for every IP whose window has closed, not just the
+        // caller's, so the map cannot grow without bound. `check` and
+        // `failure` take separate locks, so a burst can overshoot
+        // MAX_LOGIN_FAILURES by the number of in-flight requests; strict
+        // atomic reservation is out of scope for M2a.
+        map.retain(|_, bucket| bucket.reset_at_ms > now_ms);
         if let Some(b) = map.get(&ip) {
-            if now_ms < b.reset_at_ms && b.failures >= MAX_LOGIN_FAILURES {
+            if b.failures >= MAX_LOGIN_FAILURES {
                 return Err(b.reset_at_ms - now_ms);
-            }
-            if now_ms >= b.reset_at_ms {
-                map.remove(&ip);
             }
         }
         Ok(())
@@ -109,14 +112,11 @@ impl LoginLimiter {
 
     pub fn failure(&self, ip: IpAddr, now_ms: i64) {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        map.retain(|_, bucket| bucket.reset_at_ms > now_ms);
         let bucket = map.entry(ip).or_insert(Bucket {
             failures: 0,
             reset_at_ms: now_ms + LOGIN_WINDOW_MS,
         });
-        if now_ms >= bucket.reset_at_ms {
-            bucket.failures = 0;
-            bucket.reset_at_ms = now_ms + LOGIN_WINDOW_MS;
-        }
         bucket.failures += 1;
     }
 
@@ -149,16 +149,16 @@ pub fn origin_ok(origin: Option<&str>, referer: Option<&str>, host: Option<&str>
     }
 }
 
-/// Session gate for protected `/api/v1` routes. Local mode (no UI token) is
-/// implicitly authenticated; otherwise a valid signed `nuwa_session` cookie
-/// is required.
+/// Session gate for protected `/api/v1` routes. Local mode (no UI token or an
+/// empty one) is implicitly authenticated; otherwise a valid signed
+/// `nuwa_session` cookie is required.
 pub async fn require_session(
     State(state): State<Arc<crate::serve::AppState>>,
     jar: CookieJar,
     req: Request,
     next: Next,
 ) -> Response {
-    if state.ui_token.is_none() {
+    if state.local_mode() {
         return next.run(req).await;
     }
     let Some(cookie) = jar.get("nuwa_session") else {
@@ -239,6 +239,27 @@ mod tests {
         l.failure(ip, 700_001);
         l.success(ip);
         assert!(l.check(ip, 700_002).is_ok());
+    }
+
+    #[test]
+    fn limiter_prunes_stale_buckets_for_other_ips() {
+        let l = LoginLimiter::new();
+        let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        for _ in 0..3 {
+            l.failure(a, 1_000);
+        }
+        let later = 1_000 + LOGIN_WINDOW_MS + 1;
+        assert!(l.check(b, later).is_ok());
+        {
+            let map = l.inner.lock().expect("lock");
+            assert!(!map.contains_key(&a), "expired bucket pruned by check");
+            assert!(!map.contains_key(&b), "check does not insert a bucket");
+        }
+        l.failure(b, later);
+        let map = l.inner.lock().expect("lock");
+        assert!(!map.contains_key(&a), "expired bucket pruned by failure");
+        assert_eq!(map.get(&b).map(|bucket| bucket.failures), Some(1));
     }
 
     #[test]
