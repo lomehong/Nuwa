@@ -448,6 +448,39 @@ fn svc_active(name: &str) -> String {
         .unwrap_or_else(|_| "n/a".into())
 }
 
+fn authority(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = &rest[..end];
+    if host.is_empty() { None } else { Some(host) }
+}
+
+/// 过渡缓解：Basic Auth 会被浏览器自动携带，跨站表单 POST 需要拦截。
+/// 无 Origin/Referer 的非浏览器客户端（curl、脚本）保持可用。
+pub fn origin_ok(origin: Option<&str>, referer: Option<&str>, host: Option<&str>) -> bool {
+    let Some(host) = host else { return false };
+    let candidate = match origin {
+        Some(origin) => authority(origin),
+        None => referer.and_then(authority),
+    };
+    match candidate {
+        Some(host_from_header) => host_from_header.eq_ignore_ascii_case(host),
+        None => origin.is_none() && referer.is_none(),
+    }
+}
+
+pub async fn origin_guard(headers: HeaderMap, req: Request, next: Next) -> Response {
+    if req.method() == axum::http::Method::POST {
+        let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+        let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+        if !origin_ok(origin, referer, host) {
+            return (StatusCode::FORBIDDEN, "cross-origin POST rejected").into_response();
+        }
+    }
+    next.run(req).await
+}
+
 pub async fn ui_auth(
     State((_, token)): State<Shared>,
     headers: HeaderMap,
@@ -712,5 +745,35 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert!(store.ready_issue(crate::now_ms()).expect("ready").is_some());
+    }
+
+    #[test]
+    fn origin_guard_allows_same_origin_and_non_browser_clients() {
+        assert!(super::origin_ok(None, None, Some("nuwa.example:7321")));
+        assert!(super::origin_ok(
+            Some("https://nuwa.example:7321"),
+            None,
+            Some("nuwa.example:7321")
+        ));
+        assert!(super::origin_ok(
+            None,
+            Some("https://nuwa.example:7321/ui"),
+            Some("nuwa.example:7321")
+        ));
+    }
+
+    #[test]
+    fn origin_guard_rejects_cross_origin_and_malformed_values() {
+        assert!(!super::origin_ok(
+            Some("https://evil.example"),
+            None,
+            Some("nuwa.example:7321")
+        ));
+        assert!(!super::origin_ok(
+            Some("https://nuwa.example:7321"),
+            None,
+            None
+        ));
+        assert!(!super::origin_ok(Some("not-a-url"), None, Some("nuwa.example:7321")));
     }
 }

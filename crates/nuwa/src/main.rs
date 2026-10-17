@@ -670,6 +670,7 @@ async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         .route("/settings/save", post(settings::save_settings))
         .route("/settings/restart", post(settings::restart_services))
         .route_layer(ui_auth)
+        .route_layer(axum::middleware::from_fn(ui::origin_guard))
         .with_state((Arc::clone(&store), Arc::clone(&ui_token)));
     let app = axum::Router::new()
         .route("/ingest", post(ingest_endpoint).route_layer(auth))
