@@ -11,6 +11,10 @@
 Cargo.lock.bak
 *.local
 
+# Frontend build output (M3) — keep the folder for rust-embed on fresh clones
+/web/dist/*
+!/web/dist/.gitkeep
+
 # Secrets / local env — never in the repo
 .env
 .env.*

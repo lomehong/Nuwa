@@ -479,6 +479,97 @@ mod tests {
             header_str(&response, header::CONTENT_SECURITY_POLICY),
             STRICT_CSP
         );
+        assert_eq!(header_str(&response, header::CACHE_CONTROL), "no-cache");
+    }
+
+    // Extensionless GET/HEAD paths are SPA routes. Every other unmatched
+    // method stays a 404 — the placeholder must not answer writes.
+    #[tokio::test]
+    async fn spa_routes_answer_get_and_head_only() {
+        let (_dir, app) = test_app();
+        for method in ["GET", "HEAD"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/issues/abc")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            assert_common_security_headers(&response);
+            assert_eq!(
+                header_str(&response, header::CONTENT_SECURITY_POLICY),
+                STRICT_CSP,
+                "{method}"
+            );
+        }
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/issues/abc")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
+            assert_common_security_headers(&response);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_static_asset_is_404_with_strict_security_headers() {
+        let (_dir, app) = test_app();
+        for path in ["/assets/missing-abc123.js", "/favicon.ico"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_common_security_headers(&response);
+            assert_eq!(
+                header_str(&response, header::CONTENT_SECURITY_POLICY),
+                STRICT_CSP,
+                "{path}"
+            );
+        }
+    }
+
+    // Only `/api/v1` is a real API mount. Other `/api` paths must not fall
+    // through to the SPA or the legacy console.
+    #[tokio::test]
+    async fn unknown_api_namespace_returns_json_404() {
+        let (_dir, app) = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v2/x")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_common_security_headers(&response);
+        assert_eq!(
+            header_str(&response, header::CONTENT_SECURITY_POLICY),
+            STRICT_CSP
+        );
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "not_found");
     }
 
     // The legacy /ingest gate is the ingest token, not Basic auth: the refactor
