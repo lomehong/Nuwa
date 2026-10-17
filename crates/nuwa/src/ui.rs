@@ -209,10 +209,11 @@ pub fn render_dashboard(d: &DashData) -> String {
             "<span class=\"dim\">-</span>".into()
         };
         table.push_str(&format!(
-            "<tr><td class=\"mono\">{}</td>\
+            "<tr><td class=\"mono\"><a href=\"/issue/{}\">{}</a></td>\
              <td><span class=\"badge\" style=\"background:{}\">{}</span></td>\
              <td><span class=\"stone\" style=\"background:{}\"></span>{}</td>\
              <td>{}</td><td>{}</td><td>{}</td><td class=\"mono dim\">{}</td><td>{pr}</td><td>{action}</td></tr>",
+            esc(&r.fingerprint),
             esc(&r.fingerprint[..16.min(r.fingerprint.len())]),
             state_color(&r.state),
             esc(&r.state),
@@ -314,7 +315,7 @@ footer form{{display:inline}}
 </style></head><body>
 <header>
   <div><h1>女娲 · 山海经<span class="sub">自愈式修复 Agent · 运维台</span></h1></div>
-  <div class="svc">serve: <b class="{serve_cls}">{serve}</b> &nbsp; work: <b class="{work_cls}">{work}</b> &nbsp; 心跳: {hb}</div>
+  <div class="svc">serve: <b class="{serve_cls}">{serve}</b> &nbsp; work: <b class="{work_cls}">{work}</b> &nbsp; 心跳: {hb} &nbsp; <a href="/settings">⚙ 设置</a></div>
 </header>
 <div class="pipeline">{pipeline}</div>
 {flash_html}
