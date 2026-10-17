@@ -1686,4 +1686,694 @@ mod tests {
             "other repo PR issue is seeded"
         );
     }
+
+    // ---- M2b Task 6: combined six-endpoint read-API smoke test ----
+
+    const READ_API_REPO: &str = "example.com/read";
+
+    struct ReadApiSeed {
+        now: i64,
+        /// First seeded timestamp; the rest are `base + step * 1s`.
+        base: i64,
+        /// UTC hour start containing `base`, for the aggregation fixture.
+        hour: i64,
+        escalated: String,
+        merged: String,
+        merged_pr_url: String,
+        active: String,
+        queued: String,
+    }
+
+    fn read_api_signal(title: &str, severity: &str) -> shanhaijing::Signal {
+        shanhaijing::Signal {
+            repo: READ_API_REPO.to_string(),
+            language: "go".to_string(),
+            title: title.to_string(),
+            severity: severity.to_string(),
+            message: Some(format!("boom {title}")),
+            stack_trace: format!(
+                "panic: boom {title}\ngoroutine 1 [running]:\nexample.com/read.Fn_{}()\n\t/read/{}.go:1 +0x1",
+                title.replace(' ', "_"),
+                title.replace(' ', "_"),
+            ),
+        }
+    }
+
+    fn read_api_report(store: &shanhaijing::Store, title: &str, severity: &str, at: i64) -> String {
+        match store
+            .report_signal(&read_api_signal(title, severity), at)
+            .expect("report signal")
+        {
+            shanhaijing::ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("{title} must be a new issue, got {other:?}"),
+        }
+    }
+
+    /// Seeds one issue per attention bucket the console cares about: an
+    /// escalated issue, a merged issue with a run and a PR, an active fixing
+    /// run owned by a live runner, and a queued `new` issue. Plus a runner
+    /// heartbeat and an events-only fingerprint for aggregation.
+    ///
+    /// Every timestamp is pinned to the UTC day containing `now` (the same
+    /// trick as `seed_overview`) so today-scoped counters are exact even when
+    /// the test runs just after midnight.
+    fn seed_read_api(store: &shanhaijing::Store) -> ReadApiSeed {
+        use shanhaijing::{
+            RunFinish, RunStart, RunUpdate, RunnerHeartbeat, RunnerUpsert, State,
+        };
+
+        let now = crate::now_ms();
+        let day_start = now - now.rem_euclid(86_400_000);
+        let base = day_start.max(now - 20_000);
+        let at = |step: i64| base + step * 1_000;
+
+        let escalated = read_api_report(store, "read escalated", "critical", at(0));
+        overview_state(store, &escalated, State::Triggered, at(1), None);
+        overview_state(store, &escalated, State::Fixing, at(2), None);
+        overview_state(
+            store,
+            &escalated,
+            State::Escalated,
+            at(3),
+            Some("repair_failed: boom"),
+        );
+
+        let merged = read_api_report(store, "read merged", "high", at(4));
+        overview_state(store, &merged, State::Triggered, at(5), None);
+        overview_state(store, &merged, State::Fixing, at(6), None);
+        overview_state(store, &merged, State::PrOpen, at(7), None);
+        let merged_pr_url = "https://github.com/example/read/pull/7".to_string();
+        let pr_at = at(8);
+        store
+            .set_pr(&merged, &merged_pr_url, pr_at)
+            .expect("set merged pr");
+        overview_state(store, &merged, State::Merged, at(9), Some(&merged_pr_url));
+        store
+            .record_event(
+                &merged,
+                at(10),
+                Some(READ_API_REPO),
+                "system",
+                "merged",
+                &merged_pr_url,
+            )
+            .expect("merged event");
+        store
+            .start_run(&RunStart {
+                id: "run-detail".to_string(),
+                fingerprint: merged.clone(),
+                runner_id: "runner-live".to_string(),
+                repo: READ_API_REPO.to_string(),
+                started_at: at(5),
+                provider: Some("faux".to_string()),
+                model: Some("faux".to_string()),
+            })
+            .expect("start detail run");
+        store
+            .update_run(
+                "run-detail",
+                &RunUpdate {
+                    turns: Some(6),
+                    tokens_uncached: Some(17_000),
+                    tokens_cached: Some(500),
+                    verification_ok: Some(true),
+                    verification_detail: Some("verification passed".to_string()),
+                    change_stat: Some("1 file changed".to_string()),
+                    branch: Some("agent/fix/read".to_string()),
+                    commit_sha: Some("deadbeef".to_string()),
+                    pr_url: Some(merged_pr_url.clone()),
+                    pr_opened_at: Some(pr_at),
+                    ci_verdict: Some("success".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("update detail run");
+        store
+            .finish_run(
+                "run-detail",
+                &RunFinish {
+                    finished_at: at(10),
+                    outcome: "success".to_string(),
+                    ci_verdict: Some("success".to_string()),
+                    error: None,
+                },
+            )
+            .expect("finish detail run");
+
+        let active = read_api_report(store, "read active", "medium", at(11));
+        overview_state(store, &active, State::Triggered, at(12), None);
+        overview_state(store, &active, State::Fixing, at(13), None);
+        store
+            .start_run(&RunStart {
+                id: "run-active".to_string(),
+                fingerprint: active.clone(),
+                runner_id: "runner-live".to_string(),
+                repo: READ_API_REPO.to_string(),
+                started_at: at(14),
+                provider: Some("faux".to_string()),
+                model: Some("faux".to_string()),
+            })
+            .expect("start active run");
+        store
+            .update_run(
+                "run-active",
+                &RunUpdate {
+                    phase: Some("repair".to_string()),
+                    turns: Some(2),
+                    tokens_uncached: Some(1_000),
+                    tokens_cached: Some(100),
+                    ..Default::default()
+                },
+            )
+            .expect("update active run");
+
+        let queued = read_api_report(store, "read queued", "low", at(15));
+
+        // The merged issue's CI outcome events feed the overview 24h counters.
+        store
+            .record_event(
+                &merged,
+                at(16),
+                Some(READ_API_REPO),
+                "runner",
+                "ci_green",
+                "head-green",
+            )
+            .expect("ci green event");
+        store
+            .record_event(
+                &merged,
+                at(16),
+                Some(READ_API_REPO),
+                "runner",
+                "ci_timeout",
+                "head-timeout",
+            )
+            .expect("ci timeout event");
+
+        // One live runner owning the active run; the effective config pins
+        // every key the console renders.
+        let config_json = serde_json::json!({
+            "interval_secs": 600,
+            "ci_timeout_secs": 900,
+            "max_turns": 30,
+            "max_tokens": 1_500_000,
+            "failing_check": "go test ./...",
+            "forbidden_paths_count": 4,
+        })
+        .to_string();
+        store
+            .upsert_runner(&RunnerUpsert {
+                id: "runner-live".to_string(),
+                repo: READ_API_REPO.to_string(),
+                host: "read-host".to_string(),
+                pid: Some(4242),
+                started_at: now - 60_000,
+                heartbeat_at: now,
+                status: "working".to_string(),
+                provider: Some("faux".to_string()),
+                model: Some("faux".to_string()),
+                daily_pr_limit: Some(5),
+                repo_path: Some("/tmp/read".to_string()),
+                service_unit: Some("nuwa-read".to_string()),
+                config_json,
+            })
+            .expect("upsert runner");
+        store
+            .heartbeat_runner(
+                "runner-live",
+                &RunnerHeartbeat {
+                    heartbeat_at: now,
+                    status: "working".to_string(),
+                    current_fingerprint: Some(active.clone()),
+                    phase: Some("repair".to_string()),
+                    config_json: None,
+                    last_error: None,
+                },
+            )
+            .expect("runner heartbeat");
+
+        // Events-only fingerprint: three same-hour `reported` rows with an
+        // interleaved other kind, plus one row in the next hour. `aggregate=1`
+        // must group by fingerprint + UTC hour, not by adjacency.
+        let hour = base - base.rem_euclid(3_600_000);
+        for (offset, kind, detail) in [
+            (60_000i64, "reported", "r0"),
+            (120_000, "state_changed", "interleaved"),
+            (180_000, "reported", "r1"),
+            (240_000, "reported", "r2"),
+            (3_600_000, "reported", "next-hour"),
+        ] {
+            store
+                .record_event(
+                    "read-api-events",
+                    hour + offset,
+                    Some(READ_API_REPO),
+                    "system",
+                    kind,
+                    detail,
+                )
+                .expect("event fixture");
+        }
+
+        ReadApiSeed {
+            now,
+            base,
+            hour,
+            escalated,
+            merged,
+            merged_pr_url,
+            active,
+            queued,
+        }
+    }
+
+    async fn read_api_get(app: &Router, uri: &str) -> Response {
+        app.clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    fn assert_read_api_headers(response: &Response) {
+        assert_common_security_headers(response);
+        assert_eq!(
+            header_str(response, header::CONTENT_SECURITY_POLICY),
+            STRICT_CSP
+        );
+        assert_eq!(header_str(response, header::CACHE_CONTROL), "no-store");
+        assert!(
+            header_str(response, header::CONTENT_TYPE).starts_with("application/json"),
+            "read API responses must be JSON"
+        );
+    }
+
+    fn read_api_fingerprints(value: &serde_json::Value) -> Vec<&str> {
+        value["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|item| item["fingerprint"].as_str().expect("fingerprint"))
+            .collect()
+    }
+
+    /// One end-to-end walk over the six M2b read endpoints against a single
+    /// seeded local-mode app: shapes, filters, pagination, 404, response
+    /// headers, and cross-endpoint agreement (overview attention == filtered
+    /// issue list == detail; overview runner health == runner list).
+    #[tokio::test]
+    async fn read_api_covers_all_six_endpoints_end_to_end() {
+        let (_dir, state) = test_state(None);
+        let seed = seed_read_api(&state.store);
+        let app = build_app(state);
+
+        // ---- 1. GET /overview ----
+        let response = read_api_get(&app, "/api/v1/overview").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_read_api_headers(&response);
+        let overview = json_body(response).await;
+        assert_eq!(overview_counts(&overview), [1, 0, 1, 0, 1, 0, 1]);
+        let attention = overview["attention"].as_array().expect("attention");
+        assert_eq!(attention.len(), 1);
+        assert_eq!(
+            attention[0]["fingerprint"].as_str(),
+            Some(seed.escalated.as_str())
+        );
+        assert_eq!(attention[0]["state"].as_str(), Some("escalated"));
+        assert_eq!(attention[0]["severity"].as_str(), Some("critical"));
+        assert_eq!(attention[0]["repo"].as_str(), Some(READ_API_REPO));
+        assert_eq!(attention[0]["stuck"].as_bool(), Some(false));
+        assert_eq!(attention[0]["owner_runner_id"], serde_json::Value::Null);
+        assert_eq!(
+            attention[0]["reason_code"].as_str(),
+            Some("repair_failed")
+        );
+        assert_eq!(
+            attention[0]["reason_text"].as_str(),
+            Some("修复 runner 失败，需要复核")
+        );
+        assert_eq!(attention[0]["last_seen_ms"].as_i64(), Some(seed.base));
+        let active_runs = overview["active_runs"].as_array().expect("active runs");
+        assert_eq!(active_runs.len(), 1);
+        assert_eq!(active_runs[0]["id"].as_str(), Some("run-active"));
+        assert_eq!(
+            active_runs[0]["fingerprint"].as_str(),
+            Some(seed.active.as_str())
+        );
+        assert_eq!(active_runs[0]["title"].as_str(), Some("read active"));
+        assert_eq!(active_runs[0]["runner_id"].as_str(), Some("runner-live"));
+        assert_eq!(active_runs[0]["phase"].as_str(), Some("repair"));
+        assert_eq!(active_runs[0]["turns"].as_i64(), Some(2));
+        assert_eq!(active_runs[0]["tokens"].as_i64(), Some(1_100));
+        assert_eq!(overview["queue"]["ready_count"].as_u64(), Some(1));
+        assert_eq!(
+            overview["queue"]["next"][0]["fingerprint"].as_str(),
+            Some(seed.queued.as_str())
+        );
+        assert_eq!(overview["health"]["runners_total"].as_u64(), Some(1));
+        assert_eq!(overview["health"]["runners_online"].as_u64(), Some(1));
+        assert_eq!(overview["health"]["working"].as_u64(), Some(1));
+        assert_eq!(overview["health"]["idle"].as_u64(), Some(0));
+        assert_eq!(overview["health"]["reports_today"].as_u64(), Some(4));
+        assert_eq!(overview["health"]["prs_today"].as_u64(), Some(1));
+        assert_eq!(overview["ci_24h"]["green"].as_u64(), Some(1));
+        assert_eq!(overview["ci_24h"]["red"].as_u64(), Some(0));
+        assert_eq!(overview["ci_24h"]["timeout"].as_u64(), Some(1));
+        assert_eq!(overview["ci_24h"]["pending"].as_u64(), Some(0));
+
+        // ---- 2. GET /issues: filters + pagination ----
+        let response = read_api_get(
+            &app,
+            "/api/v1/issues?repo=example.com%2Fread&page=1&page_size=2",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_read_api_headers(&response);
+        let page_one = json_body(response).await;
+        assert_eq!(
+            page_one["meta"],
+            serde_json::json!({ "page": 1, "page_size": 2, "total": 4 })
+        );
+        assert_eq!(
+            read_api_fingerprints(&page_one),
+            vec![seed.queued.as_str(), seed.active.as_str()]
+        );
+        assert_eq!(page_one["data"][0]["title"].as_str(), Some("read queued"));
+        assert_eq!(page_one["data"][0]["state"].as_str(), Some("new"));
+        assert_eq!(page_one["data"][0]["severity"].as_str(), Some("low"));
+        assert_eq!(page_one["data"][0]["occurrences"].as_u64(), Some(1));
+        assert_eq!(page_one["data"][0]["stuck"].as_bool(), Some(false));
+        assert_eq!(page_one["data"][0]["owner_runner_id"], serde_json::Value::Null);
+        assert_eq!(page_one["data"][1]["state"].as_str(), Some("fixing"));
+        assert_eq!(
+            page_one["data"][1]["owner_runner_id"].as_str(),
+            Some("runner-live")
+        );
+        assert_eq!(page_one["data"][1]["stuck"].as_bool(), Some(false));
+
+        let response = read_api_get(
+            &app,
+            "/api/v1/issues?repo=example.com%2Fread&page=2&page_size=2",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page_two = json_body(response).await;
+        assert_eq!(
+            read_api_fingerprints(&page_two),
+            vec![seed.merged.as_str(), seed.escalated.as_str()]
+        );
+        assert_eq!(page_two["data"][0]["state"].as_str(), Some("merged"));
+        assert_eq!(
+            page_two["data"][0]["pr_url"].as_str(),
+            Some(seed.merged_pr_url.as_str())
+        );
+
+        let response = read_api_get(&app, "/api/v1/issues?page=3&page_size=2").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_read_api_headers(&response);
+        let page_three = json_body(response).await;
+        assert!(page_three["data"].as_array().expect("data").is_empty());
+        assert_eq!(page_three["meta"]["total"].as_u64(), Some(4));
+
+        for (query, expected) in [
+            (
+                "attention=1",
+                vec![seed.escalated.as_str()],
+            ),
+            ("state=escalated", vec![seed.escalated.as_str()]),
+            ("severity=low", vec![seed.queued.as_str()]),
+            ("q=merged", vec![seed.merged.as_str()]),
+            ("severity=critical&language=go", vec![seed.escalated.as_str()]),
+        ] {
+            let uri = format!("/api/v1/issues?repo=example.com%2Fread&{query}");
+            let response = read_api_get(&app, &uri).await;
+            assert_eq!(response.status(), StatusCode::OK, "{query}");
+            assert_eq!(
+                read_api_fingerprints(&json_body(response).await),
+                expected,
+                "{query}"
+            );
+        }
+        let response = read_api_get(&app, "/api/v1/issues?repo=example.com%2Fother").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let other_repo = json_body(response).await;
+        assert!(other_repo["data"].as_array().expect("data").is_empty());
+        assert_eq!(other_repo["meta"]["total"].as_u64(), Some(0));
+
+        // ---- 3. GET /issues/{fp}: detail + 404 ----
+        let response = read_api_get(&app, &format!("/api/v1/issues/{}", seed.merged)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_read_api_headers(&response);
+        let detail = json_body(response).await;
+        assert_eq!(
+            detail["issue"]["fingerprint"].as_str(),
+            Some(seed.merged.as_str())
+        );
+        assert_eq!(detail["issue"]["state"].as_str(), Some("merged"));
+        assert_eq!(
+            detail["issue"]["pr_url"].as_str(),
+            Some(seed.merged_pr_url.as_str())
+        );
+        assert_eq!(detail["issue"]["ci_verdict"].as_str(), Some("success"));
+        assert!(detail["stack_sample"]
+            .as_str()
+            .is_some_and(|stack| stack.contains("read merged")));
+        let timeline = detail["timeline"].as_array().expect("timeline");
+        assert!(
+            timeline
+                .iter()
+                .any(|item| item["kind"].as_str() == Some("merged")),
+            "timeline must carry the terminal event: {timeline:?}"
+        );
+        assert!(
+            timeline
+                .iter()
+                .any(|item| item["kind"].as_str() == Some("pr_opened")),
+            "timeline must carry the PR event: {timeline:?}"
+        );
+        let runs = detail["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        assert_eq!(run["id"].as_str(), Some("run-detail"));
+        assert_eq!(run["started_at_ms"].as_i64(), Some(seed.base + 5_000));
+        assert_eq!(run["finished_at_ms"].as_i64(), Some(seed.base + 10_000));
+        assert_eq!(run["phase"].as_str(), Some("done"));
+        assert_eq!(run["outcome"].as_str(), Some("success"));
+        assert_eq!(run["ci_verdict"].as_str(), Some("success"));
+        assert_eq!(run["turns"].as_i64(), Some(6));
+        assert_eq!(run["tokens_uncached"].as_i64(), Some(17_000));
+        assert_eq!(run["tokens_cached"].as_i64(), Some(500));
+        assert_eq!(run["branch"].as_str(), Some("agent/fix/read"));
+        assert_eq!(run["pr_url"].as_str(), Some(seed.merged_pr_url.as_str()));
+        assert_eq!(run["pr_opened_at_ms"].as_i64(), Some(seed.base + 8_000));
+        assert_eq!(run["verification_ok"].as_bool(), Some(true));
+        assert_eq!(detail["similar"]["count"].as_u64(), Some(0));
+        assert!(detail["similar"]["items"]
+            .as_array()
+            .expect("similar items")
+            .is_empty());
+
+        // Cross-endpoint: the overview attention issue is the only
+        // `attention=1` list row and its detail is the same escalated issue.
+        let response = read_api_get(&app, &format!("/api/v1/issues/{}", seed.escalated)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let escalated_detail = json_body(response).await;
+        assert_eq!(
+            escalated_detail["issue"]["fingerprint"].as_str(),
+            Some(seed.escalated.as_str())
+        );
+        assert_eq!(
+            escalated_detail["issue"]["state"].as_str(),
+            Some("escalated")
+        );
+        assert_eq!(
+            escalated_detail["timeline"][0]["kind"].as_str(),
+            Some("state_changed")
+        );
+        assert_eq!(
+            escalated_detail["timeline"][0]["detail"].as_str(),
+            Some("repair_failed: boom")
+        );
+
+        let response = read_api_get(&app, "/api/v1/issues/does-not-exist").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_read_api_headers(&response);
+        let missing = json_body(response).await;
+        assert_eq!(missing["error"]["code"].as_str(), Some("not_found"));
+        assert_eq!(missing["error"]["message"].as_str(), Some("issue not found"));
+
+        // ---- 4. GET /runners ----
+        let response = read_api_get(&app, "/api/v1/runners").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_read_api_headers(&response);
+        let runners = json_body(response).await;
+        let runner_list = runners["data"].as_array().expect("data");
+        assert_eq!(runner_list.len(), 1);
+        // Cross-endpoint: overview health and the fleet list agree.
+        assert_eq!(
+            overview["health"]["runners_total"].as_u64(),
+            Some(runner_list.len() as u64)
+        );
+        let runner = &runner_list[0];
+        assert_eq!(runner["id"].as_str(), Some("runner-live"));
+        assert_eq!(runner["repo"].as_str(), Some(READ_API_REPO));
+        assert_eq!(runner["host"].as_str(), Some("read-host"));
+        assert_eq!(runner["pid"].as_i64(), Some(4242));
+        assert_eq!(runner["started_at_ms"].as_i64(), Some(seed.now - 60_000));
+        assert_eq!(runner["heartbeat_at_ms"].as_i64(), Some(seed.now));
+        assert_eq!(runner["status"].as_str(), Some("working"));
+        assert_eq!(runner["offline"].as_bool(), Some(false));
+        assert_eq!(
+            runner["current_fingerprint"].as_str(),
+            Some(seed.active.as_str())
+        );
+        assert_eq!(runner["phase"].as_str(), Some("repair"));
+        assert_eq!(runner["provider"].as_str(), Some("faux"));
+        assert_eq!(runner["model"].as_str(), Some("faux"));
+        assert_eq!(runner["daily_pr_limit"].as_i64(), Some(5));
+        assert_eq!(runner["prs_today"].as_u64(), Some(1));
+        assert_eq!(runner["repo_path"].as_str(), Some("/tmp/read"));
+        assert_eq!(runner["service_unit"].as_str(), Some("nuwa-read"));
+        assert_eq!(runner["last_error"], serde_json::Value::Null);
+        assert_eq!(
+            runner["effective"],
+            serde_json::json!({
+                "interval_secs": 600,
+                "ci_timeout_secs": 900,
+                "max_turns": 30,
+                "max_tokens": 1_500_000,
+                "failing_check": "go test ./...",
+                "forbidden_paths_count": 4,
+            })
+        );
+
+        // ---- 5. GET /events: filters, pagination, aggregation ----
+        let response = read_api_get(
+            &app,
+            &format!(
+                "/api/v1/events?fingerprint={}&kind=state_changed&page=1&page_size=2",
+                seed.escalated
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_read_api_headers(&response);
+        let events = json_body(response).await;
+        assert_eq!(
+            events["meta"],
+            serde_json::json!({ "page": 1, "page_size": 2, "total": 3 })
+        );
+        let rows = events["data"].as_array().expect("data");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["ts_ms"].as_i64(), Some(seed.base + 3_000));
+        assert_eq!(rows[0]["detail"].as_str(), Some("repair_failed: boom"));
+        assert_eq!(rows[0]["repo"].as_str(), Some(READ_API_REPO));
+        assert_eq!(rows[0]["actor"].as_str(), Some("system"));
+        assert_eq!(rows[0]["count"].as_u64(), Some(1));
+        assert_eq!(rows[0]["first_ts_ms"], rows[0]["ts_ms"]);
+        assert_eq!(rows[0]["last_ts_ms"], rows[0]["ts_ms"]);
+        assert_eq!(rows[1]["ts_ms"].as_i64(), Some(seed.base + 2_000));
+
+        let response = read_api_get(
+            &app,
+            &format!(
+                "/api/v1/events?fingerprint={}&kind=state_changed&page=2&page_size=2",
+                seed.escalated
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page_two_events = json_body(response).await;
+        let rows = page_two_events["data"].as_array().expect("data");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["ts_ms"].as_i64(), Some(seed.base + 1_000));
+
+        // Without aggregation the same fingerprint yields all five fixture
+        // rows; `aggregate=1` groups the three same-hour `reported` rows even
+        // though a `state_changed` row interleaves between them.
+        let response =
+            read_api_get(&app, "/api/v1/events?fingerprint=read-api-events").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let raw_events = json_body(response).await;
+        assert_eq!(raw_events["meta"]["total"].as_u64(), Some(5));
+
+        let response =
+            read_api_get(&app, "/api/v1/events?fingerprint=read-api-events&aggregate=1").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_read_api_headers(&response);
+        let aggregated = json_body(response).await;
+        assert_eq!(
+            aggregated["meta"],
+            serde_json::json!({ "page": 1, "page_size": 50, "total": 3 })
+        );
+        let rows = aggregated["data"].as_array().expect("data");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["kind"].as_str(), Some("reported"));
+        assert_eq!(rows[0]["detail"].as_str(), Some("next-hour"));
+        assert_eq!(rows[0]["count"].as_u64(), Some(1));
+        assert_eq!(rows[1]["kind"].as_str(), Some("reported"));
+        assert_eq!(rows[1]["detail"].as_str(), Some("r2"));
+        assert_eq!(rows[1]["count"].as_u64(), Some(3));
+        assert_eq!(rows[1]["ts_ms"].as_i64(), Some(seed.hour + 240_000));
+        assert_eq!(
+            rows[1]["first_ts_ms"].as_i64(),
+            Some(seed.hour + 60_000)
+        );
+        assert_eq!(
+            rows[1]["last_ts_ms"].as_i64(),
+            Some(seed.hour + 240_000)
+        );
+        assert_eq!(rows[2]["kind"].as_str(), Some("state_changed"));
+        assert_eq!(rows[2]["count"].as_u64(), Some(1));
+        assert_eq!(rows[2]["ts_ms"].as_i64(), Some(seed.hour + 120_000));
+
+        // ---- 6. GET /metrics/trends ----
+        let response = read_api_get(
+            &app,
+            "/api/v1/metrics/trends?range=7d&repo=example.com%2Fread",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_read_api_headers(&response);
+        let trends = json_body(response).await;
+        assert_eq!(trends["range"].as_str(), Some("7d"));
+        let buckets = trends["buckets"].as_array().expect("buckets");
+        assert_eq!(buckets.len(), 7);
+        assert_eq!(
+            buckets[6],
+            serde_json::json!({
+                "day": shanhaijing::utc_day(seed.base),
+                "reports": 4,
+                "new_issues": 4,
+                "prs_opened": 1,
+                "merged": 1,
+                "rejected": 0,
+                "tokens": 18_600,
+                "ci_green": 1,
+                "ci_red": 0,
+            })
+        );
+        assert_eq!(
+            trends["totals"],
+            serde_json::json!({
+                "reports": 4,
+                "new_issues": 4,
+                "prs_opened": 1,
+                "merged": 1,
+                "rejected": 0,
+                "tokens": 18_600,
+                "median_time_to_pr_secs": 3,
+            })
+        );
+
+        let response = read_api_get(&app, "/api/v1/metrics/trends?range=1d").await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_read_api_headers(&response);
+        let invalid = json_body(response).await;
+        assert_eq!(invalid["error"]["code"].as_str(), Some("validation_failed"));
+        assert!(
+            invalid["error"]["fields"]["range"].is_string(),
+            "invalid range must name the field: {invalid}"
+        );
+    }
 }

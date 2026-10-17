@@ -97,6 +97,22 @@ nuwa work --db shanhaijing.db \
 
 **同源校验与代理**：旧 POST 的同源校验比较 Origin/Referer 与 Host。若前置反向代理改写 Host（如 `proxy_set_header Host $proxy_host`）或使用 HTTP/2 上游，合法 POST 会被 403；代理需保留 Host 并使用 HTTP/1.1 上游。当前直连 7321 的部署不受影响。
 
+## 5 · 只读 API（v3 控制台）
+
+`/api/v1` 的六个只读端点（均为 GET，响应 JSON，带 `Cache-Control: no-store` 与严格 CSP）：
+
+| 端点 | 用途 |
+|---|---|
+| `GET /api/v1/overview?repo=` | 总览：状态漏斗、需要处理、活跃 run、可领队列、runner 健康、24h CI |
+| `GET /api/v1/issues?state=&severity=&repo=&language=&q=&stuck=1&attention=1&sort=&order=&page=&page_size=` | 问题单列表（过滤/排序/分页） |
+| `GET /api/v1/issues/{fp}` | 问题单详情：堆栈样本、时间线、最近 10 次 run、同名相似单 |
+| `GET /api/v1/runners` | runner 健康与 effective 配置 |
+| `GET /api/v1/events?kind=&repo=&fingerprint=&from_ms=&to_ms=&aggregate=1&page=&page_size=` | 活动流（`aggregate=1` 按 fingerprint+UTC 小时聚合 `reported`） |
+| `GET /api/v1/metrics/trends?range=7d\|14d\|30d\|90d&repo=` | UTC 日桶趋势与区间合计 |
+
+- token 模式下 GET 也要求有效 `nuwa_session` cookie（先 `POST /api/v1/auth/login`）；本地模式（未设 `NUWA_UI_TOKEN`/`NUWA_INGEST_TOKEN`）免会话。
+- 非 GET 请求另需 `X-NUWA-CSRF` 头，其值须与 `nuwa_csrf` cookie 一致（双提交校验）；GET 不要求 CSRF 头。
+
 ## 问题单状态机（运维视角）
 
 ```

@@ -616,7 +616,8 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
   "daily_pr_limit": 5, "prs_today": 2,
   "repo_path": "/opt/nuwa/repo/spike-target",
   "service_unit": "nuwa-work", "last_error": null,
-  "effective": { "interval_secs": 30, "ci_timeout_secs": 600, "max_turns": 30, "max_tokens": 1500000 }
+  "effective": { "interval_secs": 30, "ci_timeout_secs": 600, "max_turns": 30, "max_tokens": 1500000,
+                 "failing_check": "go test ./...", "forbidden_paths_count": 5 }
 }]}
 ```
 
@@ -632,7 +633,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 }
 ```
 
-- `aggregate=1`：仅对历史 `kind=reported` 连续记录按 fingerprint + 小时合并，返回 `count/first_ts_ms/last_ts_ms`；其他 kind 不合并。
+- `aggregate=1`：仅对 `kind=reported` 记录按 fingerprint + UTC 小时分组合并（同一 fingerprint 落在同一 UTC 小时的记录即归入同组，不要求记录在时间线上严格连续），返回 `count/first_ts_ms/last_ts_ms`；其他 kind 不参与分组、原样返回。
 - v0.2 起不再为 dedup 写 `reported`，所以聚合主要服务历史数据。
 
 #### 趋势
