@@ -349,6 +349,9 @@ impl Store {
     }
 
     /// Fingerprint a signal, dedup, and decide whether it may trigger a run.
+    /// Every report also bumps the per-day aggregate in `signal_daily`; only
+    /// the first sighting writes a `reported` event (dedup must not spam the
+    /// activity feed).
     pub fn report_signal(&self, signal: &Signal, now_ms: i64) -> ShanResult<ReportOutcome> {
         let fp = fingerprint::compute(
             &signal.language,
@@ -382,6 +385,7 @@ impl Store {
                     signal.stack_trace,
                 ],
             )?;
+            bump_signal_daily(&conn, &fp, &signal.repo, now_ms)?;
             drop(conn);
             self.record_event(&fp, now_ms, Some(&signal.repo), "system", "reported", "first sighting")?;
             return Ok(ReportOutcome::NewIssue { fingerprint: fp });
@@ -391,12 +395,14 @@ impl Store {
             "UPDATE issues SET occurrences = occurrences + 1, last_seen = ?2, stack_sample = ?3, severity = ?4 WHERE fingerprint = ?1",
             rusqlite::params![fp, now_ms, signal.stack_trace, signal.severity],
         )?;
+        bump_signal_daily(&conn, &fp, &signal.repo, now_ms)?;
         let occurrences = occurrences + 1;
         drop(conn);
 
         let state = State::parse(&state).ok_or(ShanError::UnknownState(state))?;
         if state.is_terminal() && state != State::Escalated {
             self.set_state(&fp, State::New, now_ms, Some("regression: terminal issue reported again"))?;
+            self.set_cooldown(&fp, 0)?;
             return Ok(ReportOutcome::Regression {
                 fingerprint: fp,
                 occurrences,
@@ -409,7 +415,6 @@ impl Store {
                 retry_after_ms: cooldown_until - now_ms,
             });
         }
-        self.record_event(&fp, now_ms, Some(&signal.repo), "system", "reported", "dedup")?;
         Ok(ReportOutcome::Deduped {
             fingerprint: fp,
             occurrences,
@@ -606,6 +611,18 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Reports for `fingerprint` on UTC `day` (`YYYY-MM-DD`), summed across
+    /// repos — the per-issue daily report count shown by the console.
+    pub fn signal_reports_on(&self, fingerprint: &str, day: &str) -> ShanResult<u64> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(count), 0) FROM signal_daily WHERE fingerprint=?1 AND day=?2",
+            rusqlite::params![fingerprint, day],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
     }
 
     pub fn get(&self, fingerprint: &str) -> ShanResult<Option<IssueSnapshot>> {
@@ -955,6 +972,29 @@ impl Store {
     }
 }
 
+/// UTC calendar day (`YYYY-MM-DD`) containing `now_ms` — the `signal_daily`
+/// bucket key. Out-of-range timestamps fall back to the epoch day.
+pub fn utc_day(now_ms: i64) -> String {
+    use time::OffsetDateTime;
+    let seconds = now_ms.div_euclid(1_000);
+    let dt = OffsetDateTime::from_unix_timestamp(seconds).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    format!("{:04}-{:02}-{:02}", dt.year(), u8::from(dt.month()), dt.day())
+}
+
+fn bump_signal_daily(
+    conn: &rusqlite::Connection,
+    fingerprint: &str,
+    repo: &str,
+    now_ms: i64,
+) -> ShanResult<()> {
+    conn.execute(
+        "INSERT INTO signal_daily(fingerprint, repo, day, count) VALUES (?1, ?2, ?3, 1)
+         ON CONFLICT(fingerprint, repo, day) DO UPDATE SET count = count + 1",
+        rusqlite::params![fingerprint, repo, utc_day(now_ms)],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,6 +1071,31 @@ mod tests {
         assert_eq!(issue.occurrences, 2);
         // Reopened: pickable again.
         assert!(store.ready_issue(t0 + 2).expect("ready").is_some());
+    }
+
+    #[test]
+    fn regression_reopen_clears_cooldown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t0 = 7_000_000;
+        store.report_signal(&signal(), t0).expect("report");
+        let fp = store.ready_issue(t0).expect("ready").expect("issue").fingerprint;
+        store.set_state(&fp, State::Triggered, t0, None).expect("t");
+        store.set_state(&fp, State::Fixing, t0, None).expect("f");
+        store.set_state(&fp, State::PrOpen, t0, None).expect("p");
+        store.set_state(&fp, State::Merged, t0, None).expect("m");
+        // The run that produced the merge left a claim cooldown behind.
+        store
+            .set_cooldown(&fp, t0 + DEFAULT_COOLDOWN_MS)
+            .expect("cooldown");
+
+        match store.report_signal(&signal(), t0 + 1_000).expect("report") {
+            ReportOutcome::Regression { occurrences, .. } => assert_eq!(occurrences, 2),
+            other => panic!("expected Regression, got {other:?}"),
+        }
+        // A merged bug reporting again is pickable at once — it must not
+        // wait out the previous run's stale cooldown.
+        assert!(store.ready_issue(t0 + 1_000).expect("ready").is_some());
     }
 
     #[test]
@@ -1270,6 +1335,34 @@ mod tests {
         let runs = store.runs_for(&fp, 10).expect("runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].outcome.as_deref(), Some("interrupted"));
+    }
+
+    #[test]
+    fn utc_day_formats_epoch_days() {
+        assert_eq!(utc_day(0), "1970-01-01");
+        assert_eq!(utc_day(86_400_000), "1970-01-02");
+    }
+
+    #[test]
+    fn dedup_counts_signal_daily_without_report_event_spam() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t0 = 1_700_000_000_000;
+        store.report_signal(&signal(), t0).expect("first");
+        store.report_signal(&signal(), t0 + 1_000).expect("dedup");
+        store.report_signal(&signal(), t0 + 2_000).expect("dedup");
+
+        let fp = store.ready_issue(t0).expect("ready").expect("issue").fingerprint;
+        let day = utc_day(t0);
+        assert_eq!(store.signal_reports_on(&fp, &day).expect("count"), 3);
+
+        let reported = store
+            .events_for(&fp, 100)
+            .expect("events")
+            .into_iter()
+            .filter(|e| e.kind == "reported")
+            .count();
+        assert_eq!(reported, 1, "only the first sighting writes a report event");
     }
 }
 
