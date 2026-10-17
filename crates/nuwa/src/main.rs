@@ -4,6 +4,7 @@ mod guard;
 mod instructions;
 mod issue;
 mod repair;
+mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -556,32 +557,8 @@ async fn run_sync(args: Vec<String>) -> anyhow::Result<()> {
     let store =
         shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
     let now = now_ms();
-    for row in store.list_issues()? {
-        if row.state != "pr_open" {
-            continue;
-        }
-        let Some(url) = &row.pr_url else { continue };
-        let Some((slug, number)) = ci::parse_pr_url(url) else {
-            println!("skip       : {} — unparsable PR url {url}", row.fingerprint);
-            continue;
-        };
-        let state = ci::pr_merge_state(&token, &slug, number).await?;
-        match state.as_str() {
-            "merged" => {
-                store.set_state(&row.fingerprint, shanhaijing::State::Merged, now, Some(url))?;
-                println!("merged     : {} → {url}", row.fingerprint);
-            }
-            "closed" => {
-                store.set_state(
-                    &row.fingerprint,
-                    shanhaijing::State::Rejected,
-                    now,
-                    Some("PR closed without merge"),
-                )?;
-                println!("rejected   : {} (PR #{number} closed without merge)", row.fingerprint);
-            }
-            _ => println!("still open : {} — PR #{number}", row.fingerprint),
-        }
+    for line in ci::reconcile_all(&store, &token, now).await? {
+        println!("{line}");
     }
     Ok(())
 }
@@ -622,12 +599,23 @@ async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         (Arc::clone(&store), Arc::clone(&ingest_token)),
         check_auth,
     );
+    let ui_auth = axum::middleware::from_fn_with_state(
+        (Arc::clone(&store), Arc::clone(&ingest_token)),
+        ui::ui_auth,
+    );
+    let ui_routes = axum::Router::new()
+        .route("/ui", get(ui::dashboard))
+        .route("/ui/reopen", post(ui::reopen))
+        .route("/ui/sync", post(ui::sync_now))
+        .route_layer(ui_auth)
+        .with_state((Arc::clone(&store), Arc::clone(&ingest_token)));
     let app = axum::Router::new()
         .route("/ingest", post(ingest_endpoint).route_layer(auth))
         .route(
             "/health",
             get(|| async { "nuwa serve ok" }),
         )
+        .merge(ui_routes)
         .with_state((store, ingest_token));
 
     let listener = tokio::net::TcpListener::bind(&listen)

@@ -153,6 +153,51 @@ pub async fn pr_merge_state(token: &str, slug: &str, number: u64) -> anyhow::Res
     Ok(payload["state"].as_str().unwrap_or("unknown").to_string())
 }
 
+/// 对账全部 pr_open 问题单（CLI `sync` 与 Web 控制台共用）。
+/// merged → `merged`；closed 且未合并 → `rejected`；仍 open → 不动。
+pub async fn reconcile_all(
+    store: &shanhaijing::Store,
+    token: &str,
+    now: i64,
+) -> anyhow::Result<Vec<String>> {
+    use shanhaijing::State;
+    let mut out = Vec::new();
+    for row in store.list_issues().map_err(|e| anyhow::anyhow!(e))? {
+        if row.state != "pr_open" {
+            continue;
+        }
+        let Some(url) = &row.pr_url else { continue };
+        let Some((slug, number)) = parse_pr_url(url) else {
+            out.push(format!("skip       : {} — unparsable PR url {url}", row.fingerprint));
+            continue;
+        };
+        match pr_merge_state(token, &slug, number).await {
+            Ok(s) if s == "merged" => {
+                store
+                    .set_state(&row.fingerprint, State::Merged, now, Some(url))
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                out.push(format!("merged     : {} → {url}", row.fingerprint));
+            }
+            Ok(s) if s == "closed" => {
+                store
+                    .set_state(
+                        &row.fingerprint,
+                        State::Rejected,
+                        now,
+                        Some("PR closed without merge"),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                out.push(format!(
+                    "rejected   : {} (PR #{number} closed without merge)",
+                    row.fingerprint
+                ));
+            }
+            _ => out.push(format!("still open : {} — PR #{number}", row.fingerprint)),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::aggregate;
