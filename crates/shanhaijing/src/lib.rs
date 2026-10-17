@@ -16,6 +16,7 @@
 pub mod fingerprint;
 mod migration;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -190,6 +191,32 @@ pub struct EventRow {
     pub actor: Option<String>,
 }
 
+/// Filters for the console event feed. An empty `kinds` list means "every
+/// kind"; `from_ms`/`to_ms` are inclusive bounds on `events.ts`.
+#[derive(Debug, Clone, Default)]
+pub struct EventQuery {
+    pub kinds: Vec<String>,
+    pub repo: Option<String>,
+    pub fingerprint: Option<String>,
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+}
+
+/// One UTC day of the console trends chart. Aggregates are window-scoped by
+/// the optional repo filter; days without data are zero-filled.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct TrendBucket {
+    pub day: String,
+    pub reports: u64,
+    pub new_issues: u64,
+    pub prs_opened: u64,
+    pub merged: u64,
+    pub rejected: u64,
+    pub tokens: u64,
+    pub ci_green: u64,
+    pub ci_red: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunnerUpsert {
     pub id: String,
@@ -343,6 +370,13 @@ CREATE TABLE IF NOT EXISTS heartbeat (
 /// fingerprint only count occurrences (ADR-002 — no re-triggering).
 pub const DEFAULT_COOLDOWN_MS: i64 = 6 * 60 * 60 * 1000;
 
+/// UTC day width for the trends buckets (UTC has no DST).
+const DAY_MS: i64 = 86_400_000;
+
+/// Console event feed page cap — a hostile page size must not scan the whole
+/// journal.
+const EVENT_LIST_CAP: u32 = 5_000;
+
 /// Priority ordering shared by the claim and observer queries:
 /// `severity_weight × occurrences`, then oldest sighting.
 const READY_ORDER: &str = "(CASE severity
@@ -358,6 +392,13 @@ const ISSUE_VIEW_SELECT: &str = "SELECT i.fingerprint, i.title, i.language, i.re
          WHERE r.fingerprint = i.fingerprint
          ORDER BY r.started_at DESC, r.id DESC LIMIT 1) AS ci_verdict
  FROM issues i";
+
+/// Event projection shared by the feed/detail/timeline queries; legacy rows
+/// with `events.repo` NULL fall back to the issue repo. Keep aligned with
+/// [`Store::event_from_row`].
+const EVENT_SELECT: &str = "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
+        COALESCE(e.repo, i.repo, ''), e.actor
+ FROM events e LEFT JOIN issues i ON i.fingerprint = e.fingerprint";
 
 /// Full [`RunRow`] projection; keep aligned with [`Store::run_from_row`].
 const RUN_COLUMNS: &str = "id, harness_run_id, fingerprint, runner_id, repo, started_at, finished_at,
@@ -847,6 +888,169 @@ impl Store {
         Ok(count as u64)
     }
 
+    /// Daily aggregates for the console trends chart. Returns exactly `days`
+    /// UTC day buckets ending on the day containing `now_ms`, oldest first;
+    /// days without data are zero-filled. `repo` filters every source.
+    pub fn trends(
+        &self,
+        days: u32,
+        repo: Option<&str>,
+        now_ms: i64,
+    ) -> ShanResult<Vec<TrendBucket>> {
+        if days == 0 {
+            return Ok(Vec::new());
+        }
+        let span = i64::from(days);
+        let today_start = now_ms - now_ms.rem_euclid(DAY_MS);
+        let window_start = today_start - (span - 1) * DAY_MS;
+        let window_end = today_start + DAY_MS;
+
+        let mut buckets: BTreeMap<String, TrendBucket> = BTreeMap::new();
+        for offset in (0..span).rev() {
+            let day = utc_day(today_start - offset * DAY_MS);
+            buckets.insert(
+                day.clone(),
+                TrendBucket {
+                    day,
+                    ..TrendBucket::default()
+                },
+            );
+        }
+        let first_day = buckets.keys().next().cloned().unwrap_or_default();
+        let last_day = buckets.keys().next_back().cloned().unwrap_or_default();
+
+        let conn = self.lock();
+
+        // Reports are already aggregated per day and repo by report_signal.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT day, COALESCE(SUM(count), 0) FROM signal_daily
+                 WHERE day >= :from_day AND day <= :to_day
+                   AND (:repo IS NULL OR repo = :repo)
+                 GROUP BY day",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::named_params! {
+                    ":from_day": &first_day,
+                    ":to_day": &last_day,
+                    ":repo": repo,
+                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            for row in rows {
+                let (day, count) = row?;
+                if let Some(bucket) = buckets.get_mut(&day) {
+                    bucket.reports = count.max(0) as u64;
+                }
+            }
+        }
+
+        // New issues: bucket first_seen in Rust (R29).
+        {
+            let mut stmt = conn.prepare(
+                "SELECT first_seen FROM issues
+                 WHERE first_seen >= :from AND first_seen < :to
+                   AND (:repo IS NULL OR repo = :repo)",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::named_params! {
+                    ":from": window_start,
+                    ":to": window_end,
+                    ":repo": repo,
+                },
+                |row| row.get::<_, i64>(0),
+            )?;
+            for ts in rows {
+                if let Some(bucket) = buckets.get_mut(&utc_day(ts?)) {
+                    bucket.new_issues += 1;
+                }
+            }
+        }
+
+        // PRs opened: bucket pr_opened_at in Rust.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT pr_opened_at FROM runs
+                 WHERE pr_opened_at IS NOT NULL
+                   AND pr_opened_at >= :from AND pr_opened_at < :to
+                   AND (:repo IS NULL OR repo = :repo)",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::named_params! {
+                    ":from": window_start,
+                    ":to": window_end,
+                    ":repo": repo,
+                },
+                |row| row.get::<_, i64>(0),
+            )?;
+            for ts in rows {
+                if let Some(bucket) = buckets.get_mut(&utc_day(ts?)) {
+                    bucket.prs_opened += 1;
+                }
+            }
+        }
+
+        // Tokens: bucket by run start day.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT started_at,
+                        COALESCE(tokens_uncached, 0) + COALESCE(tokens_cached, 0)
+                 FROM runs
+                 WHERE started_at >= :from AND started_at < :to
+                   AND (:repo IS NULL OR repo = :repo)",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::named_params! {
+                    ":from": window_start,
+                    ":to": window_end,
+                    ":repo": repo,
+                },
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            for row in rows {
+                let (ts, tokens) = row?;
+                if let Some(bucket) = buckets.get_mut(&utc_day(ts)) {
+                    bucket.tokens += tokens.max(0) as u64;
+                }
+            }
+        }
+
+        // Lifecycle outcomes: legacy rows resolve their repo through the
+        // issue join, same COALESCE semantics as list_events.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT e.kind, e.ts FROM events e
+                 LEFT JOIN issues i ON i.fingerprint = e.fingerprint
+                 WHERE e.kind IN ('merged', 'rejected', 'ci_green', 'ci_red')
+                   AND e.ts >= :from AND e.ts < :to
+                   AND (:repo IS NULL OR COALESCE(e.repo, i.repo, '') = :repo)",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::named_params! {
+                    ":from": window_start,
+                    ":to": window_end,
+                    ":repo": repo,
+                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            for row in rows {
+                let (kind, ts) = row?;
+                let Some(bucket) = buckets.get_mut(&utc_day(ts)) else {
+                    continue;
+                };
+                match kind.as_str() {
+                    "merged" => bucket.merged += 1,
+                    "rejected" => bucket.rejected += 1,
+                    "ci_green" => bucket.ci_green += 1,
+                    "ci_red" => bucket.ci_red += 1,
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(buckets.into_values().collect())
+    }
+
     /// Events of the given kinds at or after `since_ms` — CI counters.
     /// `kinds` are bound parameters; the placeholder list is built from
     /// their count only, so no value ever reaches the SQL text.
@@ -943,74 +1147,92 @@ impl Store {
     /// Recent lifecycle events, newest first — the console activity feed.
     pub fn recent_events(&self, limit: u32) -> ShanResult<Vec<EventRow>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
-                    COALESCE(e.repo, i.repo, ''), e.actor
-             FROM events e LEFT JOIN issues i ON i.fingerprint = e.fingerprint
-             ORDER BY e.id DESC LIMIT ?1",
-        )?;
-        let mut rows = stmt.query([limit])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(EventRow {
-                fingerprint: row.get(0)?,
-                ts: row.get(1)?,
-                kind: row.get(2)?,
-                detail: row.get(3)?,
-                repo: row.get(4)?,
-                actor: row.get(5)?,
-            });
-        }
-        Ok(out)
+        let mut stmt = conn.prepare(&format!("{EVENT_SELECT} ORDER BY e.id DESC LIMIT ?1"))?;
+        let rows = stmt.query_map([limit], Self::event_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Per-issue lifecycle events, newest first — the detail page timeline.
     pub fn events_for(&self, fingerprint: &str, limit: u32) -> ShanResult<Vec<EventRow>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
-                    COALESCE(e.repo, i.repo, ''), e.actor
-             FROM events e LEFT JOIN issues i ON i.fingerprint = e.fingerprint
-             WHERE e.fingerprint = ?1
-             ORDER BY e.id DESC LIMIT ?2",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![fingerprint, limit])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(EventRow {
-                fingerprint: row.get(0)?,
-                ts: row.get(1)?,
-                kind: row.get(2)?,
-                detail: row.get(3)?,
-                repo: row.get(4)?,
-                actor: row.get(5)?,
-            });
-        }
-        Ok(out)
+        let mut stmt = conn.prepare(&format!(
+            "{EVENT_SELECT} WHERE e.fingerprint = ?1 ORDER BY e.id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![fingerprint, limit], Self::event_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Newest event for one issue — detail header / attention reason.
     pub fn latest_event(&self, fingerprint: &str) -> ShanResult<Option<EventRow>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
-                    COALESCE(e.repo, i.repo, ''), e.actor
-             FROM events e LEFT JOIN issues i ON i.fingerprint = e.fingerprint
-             WHERE e.fingerprint = ?1
-             ORDER BY e.ts DESC, e.id DESC LIMIT 1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{EVENT_SELECT} WHERE e.fingerprint = ?1 ORDER BY e.ts DESC, e.id DESC LIMIT 1"
+        ))?;
         let mut rows = stmt.query([fingerprint])?;
         match rows.next()? {
-            Some(row) => Ok(Some(EventRow {
-                fingerprint: row.get(0)?,
-                ts: row.get(1)?,
-                kind: row.get(2)?,
-                detail: row.get(3)?,
-                repo: row.get(4)?,
-                actor: row.get(5)?,
-            })),
+            Some(row) => Ok(Some(Self::event_from_row(row)?)),
             None => Ok(None),
         }
+    }
+
+    fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
+        Ok(EventRow {
+            fingerprint: row.get(0)?,
+            ts: row.get(1)?,
+            kind: row.get(2)?,
+            detail: row.get(3)?,
+            repo: row.get(4)?,
+            actor: row.get(5)?,
+        })
+    }
+
+    /// Filtered lifecycle events, newest first (`ts DESC, id DESC`) — the
+    /// console event feed. `limit` is capped at 5000.
+    pub fn list_events(&self, query: &EventQuery, limit: u32) -> ShanResult<Vec<EventRow>> {
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+        if !query.kinds.is_empty() {
+            // Only the placeholder list is interpolated; kind values stay bound.
+            let placeholders = vec!["?"; query.kinds.len()].join(", ");
+            conditions.push(format!("e.kind IN ({placeholders})"));
+            params.extend(
+                query
+                    .kinds
+                    .iter()
+                    .cloned()
+                    .map(rusqlite::types::Value::Text),
+            );
+        }
+        if let Some(repo) = &query.repo {
+            conditions.push("COALESCE(e.repo, i.repo, '') = ?".to_string());
+            params.push(rusqlite::types::Value::Text(repo.clone()));
+        }
+        if let Some(fingerprint) = &query.fingerprint {
+            conditions.push("e.fingerprint = ?".to_string());
+            params.push(rusqlite::types::Value::Text(fingerprint.clone()));
+        }
+        if let Some(from_ms) = query.from_ms {
+            conditions.push("e.ts >= ?".to_string());
+            params.push(rusqlite::types::Value::Integer(from_ms));
+        }
+        if let Some(to_ms) = query.to_ms {
+            conditions.push("e.ts <= ?".to_string());
+            params.push(rusqlite::types::Value::Integer(to_ms));
+        }
+        let mut sql = String::from(EVENT_SELECT);
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(" ORDER BY e.ts DESC, e.id DESC LIMIT ?");
+        params.push(rusqlite::types::Value::Integer(i64::from(
+            limit.min(EVENT_LIST_CAP),
+        )));
+
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), Self::event_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Runner liveness heartbeat — work loop upserts each iteration; the
@@ -1324,6 +1546,40 @@ mod tests {
         sig.title = title.to_string();
         sig.stack_trace = TRACE.replace("Average", symbol);
         sig
+    }
+
+    /// Start a run and fill the evidence columns the trends buckets read.
+    fn seed_run(
+        store: &Store,
+        id: &str,
+        fingerprint: &str,
+        repo: &str,
+        started_at: i64,
+        pr_opened_at: Option<i64>,
+        tokens: (i64, i64),
+    ) {
+        store
+            .start_run(&RunStart {
+                id: id.to_string(),
+                fingerprint: fingerprint.to_string(),
+                runner_id: "host:runner".to_string(),
+                repo: repo.to_string(),
+                started_at,
+                provider: None,
+                model: None,
+            })
+            .expect("seed run");
+        store
+            .update_run(
+                id,
+                &RunUpdate {
+                    tokens_uncached: Some(tokens.0),
+                    tokens_cached: Some(tokens.1),
+                    pr_opened_at,
+                    ..RunUpdate::default()
+                },
+            )
+            .expect("seed run update");
     }
 
     #[test]
@@ -2434,6 +2690,410 @@ mod tests {
             .similar_issues("panic in Nonexistent", &fp_a, 10)
             .expect("none")
             .is_empty());
+    }
+
+    #[test]
+    fn list_events_filters_kinds_repo_fingerprint_and_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let repo_a = "example.com/spike-target";
+        let repo_b = "example.com/other";
+        let sig_a = signal();
+        let sig_b = issue_signal("panic in Submit", "Submit");
+        let fp_a = fingerprint::compute("go", None, &sig_a.stack_trace);
+        let fp_b = fingerprint::compute("go", None, &sig_b.stack_trace);
+        // Both issues exist so the legacy NULL-repo event can resolve its repo
+        // through the issue join; their `reported` events sit at ts=1, outside
+        // every window below.
+        store.report_signal(&sig_a, 1).expect("issue a");
+        store.report_signal(&sig_b, 1).expect("issue b");
+
+        store
+            .record_event(&fp_a, 1_000, Some(repo_a), "system", "ci_green", "g1")
+            .expect("g1");
+        store
+            .record_event(&fp_b, 1_500, Some(repo_a), "system", "ci_green", "g2")
+            .expect("g2");
+        store
+            .record_event(&fp_a, 1_600, Some(repo_a), "system", "ci_red", "r1")
+            .expect("r1");
+        store
+            .record_event(&fp_a, 1_700, None, "system", "reported", "legacy")
+            .expect("legacy");
+        store
+            .record_event(&fp_b, 1_800, Some(repo_b), "system", "ci_red", "elsewhere")
+            .expect("other repo");
+        store
+            .record_event(&fp_b, 2_000, Some(repo_a), "system", "reported", "rep")
+            .expect("rep");
+        store
+            .record_event(&fp_a, 2_001, Some(repo_a), "system", "ci_green", "after")
+            .expect("after");
+        store
+            .record_event(&fp_a, 999, Some(repo_a), "system", "ci_green", "before")
+            .expect("before");
+
+        // Kind filter, newest first.
+        let kinds = EventQuery {
+            kinds: vec!["ci_red".into(), "ci_green".into()],
+            ..EventQuery::default()
+        };
+        assert_eq!(
+            store
+                .list_events(&kinds, 10)
+                .expect("kinds")
+                .iter()
+                .map(|e| e.ts)
+                .collect::<Vec<_>>(),
+            [2_001, 1_800, 1_600, 1_500, 1_000, 999]
+        );
+
+        // from/to are inclusive on both ends.
+        let windowed = EventQuery {
+            from_ms: Some(1_000),
+            to_ms: Some(2_000),
+            ..EventQuery::default()
+        };
+        assert_eq!(
+            store
+                .list_events(&windowed, 10)
+                .expect("window")
+                .iter()
+                .map(|e| e.ts)
+                .collect::<Vec<_>>(),
+            [2_000, 1_800, 1_700, 1_600, 1_500, 1_000]
+        );
+
+        let by_repo = EventQuery {
+            repo: Some(repo_a.to_string()),
+            from_ms: Some(1_000),
+            to_ms: Some(2_000),
+            ..EventQuery::default()
+        };
+        let rows = store.list_events(&by_repo, 10).expect("repo");
+        assert_eq!(
+            rows.iter().map(|e| e.ts).collect::<Vec<_>>(),
+            [2_000, 1_700, 1_600, 1_500, 1_000]
+        );
+        let legacy = rows.iter().find(|e| e.ts == 1_700).expect("legacy row");
+        assert_eq!(legacy.repo, repo_a, "NULL event.repo falls back to the issue repo");
+
+        let other_repo = EventQuery {
+            repo: Some(repo_b.to_string()),
+            from_ms: Some(1_000),
+            to_ms: Some(2_000),
+            ..EventQuery::default()
+        };
+        assert_eq!(
+            store
+                .list_events(&other_repo, 10)
+                .expect("other repo")
+                .iter()
+                .map(|e| e.ts)
+                .collect::<Vec<_>>(),
+            [1_800]
+        );
+
+        let by_fingerprint = EventQuery {
+            fingerprint: Some(fp_b.clone()),
+            from_ms: Some(1_000),
+            to_ms: Some(2_000),
+            ..EventQuery::default()
+        };
+        assert_eq!(
+            store
+                .list_events(&by_fingerprint, 10)
+                .expect("fingerprint")
+                .iter()
+                .map(|e| e.ts)
+                .collect::<Vec<_>>(),
+            [2_000, 1_800, 1_500]
+        );
+
+        let mut limited = by_repo.clone();
+        limited.kinds = Vec::new();
+        let page = store.list_events(&limited, 2).expect("limit");
+        assert_eq!(page.iter().map(|e| e.ts).collect::<Vec<_>>(), [2_000, 1_700]);
+        assert!(store
+            .list_events(&EventQuery::default(), 0)
+            .expect("zero limit")
+            .is_empty());
+
+        let injection = EventQuery {
+            kinds: vec!["ci_green' OR 1=1 --".into()],
+            ..EventQuery::default()
+        };
+        assert!(
+            store.list_events(&injection, 10).expect("bound kind").is_empty(),
+            "kind values stay bound parameters"
+        );
+    }
+
+    #[test]
+    fn list_events_orders_by_ts_then_id_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store
+            .record_event("fp-a", 100, Some("r"), "system", "reported", "first")
+            .expect("a");
+        store
+            .record_event("fp-b", 300, Some("r"), "system", "ci_green", "green")
+            .expect("b");
+        store
+            .record_event("fp-c", 300, Some("r"), "system", "ci_red", "red")
+            .expect("c");
+        store
+            .record_event("fp-d", 200, Some("r"), "system", "rejected", "no")
+            .expect("d");
+
+        let rows = store
+            .list_events(&EventQuery::default(), 10)
+            .expect("events");
+        assert_eq!(
+            rows.iter().map(|e| e.ts).collect::<Vec<_>>(),
+            [300, 300, 200, 100]
+        );
+        assert_eq!(rows[0].kind, "ci_red", "same ts → newest row id first");
+        assert_eq!(rows[1].kind, "ci_green");
+    }
+
+    #[test]
+    fn list_events_caps_limit_at_5000() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        {
+            let mut conn = store.lock();
+            let tx = conn.transaction().expect("tx");
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO events(fingerprint, ts, repo, actor, kind, detail)
+                         VALUES ('fp', ?1, 'example.com/r', 'system', 'reported', 'bulk')",
+                    )
+                    .expect("prepare");
+                for ts in 1..=5_001 {
+                    stmt.execute([ts]).expect("insert");
+                }
+            }
+            tx.commit().expect("commit");
+        }
+
+        let rows = store
+            .list_events(&EventQuery::default(), 10_000)
+            .expect("capped");
+        assert_eq!(rows.len(), 5_000);
+        assert_eq!(rows[0].ts, 5_001);
+        assert_eq!(rows[4_999].ts, 2);
+    }
+
+    #[test]
+    fn trends_fill_each_source_and_apply_repo_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let repo_a = "example.com/spike-target";
+        let repo_b = "example.com/other";
+        let day_ms = 86_400_000i64;
+        let now = 1_700_000_000_000i64;
+        let today = now - now.rem_euclid(day_ms);
+        let d0 = today - 2 * day_ms;
+        let d1 = today - day_ms;
+        let d2 = today;
+        let before = d0 - day_ms;
+        let at = |day: i64, hour: i64| day + hour * 3_600_000;
+
+        let sig_a = signal();
+        let sig_b = issue_signal("panic in Submit", "Submit");
+        let mut sig_c = issue_signal("panic in Load", "Load");
+        sig_c.repo = repo_b.to_string();
+        let mut sig_d = issue_signal("panic in Enqueue", "Enqueue");
+        sig_d.repo = repo_b.to_string();
+        let sig_old = issue_signal("panic in Archive", "Archive");
+        let fp_a = fingerprint::compute("go", None, &sig_a.stack_trace);
+        let fp_c = fingerprint::compute("go", None, &sig_c.stack_trace);
+
+        // Reports also create the issues that own them; the old issue and its
+        // report fall outside the 3-day window.
+        store.report_signal(&sig_a, at(d0, 1)).expect("a d0");
+        store.report_signal(&sig_a, at(d1, 1)).expect("a d1");
+        store.report_signal(&sig_a, at(d1, 2)).expect("a d1 again");
+        store.report_signal(&sig_b, at(d1, 3)).expect("b d1");
+        store.report_signal(&sig_c, at(d1, 4)).expect("c d1");
+        store.report_signal(&sig_d, at(d2, 1)).expect("d d2");
+        store.report_signal(&sig_a, at(d2, 2)).expect("a d2");
+        store.report_signal(&sig_old, at(before, 3)).expect("old issue");
+
+        // Tokens bucket by run start; PRs opened by pr_opened_at.
+        seed_run(&store, "run-1", &fp_a, repo_a, at(d0, 5), Some(at(d1, 5)), (100, 50));
+        seed_run(&store, "run-2", &fp_a, repo_a, at(d1, 5), Some(at(d2, 5)), (200, 100));
+        seed_run(&store, "run-3", &fp_c, repo_b, at(d2, 5), None, (50, 10));
+        seed_run(&store, "run-old", &fp_a, repo_a, at(before, 5), Some(at(before, 6)), (999, 999));
+
+        // Window is [d0 00:00, d2+1 00:00): the exact start is counted, the
+        // exact end and earlier days are not.
+        store
+            .record_event(&fp_c, d0, Some(repo_b), "system", "ci_green", "window start")
+            .expect("start");
+        store
+            .record_event(&fp_c, at(d0, 6), Some(repo_b), "system", "ci_red", "d0 red")
+            .expect("d0 red");
+        store
+            .record_event(&fp_a, at(d1, 6), Some(repo_a), "system", "merged", "d1 merge")
+            .expect("d1 merge");
+        store
+            .record_event(&fp_c, at(d1, 7), Some(repo_b), "system", "rejected", "d1 reject")
+            .expect("d1 reject");
+        store
+            .record_event(&fp_a, at(d2, 6), Some(repo_a), "system", "ci_green", "d2 green")
+            .expect("d2 green");
+        store
+            .record_event(&fp_a, at(d2, 7), Some(repo_a), "system", "ci_green", "d2 green 2")
+            .expect("d2 green 2");
+        store
+            .record_event(&fp_a, at(d2, 8), None, "system", "ci_green", "legacy null repo")
+            .expect("legacy green");
+        store
+            .record_event(&fp_a, at(d1, 8), Some(repo_a), "system", "state_changed", "ignored")
+            .expect("ignored kind");
+        store
+            .record_event(&fp_a, at(before, 6), Some(repo_a), "system", "merged", "before")
+            .expect("before");
+        store
+            .record_event(&fp_a, d2 + day_ms, Some(repo_a), "system", "merged", "window end")
+            .expect("window end");
+
+        let expected_all = vec![
+            TrendBucket {
+                day: utc_day(d0),
+                reports: 1,
+                new_issues: 1,
+                tokens: 150,
+                ci_green: 1,
+                ci_red: 1,
+                ..TrendBucket::default()
+            },
+            TrendBucket {
+                day: utc_day(d1),
+                reports: 4,
+                new_issues: 2,
+                prs_opened: 1,
+                merged: 1,
+                rejected: 1,
+                tokens: 300,
+                ..TrendBucket::default()
+            },
+            TrendBucket {
+                day: utc_day(d2),
+                reports: 2,
+                new_issues: 1,
+                prs_opened: 1,
+                tokens: 60,
+                ci_green: 3,
+                ..TrendBucket::default()
+            },
+        ];
+        assert_eq!(store.trends(3, None, now).expect("all repos"), expected_all);
+
+        let expected_a = vec![
+            TrendBucket {
+                day: utc_day(d0),
+                reports: 1,
+                new_issues: 1,
+                tokens: 150,
+                ..TrendBucket::default()
+            },
+            TrendBucket {
+                day: utc_day(d1),
+                reports: 3,
+                new_issues: 1,
+                prs_opened: 1,
+                merged: 1,
+                tokens: 300,
+                ..TrendBucket::default()
+            },
+            TrendBucket {
+                day: utc_day(d2),
+                reports: 1,
+                prs_opened: 1,
+                ci_green: 3,
+                ..TrendBucket::default()
+            },
+        ];
+        assert_eq!(store.trends(3, Some(repo_a), now).expect("repo a"), expected_a);
+
+        let expected_b = vec![
+            TrendBucket {
+                day: utc_day(d0),
+                ci_green: 1,
+                ci_red: 1,
+                ..TrendBucket::default()
+            },
+            TrendBucket {
+                day: utc_day(d1),
+                reports: 1,
+                new_issues: 1,
+                rejected: 1,
+                ..TrendBucket::default()
+            },
+            TrendBucket {
+                day: utc_day(d2),
+                reports: 1,
+                new_issues: 1,
+                tokens: 60,
+                ..TrendBucket::default()
+            },
+        ];
+        assert_eq!(store.trends(3, Some(repo_b), now).expect("repo b"), expected_b);
+    }
+
+    #[test]
+    fn trends_zero_fill_missing_days_and_handle_zero_days() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let day_ms = 86_400_000i64;
+        let now = 1_700_000_000_000i64;
+        let today = now - now.rem_euclid(day_ms);
+        store
+            .report_signal(&signal(), today + 3_600_000)
+            .expect("today report");
+
+        let buckets = store.trends(5, None, now).expect("trends");
+        assert_eq!(buckets.len(), 5, "exactly `days` buckets");
+        let days: Vec<String> = (0..5)
+            .map(|offset| utc_day(today - (4 - offset) * day_ms))
+            .collect();
+        for (bucket, day) in buckets.iter().take(4).zip(&days[..4]) {
+            assert_eq!(
+                bucket,
+                &TrendBucket { day: day.clone(), ..TrendBucket::default() },
+                "missing days are zero-filled: {day}"
+            );
+        }
+        assert_eq!(buckets[4].day, days[4]);
+        assert_eq!(buckets[4].reports, 1);
+        assert_eq!(buckets[4].new_issues, 1);
+
+        assert!(store.trends(0, None, now).expect("zero days").is_empty());
+    }
+
+    #[test]
+    fn trends_buckets_flip_at_utc_midnight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let day_ms = 86_400_000i64;
+        let now = 1_700_000_000_123i64;
+        let midnight = now - now.rem_euclid(day_ms);
+        store
+            .report_signal(&signal(), midnight)
+            .expect("midnight report");
+
+        let before = store.trends(2, None, midnight - 1).expect("before midnight");
+        assert_eq!(before[1].day, utc_day(midnight - day_ms));
+        assert_eq!(before[1].reports, 0, "midnight belongs to the next day");
+
+        let after = store.trends(2, None, midnight).expect("at midnight");
+        assert_eq!(after[1].day, utc_day(midnight));
+        assert_eq!(after[1].reports, 1);
+        assert_eq!(after[1].new_issues, 1);
     }
 }
 
