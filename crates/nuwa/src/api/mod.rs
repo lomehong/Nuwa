@@ -88,6 +88,14 @@ pub fn api_not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not_found", "unknown API endpoint")
 }
 
+/// `/api/v1` router. Task 4 replaces this fallback-only stub with the auth
+/// routes and the session/CSRF middleware.
+pub fn router(state: std::sync::Arc<crate::serve::AppState>) -> axum::Router {
+    axum::Router::new()
+        .fallback(|| async { api_not_found() })
+        .with_state((*state).clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

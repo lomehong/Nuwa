@@ -5,19 +5,16 @@ mod guard;
 mod instructions;
 mod issue;
 mod repair;
+mod serve;
 mod session;
 mod settings;
 mod ui;
+mod web;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
-use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
 
 /// serve 各路由共享的状态：（问题单库，UI 鉴权令牌）。
 pub type Shared = (Arc<shanhaijing::Store>, Arc<Option<String>>);
@@ -100,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         Some("fix") => run_fix().await,
         Some("ingest") => run_ingest(argv.collect()),
         Some("work") => run_work(argv.collect()).await,
-        Some("serve") => run_serve(argv.collect()).await,
+        Some("serve") => serve::run_serve(argv.collect()).await,
         Some("status") => run_status(argv.collect()),
         Some("sync") => run_sync(argv.collect()).await,
         Some("reopen") => run_reopen(argv.collect()),
@@ -113,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Shared by `ingest` (file) and `serve` (HTTP body): one JSON object or
 /// JSONL — the 青鸟 FileSink/HTTPSink wire formats.
-fn parse_signals(raw: &str) -> anyhow::Result<Vec<shanhaijing::Signal>> {
+pub(crate) fn parse_signals(raw: &str) -> anyhow::Result<Vec<shanhaijing::Signal>> {
     match serde_json::from_str::<shanhaijing::Signal>(raw) {
         Ok(signal) => Ok(vec![signal]),
         Err(first_error) => raw
@@ -223,7 +220,7 @@ fn run_ingest(args: Vec<String>) -> anyhow::Result<()> {
 }
 
 /// One report → the human/HTTP response line.
-fn report_one(
+pub(crate) fn report_one(
     store: &shanhaijing::Store,
     signal: &shanhaijing::Signal,
     now: i64,
@@ -1212,7 +1209,7 @@ async fn run_sync(args: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1239,133 +1236,6 @@ fn env_provider_default() -> repair::ProviderKind {
             model: std::env::var("NUWA_MODEL").ok().filter(|s| !s.is_empty()),
         },
     }
-}
-
-/// HTTP ingest 服务端 — the online half of the 青鸟 path (HTTPSink → here).
-/// POST /ingest with one envelope JSON or JSONL body; GET /health for checks.
-/// v0 binds localhost by default: the collector runs on the same trust domain.
-async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
-    let mut db_path = std::path::PathBuf::from("shanhaijing.db");
-    let mut listen = String::from("127.0.0.1:7321");
-    let mut it = args.into_iter();
-    while let Some(flag) = it.next() {
-        match flag.as_str() {
-            "--db" => db_path = PathBuf::from(it.next().context("--db needs a value")?),
-            "--listen" => listen = it.next().context("--listen needs a value")?,
-            other => bail!("unknown serve flag {other}"),
-        }
-    }
-    match settings::migrate_env_file() {
-        Ok(changed) if !changed.is_empty() => {
-            println!(
-                "env        : migrated lowercase keys -> {}（restart services to apply）",
-                changed.join(", ")
-            );
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("env migrate: {e}"),
-    }
-    let store = Arc::new(
-        shanhaijing::Store::open(&db_path)
-            .with_context(|| format!("open db {}", db_path.display()))?,
-    );
-    // Shared collector token (NUWA_INGEST_TOKEN). Set it when serving beyond
-    // localhost: without it anyone can spam the issue store. This is a
-    // report-only token — leak consequence is junk signals, rotate freely;
-    // it is NOT an LLM key or repo credential (ADR: 现场无密钥红线不破).
-    let ingest_token = Arc::new(std::env::var("NUWA_INGEST_TOKEN").ok().filter(|t| !t.is_empty()));
-    // 控制台鉴权与上报令牌分离（设置页可改密钥）：未设 NUWA_UI_TOKEN 时
-    // fallback 到上报令牌，兼容既有部署。
-    let ui_token = std::env::var("NUWA_UI_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .map(|t| Arc::new(Some(t)) as Arc<Option<String>>)
-        .unwrap_or_else(|| Arc::clone(&ingest_token));
-
-    let token_mode = if ingest_token.is_some() { "required" } else { "DISABLED (local mode)" };
-    let auth = axum::middleware::from_fn_with_state(
-        (Arc::clone(&store), Arc::clone(&ingest_token)),
-        check_auth,
-    );
-    let ui_auth = axum::middleware::from_fn_with_state(
-        (Arc::clone(&store), Arc::clone(&ui_token)),
-        ui::ui_auth,
-    );
-    let ui_routes = axum::Router::new()
-        .route("/ui", get(ui::dashboard))
-        .route("/ui/reopen", post(ui::reopen))
-        .route("/ui/sync", post(ui::sync_now))
-        .route("/issue/{fp}", get(ui::issue_detail))
-        .route("/settings", get(settings::get_settings))
-        .route("/settings/save", post(settings::save_settings))
-        .route("/settings/restart", post(settings::restart_services))
-        .route_layer(ui_auth)
-        .route_layer(axum::middleware::from_fn(ui::origin_guard))
-        .with_state((Arc::clone(&store), Arc::clone(&ui_token)));
-    let app = axum::Router::new()
-        .route("/ingest", post(ingest_endpoint).route_layer(auth))
-        .route(
-            "/health",
-            get(|| async { "nuwa serve ok" }),
-        )
-        .merge(ui_routes)
-        .with_state((store, ingest_token));
-
-    let listener = tokio::net::TcpListener::bind(&listen)
-        .await
-        .with_context(|| format!("bind {listen}"))?;
-    println!(
-        "serve      : listening on http://{listen} (POST /ingest, GET /health) — token {token_mode}"
-    );
-    axum::serve(listener, app).await.context("serve")
-}
-
-/// Shared-token gate. `401` unless NUWA_INGEST_TOKEN is unset (local mode)
-/// or the `X-NUWA-Token` header matches.
-async fn check_auth(
-    State((_, expected)): State<(Arc<shanhaijing::Store>, Arc<Option<String>>)>,
-    headers: HeaderMap,
-    req: Request,
-    next: Next,
-) -> Response {
-    if let Some(expected) = expected.as_deref() {
-        let got = headers
-            .get("x-nuwa-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if got != expected {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "missing or wrong X-NUWA-Token header".to_string(),
-            )
-                .into_response();
-        }
-    }
-    next.run(req).await
-}
-
-async fn ingest_endpoint(
-    State((store, _)): State<(Arc<shanhaijing::Store>, Arc<Option<String>>)>,
-    body: axum::body::Bytes,
-) -> (StatusCode, String) {
-    let raw = match std::str::from_utf8(&body) {
-        Ok(s) => s,
-        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, format!("bad utf8: {e}")),
-    };
-    let signals = match parse_signals(raw) {
-        Ok(s) if !s.is_empty() => s,
-        Ok(_) => return (axum::http::StatusCode::BAD_REQUEST, "empty payload".to_string()),
-        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, format!("bad payload: {e:#}")),
-    };
-    let now = now_ms();
-    let mut lines = Vec::with_capacity(signals.len());
-    for signal in &signals {
-        match report_one(&store, signal, now) {
-            Ok(line) => lines.push(line),
-            Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("store: {e:#}")),
-        }
-    }
-    (axum::http::StatusCode::OK, lines.join("\n"))
 }
 
 /// Ops view: every issue, newest sighting first.
