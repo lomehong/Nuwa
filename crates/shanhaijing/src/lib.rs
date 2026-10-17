@@ -734,15 +734,50 @@ impl Store {
     }
 
     /// PRs opened for `repo` since `since_ms` — the counter behind the
-    /// per-repo daily PR limit (ADR-003 频控).
+    /// per-repo daily PR limit (ADR-003 频控). Counts distinct PR URLs across
+    /// the run ledger and legacy issue rows so retries of the same PR never
+    /// consume quota twice.
     pub fn prs_opened_since(&self, repo: &str, since_ms: i64) -> ShanResult<u64> {
         let conn = self.lock();
         let count: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM issues WHERE repo = ?1 AND pr_opened_at IS NOT NULL AND pr_opened_at >= ?2",
+            "SELECT COUNT(DISTINCT pr_url) FROM (
+                SELECT pr_url FROM runs
+                WHERE repo = ?1 AND pr_opened_at IS NOT NULL AND pr_opened_at >= ?2
+                UNION ALL
+                SELECT pr_url FROM issues
+                WHERE repo = ?1 AND pr_opened_at IS NOT NULL AND pr_opened_at >= ?2
+            )",
             rusqlite::params![repo, since_ms],
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Delete telemetry past its retention window and return the total number
+    /// of removed rows. Normal events roll off after `event_days`, audit
+    /// events (`config_changed` / `config_migrated` / `restart_requested`)
+    /// are kept for 365 days, runs after `run_days`, and runner rows whose
+    /// last heartbeat is older than 30 days. Callers schedule this (M1b/M2).
+    pub fn prune(&self, now_ms: i64, event_days: u32, run_days: u32) -> ShanResult<u64> {
+        let event_cutoff = now_ms - i64::from(event_days) * 86_400_000;
+        let audit_cutoff = now_ms - 365 * 86_400_000;
+        let run_cutoff = now_ms - i64::from(run_days) * 86_400_000;
+        let runner_cutoff = now_ms - 30 * 86_400_000;
+        let conn = self.lock();
+        let mut deleted = 0u64;
+        deleted += conn.execute(
+            "DELETE FROM events WHERE ts < ?1 AND kind NOT IN
+                ('config_changed','config_migrated','restart_requested')",
+            [event_cutoff],
+        )? as u64;
+        deleted += conn.execute(
+            "DELETE FROM events WHERE ts < ?1 AND kind IN
+                ('config_changed','config_migrated','restart_requested')",
+            [audit_cutoff],
+        )? as u64;
+        deleted += conn.execute("DELETE FROM runs WHERE started_at < ?1", [run_cutoff])? as u64;
+        deleted += conn.execute("DELETE FROM runners WHERE heartbeat_at < ?1", [runner_cutoff])? as u64;
+        Ok(deleted)
     }
 
     /// Reports for `fingerprint` on UTC `day` (`YYYY-MM-DD`), summed across
@@ -1340,6 +1375,78 @@ mod tests {
             1,
             "window starts at since_ms"
         );
+    }
+
+    #[test]
+    fn pr_quota_counts_distinct_urls_from_runs_and_issues() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let now = 1_700_000_000_000;
+        store.report_signal(&signal(), now).expect("report");
+        let fp = store.ready_issue(now).expect("ready").expect("issue").fingerprint;
+        store.set_pr(&fp, "https://github.com/a/b/pull/1", now).expect("legacy pr");
+        store
+            .start_run(&RunStart {
+                id: "run1".into(),
+                fingerprint: fp.clone(),
+                runner_id: "r".into(),
+                repo: signal().repo,
+                started_at: now,
+                provider: None,
+                model: None,
+            })
+            .expect("run");
+        store
+            .update_run(
+                "run1",
+                &RunUpdate {
+                    pr_url: Some("https://github.com/a/b/pull/1".into()),
+                    pr_opened_at: Some(now + 1),
+                    ..RunUpdate::default()
+                },
+            )
+            .expect("update");
+        assert_eq!(store.prs_opened_since(&signal().repo, now - 1).expect("count"), 1);
+
+        store
+            .update_run(
+                "run1",
+                &RunUpdate {
+                    pr_url: Some("https://github.com/a/b/pull/2".into()),
+                    pr_opened_at: Some(now + 2),
+                    ..RunUpdate::default()
+                },
+            )
+            .expect("update2");
+        assert_eq!(store.prs_opened_since(&signal().repo, now - 1).expect("count"), 2);
+    }
+
+    #[test]
+    fn prune_removes_old_rows_and_keeps_audit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let day = 86_400_000;
+        let now = 400 * day;
+        store.record_event("fp", now - 100 * day, Some("r"), "system", "reported", "old").expect("e");
+        store.record_event("fp", now - 100 * day, Some("r"), "owner", "config_changed", "k").expect("audit");
+        store
+            .record_event("fp", now - 400 * day, Some("r"), "owner", "config_changed", "old-audit")
+            .expect("audit old");
+        store
+            .upsert_runner(&RunnerUpsert {
+                id: "r".into(), repo: "r".into(), host: "h".into(), pid: None,
+                started_at: 0, heartbeat_at: now - 40 * day, status: "idle".into(),
+                provider: None, model: None, daily_pr_limit: None, repo_path: None,
+                service_unit: None, config_json: "{}".into(),
+            })
+            .expect("runner");
+        let deleted = store.prune(now, 90, 365).expect("prune");
+        assert!(deleted >= 3);
+        let events = store.recent_events(100).expect("events");
+        assert!(events.iter().any(|e| e.kind == "config_changed" && e.detail == "k"));
+        assert!(!events.iter().any(|e| e.detail == "old"));
+        assert!(!events.iter().any(|e| e.detail == "old-audit"));
+        assert!(store.list_runners().expect("runners").is_empty());
     }
 
     #[test]
