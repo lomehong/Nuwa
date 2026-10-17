@@ -7,13 +7,18 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 
 use crate::{now_ms, parse_signals, report_one, Shared};
+
+/// Strict CSP for the JSON API and the SPA: no inline script or style.
+const CSP_STRICT: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+/// The legacy console keeps inline styles until it is replaced in M6.
+const CSP_LEGACY: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'";
 
 /// State shared by the legacy console routes and the `/api/v1` surface.
 #[derive(Clone)]
@@ -31,7 +36,8 @@ pub struct AppState {
 }
 
 /// Full app assembly: legacy console + `/api/v1` + static fallback.
-/// Task 5 layers the security headers on top of this router.
+/// The security-header layer wraps every route, so auth rejections and
+/// fallback responses carry the headers too.
 pub fn build_app(state: AppState) -> Router {
     let legacy_state: Shared = (Arc::clone(&state.store), Arc::clone(&state.ui_token));
     let ingest_auth = axum::middleware::from_fn_with_state(
@@ -66,6 +72,37 @@ pub fn build_app(state: AppState) -> Router {
         .merge(legacy)
         .nest("/api/v1", api)
         .fallback(crate::web::serve)
+        .layer(axum::middleware::from_fn(crate::serve::security_headers))
+}
+
+/// Response hardening for every route. The legacy console (`/ui`, `/issue/`,
+/// `/settings`) keeps `style-src 'unsafe-inline'` until M6 replaces it; the
+/// JSON API and the SPA get the strict policy.
+pub async fn security_headers(req: Request, next: Next) -> Response {
+    let legacy = req.uri().path().starts_with("/ui")
+        || req.uri().path().starts_with("/issue/")
+        || req.uri().path().starts_with("/settings");
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    let csp = if legacy { CSP_LEGACY } else { CSP_STRICT };
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(csp),
+    );
+    res
 }
 
 /// HTTP ingest server — the online half of the 青鸟 path (HTTPSink → here).
@@ -228,6 +265,35 @@ mod tests {
         serde_json::from_str(&body_text(response).await).expect("json body")
     }
 
+    const STRICT_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+    const LEGACY_CSP: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'";
+
+    fn header_str(response: &Response, name: header::HeaderName) -> String {
+        response
+            .headers()
+            .get(&name)
+            .unwrap_or_else(|| panic!("missing header {name}"))
+            .to_str()
+            .expect("ascii header")
+            .to_string()
+    }
+
+    fn assert_common_security_headers(response: &Response) {
+        assert_eq!(
+            header_str(response, header::X_CONTENT_TYPE_OPTIONS),
+            "nosniff"
+        );
+        assert_eq!(header_str(response, header::REFERRER_POLICY), "no-referrer");
+        assert_eq!(header_str(response, header::X_FRAME_OPTIONS), "DENY");
+        assert_eq!(
+            header_str(
+                response,
+                header::HeaderName::from_static("permissions-policy")
+            ),
+            "camera=(), microphone=(), geolocation=()"
+        );
+    }
+
     fn peer() -> axum::extract::ConnectInfo<SocketAddr> {
         axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41234)))
     }
@@ -344,6 +410,75 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/html")));
         assert!(body_text(response).await.contains("Nuwa console"));
+    }
+
+    #[tokio::test]
+    async fn api_response_carries_strict_security_headers() {
+        let (_dir, app) = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/nope")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_common_security_headers(&response);
+        let csp = header_str(&response, header::CONTENT_SECURITY_POLICY);
+        assert_eq!(csp, STRICT_CSP);
+        assert!(
+            !csp.contains("unsafe-inline"),
+            "API CSP must stay strict: {csp}"
+        );
+    }
+
+    // The legacy console keeps inline styles until M6, and headers must be
+    // applied even when auth rejects the request before a handler runs.
+    #[tokio::test]
+    async fn legacy_console_responses_carry_relaxed_security_headers() {
+        let (_dir, app) = test_app();
+        for path in ["/ui", "/settings", "/issue/abc123"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert_common_security_headers(&response);
+            let csp = header_str(&response, header::CONTENT_SECURITY_POLICY);
+            assert_eq!(csp, LEGACY_CSP, "{path}");
+            assert!(
+                csp.contains("style-src 'self' 'unsafe-inline'"),
+                "legacy CSP must allow inline styles: {csp}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_placeholder_carries_strict_security_headers() {
+        let (_dir, app) = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_common_security_headers(&response);
+        assert_eq!(
+            header_str(&response, header::CONTENT_SECURITY_POLICY),
+            STRICT_CSP
+        );
     }
 
     // The legacy /ingest gate is the ingest token, not Basic auth: the refactor
