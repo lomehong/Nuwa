@@ -120,6 +120,8 @@ pub enum ShanError {
     UnknownState(String),
     #[error("unknown runner {0}")]
     UnknownRunner(String),
+    #[error("unknown run {0}")]
+    UnknownRun(String),
 }
 
 pub type ShanResult<T> = Result<T, ShanError>;
@@ -224,6 +226,74 @@ pub struct RunnerRow {
     pub service_unit: Option<String>,
     pub config_json: String,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunStart {
+    pub id: String,
+    pub fingerprint: String,
+    pub runner_id: String,
+    pub repo: String,
+    pub started_at: i64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RunUpdate {
+    pub phase: Option<String>,
+    pub turns: Option<i64>,
+    pub tokens_uncached: Option<i64>,
+    pub tokens_cached: Option<i64>,
+    pub harness_run_id: Option<String>,
+    pub root_cause: Option<String>,
+    pub verification_ok: Option<bool>,
+    pub verification_detail: Option<String>,
+    pub change_stat: Option<String>,
+    pub branch: Option<String>,
+    pub commit_sha: Option<String>,
+    pub pr_url: Option<String>,
+    pub pr_opened_at: Option<i64>,
+    pub ci_verdict: Option<String>,
+    pub session_dir: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunFinish {
+    pub finished_at: i64,
+    pub outcome: String,
+    pub ci_verdict: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RunRow {
+    pub id: String,
+    pub harness_run_id: Option<String>,
+    pub fingerprint: String,
+    pub runner_id: String,
+    pub repo: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub phase: String,
+    pub outcome: Option<String>,
+    pub ci_verdict: Option<String>,
+    pub turns: i64,
+    pub tokens_uncached: i64,
+    pub tokens_cached: i64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub root_cause: Option<String>,
+    pub change_stat: Option<String>,
+    pub branch: Option<String>,
+    pub commit_sha: Option<String>,
+    pub pr_url: Option<String>,
+    pub pr_opened_at: Option<i64>,
+    pub verification_ok: Option<bool>,
+    pub verification_detail: Option<String>,
+    pub session_dir: Option<String>,
+    pub error: Option<String>,
 }
 
 pub struct Store {
@@ -730,6 +800,141 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    pub fn start_run(&self, r: &RunStart) -> ShanResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO runs(id, fingerprint, runner_id, repo, started_at, phase, provider, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'claim', ?6, ?7)",
+            rusqlite::params![
+                r.id, r.fingerprint, r.runner_id, r.repo, r.started_at, r.provider, r.model
+            ],
+        )?;
+        conn.execute(
+            "UPDATE issues SET owner_runner_id = ?2 WHERE fingerprint = ?1",
+            rusqlite::params![r.fingerprint, r.runner_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_run(&self, id: &str, u: &RunUpdate) -> ShanResult<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE runs SET
+                phase = COALESCE(?2, phase),
+                turns = COALESCE(?3, turns),
+                tokens_uncached = COALESCE(?4, tokens_uncached),
+                tokens_cached = COALESCE(?5, tokens_cached),
+                harness_run_id = COALESCE(?6, harness_run_id),
+                root_cause = COALESCE(?7, root_cause),
+                verification_ok = COALESCE(?8, verification_ok),
+                verification_detail = COALESCE(?9, verification_detail),
+                change_stat = COALESCE(?10, change_stat),
+                branch = COALESCE(?11, branch),
+                commit_sha = COALESCE(?12, commit_sha),
+                pr_url = COALESCE(?13, pr_url),
+                pr_opened_at = COALESCE(?14, pr_opened_at),
+                ci_verdict = COALESCE(?15, ci_verdict),
+                session_dir = COALESCE(?16, session_dir),
+                error = COALESCE(?17, error)
+             WHERE id = ?1",
+            rusqlite::params![
+                id, u.phase, u.turns, u.tokens_uncached, u.tokens_cached, u.harness_run_id,
+                u.root_cause, u.verification_ok, u.verification_detail, u.change_stat, u.branch,
+                u.commit_sha, u.pr_url, u.pr_opened_at, u.ci_verdict, u.session_dir, u.error,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownRun(id.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn finish_run(&self, id: &str, f: &RunFinish) -> ShanResult<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE runs SET finished_at=?2, phase='done', outcome=?3,
+                ci_verdict=COALESCE(?4, ci_verdict), error=COALESCE(?5, error)
+             WHERE id=?1",
+            rusqlite::params![id, f.finished_at, f.outcome, f.ci_verdict, f.error],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownRun(id.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn mark_interrupted(&self, runner_id: &str, now_ms: i64) -> ShanResult<u64> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE runs SET finished_at=?2, phase='done', outcome='interrupted',
+                error='runner restarted before completion'
+             WHERE runner_id=?1 AND finished_at IS NULL",
+            rusqlite::params![runner_id, now_ms],
+        )?;
+        Ok(changed as u64)
+    }
+
+    fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
+        Ok(RunRow {
+            id: row.get(0)?,
+            harness_run_id: row.get(1)?,
+            fingerprint: row.get(2)?,
+            runner_id: row.get(3)?,
+            repo: row.get(4)?,
+            started_at: row.get(5)?,
+            finished_at: row.get(6)?,
+            phase: row.get(7)?,
+            outcome: row.get(8)?,
+            ci_verdict: row.get(9)?,
+            turns: row.get(10)?,
+            tokens_uncached: row.get(11)?,
+            tokens_cached: row.get(12)?,
+            provider: row.get(13)?,
+            model: row.get(14)?,
+            root_cause: row.get(15)?,
+            change_stat: row.get(16)?,
+            branch: row.get(17)?,
+            commit_sha: row.get(18)?,
+            pr_url: row.get(19)?,
+            pr_opened_at: row.get(20)?,
+            verification_ok: row.get(21)?,
+            verification_detail: row.get(22)?,
+            session_dir: row.get(23)?,
+            error: row.get(24)?,
+        })
+    }
+
+    pub fn latest_run(&self, fingerprint: &str) -> ShanResult<Option<RunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, harness_run_id, fingerprint, runner_id, repo, started_at, finished_at,
+                    phase, outcome, ci_verdict, turns, tokens_uncached, tokens_cached, provider,
+                    model, root_cause, change_stat, branch, commit_sha, pr_url, pr_opened_at,
+                    verification_ok, verification_detail, session_dir, error
+             FROM runs WHERE fingerprint=?1 ORDER BY started_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([fingerprint])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::run_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn runs_for(&self, fingerprint: &str, limit: u32) -> ShanResult<Vec<RunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, harness_run_id, fingerprint, runner_id, repo, started_at, finished_at,
+                    phase, outcome, ci_verdict, turns, tokens_uncached, tokens_cached, provider,
+                    model, root_cause, change_stat, branch, commit_sha, pr_url, pr_opened_at,
+                    verification_ok, verification_detail, session_dir, error
+             FROM runs WHERE fingerprint=?1 ORDER BY started_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![fingerprint, limit], |row| {
+            Self::run_from_row(row)
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Append a lifecycle event (console activity feed + per-issue timeline).
     pub fn record_event(
         &self,
@@ -989,6 +1194,82 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| e.kind == "state_changed" && e.actor.as_deref() == Some("runner")));
+    }
+
+    #[test]
+    fn run_lifecycle_and_latest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+
+        store
+            .start_run(&RunStart {
+                id: "run1".into(),
+                fingerprint: fp.clone(),
+                runner_id: "host:repo".into(),
+                repo: "example.com/spike-target".into(),
+                started_at: 100,
+                provider: Some("zai".into()),
+                model: Some("glm-5.3-flash".into()),
+            })
+            .expect("start");
+
+        store
+            .update_run(
+                "run1",
+                &RunUpdate {
+                    phase: Some("repair".into()),
+                    turns: Some(3),
+                    tokens_uncached: Some(1200),
+                    tokens_cached: Some(300),
+                    session_dir: Some("sessions/xxxx".into()),
+                    ..RunUpdate::default()
+                },
+            )
+            .expect("update");
+        store
+            .finish_run(
+                "run1",
+                &RunFinish {
+                    finished_at: 200,
+                    outcome: "success".into(),
+                    ci_verdict: Some("success".into()),
+                    error: None,
+                },
+            )
+            .expect("finish");
+
+        let run = store.latest_run(&fp).expect("latest").expect("run");
+        assert_eq!(run.id, "run1");
+        assert_eq!(run.phase, "done");
+        assert_eq!(run.outcome.as_deref(), Some("success"));
+        assert_eq!(run.turns, 3);
+        assert_eq!(run.tokens_uncached, 1200);
+        assert_eq!(run.finished_at, Some(200));
+    }
+
+    #[test]
+    fn mark_interrupted_closes_open_runs_for_runner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        store
+            .start_run(&RunStart {
+                id: "run2".into(),
+                fingerprint: fp.clone(),
+                runner_id: "host:repo".into(),
+                repo: "example.com/spike-target".into(),
+                started_at: 100,
+                provider: None,
+                model: None,
+            })
+            .expect("start");
+        assert_eq!(store.mark_interrupted("host:repo", 300).expect("mark"), 1);
+        let runs = store.runs_for(&fp, 10).expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].outcome.as_deref(), Some("interrupted"));
     }
 }
 
