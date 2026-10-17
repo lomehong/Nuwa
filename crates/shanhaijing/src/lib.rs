@@ -118,6 +118,8 @@ pub enum ShanError {
     UnknownIssue(String),
     #[error("unknown state string {0}")]
     UnknownState(String),
+    #[error("unknown runner {0}")]
+    UnknownRunner(String),
 }
 
 pub type ShanResult<T> = Result<T, ShanError>;
@@ -175,6 +177,53 @@ pub struct EventRow {
     pub detail: String,
     pub repo: String,
     pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerUpsert {
+    pub id: String,
+    pub repo: String,
+    pub host: String,
+    pub pid: Option<i64>,
+    pub started_at: i64,
+    pub heartbeat_at: i64,
+    pub status: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub daily_pr_limit: Option<i64>,
+    pub repo_path: Option<String>,
+    pub service_unit: Option<String>,
+    pub config_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerHeartbeat {
+    pub heartbeat_at: i64,
+    pub status: String,
+    pub current_fingerprint: Option<String>,
+    pub phase: Option<String>,
+    pub config_json: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RunnerRow {
+    pub id: String,
+    pub repo: String,
+    pub host: String,
+    pub pid: Option<i64>,
+    pub started_at: i64,
+    pub heartbeat_at: i64,
+    pub status: String,
+    pub current_fingerprint: Option<String>,
+    pub phase: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub daily_pr_limit: Option<i64>,
+    pub repo_path: Option<String>,
+    pub service_unit: Option<String>,
+    pub config_json: String,
+    pub last_error: Option<String>,
 }
 
 pub struct Store {
@@ -610,6 +659,77 @@ impl Store {
         Ok(ts)
     }
 
+    pub fn upsert_runner(&self, r: &RunnerUpsert) -> ShanResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO runners(id, repo, host, pid, started_at, heartbeat_at, status,
+                                 current_fingerprint, phase, provider, model, daily_pr_limit,
+                                 repo_path, service_unit, config_json, last_error)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,?9,?10,?11,?12,?13,NULL)
+             ON CONFLICT(id) DO UPDATE SET
+                repo=excluded.repo, host=excluded.host, pid=excluded.pid,
+                started_at=excluded.started_at, heartbeat_at=excluded.heartbeat_at,
+                status=excluded.status, current_fingerprint=NULL, phase=NULL,
+                provider=excluded.provider, model=excluded.model,
+                daily_pr_limit=excluded.daily_pr_limit, repo_path=excluded.repo_path,
+                service_unit=excluded.service_unit, config_json=excluded.config_json,
+                last_error=NULL",
+            rusqlite::params![
+                r.id, r.repo, r.host, r.pid, r.started_at, r.heartbeat_at, r.status,
+                r.provider, r.model, r.daily_pr_limit, r.repo_path, r.service_unit, r.config_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn heartbeat_runner(&self, id: &str, hb: &RunnerHeartbeat) -> ShanResult<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE runners SET heartbeat_at=?2, status=?3, current_fingerprint=?4, phase=?5,
+                config_json=COALESCE(?6, config_json), last_error=?7
+             WHERE id=?1",
+            rusqlite::params![
+                id, hb.heartbeat_at, hb.status, hb.current_fingerprint, hb.phase,
+                hb.config_json, hb.last_error,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownRunner(id.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn list_runners(&self) -> ShanResult<Vec<RunnerRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, repo, host, pid, started_at, heartbeat_at, status,
+                    current_fingerprint, phase, provider, model, daily_pr_limit,
+                    repo_path, service_unit, config_json, last_error
+             FROM runners ORDER BY heartbeat_at DESC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RunnerRow {
+                id: row.get(0)?,
+                repo: row.get(1)?,
+                host: row.get(2)?,
+                pid: row.get(3)?,
+                started_at: row.get(4)?,
+                heartbeat_at: row.get(5)?,
+                status: row.get(6)?,
+                current_fingerprint: row.get(7)?,
+                phase: row.get(8)?,
+                provider: row.get(9)?,
+                model: row.get(10)?,
+                daily_pr_limit: row.get(11)?,
+                repo_path: row.get(12)?,
+                service_unit: row.get(13)?,
+                config_json: row.get(14)?,
+                last_error: row.get(15)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Append a lifecycle event (console activity feed + per-issue timeline).
     pub fn record_event(
         &self,
@@ -908,5 +1028,69 @@ mod heartbeat_tests {
         let events = store.events_for(&fp, 10).expect("events");
         let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
         assert!(kinds.contains(&"state_changed"), "{kinds:?}");
+    }
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+
+    #[test]
+    fn runner_upsert_heartbeat_and_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store
+            .upsert_runner(&RunnerUpsert {
+                id: "host:repo".into(),
+                repo: "example.com/r".into(),
+                host: "host".into(),
+                pid: Some(42),
+                started_at: 100,
+                heartbeat_at: 100,
+                status: "starting".into(),
+                provider: Some("zai".into()),
+                model: Some("glm-5.3-flash".into()),
+                daily_pr_limit: Some(5),
+                repo_path: Some("/opt/nuwa/repo".into()),
+                service_unit: Some("nuwa-work".into()),
+                config_json: "{}".into(),
+            })
+            .expect("upsert");
+
+        store
+            .heartbeat_runner(
+                "host:repo",
+                &RunnerHeartbeat {
+                    heartbeat_at: 200,
+                    status: "working".into(),
+                    current_fingerprint: Some("fp1".into()),
+                    phase: Some("repair".into()),
+                    config_json: Some("{\"max_turns\":30}".into()),
+                    last_error: None,
+                },
+            )
+            .expect("heartbeat");
+
+        let runners = store.list_runners().expect("list");
+        assert_eq!(runners.len(), 1);
+        let r = &runners[0];
+        assert_eq!(r.status, "working");
+        assert_eq!(r.current_fingerprint.as_deref(), Some("fp1"));
+        assert_eq!(r.phase.as_deref(), Some("repair"));
+        assert_eq!(r.heartbeat_at, 200);
+        assert!(r.config_json.contains("max_turns"));
+        assert!(store
+            .heartbeat_runner(
+                "missing",
+                &RunnerHeartbeat {
+                    heartbeat_at: 1,
+                    status: "idle".into(),
+                    current_fingerprint: None,
+                    phase: None,
+                    config_json: None,
+                    last_error: None,
+                }
+            )
+            .is_err());
     }
 }
