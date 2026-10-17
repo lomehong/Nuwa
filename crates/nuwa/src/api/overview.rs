@@ -10,41 +10,16 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::api::common::{
+    attention_kind, issue_is_stuck, runner_intervals, DAY_MS, STATES,
+};
 use crate::api::ApiError;
 use crate::serve::AppState;
-use shanhaijing::{EventQuery, IssueRow, RunnerRow, ShanResult, Store};
+use shanhaijing::{IssueRow, RunnerRow, ShanResult, Store};
 
 /// A runner is offline once its heartbeat is older than this (docs/09 §9.2).
 const RUNNER_OFFLINE_MS: i64 = 90_000;
-/// Poll interval assumed when a runner's `config_json` has no usable
-/// `interval_secs` (docs/09 §8.4).
-const DEFAULT_INTERVAL_SECS: u64 = 30;
-/// Stuck window floor: `stuck_after = max(3 × interval, 300s)` (docs/09 §8.4).
-const STUCK_AFTER_FLOOR_MS: i64 = 300_000;
-/// `NUWA_INTERVAL` is documented at ≤ 86400s, so `3 × interval` tops out at
-/// 72h; clamp there so a corrupt config cannot disable stuck detection.
-const STUCK_AFTER_CEILING_MS: i64 = 259_200_000;
-const DAY_MS: i64 = 86_400_000;
 const QUEUE_NEXT_LIMIT: u32 = 3;
-
-/// Funnel keys; every key is present even when its count is zero.
-const STATES: [&str; 7] = [
-    "new",
-    "triggered",
-    "fixing",
-    "pr_open",
-    "merged",
-    "rejected",
-    "escalated",
-];
-
-const REASON_REPAIR_FAILED: (&str, &str) = ("repair_failed", "修复 runner 失败，需要复核");
-const REASON_DELIVERY_FAILED: (&str, &str) = ("delivery_failed", "验证/交付失败，需要复核");
-const REASON_BUDGET_EXCEEDED: (&str, &str) = ("budget_exceeded", "token 预算超限，需要复核");
-const REASON_CI_RED: (&str, &str) = ("ci_red", "CI 红灯，PR 已关闭");
-const REASON_PR_CLOSED: (&str, &str) = ("pr_closed", "PR 未合并被关闭");
-const REASON_STUCK: (&str, &str) = ("stuck", "疑似卡单，runner 心跳已过期");
-const REASON_CI_TIMEOUT: (&str, &str) = ("ci_timeout", "CI 超时，需要人工查看");
 
 /// `?repo=` scopes issues, runners and active runs; an empty value means all.
 #[derive(Debug, Default, Deserialize)]
@@ -199,8 +174,9 @@ struct AttentionCandidate {
 
 /// Attention = escalated, stuck, rejected, or pr_open with a `ci_timeout`
 /// event in the last 24h. Order: escalated > stuck > rejected > ci_timeout,
-/// then oldest `last_seen` first (docs/09 §9.2). The stuck window follows the
-/// owning runner's configured poll interval (docs/09 §8.4).
+/// then oldest `last_seen` first (docs/09 §9.2). The predicate and the stuck
+/// window follow the owner runner's configured poll interval (docs/09 §8.4)
+/// and are shared with the issue list.
 fn build_attention(
     store: &Store,
     issues: &[IssueRow],
@@ -209,36 +185,13 @@ fn build_attention(
 ) -> ShanResult<Vec<AttentionItem>> {
     let mut candidates = Vec::new();
     for issue in issues {
-        let (rank, stuck, (reason_code, reason_text)) = match issue.state.as_str() {
-            "escalated" | "rejected" => {
-                let detail = store
-                    .latest_event(&issue.fingerprint)?
-                    .map(|event| event.detail)
-                    .unwrap_or_default();
-                let rank = if issue.state == "escalated" { 0 } else { 2 };
-                (rank, false, reason_for_detail(&detail, &issue.state))
-            }
-            "triggered" | "fixing" => {
-                let interval_secs = issue
-                    .owner_runner_id
-                    .as_deref()
-                    .and_then(|owner| runner_intervals.get(owner).copied())
-                    .unwrap_or(DEFAULT_INTERVAL_SECS);
-                if !store.stuck(&issue.fingerprint, now, stuck_after_ms(interval_secs))? {
-                    continue;
-                }
-                (1, true, REASON_STUCK)
-            }
-            "pr_open" => {
-                if !ci_timeout_within_day(store, &issue.fingerprint, now)? {
-                    continue;
-                }
-                (3, false, REASON_CI_TIMEOUT)
-            }
-            _ => continue,
+        let stuck = issue_is_stuck(store, issue, runner_intervals, now)?;
+        let Some(kind) = attention_kind(store, issue, stuck, now)? else {
+            continue;
         };
+        let (reason_code, reason_text) = kind.reason(store, issue)?;
         candidates.push(AttentionCandidate {
-            rank,
+            rank: kind.rank(),
             item: AttentionItem {
                 fingerprint: issue.fingerprint.clone(),
                 title: issue.title.clone(),
@@ -264,74 +217,6 @@ fn build_attention(
         .into_iter()
         .map(|candidate| candidate.item)
         .collect())
-}
-
-/// Owner runner id → configured poll interval, used to size each issue's
-/// stuck window. Runners with absent/malformed configs keep the 30s default.
-fn runner_intervals(runners: &[RunnerRow]) -> BTreeMap<&str, u64> {
-    runners
-        .iter()
-        .map(|runner| {
-            (
-                runner.id.as_str(),
-                runner_interval_secs(&runner.config_json),
-            )
-        })
-        .collect()
-}
-
-/// Read `interval_secs` from a runner's effective `config_json`; anything
-/// missing, malformed or non-numeric falls back to the 30s default.
-fn runner_interval_secs(config_json: &str) -> u64 {
-    serde_json::from_str::<serde_json::Value>(config_json)
-        .ok()
-        .and_then(|config| {
-            config
-                .get("interval_secs")
-                .and_then(serde_json::Value::as_u64)
-        })
-        .unwrap_or(DEFAULT_INTERVAL_SECS)
-}
-
-/// `stuck_after = max(3 × interval, 300s)` (docs/09 §8.4), saturated and
-/// clamped so a corrupt interval can neither overflow nor disable detection.
-fn stuck_after_ms(interval_secs: u64) -> i64 {
-    let window_ms = interval_secs.saturating_mul(3).saturating_mul(1_000);
-    let window_ms = i64::try_from(window_ms).unwrap_or(i64::MAX);
-    window_ms.clamp(STUCK_AFTER_FLOOR_MS, STUCK_AFTER_CEILING_MS)
-}
-
-/// Map the newest event detail to a stable reason. Escalation details carry
-/// a phase prefix (`repair_failed: …`, docs/09 §8.3); a rejected issue
-/// without one is a PR closed by `sync`.
-fn reason_for_detail(detail: &str, state: &str) -> (&'static str, &'static str) {
-    for (prefix, reason) in [
-        ("repair_failed:", REASON_REPAIR_FAILED),
-        ("delivery_failed:", REASON_DELIVERY_FAILED),
-        ("budget_exceeded:", REASON_BUDGET_EXCEEDED),
-        ("ci_red:", REASON_CI_RED),
-    ] {
-        if detail.starts_with(prefix) {
-            return reason;
-        }
-    }
-    if state == "rejected" {
-        REASON_PR_CLOSED
-    } else {
-        // Legacy escalations without a phase prefix still mean the repair
-        // pipeline gave up; repair_failed is the generic bucket.
-        REASON_REPAIR_FAILED
-    }
-}
-
-fn ci_timeout_within_day(store: &Store, fingerprint: &str, now: i64) -> ShanResult<bool> {
-    let query = EventQuery {
-        kinds: vec!["ci_timeout".to_string()],
-        fingerprint: Some(fingerprint.to_string()),
-        from_ms: Some(now - DAY_MS),
-        ..EventQuery::default()
-    };
-    Ok(!store.list_events(&query, 1)?.is_empty())
 }
 
 fn build_active_runs(
@@ -449,89 +334,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reason_for_detail_maps_every_documented_prefix() {
-        let cases = [
-            (
-                "repair_failed: boom",
-                "escalated",
-                "repair_failed",
-                "修复 runner 失败，需要复核",
-            ),
-            (
-                "delivery_failed: verify failed",
-                "escalated",
-                "delivery_failed",
-                "验证/交付失败，需要复核",
-            ),
-            (
-                "budget_exceeded: 900 > 800",
-                "escalated",
-                "budget_exceeded",
-                "token 预算超限，需要复核",
-            ),
-            (
-                "ci_red: CI red — PR #7 closed",
-                "rejected",
-                "ci_red",
-                "CI 红灯，PR 已关闭",
-            ),
-        ];
-        for (detail, state, code, text) in cases {
-            assert_eq!(
-                reason_for_detail(detail, state),
-                (code, text),
-                "detail {detail:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn reason_for_detail_requires_the_prefix_and_falls_back() {
-        // A prefix must start the detail, not merely appear inside it.
-        for detail in [
-            "repair failed: repair_failed: boom",
-            "repair_failedness",
-            "repair_failed",
-        ] {
-            assert_eq!(
-                reason_for_detail(detail, "escalated"),
-                REASON_REPAIR_FAILED,
-                "detail {detail:?}"
-            );
-        }
-        // Rejections without a phase prefix come from `sync` closing a PR.
-        assert_eq!(reason_for_detail("", "rejected"), REASON_PR_CLOSED);
-        assert_eq!(
-            reason_for_detail("PR closed without merge", "rejected"),
-            REASON_PR_CLOSED
-        );
-    }
-
-    #[test]
     fn counts_include_every_state_even_when_zero() {
         let counts = build_counts(&[]);
         assert_eq!(counts.len(), STATES.len());
         for state in STATES {
             assert_eq!(counts[state], 0, "{state}");
-        }
-    }
-
-    #[test]
-    fn stuck_window_follows_the_runner_interval_with_a_300s_floor() {
-        assert_eq!(stuck_after_ms(30), STUCK_AFTER_FLOOR_MS);
-        assert_eq!(stuck_after_ms(600), 1_800_000);
-        assert_eq!(stuck_after_ms(u64::MAX), STUCK_AFTER_CEILING_MS);
-        assert_eq!(
-            runner_interval_secs(r#"{"interval_secs":600}"#),
-            600,
-            "the configured interval is honoured"
-        );
-        for config in ["{}", "", "not json", r#"{"interval_secs":"600"}"#, "[]"] {
-            assert_eq!(
-                runner_interval_secs(config),
-                DEFAULT_INTERVAL_SECS,
-                "config {config:?} falls back to the default"
-            );
         }
     }
 

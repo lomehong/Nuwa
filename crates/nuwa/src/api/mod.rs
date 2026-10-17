@@ -1,4 +1,6 @@
 pub mod auth;
+pub mod common;
+pub mod issues;
 pub mod overview;
 
 use axum::http::StatusCode;
@@ -64,8 +66,7 @@ impl ApiError {
     pub fn invalid_state(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "invalid_state", message)
     }
-    // Consumed by the issue endpoints in M2b.
-    #[allow(dead_code)]
+    // Consumed by the issue endpoints in M2b/M2c.
     pub fn validation(fields: BTreeMap<String, String>) -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -108,6 +109,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route("/overview", get(overview::overview))
+        .route("/issues", get(issues::list))
+        .route("/issues/{fp}", get(issues::detail))
         .route_layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::session::require_session,
