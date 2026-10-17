@@ -43,6 +43,18 @@ pub fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// 筛选说明。query 值必须转义后再拼进 HTML——这里是 v2 的反射型 XSS 入口。
+pub fn filter_note(state: Option<&str>, repo: Option<&str>) -> String {
+    let state = state.map(esc);
+    let repo = repo.map(esc);
+    match (state.as_deref(), repo.as_deref()) {
+        (Some(s), Some(r)) => format!("筛选：state={s} · repo={r}（<a href=\"/ui\">清除</a>）"),
+        (Some(s), None) => format!("筛选：state={s}（<a href=\"/ui\">清除</a>）"),
+        (None, Some(r)) => format!("筛选：repo={r}（<a href=\"/ui\">清除</a>）"),
+        _ => String::new(),
+    }
+}
+
 /// 状态→色（GitHub dark 调）。
 fn state_color(state: &str) -> &'static str {
     match state {
@@ -267,15 +279,7 @@ pub fn render_dashboard(d: &DashData) -> String {
         Some(ts) => rel_time(ts, d.now),
         None => "无记录".into(),
     };
-    let state_note = match (
-        d.filter_state.as_deref(),
-        d.filter_repo.as_deref(),
-    ) {
-        (Some(s), Some(r)) => format!("筛选：state={s} · repo={r}（<a href=\"/ui\">清除</a>）"),
-        (Some(s), None) => format!("筛选：state={s}（<a href=\"/ui\">清除</a>）"),
-        (None, Some(r)) => format!("筛选：repo={r}（<a href=\"/ui\">清除</a>）"),
-        _ => String::new(),
-    };
+    let state_note = filter_note(d.filter_state.as_deref(), d.filter_repo.as_deref());
 
     format!(
         r#"<!doctype html><html lang="zh"><head><meta charset="utf-8">
@@ -569,7 +573,7 @@ pub async fn issue_detail(
 
 #[cfg(test)]
 mod tests {
-    use super::{basic_password_ok, esc, rel_time};
+    use super::{basic_password_ok, esc, filter_note, rel_time};
 
     #[test]
     fn basic_auth_accepts_matching_password() {
@@ -606,5 +610,18 @@ mod tests {
         assert_eq!(rel_time(0, 150_000), "2 分钟前");
         assert_eq!(rel_time(0, 7_200_000), "2 小时前");
         assert_eq!(rel_time(0, 172_800_000), "2 天前");
+    }
+
+    #[test]
+    fn filter_note_escapes_query_values() {
+        let note = filter_note(
+            Some("<img src=x onerror=alert(1)>"),
+            Some("<script>alert(1)</script>"),
+        );
+        assert!(note.contains("&lt;img"));
+        assert!(note.contains("&lt;script&gt;"));
+        assert!(!note.contains("<img"));
+        assert!(!note.contains("<script>"));
+        assert!(filter_note(None, None).is_empty());
     }
 }
