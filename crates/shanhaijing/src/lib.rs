@@ -14,6 +14,7 @@
 //! Storage is SQLite (one file per deployment), matching docs/07 A-1.
 
 pub mod fingerprint;
+mod migration;
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -215,12 +216,8 @@ pub const DEFAULT_COOLDOWN_MS: i64 = 6 * 60 * 60 * 1000;
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> ShanResult<Self> {
-        let conn = Connection::open(path.as_ref())?;
-        conn.execute_batch(SCHEMA)?;
-        // Older databases (pre pr-columns): add missing columns idempotently.
-        for column in ["pr_url TEXT", "pr_opened_at INTEGER"] {
-            let _ = conn.execute(&format!("ALTER TABLE issues ADD COLUMN {column}"), []);
-        }
+        let mut conn = Connection::open(path.as_ref())?;
+        migration::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

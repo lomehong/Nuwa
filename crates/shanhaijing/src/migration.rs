@@ -1,0 +1,263 @@
+use rusqlite::Connection;
+
+use crate::ShanResult;
+
+pub const SCHEMA_VERSION: i64 = 1;
+
+pub fn apply(conn: &mut Connection) -> ShanResult<()> {
+    conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+    conn.execute_batch(
+        "PRAGMA busy_timeout=5000;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA foreign_keys=ON;",
+    )?;
+    // v0 基线表（issues/events/heartbeat）。CREATE IF NOT EXISTS 对旧库无副作用。
+    conn.execute_batch(super::SCHEMA)?;
+
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < SCHEMA_VERSION {
+        let tx = conn.transaction()?;
+        migrate_v1(&tx)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn migrate_v1(conn: &Connection) -> ShanResult<()> {
+    add_column_if_missing(conn, "issues", "pr_url", "TEXT")?;
+    add_column_if_missing(conn, "issues", "pr_opened_at", "INTEGER")?;
+    add_column_if_missing(conn, "issues", "state_changed_at", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "issues", "owner_runner_id", "TEXT")?;
+    add_column_if_missing(conn, "events", "repo", "TEXT")?;
+    add_column_if_missing(conn, "events", "actor", "TEXT")?;
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS runners (
+            id                  TEXT PRIMARY KEY,
+            repo                TEXT NOT NULL,
+            host                TEXT NOT NULL,
+            pid                 INTEGER,
+            started_at          INTEGER NOT NULL,
+            heartbeat_at        INTEGER NOT NULL,
+            status              TEXT NOT NULL,
+            current_fingerprint TEXT,
+            phase               TEXT,
+            provider            TEXT,
+            model               TEXT,
+            daily_pr_limit      INTEGER,
+            repo_path           TEXT,
+            service_unit        TEXT,
+            config_json         TEXT NOT NULL DEFAULT '{}',
+            last_error          TEXT
+        );
+        CREATE TABLE IF NOT EXISTS runs (
+            id                  TEXT PRIMARY KEY,
+            harness_run_id      TEXT,
+            fingerprint         TEXT NOT NULL,
+            runner_id           TEXT NOT NULL,
+            repo                TEXT NOT NULL,
+            started_at          INTEGER NOT NULL,
+            finished_at         INTEGER,
+            phase               TEXT NOT NULL,
+            outcome             TEXT,
+            ci_verdict          TEXT,
+            turns               INTEGER DEFAULT 0,
+            tokens_uncached     INTEGER DEFAULT 0,
+            tokens_cached       INTEGER DEFAULT 0,
+            provider            TEXT,
+            model               TEXT,
+            root_cause          TEXT,
+            change_stat         TEXT,
+            branch              TEXT,
+            commit_sha          TEXT,
+            pr_url              TEXT,
+            pr_opened_at        INTEGER,
+            verification_ok     INTEGER,
+            verification_detail TEXT,
+            session_dir         TEXT,
+            error               TEXT
+        );
+        CREATE TABLE IF NOT EXISTS signal_daily (
+            fingerprint TEXT NOT NULL,
+            repo        TEXT NOT NULL,
+            day         TEXT NOT NULL,
+            count       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (fingerprint, repo, day)
+        );
+        CREATE INDEX IF NOT EXISTS idx_issues_state_last ON issues(state, last_seen DESC);
+        CREATE INDEX IF NOT EXISTS idx_issues_repo_last  ON issues(repo, last_seen DESC);
+        CREATE INDEX IF NOT EXISTS idx_events_ts         ON events(ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_events_kind       ON events(kind, ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_runs_fp           ON runs(fingerprint, started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_runs_started      ON runs(started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_signal_day        ON signal_daily(day, repo);",
+    )?;
+
+    conn.execute_batch(
+        "UPDATE issues SET state_changed_at = COALESCE(
+            (SELECT MAX(ts) FROM events
+             WHERE events.fingerprint = issues.fingerprint AND events.kind = 'state_changed'),
+            last_seen
+        ) WHERE state_changed_at = 0;
+        UPDATE events SET repo = (
+            SELECT repo FROM issues WHERE issues.fingerprint = events.fingerprint
+        ) WHERE repo IS NULL;",
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> ShanResult<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    if !columns.iter().any(|c| c == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query")
+            > 0
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare");
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
+            .iter()
+            .any(|c| c == column)
+    }
+
+    fn v0_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE issues (
+                fingerprint TEXT PRIMARY KEY, title TEXT NOT NULL, language TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'medium', state TEXT NOT NULL DEFAULT 'new',
+                occurrences INTEGER NOT NULL DEFAULT 1, first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL, cooldown_until INTEGER NOT NULL DEFAULT 0,
+                repo TEXT NOT NULL, stack_sample TEXT NOT NULL
+            );
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT NOT NULL,
+                ts INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT
+            );
+            CREATE TABLE heartbeat (id INTEGER PRIMARY KEY CHECK (id = 1), ts INTEGER NOT NULL);",
+        )
+        .expect("v0 schema");
+        conn.execute(
+            "INSERT INTO issues(fingerprint,title,language,repo,stack_sample,first_seen,last_seen,state)
+             VALUES ('fp1','t','go','example.com/r','stack',100,200,'fixing')",
+            [],
+        )
+        .expect("issue");
+        conn.execute(
+            "INSERT INTO events(fingerprint,ts,kind,detail) VALUES ('fp1',150,'state_changed','claimed')",
+            [],
+        )
+        .expect("event");
+    }
+
+    #[test]
+    fn fresh_database_is_v1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fresh.db");
+        let _store = Store::open(&path).expect("open");
+        let conn = Connection::open(&path).expect("reopen");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 1);
+        for table in ["issues", "events", "runners", "runs", "signal_daily"] {
+            assert!(table_exists(&conn, table), "missing {table}");
+        }
+        for (table, column) in [
+            ("issues", "state_changed_at"),
+            ("issues", "owner_runner_id"),
+            ("events", "repo"),
+            ("events", "actor"),
+        ] {
+            assert!(column_exists(&conn, table, column), "missing {table}.{column}");
+        }
+    }
+
+    #[test]
+    fn migrates_v0_and_backfills() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v0.db");
+        {
+            let conn = Connection::open(&path).expect("open");
+            v0_schema(&conn);
+        }
+        let _store = Store::open(&path).expect("migrate");
+        let conn = Connection::open(&path).expect("reopen");
+        let (state_changed_at, owner): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT state_changed_at, owner_runner_id FROM issues WHERE fingerprint='fp1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("issue");
+        assert_eq!(state_changed_at, 150, "backfill from latest state_changed event");
+        assert_eq!(owner, None);
+        let repo: String = conn
+            .query_row("SELECT repo FROM events WHERE fingerprint='fp1'", [], |row| row.get(0))
+            .expect("event repo");
+        assert_eq!(repo, "example.com/r");
+        assert!(column_exists(&conn, "issues", "pr_url"));
+        assert!(column_exists(&conn, "issues", "pr_opened_at"));
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("idem.db");
+        drop(Store::open(&path).expect("first"));
+        drop(Store::open(&path).expect("second"));
+        let conn = Connection::open(&path).expect("reopen");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn wal_and_busy_timeout_are_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal.db");
+        let _store = Store::open(&path).expect("open");
+        let conn = Connection::open(&path).expect("reopen");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode");
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy timeout");
+        assert_eq!(timeout, 5000);
+    }
+}
