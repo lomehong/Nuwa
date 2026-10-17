@@ -82,13 +82,35 @@ pub fn migrate_env_file_at(path: &std::path::Path) -> Result<Vec<String>, String
     if changed.is_empty() {
         return Ok(changed);
     }
-    std::fs::write(path, render_env(&new)).map_err(|e| format!("write {}: {e}", path.display()))?;
+    // 迁移会重排文件（注释/顺序不保留）：先备份，再原子替换。
+    let backup = path.with_extension("env.bak");
+    std::fs::copy(path, &backup)
+        .map_err(|e| format!("backup {} -> {}: {e}", path.display(), backup.display()))?;
+    write_env_atomic(path, &render_env(&new))?;
+    Ok(changed)
+}
+
+/// 原子写：Unix 先写临时文件（chmod 600）再 rename 覆盖；失败时清理临时文件。
+fn write_env_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        let tmp = path.with_extension("env.tmp");
+        let write = (|| -> std::io::Result<()> {
+            std::fs::write(&tmp, contents)?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("write {}: {e}", path.display()));
+        }
+        Ok(())
     }
-    Ok(changed)
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents).map_err(|e| format!("write {}: {e}", path.display()))
+    }
 }
 
 pub fn migrate_env_file() -> Result<Vec<String>, String> {
@@ -266,7 +288,8 @@ pub fn render_settings(map: &BTreeMap<String, String>, flash: Option<&str>) -> S
     let text_row = |key: &str, label: &str, placeholder: &str| {
         format!(
             "<tr><td>{label}</td><td class=\"mono dim\">{}</td>\
-             <td><input type=\"text\" name=\"{key}\" value=\"{}\"></td></tr>",
+             <td><input type=\"text\" name=\"{key}\" value=\"{}\" placeholder=\"{}\"></td></tr>",
+            esc(get(key)),
             esc(get(key)),
             esc(placeholder)
         )
@@ -347,7 +370,9 @@ a{{color:#58a6ff}} .row{{display:flex;gap:10px;margin-top:18px}}
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_form, migrate_env_file_at, normalize_known_keys, render_env};
+    use super::{
+        apply_form, migrate_env_file_at, normalize_known_keys, render_env, render_settings,
+    };
     use std::collections::{BTreeMap, HashMap};
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -393,6 +418,28 @@ mod tests {
     }
 
     #[test]
+    fn text_fields_render_current_values_not_placeholders() {
+        let map = map(&[
+            ("NUWA_MODEL", "custom-model"),
+            ("NUWA_BASE_URL", "https://example.test/v1"),
+        ]);
+        let html = render_settings(&map, None);
+        assert!(html.contains("name=\"NUWA_MODEL\" value=\"custom-model\""));
+        assert!(html.contains("name=\"NUWA_BASE_URL\" value=\"https://example.test/v1\""));
+        assert!(html.contains("placeholder=\"glm-5.3-flash\""));
+    }
+
+    #[test]
+    fn migrate_env_file_missing_path_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent.env");
+        let changed = migrate_env_file_at(&path).expect("noop");
+        assert!(changed.is_empty());
+        assert!(!path.exists());
+        assert!(!path.with_extension("env.bak").exists());
+    }
+
+    #[test]
     fn migrate_env_file_is_idempotent_and_keeps_uppercase_value() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nuwa.env");
@@ -407,6 +454,10 @@ mod tests {
         assert!(text.contains("NUWA_PROVIDER=zai"));
         assert!(!text.contains("nuwa_interval"));
         assert!(!text.contains("nuwa_provider"));
+
+        // 迁移前原文件已备份（含小写历史键）。
+        let backup = std::fs::read_to_string(path.with_extension("env.bak")).expect("backup");
+        assert!(backup.contains("nuwa_interval=30"));
 
         assert!(migrate_env_file_at(&path).expect("second").is_empty());
     }

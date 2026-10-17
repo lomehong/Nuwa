@@ -178,7 +178,7 @@ pub fn render_dashboard(d: &DashData) -> String {
     // ---- sections: needs attention ----
     let needs: Vec<&&shanhaijing::IssueRow> = rows
         .iter()
-        .filter(|r| matches!(r.state.as_str(), "escalated" | "rejected"))
+        .filter(|r| can_reopen(&r.state))
         .collect();
 
     let mut attention = String::new();
@@ -211,7 +211,7 @@ pub fn render_dashboard(d: &DashData) -> String {
             .as_deref()
             .map(|u| format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener\">PR ↗</a>", esc(u)))
             .unwrap_or_else(|| "<span class=\"dim\">-</span>".into());
-        let action = if r.state == "escalated" {
+        let action = if can_reopen(&r.state) {
             format!(
                 "<form method=\"post\" action=\"/ui/reopen\" style=\"margin:0\">\
                  <input type=\"hidden\" name=\"fp\" value=\"{}\"><button>reopen</button></form>",
@@ -538,7 +538,7 @@ pub fn render_issue_detail(
         .as_deref()
         .map(|u| format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a>", esc(u), esc(u)))
         .unwrap_or_else(|| "<span class=\"dim\">-</span>".into());
-    let action = if matches!(row.state.as_str(), "escalated" | "rejected") {
+    let action = if can_reopen(&row.state) {
         format!(
             "<form method=\"post\" action=\"/ui/reopen\" style=\"display:inline\">\
              <input type=\"hidden\" name=\"fp\" value=\"{}\"><button>reopen 重新入队</button></form>",
@@ -689,6 +689,54 @@ mod tests {
         assert!(!note.contains("<img"));
         assert!(!note.contains("<script>"));
         assert!(filter_note(None, None).is_empty());
+
+        let state_only = filter_note(Some("new"), None);
+        assert!(state_only.contains("state=new"));
+        assert!(state_only.contains("清除"));
+        let repo_only = filter_note(None, Some("example.com/r"));
+        assert!(repo_only.contains("repo=example.com/r"));
+    }
+
+    #[test]
+    fn rejected_rows_offer_reopen_in_table_and_attention() {
+        let row = |state: &str| shanhaijing::IssueRow {
+            fingerprint: "fp-rejected-0001".into(),
+            title: "panic: boom".into(),
+            language: "go".into(),
+            repo: "example.com/spike".into(),
+            severity: "high".into(),
+            state: state.into(),
+            occurrences: 1,
+            pr_url: None,
+            first_seen: 0,
+            last_seen: 0,
+        };
+        let rejected = super::render_dashboard(&super::DashData {
+            rows: vec![row("rejected")],
+            events: Vec::new(),
+            serve: "active".into(),
+            work: "active".into(),
+            work_hb: None,
+            now: 1,
+            filter_state: None,
+            filter_repo: None,
+            flash: None,
+        });
+        // 提醒卡片 + 全量表各一个 reopen 表单。
+        assert_eq!(rejected.matches("action=\"/ui/reopen\"").count(), 2);
+
+        let merged = super::render_dashboard(&super::DashData {
+            rows: vec![row("merged")],
+            events: Vec::new(),
+            serve: "active".into(),
+            work: "active".into(),
+            work_hb: None,
+            now: 1,
+            filter_state: None,
+            filter_repo: None,
+            flash: None,
+        });
+        assert_eq!(merged.matches("action=\"/ui/reopen\"").count(), 0);
     }
 
     #[test]
@@ -747,6 +795,24 @@ mod tests {
         assert!(store.ready_issue(crate::now_ms()).expect("ready").is_some());
     }
 
+    #[tokio::test]
+    async fn reopen_non_reopenable_returns_conflict() {
+        use shanhaijing::State as IssueState;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
+        let fp = seed_issue(
+            &store,
+            &[IssueState::Triggered, IssueState::Fixing, IssueState::PrOpen],
+        );
+        let shared: crate::Shared = (Arc::clone(&store), Arc::new(None));
+        let response = reopen(
+            State(shared),
+            Form(HashMap::from([("fp".to_string(), fp)])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
     #[test]
     fn origin_guard_allows_same_origin_and_non_browser_clients() {
         assert!(super::origin_ok(None, None, Some("nuwa.example:7321")));
@@ -760,6 +826,11 @@ mod tests {
             Some("https://nuwa.example:7321/ui"),
             Some("nuwa.example:7321")
         ));
+        assert!(super::origin_ok(
+            Some("HTTPS://NUWA.EXAMPLE:7321"),
+            None,
+            Some("nuwa.example:7321")
+        ));
     }
 
     #[test]
@@ -770,10 +841,16 @@ mod tests {
             Some("nuwa.example:7321")
         ));
         assert!(!super::origin_ok(
+            None,
+            Some("https://evil.example/x"),
+            Some("nuwa.example:7321")
+        ));
+        assert!(!super::origin_ok(
             Some("https://nuwa.example:7321"),
             None,
             None
         ));
         assert!(!super::origin_ok(Some("not-a-url"), None, Some("nuwa.example:7321")));
+        assert!(!super::origin_ok(Some("https://"), None, Some("nuwa.example:7321")));
     }
 }

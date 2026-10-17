@@ -85,6 +85,11 @@ nuwa work --db shanhaijing.db \
 | `nuwa work …` | 领单 → 修复 → 验证 → 交付（`--no-deliver` 只修不交） |
 | `nuwa reopen --db p --fingerprint FP` | 人工复核升级单后重新入队（清冷却） |
 | `nuwa fix --issue … --repo …` | 手工指定问题单跑一次（调试用） |
+| `nuwa migrate-env [--env-file p]` | 部署期把历史小写 env 键迁移为大写；写前备份 `.bak`，Unix 原子替换 |
+
+**v0.1.7 升级注意（env 键迁移）**：升级前停 serve/work，备份 `nuwa.env`，运行 `nuwa migrate-env --env-file /opt/nuwa/nuwa.env`，确认键为大写后启动。若直接启动新二进制，它会在启动时迁移文件，但 systemd 已把旧环境注入当前进程；需再重启一次 serve/work，并用无凭证访问确认 `/ui` 返回 401。
+
+**同源校验与代理**：旧 POST 的同源校验比较 Origin/Referer 与 Host。若前置反向代理改写 Host（如 `proxy_set_header Host $proxy_host`）或使用 HTTP/2 上游，合法 POST 会被 403；代理需保留 Host 并使用 HTTP/1.1 上游。当前直连 7321 的部署不受影响。
 
 ## 问题单状态机（运维视角）
 

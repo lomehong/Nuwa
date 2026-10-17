@@ -102,8 +102,9 @@ async fn main() -> anyhow::Result<()> {
         Some("status") => run_status(argv.collect()),
         Some("sync") => run_sync(argv.collect()).await,
         Some("reopen") => run_reopen(argv.collect()),
+        Some("migrate-env") => run_migrate_env(argv.collect()),
         other => bail!(
-            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp>   (owner reviewed an escalation)\n        (got {other:?})"
+            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp>   (owner reviewed an escalation)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
         ),
     }
 }
@@ -146,6 +147,33 @@ fn run_reopen(args: Vec<String>) -> anyhow::Result<()> {
     store.set_state(&fp, shanhaijing::State::New, now_ms(), Some("reopened by owner"))?;
     store.set_cooldown(&fp, 0)?;
     println!("reopened   : {fp} — ready for pickup");
+    Ok(())
+}
+
+/// 部署期 env 键迁移：把历史小写键规范为大写（启动迁移不能改变 systemd
+/// 已注入当前进程的环境，所以作为独立部署步骤提供）。写前备份，原子替换。
+fn run_migrate_env(args: Vec<String>) -> anyhow::Result<()> {
+    let mut env_file = settings::env_file_path();
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--env-file" => {
+                env_file = PathBuf::from(it.next().context("--env-file needs a value")?)
+            }
+            other => bail!("unknown migrate-env flag {other}"),
+        }
+    }
+    let changed = settings::migrate_env_file_at(&env_file).map_err(|e| anyhow::anyhow!(e))?;
+    if changed.is_empty() {
+        println!("env        : no lowercase keys to migrate in {}", env_file.display());
+    } else {
+        println!(
+            "env        : migrated {} -> {} (backup: {})",
+            changed.join(", "),
+            env_file.display(),
+            env_file.with_extension("env.bak").display()
+        );
+    }
     Ok(())
 }
 
@@ -630,7 +658,10 @@ async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
     }
     match settings::migrate_env_file() {
         Ok(changed) if !changed.is_empty() => {
-            println!("env        : migrated lowercase keys -> {}", changed.join(", "));
+            println!(
+                "env        : migrated lowercase keys -> {}（restart services to apply）",
+                changed.join(", ")
+            );
         }
         Ok(_) => {}
         Err(e) => eprintln!("env migrate: {e}"),
@@ -852,6 +883,18 @@ mod tests {
     use super::*;
     use crate::instructions::RepoInstructions;
     use crate::issue::FailingCheck;
+
+    #[test]
+    fn migrate_env_command_normalizes_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nuwa.env");
+        std::fs::write(&path, "nuwa_interval=30\n").expect("write");
+        run_migrate_env(vec!["--env-file".into(), path.display().to_string()]).expect("migrate");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("NUWA_INTERVAL=30"));
+        assert!(!text.contains("nuwa_interval"));
+        assert!(path.with_extension("env.bak").exists());
+    }
 
     #[tokio::test]
     async fn quota_stand_down_still_writes_heartbeat() {

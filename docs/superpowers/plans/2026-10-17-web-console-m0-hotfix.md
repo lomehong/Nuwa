@@ -857,7 +857,7 @@ git commit -m "docs: record M0 web console hotfix and verification evidence"
 
 - [ ] **Step 6: 发布准备（需所有者批准后执行）**
 
-发布流程不变：合并 main → 由所有者决定 tag `v0.1.6` → GitHub Actions 构建双平台产物 → 按 `docs/08-onboarding.md` 部署。**不要在本计划执行过程中自行 tag、推送或部署生产。**
+发布流程不变：合并 main → 由所有者决定 tag `v0.1.7` → GitHub Actions 构建双平台产物 → 按 `docs/08-onboarding.md` 部署。**不要在本计划执行过程中自行 tag、推送或部署生产。**
 
 ---
 
