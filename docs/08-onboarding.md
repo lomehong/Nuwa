@@ -17,7 +17,7 @@
 └── nuwa.env              # systemd EnvironmentFile（三把 token）
 ```
 
-- systemd 单元：`nuwa-serve`（`serve --listen 0.0.0.0:7321`）+ `nuwa-work`（`work --loop --interval 60 --pr`），均 `Restart=on-failure`
+- systemd 单元：`nuwa-serve`（`serve --listen 0.0.0.0:7321`）+ `nuwa-work`（`work --loop --interval 60 --pr --runner-id <host:repo> --service-unit nuwa-work`），均 `Restart=on-failure`
 - 已知噪音：ubuntu 构建的产物在旧 glibc 上有 weak-version 警告（不致命）——待办：musl 静态构建
 - 腾讯云控制台安全组：放行 **TCP 7321**（来源限采集器网段）
 - 传输注意：CN→GitHub 大文件（>12MB）下载会被掐断——release 产物下载用**分块 Range 循环**，或本机经 SSH 直传（SSH 隧道稳定）
@@ -70,8 +70,12 @@ sink 二选一：`FileSink{Path}`（JSONL，落盘后 `nuwa ingest`）或 `HTTPS
 # 常驻轮询（串行 v0；每仓库一个 runner 实例，避免同仓库 git 竞争）
 nuwa work --db shanhaijing.db \
   --instructions /path/to/your-repo/nuwa.repo.json \
+  --runner-id <host:repo> --service-unit nuwa-work \
   --provider anthropic --pr --loop --interval 30
 ```
+
+- `--runner-id`：控制台可见的 runner 身份，默认 `hostname:repo`；仅保留字母数字与 `.:_-`，超长截断
+- `--service-unit`：记录 systemd 单元名（默认 `nuwa-work`）。当前只落库展示，M2 的“重启服务”动作才会消费它
 
 ## 4 · 日常运维命令
 
@@ -82,7 +86,7 @@ nuwa work --db shanhaijing.db \
 | `nuwa serve --db p [--listen 127.0.0.1:7321]` | HTTP ingest 服务端：`POST /ingest`（单信封或 JSONL，`application/json`），`GET /health`。青鸟 `HTTPSink` 直连 |
 | `nuwa ingest --signal s.jsonl [--db p]` | 投喂采集信号（单对象或 JSONL，离线/文件形态） |
 | `nuwa status [--db p]` | 全部问题单：状态/严重度/频次/PR 链接 |
-| `nuwa work …` | 领单 → 修复 → 验证 → 交付（`--no-deliver` 只修不交） |
+| `nuwa work …` | 领单 → 修复 → 验证 → 交付（`--no-deliver` 只修不交；`--runner-id`/`--service-unit` 见第 3 节） |
 | `nuwa reopen --db p --fingerprint FP` | 人工复核升级单后重新入队（清冷却） |
 | `nuwa fix --issue … --repo …` | 手工指定问题单跑一次（调试用） |
 | `nuwa migrate-env [--env-file p]` | 部署期把历史小写 env 键迁移为大写；写前备份 `.bak`，Unix 原子替换 |

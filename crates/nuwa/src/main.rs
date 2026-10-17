@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         Some("reopen") => run_reopen(argv.collect()),
         Some("migrate-env") => run_migrate_env(argv.collect()),
         other => bail!(
-            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp>   (owner reviewed an escalation)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
+            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--runner-id <id>] [--service-unit <unit>] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp>   (owner reviewed an escalation)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
         ),
     }
 }
@@ -379,7 +379,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         Arc::clone(&live),
         config_json,
     );
-    live_update(&store, &runner_id, &live, "starting", None, None, None).await;
+    live_update(&live, "starting", None, None, None).await;
 
     let result: anyhow::Result<()> = async {
         loop {
@@ -500,40 +500,52 @@ async fn live_snapshot(live: &SharedLive) -> (String, Option<String>, Option<Str
     )
 }
 
-async fn beat_now(store: &Arc<shanhaijing::Store>, runner_id: &str, live: &SharedLive) {
-    let (status, fp, phase, error) = live_snapshot(live).await;
-    let _ = store.heartbeat_runner(
-        runner_id,
-        &shanhaijing::RunnerHeartbeat {
-            heartbeat_at: now_ms(),
-            status,
-            current_fingerprint: fp,
-            phase,
-            config_json: None,
-            last_error: error,
-        },
-    );
-    // v0.2.x 回滚保护：旧控制台仍读全局 heartbeat 表。
-    let _ = store.heartbeat(now_ms());
+/// Persist a run update off the async worker. Best-effort: a finished run
+/// rejects late writes, and that error is intentionally dropped.
+async fn persist_run(
+    store: &Arc<shanhaijing::Store>,
+    run_id: &str,
+    update: shanhaijing::RunUpdate,
+) {
+    let store = Arc::clone(store);
+    let run_id = run_id.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = store.update_run(&run_id, &update);
+    })
+    .await;
 }
 
+/// Bound telemetry error text (~16 KiB) so a runaway command output cannot
+/// bloat the runs table. Truncates on a UTF-8 boundary.
+fn bounded_text(text: &str) -> String {
+    const LIMIT: usize = 16_000;
+    if text.len() <= LIMIT {
+        return text.to_string();
+    }
+    let mut end = LIMIT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = text[..end].to_string();
+    out.push_str("\n… (truncated)");
+    out
+}
+
+/// Update the in-memory runner state. Memory-only by design: telemetry must
+/// not block the repair/delivery hot path, so SQLite persistence is owned by
+/// the background heartbeat task and the explicit run writes.
 async fn live_update(
-    store: &Arc<shanhaijing::Store>,
-    runner_id: &str,
     live: &SharedLive,
     status: &str,
     fp: Option<&str>,
     phase: Option<&str>,
     error: Option<String>,
 ) {
-    {
-        let mut state = live.lock().await;
-        state.status = status.to_string();
-        state.current_fingerprint = fp.map(str::to_string);
-        state.phase = phase.map(str::to_string);
-        state.last_error = error;
-    }
-    beat_now(store, runner_id, live).await;
+    let mut state = live.lock().await;
+    state.status = status.to_string();
+    state.current_fingerprint = fp.map(str::to_string);
+    state.phase = phase.map(str::to_string);
+    state.last_error = error;
 }
 
 fn spawn_heartbeat(
@@ -544,20 +556,42 @@ fn spawn_heartbeat(
     config_json: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut logged_failure = false;
         loop {
             let (status, fp, phase, error) = live_snapshot(&live).await;
-            let _ = store.heartbeat_runner(
-                &runner_id,
-                &shanhaijing::RunnerHeartbeat {
-                    heartbeat_at: now_ms(),
-                    status,
-                    current_fingerprint: fp,
-                    phase,
-                    config_json: Some(config_json.clone()),
-                    last_error: error,
-                },
-            );
-            let _ = store.heartbeat(now_ms());
+            let store = Arc::clone(&store);
+            let runner_id = runner_id.clone();
+            let config_json = config_json.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let result = store.heartbeat_runner(
+                    &runner_id,
+                    &shanhaijing::RunnerHeartbeat {
+                        heartbeat_at: now_ms(),
+                        status,
+                        current_fingerprint: fp,
+                        phase,
+                        config_json: Some(config_json),
+                        last_error: error,
+                    },
+                );
+                // v0.2.x 回滚保护：旧控制台仍读全局 heartbeat 表。
+                let _ = store.heartbeat(now_ms());
+                result
+            })
+            .await;
+            if !logged_failure {
+                match result {
+                    Ok(Err(e)) => {
+                        eprintln!("heartbeat: {e}");
+                        logged_failure = true;
+                    }
+                    Err(e) => {
+                        eprintln!("heartbeat task: {e}");
+                        logged_failure = true;
+                    }
+                    Ok(Ok(())) => {}
+                }
+            }
             tokio::time::sleep(interval).await;
         }
     })
@@ -596,7 +630,7 @@ async fn work_once(
                 "quota      : {opened}/{daily_pr_limit} PRs today for {} — standing down until the window rolls",
                 repo_config.repo
             );
-            live_update(store, runner_id, &live, "standing_down", None, None, None).await;
+            live_update(&live, "standing_down", None, None, None).await;
             return Ok(false);
         }
     }
@@ -607,7 +641,7 @@ async fn work_once(
     let head = match deliver::git(repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
         Ok(head) => head,
         Err(e) => {
-            live_update(store, runner_id, &live, "error", None, None, Some(format!("{e:#}"))).await;
+            live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
             return Err(e);
         }
     };
@@ -617,7 +651,7 @@ async fn work_once(
             repo_dir.display(),
             head
         );
-        live_update(store, runner_id, &live, "error", None, None, Some(message.clone())).await;
+        live_update(&live, "error", None, None, Some(message.clone())).await;
         bail!("{message}");
     }
     let dirty = match deliver::git(
@@ -626,7 +660,7 @@ async fn work_once(
     ) {
         Ok(dirty) => dirty,
         Err(e) => {
-            live_update(store, runner_id, &live, "error", None, None, Some(format!("{e:#}"))).await;
+            live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
             return Err(e);
         }
     };
@@ -636,7 +670,7 @@ async fn work_once(
             repo_dir.display(),
             dirty.trim()
         );
-        live_update(store, runner_id, &live, "error", None, None, Some(message.clone())).await;
+        live_update(&live, "error", None, None, Some(message.clone())).await;
         bail!("{message}");
     }
 
@@ -645,7 +679,7 @@ async fn work_once(
         store.claim_ready_issue(now, now + shanhaijing::DEFAULT_COOLDOWN_MS)?
     else {
         println!("nothing ready for pickup");
-        live_update(store, runner_id, &live, "idle", None, None, None).await;
+        live_update(&live, "idle", None, None, None).await;
         return Ok(false);
     };
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -657,10 +691,25 @@ async fn work_once(
             snapshot.repo,
             repo_config.repo
         );
-        live_update(store, runner_id, &live, "error", Some(&snapshot.fingerprint), None, Some(message.clone())).await;
+        live_update(&live, "error", Some(&snapshot.fingerprint), None, Some(message.clone())).await;
         bail!("{message}");
     }
     let fp = snapshot.fingerprint.clone();
+    // Build the issue before `start_run` so the deterministic session dir is
+    // known for the first lifecycle write.
+    let prob = issue::Issue {
+        fingerprint: fp.clone(),
+        title: snapshot.title.clone(),
+        language: snapshot.language.clone(),
+        occurrences: snapshot.occurrences,
+        severity: snapshot.severity.clone(),
+        first_seen: String::new(),
+        last_seen: String::new(),
+        stack_trace: snapshot.stack_sample.clone(),
+        log_window: Vec::new(),
+        failing_check: repo_config.failing_check.clone(),
+        forbidden_paths: repo_config.forbidden_paths.clone(),
+    };
     let _ = store.start_run(&shanhaijing::RunStart {
         id: run_id.clone(),
         fingerprint: fp.clone(),
@@ -670,7 +719,7 @@ async fn work_once(
         provider: Some(provider_name.clone()),
         model: Some(model_name.clone()),
     });
-    live_update(store, runner_id, &live, "working", Some(&fp), Some("claim"), None).await;
+    live_update(&live, "working", Some(&fp), Some("claim"), None).await;
     println!(
         "claimed    : {} [{}] {} — {}x\nrepo       : {}\nprovider   : {}",
         fp,
@@ -690,43 +739,51 @@ async fn work_once(
             },
         },
     );
-    store.set_state_as(
+    if let Err(e) = store.set_state_as(
         &fp,
         shanhaijing::State::Fixing,
         now,
         Some("repair run started"),
         "runner",
-    )?;
+    ) {
+        let detail = bounded_text(&format!("repair_failed: state update: {e:#}"));
+        let _ = store.finish_run(
+            &run_id,
+            &shanhaijing::RunFinish {
+                finished_at: now_ms(),
+                outcome: "repair_failed".into(),
+                ci_verdict: None,
+                error: Some(detail.clone()),
+            },
+        );
+        live_update(&live, "error", Some(&fp), None, Some(detail)).await;
+        return Err(e.into());
+    }
 
     // ---- repair ----
-    let prob = issue::Issue {
-        fingerprint: fp.clone(),
-        title: snapshot.title.clone(),
-        language: snapshot.language.clone(),
-        occurrences: snapshot.occurrences,
-        severity: snapshot.severity.clone(),
-        first_seen: String::new(),
-        last_seen: String::new(),
-        stack_trace: snapshot.stack_sample.clone(),
-        log_window: Vec::new(),
-        failing_check: repo_config.failing_check.clone(),
-        forbidden_paths: repo_config.forbidden_paths.clone(),
-    };
     let guards = std::sync::Arc::new(guard::Guards::new(repo_config.forbidden_paths.clone()));
     let progress_store = Arc::clone(store);
     let progress_run = run_id.clone();
     let progress: Option<Arc<dyn Fn(repair::RepairProgress) + Send + Sync>> =
         Some(Arc::new(move |p| {
-            let _ = progress_store.update_run(
-                &progress_run,
-                &shanhaijing::RunUpdate {
+            let store = Arc::clone(&progress_store);
+            let run_id = progress_run.clone();
+            // Fire-and-forget: progress is best-effort telemetry and must not
+            // sit in the event drain that drives the repair loop.
+            tokio::spawn(async move {
+                let update = shanhaijing::RunUpdate {
                     turns: Some(i64::from(p.turns)),
                     tokens_uncached: Some(p.uncached_tokens as i64),
                     tokens_cached: Some(p.cached_tokens as i64),
                     ..Default::default()
-                },
-            );
+                };
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = store.update_run(&run_id, &update);
+                })
+                .await;
+            });
         }));
+    let session_dir = sessions_dir.join(prob.short_fingerprint());
     let job = repair::RepairJob {
         repo: repo_dir.to_path_buf(),
         issue: prob,
@@ -738,11 +795,21 @@ async fn work_once(
         progress,
     };
 
-    live_update(store, runner_id, &live, "working", Some(&fp), Some("repair"), None).await;
+    live_update(&live, "working", Some(&fp), Some("repair"), None).await;
+    persist_run(
+        store,
+        &run_id,
+        shanhaijing::RunUpdate {
+            phase: Some("repair".into()),
+            session_dir: Some(session_dir.display().to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
     let report = match repair::run(&job).await {
         Ok(r) => r,
         Err(e) => {
-            let detail = format!("repair_failed: {e:#}");
+            let detail = bounded_text(&format!("repair_failed: {e:#}"));
             let _ = store.finish_run(
                 &run_id,
                 &shanhaijing::RunFinish {
@@ -752,7 +819,7 @@ async fn work_once(
                     error: Some(detail.clone()),
                 },
             );
-            live_update(store, runner_id, &live, "error", Some(&fp), None, Some(detail.clone())).await;
+            live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
             store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
             bail!("repair failed — issue escalated: {e:#}");
         }
@@ -765,10 +832,12 @@ async fn work_once(
     println!("root cause : {cause}");
 
     // 事件排水在 prompt 返回时被 abort，尾部的 TurnEnd 可能缺失；以
-    // RepairReport 的累计值/轮数为准覆盖进度回调的中间态。
-    let _ = store.update_run(
+    // RepairReport 的累计值/轮数为准覆盖进度回调的中间态。这不是尽力而为
+    // 的遥测：证据必须在 run 结束前落库，所以等待阻塞池完成而不占用异步 worker。
+    persist_run(
+        store,
         &run_id,
-        &shanhaijing::RunUpdate {
+        shanhaijing::RunUpdate {
             phase: Some("verify".into()),
             harness_run_id: Some(report.run_id.clone()),
             turns: Some(i64::from(report.turns)),
@@ -778,14 +847,15 @@ async fn work_once(
             session_dir: Some(report.session_dir.clone()),
             ..Default::default()
         },
-    );
+    )
+    .await;
 
     // ---- budget gate: per-issue token ceiling ----
     // The turn cap bounds the loop mid-run (RPI_MAX_TURNS_PER_RUN); this gate
     // is the spend ceiling — an over-budget run never reaches delivery.
     let spent = report.uncached_tokens + report.cached_tokens;
     if spent > max_tokens {
-        let detail = format!("budget_exceeded: {spent} > {max_tokens}");
+        let detail = bounded_text(&format!("budget_exceeded: {spent} > {max_tokens}"));
         let _ = store.finish_run(
             &run_id,
             &shanhaijing::RunFinish {
@@ -795,14 +865,23 @@ async fn work_once(
                 error: Some(detail.clone()),
             },
         );
-        live_update(store, runner_id, &live, "error", Some(&fp), None, Some(detail.clone())).await;
+        live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
         store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
         bail!("{detail} — issue escalated");
     }
     println!("tokens     : {spent} (cap {max_tokens})");
 
     // ---- deliver ----
-    live_update(store, runner_id, &live, "working", Some(&fp), Some("deliver"), None).await;
+    live_update(&live, "working", Some(&fp), Some("deliver"), None).await;
+    persist_run(
+        store,
+        &run_id,
+        shanhaijing::RunUpdate {
+            phase: Some("deliver".into()),
+            ..Default::default()
+        },
+    )
+    .await;
     let delivered = match deliver::deliver(
         &job.repo,
         &job.issue,
@@ -815,7 +894,7 @@ async fn work_once(
     {
         Ok(d) => d,
         Err(e) => {
-            let detail = format!("delivery_failed: {e:#}");
+            let detail = bounded_text(&format!("delivery_failed: {e:#}"));
             let _ = store.finish_run(
                 &run_id,
                 &shanhaijing::RunFinish {
@@ -825,16 +904,18 @@ async fn work_once(
                     error: Some(detail.clone()),
                 },
             );
-            live_update(store, runner_id, &live, "error", Some(&fp), None, Some(detail.clone())).await;
+            live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
             store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
             bail!("delivery failed — issue escalated: {e:#}");
         }
     };
 
     let pr_opened_at = delivered.pr_url.as_ref().map(|_| now_ms());
-    let _ = store.update_run(
+    // 交付证据同样必须在 run 结束前落库（阻塞池执行，不占用异步 worker）。
+    persist_run(
+        store,
         &run_id,
-        &shanhaijing::RunUpdate {
+        shanhaijing::RunUpdate {
             phase: Some("ci".into()),
             branch: Some(delivered.branch.clone()),
             commit_sha: Some(delivered.commit.clone()),
@@ -846,17 +927,44 @@ async fn work_once(
             session_dir: Some(report.session_dir.clone()),
             ..Default::default()
         },
-    );
+    )
+    .await;
 
-    store.set_state_as(
+    if let Err(e) = store.set_state_as(
         &fp,
         shanhaijing::State::PrOpen,
         now_ms(),
         Some(delivered.pr_url.as_deref().unwrap_or("branch pushed, no PR")),
         "runner",
-    )?;
+    ) {
+        let detail = bounded_text(&format!("delivery_failed: state update: {e:#}"));
+        let _ = store.finish_run(
+            &run_id,
+            &shanhaijing::RunFinish {
+                finished_at: now_ms(),
+                outcome: "delivery_failed".into(),
+                ci_verdict: None,
+                error: Some(detail.clone()),
+            },
+        );
+        live_update(&live, "error", Some(&fp), None, Some(detail)).await;
+        return Err(e.into());
+    }
     if let Some(url) = &delivered.pr_url {
-        store.set_pr(&fp, url, now_ms())?;
+        if let Err(e) = store.set_pr(&fp, url, now_ms()) {
+            let detail = bounded_text(&format!("delivery_failed: set_pr: {e:#}"));
+            let _ = store.finish_run(
+                &run_id,
+                &shanhaijing::RunFinish {
+                    finished_at: now_ms(),
+                    outcome: "delivery_failed".into(),
+                    ci_verdict: None,
+                    error: Some(detail.clone()),
+                },
+            );
+            live_update(&live, "error", Some(&fp), None, Some(detail)).await;
+            return Err(e.into());
+        }
     }
 
     if !create_pr {
@@ -869,7 +977,7 @@ async fn work_once(
                 error: None,
             },
         );
-        live_update(store, runner_id, &live, "idle", None, None, None).await;
+        live_update(&live, "idle", None, None, None).await;
         println!(
             "delivered  : branch {} commit {} pr {}",
             delivered.branch,
@@ -880,11 +988,36 @@ async fn work_once(
     }
 
     // ---- CI 闸门消费（docs/03 末段）：红 → 自动关 PR + rejected；绿/超时 → 留给人工合并 ----
-    live_update(store, runner_id, &live, "working", Some(&fp), Some("ci"), None).await;
+    live_update(&live, "working", Some(&fp), Some("ci"), None).await;
     if let (Some(slug), Some(number)) = (&delivered.slug, delivered.pr_number) {
-        let token = std::env::var("NUWA_GITHUB_TOKEN")
+        let token = match std::env::var("NUWA_GITHUB_TOKEN")
             .or_else(|_| std::env::var("GITHUB_TOKEN"))
-            .context("NUWA_GITHUB_TOKEN not set — cannot poll CI checks")?;
+        {
+            Ok(token) => token,
+            Err(_) => {
+                // PR 已开出；缺令牌不是交付失败，只是 CI 闸门不可用。仍要
+                // 关闭 run，否则它会永远停在 open 状态。
+                let detail = bounded_text("NUWA_GITHUB_TOKEN not set — cannot poll CI checks");
+                let _ = store.update_run(
+                    &run_id,
+                    &shanhaijing::RunUpdate {
+                        ci_verdict: Some("unavailable".into()),
+                        ..Default::default()
+                    },
+                );
+                let _ = store.finish_run(
+                    &run_id,
+                    &shanhaijing::RunFinish {
+                        finished_at: now_ms(),
+                        outcome: "success".into(),
+                        ci_verdict: Some("unavailable".into()),
+                        error: Some(detail.clone()),
+                    },
+                );
+                live_update(&live, "idle", None, None, Some(detail.clone())).await;
+                return Err(anyhow::anyhow!(detail));
+            }
+        };
         println!(
             "ci gate   : polling checks for {} (timeout {ci_timeout_secs}s)…",
             &delivered.commit[..12.min(delivered.commit.len())]
@@ -920,7 +1053,7 @@ async fn work_once(
             }
             Ok(ci::Verdict::Failure) => {
                 if let Err(e) = ci::close_pr(&token, slug, number).await {
-                    let detail = format!("ci_red: close PR failed: {e:#}");
+                    let detail = bounded_text(&format!("ci_red: close PR failed: {e:#}"));
                     let _ = store.finish_run(
                         &run_id,
                         &shanhaijing::RunFinish {
@@ -930,7 +1063,7 @@ async fn work_once(
                             error: Some(detail.clone()),
                         },
                     );
-                    live_update(store, runner_id, &live, "error", Some(&fp), None, Some(detail)).await;
+                    live_update(&live, "error", Some(&fp), None, Some(detail)).await;
                     return Err(e);
                 }
                 let _ = store.update_run(
@@ -946,7 +1079,7 @@ async fn work_once(
                         finished_at: now_ms(),
                         outcome: "ci_red".into(),
                         ci_verdict: Some("failure".into()),
-                        error: Some(format!("CI red — PR #{number} closed")),
+                        error: Some(bounded_text(&format!("CI red — PR #{number} closed"))),
                     },
                 );
                 let _ = store.record_event(
@@ -965,8 +1098,6 @@ async fn work_once(
                     "runner",
                 )?;
                 live_update(
-                    store,
-                    runner_id,
                     &live,
                     "error",
                     Some(&fp),
@@ -1024,9 +1155,29 @@ async fn work_once(
                 );
             }
         }
+    } else {
+        // Defensive: a PR was requested but there is no slug/number to poll.
+        // The run still has to be closed; the PR (if any) stays open.
+        let detail = bounded_text("PR number unavailable — CI gate skipped");
+        let _ = store.update_run(
+            &run_id,
+            &shanhaijing::RunUpdate {
+                ci_verdict: Some("unavailable".into()),
+                ..Default::default()
+            },
+        );
+        let _ = store.finish_run(
+            &run_id,
+            &shanhaijing::RunFinish {
+                finished_at: now_ms(),
+                outcome: "success".into(),
+                ci_verdict: Some("unavailable".into()),
+                error: Some(detail),
+            },
+        );
     }
 
-    live_update(store, runner_id, &live, "idle", None, None, None).await;
+    live_update(&live, "idle", None, None, None).await;
     println!(
         "delivered  : branch {} commit {} pr {}",
         delivered.branch,
@@ -1360,6 +1511,20 @@ mod tests {
     }
 
     #[test]
+    fn bounded_text_caps_run_errors() {
+        const LIMIT: usize = 16_000;
+        let marker = "\n… (truncated)";
+        assert_eq!(bounded_text("boom"), "boom");
+        let long = "x".repeat(20_000);
+        let bounded = bounded_text(&long);
+        assert!(bounded.len() <= LIMIT + marker.len());
+        assert!(bounded.ends_with("(truncated)"));
+        // Multi-byte input must truncate on a char boundary.
+        let wide = "错".repeat(10_000);
+        assert!(bounded_text(&wide).len() <= LIMIT + marker.len());
+    }
+
+    #[test]
     fn migrate_env_command_normalizes_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nuwa.env");
@@ -1507,6 +1672,15 @@ mod tests {
         assert_eq!(run.outcome.as_deref(), Some("success"));
         assert!(run.turns >= 1, "faux run must record at least one turn");
         assert!(run.session_dir.is_some());
+        assert!(run.harness_run_id.is_some());
+        assert!(
+            !run.verification_detail.as_deref().unwrap_or("").is_empty(),
+            "verification evidence must land on the run"
+        );
+        assert!(
+            !run.change_stat.as_deref().unwrap_or("").is_empty(),
+            "diff stat must land on the run"
+        );
         assert!(run.verification_ok == Some(true));
         assert!(run.branch.as_deref().unwrap_or("").starts_with("agent/fix/"));
         assert_eq!(run.runner_id, "test:runner");
@@ -1514,5 +1688,123 @@ mod tests {
         let branch = run.branch.clone().expect("branch");
         let fixed = git_output(&repo, &["show", &format!("{branch}:calc.go")]);
         assert!(fixed.contains("i < len(xs)"));
+    }
+
+    // Process-level evidence: `run_work` itself must register the runner,
+    // record the finished run, and reset a crashed in-flight run at startup.
+    // The faux test above bypasses all of that by calling `work_once` directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_work_registers_and_marks_interrupted() {
+        use shanhaijing::{State, Store};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::write(
+            repo.join("calc.go"),
+            "package main\n\nfunc Average(xs []float64) float64 {\n\
+             \tvar sum float64\n\
+             \tfor i := 0; i <= len(xs); i++ {\n\
+             \t\tsum += xs[i]\n\
+             \t}\n\
+             \treturn sum / float64(len(xs))\n\
+             }\n",
+        )
+        .expect("calc");
+        std::fs::write(
+            repo.join("nuwa.repo.json"),
+            r#"{"repo":"example.com/spike","failing_check":{"command":"echo ok"},"forbidden_paths":[],"notes":""}"#,
+        )
+        .expect("instructions");
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
+        );
+
+        let db = dir.path().join("m1b.db");
+        let sessions = dir.path().join("sessions");
+        let now = now_ms();
+        let store = Store::open(&db).expect("open");
+        let sig_a = shanhaijing::Signal {
+            repo: "example.com/spike".into(),
+            language: "go".into(),
+            title: "panic in Average".into(),
+            severity: "high".into(),
+            message: None,
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+        };
+        let sig_b = shanhaijing::Signal {
+            title: "panic in Pipeline".into(),
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Pipeline()\n\t/app/calc.go:25 +0x1".into(),
+            ..sig_a.clone()
+        };
+        store.report_signal(&sig_a, now).expect("a");
+        store.report_signal(&sig_b, now + 1).expect("b");
+        let fp_a = store.ready_issue(now).expect("ready").expect("a").fingerprint;
+        // B is newer; A is picked first by last_seen ASC. Identify B separately.
+        let fp_b = store
+            .list_issues()
+            .expect("issues")
+            .into_iter()
+            .find(|i| i.fingerprint != fp_a)
+            .expect("b")
+            .fingerprint;
+        drop(store);
+
+        let args = |db: &std::path::Path, repo: &std::path::Path, sessions: &std::path::Path| {
+            vec![
+                "--db".to_string(),
+                db.display().to_string(),
+                "--instructions".to_string(),
+                repo.join("nuwa.repo.json").display().to_string(),
+                "--sessions".to_string(),
+                sessions.display().to_string(),
+                "--provider".to_string(),
+                "faux".to_string(),
+                "--runner-id".to_string(),
+                "test:runner".to_string(),
+                "--interval".to_string(),
+                "5".to_string(),
+                "--max-turns".to_string(),
+                "5".to_string(),
+                "--max-tokens".to_string(),
+                "1000000".to_string(),
+            ]
+        };
+
+        run_work(args(&db, &repo, &sessions)).await.expect("first run");
+
+        let store = Store::open(&db).expect("reopen");
+        let runners = store.list_runners().expect("runners");
+        assert!(runners.iter().any(|r| r.id == "test:runner"), "runner must be registered");
+        let run_a = store.latest_run(&fp_a).expect("latest a").expect("run a");
+        assert_eq!(run_a.outcome.as_deref(), Some("success"));
+        assert_eq!(run_a.runner_id, "test:runner");
+
+        // Simulate a crashed in-flight run for B, owned by the same runner.
+        store.set_state(&fp_b, State::Triggered, now + 2, None).expect("t");
+        store.set_state(&fp_b, State::Fixing, now + 3, None).expect("f");
+        store.set_state(&fp_b, State::Escalated, now + 4, None).expect("e");
+        store
+            .start_run(&shanhaijing::RunStart {
+                id: "open-run".into(),
+                fingerprint: fp_b.clone(),
+                runner_id: "test:runner".into(),
+                repo: "example.com/spike".into(),
+                started_at: now + 5,
+                provider: Some("faux".into()),
+                model: Some("faux".into()),
+            })
+            .expect("open run");
+        drop(store);
+
+        run_work(args(&db, &repo, &sessions)).await.expect("second run");
+
+        let store = Store::open(&db).expect("reopen2");
+        let run_b = store.latest_run(&fp_b).expect("latest b").expect("run b");
+        assert_eq!(run_b.outcome.as_deref(), Some("interrupted"));
+        assert!(run_b.finished_at.is_some());
     }
 }
