@@ -1183,4 +1183,507 @@ mod tests {
             assert!(!listen_is_local(listen), "{listen}");
         }
     }
+
+    // ---- M2b Task 3: GET /api/v1/overview ----
+
+    const OVERVIEW_REPO: &str = "example.com/app";
+    const OVERVIEW_OTHER_REPO: &str = "example.com/other";
+
+    struct OverviewSeed {
+        now: i64,
+        escalated_old: String,
+        escalated_new: String,
+        fixing_stuck: String,
+        fixing_healthy: String,
+        rejected_closed: String,
+        rejected_ci_red: String,
+        pr_open_recent: String,
+        pr_open_stale: String,
+        other_pr_open: String,
+        merged: String,
+        run_repair_issue: String,
+        new_critical: String,
+        new_high: String,
+        new_medium: String,
+        pr_url: String,
+    }
+
+    fn overview_signal(title: &str, repo: &str, severity: &str) -> shanhaijing::Signal {
+        shanhaijing::Signal {
+            repo: repo.to_string(),
+            language: "go".to_string(),
+            title: title.to_string(),
+            severity: severity.to_string(),
+            message: Some(format!("boom {title}")),
+            stack_trace: format!(
+                "panic: boom {title}\ngoroutine 1 [running]:\nexample.com/app.Fn_{}()\n\t/app/{}.go:1 +0x1",
+                title.replace(' ', "_"),
+                title.replace(' ', "_"),
+            ),
+        }
+    }
+
+    fn overview_issue(
+        store: &shanhaijing::Store,
+        title: &str,
+        repo: &str,
+        severity: &str,
+        at: i64,
+    ) -> String {
+        match store
+            .report_signal(&overview_signal(title, repo, severity), at)
+            .expect("report signal")
+        {
+            shanhaijing::ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("{title} must be a new issue, got {other:?}"),
+        }
+    }
+
+    fn overview_state(
+        store: &shanhaijing::Store,
+        fp: &str,
+        state: shanhaijing::State,
+        at: i64,
+        detail: Option<&str>,
+    ) {
+        store.set_state(fp, state, at, detail).expect("set state");
+    }
+
+    fn overview_runner(
+        store: &shanhaijing::Store,
+        id: &str,
+        repo: &str,
+        status: &str,
+        heartbeat_at: i64,
+        now: i64,
+    ) {
+        store
+            .upsert_runner(&shanhaijing::RunnerUpsert {
+                id: id.to_string(),
+                repo: repo.to_string(),
+                host: "test-host".to_string(),
+                pid: None,
+                started_at: now - 600_000,
+                heartbeat_at,
+                status: status.to_string(),
+                provider: Some("faux".to_string()),
+                model: Some("faux".to_string()),
+                daily_pr_limit: Some(5),
+                repo_path: None,
+                service_unit: None,
+                config_json: r#"{"interval_secs":30}"#.to_string(),
+            })
+            .expect("upsert runner");
+    }
+
+    /// Seed one of each overview bucket: escalation prefixes, a stuck issue, a
+    /// rejected-without-prefix issue, a recent and an expired `ci_timeout`,
+    /// runners in every status (plus a stale heartbeat), active runs in two
+    /// repos, and CI events inside/outside the 24h window.
+    fn seed_overview(store: &shanhaijing::Store) -> OverviewSeed {
+        use shanhaijing::State;
+
+        let now = crate::now_ms();
+        // Reports must land on today's UTC day so `reports_today` is exact even
+        // when the test runs just after midnight.
+        let day_start = now - now.rem_euclid(86_400_000);
+        let base = day_start.max(now - 15_000);
+        let at = |step: i64| base + step * 500;
+
+        let escalated_old = overview_issue(store, "escalated old", OVERVIEW_REPO, "high", at(1));
+        overview_state(store, &escalated_old, State::Triggered, at(1) + 1_000, None);
+        overview_state(store, &escalated_old, State::Fixing, at(1) + 2_000, None);
+        overview_state(
+            store,
+            &escalated_old,
+            State::Escalated,
+            at(1) + 3_000,
+            Some("repair_failed: boom"),
+        );
+
+        let escalated_new = overview_issue(store, "escalated new", OVERVIEW_REPO, "medium", at(2));
+        overview_state(store, &escalated_new, State::Triggered, at(2) + 1_000, None);
+        overview_state(
+            store,
+            &escalated_new,
+            State::Escalated,
+            at(2) + 2_000,
+            Some("budget_exceeded: 900 > 800"),
+        );
+
+        let fixing_stuck = overview_issue(store, "fixing stuck", OVERVIEW_REPO, "high", at(3));
+        overview_state(store, &fixing_stuck, State::Triggered, now - 700_000, None);
+        overview_state(store, &fixing_stuck, State::Fixing, now - 650_000, None);
+
+        let fixing_healthy = overview_issue(store, "fixing healthy", OVERVIEW_REPO, "medium", at(4));
+        overview_state(store, &fixing_healthy, State::Triggered, now - 2_000, None);
+        overview_state(store, &fixing_healthy, State::Fixing, now - 1_000, None);
+
+        let rejected_closed = overview_issue(store, "rejected closed", OVERVIEW_REPO, "high", at(5));
+        let pr_at = day_start.max(now - 5_000);
+        overview_state(store, &rejected_closed, State::Triggered, pr_at - 3_000, None);
+        overview_state(store, &rejected_closed, State::Fixing, pr_at - 2_000, None);
+        overview_state(store, &rejected_closed, State::PrOpen, pr_at - 1_000, None);
+        let pr_url = "https://github.com/example/app/pull/42".to_string();
+        store.set_pr(&rejected_closed, &pr_url, pr_at).expect("set pr");
+        overview_state(
+            store,
+            &rejected_closed,
+            State::Rejected,
+            pr_at + 1_000,
+            Some("PR closed without merge"),
+        );
+
+        let rejected_ci_red = overview_issue(store, "rejected ci red", OVERVIEW_REPO, "high", at(6));
+        overview_state(store, &rejected_ci_red, State::Triggered, at(6) + 1_000, None);
+        overview_state(store, &rejected_ci_red, State::Fixing, at(6) + 2_000, None);
+        overview_state(store, &rejected_ci_red, State::PrOpen, at(6) + 3_000, None);
+        overview_state(
+            store,
+            &rejected_ci_red,
+            State::Rejected,
+            at(6) + 4_000,
+            Some("ci_red: CI red — PR #7 closed, back to owner"),
+        );
+
+        let pr_open_recent = overview_issue(store, "pr open recent", OVERVIEW_REPO, "medium", at(7));
+        overview_state(store, &pr_open_recent, State::Triggered, at(7) + 1_000, None);
+        overview_state(store, &pr_open_recent, State::Fixing, at(7) + 2_000, None);
+        overview_state(store, &pr_open_recent, State::PrOpen, at(7) + 3_000, None);
+        store
+            .record_event(
+                &pr_open_recent,
+                now - 3_000,
+                Some(OVERVIEW_REPO),
+                "runner",
+                "ci_timeout",
+                "head-abc",
+            )
+            .expect("recent ci timeout event");
+
+        let pr_open_stale = overview_issue(store, "pr open stale", OVERVIEW_REPO, "medium", at(8));
+        overview_state(store, &pr_open_stale, State::Triggered, at(8) + 1_000, None);
+        overview_state(store, &pr_open_stale, State::Fixing, at(8) + 2_000, None);
+        overview_state(store, &pr_open_stale, State::PrOpen, at(8) + 3_000, None);
+        store
+            .record_event(
+                &pr_open_stale,
+                now - 90_000_000,
+                Some(OVERVIEW_REPO),
+                "runner",
+                "ci_timeout",
+                "head-old",
+            )
+            .expect("expired ci timeout event");
+
+        let other_pr_open =
+            overview_issue(store, "other pr open", OVERVIEW_OTHER_REPO, "high", at(9));
+        overview_state(store, &other_pr_open, State::Triggered, at(9) + 1_000, None);
+        overview_state(store, &other_pr_open, State::Fixing, at(9) + 2_000, None);
+        overview_state(store, &other_pr_open, State::PrOpen, at(9) + 3_000, None);
+
+        let _other_new = overview_issue(store, "other new", OVERVIEW_OTHER_REPO, "low", at(10));
+
+        let merged = overview_issue(store, "merged issue", OVERVIEW_REPO, "low", at(11));
+        overview_state(store, &merged, State::Triggered, at(11) + 1_000, None);
+        overview_state(store, &merged, State::Fixing, at(11) + 2_000, None);
+        overview_state(store, &merged, State::PrOpen, at(11) + 3_000, None);
+        overview_state(
+            store,
+            &merged,
+            State::Merged,
+            at(11) + 4_000,
+            Some("https://github.com/example/app/pull/9"),
+        );
+
+        let run_repair_issue =
+            overview_issue(store, "other repairing", OVERVIEW_OTHER_REPO, "high", at(12));
+        overview_state(store, &run_repair_issue, State::Triggered, now - 2_000, None);
+        overview_state(store, &run_repair_issue, State::Fixing, now - 1_000, None);
+
+        let new_critical = overview_issue(store, "new critical", OVERVIEW_REPO, "critical", at(13));
+        let new_high = overview_issue(store, "new high", OVERVIEW_REPO, "high", at(14));
+        let new_medium = overview_issue(store, "new medium", OVERVIEW_REPO, "medium", at(15));
+        let _new_low = overview_issue(store, "new low", OVERVIEW_REPO, "low", at(16));
+
+        // One runner per status plus a stale heartbeat: the stale runner's
+        // `idle` status must not leak into the online status counts.
+        overview_runner(store, "runner-fresh", OVERVIEW_REPO, "working", now, now);
+        overview_runner(store, "runner-idle", OVERVIEW_REPO, "idle", now, now);
+        overview_runner(store, "runner-standing", OVERVIEW_REPO, "standing_down", now, now);
+        overview_runner(store, "runner-error", OVERVIEW_REPO, "error", now, now);
+        overview_runner(store, "runner-stale", OVERVIEW_REPO, "idle", now - 200_000, now);
+        overview_runner(store, "runner-other", OVERVIEW_OTHER_REPO, "working", now, now);
+
+        store
+            .start_run(&shanhaijing::RunStart {
+                id: "run-ci".to_string(),
+                fingerprint: fixing_healthy.clone(),
+                runner_id: "runner-fresh".to_string(),
+                repo: OVERVIEW_REPO.to_string(),
+                started_at: now - 60_000,
+                provider: Some("faux".to_string()),
+                model: Some("faux".to_string()),
+            })
+            .expect("start ci run");
+        store
+            .update_run(
+                "run-ci",
+                &shanhaijing::RunUpdate {
+                    phase: Some("ci".to_string()),
+                    turns: Some(6),
+                    tokens_uncached: Some(17_000),
+                    tokens_cached: Some(500),
+                    ..Default::default()
+                },
+            )
+            .expect("update ci run");
+        store
+            .start_run(&shanhaijing::RunStart {
+                id: "run-repair".to_string(),
+                fingerprint: run_repair_issue.clone(),
+                runner_id: "runner-other".to_string(),
+                repo: OVERVIEW_OTHER_REPO.to_string(),
+                started_at: now - 120_000,
+                provider: Some("faux".to_string()),
+                model: Some("faux".to_string()),
+            })
+            .expect("start repair run");
+        store
+            .update_run(
+                "run-repair",
+                &shanhaijing::RunUpdate {
+                    phase: Some("repair".to_string()),
+                    turns: Some(2),
+                    tokens_uncached: Some(100),
+                    tokens_cached: Some(50),
+                    ..Default::default()
+                },
+            )
+            .expect("update repair run");
+
+        store
+            .record_event(&merged, now - 1_000, Some(OVERVIEW_REPO), "runner", "ci_green", "head-green")
+            .expect("ci green event");
+        // Older than the rejection state change, so the state_changed event
+        // (detail prefix `ci_red:`) stays the newest for the attention reason.
+        store
+            .record_event(
+                &rejected_ci_red,
+                at(6) + 500,
+                Some(OVERVIEW_REPO),
+                "runner",
+                "ci_red",
+                "head-red",
+            )
+            .expect("ci red event");
+
+        OverviewSeed {
+            now,
+            escalated_old,
+            escalated_new,
+            fixing_stuck,
+            fixing_healthy,
+            rejected_closed,
+            rejected_ci_red,
+            pr_open_recent,
+            pr_open_stale,
+            other_pr_open,
+            merged,
+            run_repair_issue,
+            new_critical,
+            new_high,
+            new_medium,
+            pr_url,
+        }
+    }
+
+    async fn overview_request(app: &Router, uri: &str) -> Response {
+        app.clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    fn overview_counts(value: &serde_json::Value) -> [u64; 7] {
+        let counts = &value["counts"];
+        ["new", "triggered", "fixing", "pr_open", "merged", "rejected", "escalated"]
+            .map(|state| counts[state].as_u64().unwrap_or_else(|| panic!("counts.{state} missing")))
+    }
+
+    #[tokio::test]
+    async fn overview_returns_counts_attention_runs_queue_health_and_ci() {
+        let (_dir, state) = test_state(None);
+        let seed = seed_overview(&state.store);
+        let app = build_app(state);
+
+        let response = overview_request(&app, "/api/v1/overview").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_common_security_headers(&response);
+        assert_eq!(
+            header_str(&response, header::CONTENT_SECURITY_POLICY),
+            STRICT_CSP
+        );
+        assert_eq!(header_str(&response, header::CACHE_CONTROL), "no-store");
+        let value = json_body(response).await;
+
+        // The state funnel keeps all seven keys, zeros included.
+        assert_eq!(overview_counts(&value), [5, 0, 3, 3, 1, 2, 2]);
+        assert_eq!(value["counts"].as_object().expect("counts object").len(), 7);
+
+        // Escalated > stuck > rejected > ci_timeout; same level by last_seen asc.
+        let attention = value["attention"].as_array().expect("attention array");
+        let expected = [
+            (seed.escalated_old.as_str(), "escalated", "repair_failed", "修复 runner 失败，需要复核", false),
+            (seed.escalated_new.as_str(), "escalated", "budget_exceeded", "token 预算超限，需要复核", false),
+            (seed.fixing_stuck.as_str(), "fixing", "stuck", "疑似卡单，runner 心跳已过期", true),
+            (seed.rejected_closed.as_str(), "rejected", "pr_closed", "PR 未合并被关闭", false),
+            (seed.rejected_ci_red.as_str(), "rejected", "ci_red", "CI 红灯，PR 已关闭", false),
+            (seed.pr_open_recent.as_str(), "pr_open", "ci_timeout", "CI 超时，需要人工查看", false),
+        ];
+        assert_eq!(attention.len(), expected.len(), "attention: {attention:?}");
+        for (index, (fp, state, code, text, stuck)) in expected.iter().enumerate() {
+            let item = &attention[index];
+            assert_eq!(item["fingerprint"].as_str(), Some(*fp), "attention[{index}]");
+            assert_eq!(item["state"].as_str(), Some(*state), "attention[{index}]");
+            assert_eq!(item["reason_code"].as_str(), Some(*code), "attention[{index}]");
+            assert_eq!(item["reason_text"].as_str(), Some(*text), "attention[{index}]");
+            assert_eq!(item["stuck"].as_bool(), Some(*stuck), "attention[{index}]");
+            assert!(item["last_seen_ms"].is_i64(), "attention[{index}]: {item}");
+            assert!(item["title"].as_str().is_some_and(|title| !title.is_empty()));
+            assert_eq!(item["repo"].as_str(), Some(OVERVIEW_REPO));
+        }
+        assert_eq!(attention[0]["owner_runner_id"], serde_json::Value::Null);
+        assert_eq!(attention[3]["pr_url"].as_str(), Some(seed.pr_url.as_str()));
+        assert!(
+            attention
+                .iter()
+                .all(|item| item["fingerprint"].as_str() != Some(seed.pr_open_stale.as_str())),
+            "a ci_timeout older than 24h must not be attention"
+        );
+        assert!(
+            attention
+                .iter()
+                .all(|item| item["fingerprint"].as_str() != Some(seed.fixing_healthy.as_str())),
+            "a healthy fixing issue must not be attention"
+        );
+        assert!(
+            attention
+                .iter()
+                .all(|item| item["fingerprint"].as_str() != Some(seed.merged.as_str())),
+            "a merged issue must not be attention"
+        );
+
+        // Active runs: newest first, titles resolved from the issue rows.
+        let runs = value["active_runs"].as_array().expect("active runs");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["id"].as_str(), Some("run-ci"));
+        assert_eq!(runs[0]["fingerprint"].as_str(), Some(seed.fixing_healthy.as_str()));
+        assert_eq!(runs[0]["title"].as_str(), Some("fixing healthy"));
+        assert_eq!(runs[0]["repo"].as_str(), Some(OVERVIEW_REPO));
+        assert_eq!(runs[0]["runner_id"].as_str(), Some("runner-fresh"));
+        assert_eq!(runs[0]["phase"].as_str(), Some("ci"));
+        assert_eq!(runs[0]["started_at_ms"].as_i64(), Some(seed.now - 60_000));
+        assert_eq!(runs[0]["turns"].as_i64(), Some(6));
+        assert_eq!(runs[0]["tokens"].as_i64(), Some(17_500));
+        assert_eq!(runs[1]["id"].as_str(), Some("run-repair"));
+        assert_eq!(runs[1]["title"].as_str(), Some("other repairing"));
+        assert_eq!(runs[1]["phase"].as_str(), Some("repair"));
+        assert_eq!(runs[1]["tokens"].as_i64(), Some(150));
+
+        // Queue: globally pickable issues, top three in claim order.
+        assert_eq!(value["queue"]["ready_count"].as_u64(), Some(5));
+        let next = value["queue"]["next"].as_array().expect("queue next");
+        assert_eq!(next.len(), 3);
+        assert_eq!(next[0]["fingerprint"].as_str(), Some(seed.new_critical.as_str()));
+        assert_eq!(next[1]["fingerprint"].as_str(), Some(seed.new_high.as_str()));
+        assert_eq!(next[2]["fingerprint"].as_str(), Some(seed.new_medium.as_str()));
+        assert_eq!(next[0]["severity"].as_str(), Some("critical"));
+        assert_eq!(next[0]["occurrences"].as_u64(), Some(1));
+        assert!(next[0]["title"].as_str().is_some_and(|title| !title.is_empty()));
+
+        // Health: the stale runner counts offline, not as idle.
+        let health = &value["health"];
+        assert_eq!(health["runners_total"].as_u64(), Some(6));
+        assert_eq!(health["runners_online"].as_u64(), Some(5));
+        assert_eq!(health["working"].as_u64(), Some(2));
+        assert_eq!(health["idle"].as_u64(), Some(1));
+        assert_eq!(health["standing_down"].as_u64(), Some(1));
+        assert_eq!(health["error"].as_u64(), Some(1));
+        assert_eq!(health["reports_today"].as_u64(), Some(16));
+        assert_eq!(health["prs_today"].as_u64(), Some(1));
+
+        // CI 24h counters: the expired ci_timeout is outside the window.
+        let ci = &value["ci_24h"];
+        assert_eq!(ci["green"].as_u64(), Some(1));
+        assert_eq!(ci["red"].as_u64(), Some(1));
+        assert_eq!(ci["timeout"].as_u64(), Some(1));
+        assert_eq!(ci["pending"].as_u64(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn overview_repo_filter_scopes_issues_runners_and_runs_but_not_the_queue() {
+        let (_dir, state) = test_state(None);
+        let seed = seed_overview(&state.store);
+        let app = build_app(state);
+
+        let response = overview_request(&app, "/api/v1/overview?repo=example.com%2Fapp").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(overview_counts(&value), [4, 0, 2, 2, 1, 2, 2]);
+        assert_eq!(value["attention"].as_array().expect("attention").len(), 6);
+        let runs = value["active_runs"].as_array().expect("active runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["id"].as_str(), Some("run-ci"));
+        // The queue is a global claim-order view; a repo filter must not
+        // change what the runner pool will pick next.
+        assert_eq!(value["queue"]["ready_count"].as_u64(), Some(5));
+        assert_eq!(
+            value["queue"]["next"][0]["fingerprint"].as_str(),
+            Some(seed.new_critical.as_str())
+        );
+        let health = &value["health"];
+        assert_eq!(health["runners_total"].as_u64(), Some(5));
+        assert_eq!(health["runners_online"].as_u64(), Some(4));
+        assert_eq!(health["working"].as_u64(), Some(1));
+        assert_eq!(health["idle"].as_u64(), Some(1));
+        assert_eq!(health["standing_down"].as_u64(), Some(1));
+        assert_eq!(health["error"].as_u64(), Some(1));
+        assert_eq!(health["reports_today"].as_u64(), Some(16));
+        assert_eq!(health["prs_today"].as_u64(), Some(1));
+        assert_eq!(value["ci_24h"]["timeout"].as_u64(), Some(1));
+        assert_eq!(value["ci_24h"]["pending"].as_u64(), Some(1));
+
+        let response = overview_request(&app, "/api/v1/overview?repo=example.com%2Fother").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(overview_counts(&value), [1, 0, 1, 1, 0, 0, 0]);
+        assert!(value["attention"].as_array().expect("attention").is_empty());
+        assert_eq!(value["attention"].as_array().expect("attention").len(), 0);
+        let runs = value["active_runs"].as_array().expect("active runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["id"].as_str(), Some("run-repair"));
+        assert_eq!(runs[0]["fingerprint"].as_str(), Some(seed.run_repair_issue.as_str()));
+        assert_eq!(value["queue"]["ready_count"].as_u64(), Some(5));
+        let health = &value["health"];
+        assert_eq!(health["runners_total"].as_u64(), Some(1));
+        assert_eq!(health["runners_online"].as_u64(), Some(1));
+        assert_eq!(health["working"].as_u64(), Some(1));
+        assert_eq!(health["idle"].as_u64(), Some(0));
+        assert_eq!(health["reports_today"].as_u64(), Some(16));
+        assert_eq!(health["prs_today"].as_u64(), Some(0));
+
+        // `?repo=` (blank) means no filter.
+        let response = overview_request(&app, "/api/v1/overview?repo=").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(overview_counts(&value), [5, 0, 3, 3, 1, 2, 2]);
+        assert_eq!(value["active_runs"].as_array().expect("active runs").len(), 2);
+        assert_eq!(value["queue"]["ready_count"].as_u64(), Some(5));
+        assert_eq!(value["health"]["runners_total"].as_u64(), Some(6));
+        assert!(
+            !seed.other_pr_open.is_empty(),
+            "other repo PR issue is seeded"
+        );
+    }
 }

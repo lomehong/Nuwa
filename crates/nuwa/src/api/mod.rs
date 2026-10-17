@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod overview;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -106,6 +107,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
     let protected = axum::Router::new()
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        .route("/overview", get(overview::overview))
         .route_layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::session::require_session,
