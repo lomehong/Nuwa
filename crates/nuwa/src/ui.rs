@@ -710,6 +710,9 @@ mod tests {
             pr_url: None,
             first_seen: 0,
             last_seen: 0,
+            state_changed_at: 0,
+            owner_runner_id: None,
+            ci_verdict: None,
         };
         let rejected = super::render_dashboard(&super::DashData {
             rows: vec![row("rejected")],

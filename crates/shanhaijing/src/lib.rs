@@ -168,8 +168,15 @@ pub struct IssueRow {
     pub state: String,
     pub occurrences: u64,
     pub pr_url: Option<String>,
+    #[serde(rename = "first_seen_ms")]
     pub first_seen: i64,
+    #[serde(rename = "last_seen_ms")]
     pub last_seen: i64,
+    #[serde(rename = "state_changed_at_ms")]
+    pub state_changed_at: i64,
+    pub owner_runner_id: Option<String>,
+    /// Verdict of the newest run for this fingerprint, if any.
+    pub ci_verdict: Option<String>,
 }
 
 /// One lifecycle event — console activity feed row.
@@ -336,6 +343,28 @@ CREATE TABLE IF NOT EXISTS heartbeat (
 /// fingerprint only count occurrences (ADR-002 — no re-triggering).
 pub const DEFAULT_COOLDOWN_MS: i64 = 6 * 60 * 60 * 1000;
 
+/// Priority ordering shared by the claim and observer queries:
+/// `severity_weight × occurrences`, then oldest sighting.
+const READY_ORDER: &str = "(CASE severity
+        WHEN 'critical' THEN 10 WHEN 'high' THEN 5 WHEN 'medium' THEN 2 ELSE 1 END)
+        * occurrences DESC,
+        last_seen ASC";
+
+/// Full [`IssueRow`] projection; keep aligned with [`Store::issue_from_row`].
+const ISSUE_VIEW_SELECT: &str = "SELECT i.fingerprint, i.title, i.language, i.repo, i.severity,
+        i.state, i.occurrences, i.pr_url, i.first_seen, i.last_seen,
+        i.state_changed_at, i.owner_runner_id,
+        (SELECT r.ci_verdict FROM runs r
+         WHERE r.fingerprint = i.fingerprint
+         ORDER BY r.started_at DESC, r.id DESC LIMIT 1) AS ci_verdict
+ FROM issues i";
+
+/// Full [`RunRow`] projection; keep aligned with [`Store::run_from_row`].
+const RUN_COLUMNS: &str = "id, harness_run_id, fingerprint, runner_id, repo, started_at, finished_at,
+        phase, outcome, ci_verdict, turns, tokens_uncached, tokens_cached, provider,
+        model, root_cause, change_stat, branch, commit_sha, pr_url, pr_opened_at,
+        verification_ok, verification_detail, session_dir, error";
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> ShanResult<Self> {
         let mut conn = Connection::open(path.as_ref())?;
@@ -427,29 +456,55 @@ impl Store {
     /// ordered by `severity_weight × occurrences` then oldest sighting.
     pub fn ready_issue(&self, now_ms: i64) -> ShanResult<Option<IssueSnapshot>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT fingerprint, title, language, repo, severity, occurrences, stack_sample
              FROM issues
              WHERE state = 'new' AND cooldown_until <= ?1
-             ORDER BY (CASE severity
-                 WHEN 'critical' THEN 10 WHEN 'high' THEN 5 WHEN 'medium' THEN 2 ELSE 1 END)
-                 * occurrences DESC,
-                 last_seen ASC
-             LIMIT 1",
-        )?;
+             ORDER BY {READY_ORDER}
+             LIMIT 1"
+        ))?;
         let mut rows = stmt.query([now_ms])?;
         match rows.next()? {
-            Some(row) => Ok(Some(IssueSnapshot {
-                fingerprint: row.get(0)?,
-                title: row.get(1)?,
-                language: row.get(2)?,
-                repo: row.get(3)?,
-                severity: row.get(4)?,
-                occurrences: row.get(5)?,
-                stack_sample: row.get(6)?,
-            })),
+            Some(row) => Ok(Some(Self::snapshot_from_row(row)?)),
             None => Ok(None),
         }
+    }
+
+    /// Pickable issues in claim order, untouched — the console queue view.
+    pub fn ready_issues(&self, now_ms: i64, limit: u32) -> ShanResult<Vec<IssueSnapshot>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT fingerprint, title, language, repo, severity, occurrences, stack_sample
+             FROM issues
+             WHERE state = 'new' AND cooldown_until <= ?1
+             ORDER BY {READY_ORDER}
+             LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![now_ms, limit], Self::snapshot_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Size of the pickable queue at `now_ms` (same predicate as claim).
+    pub fn count_ready(&self, now_ms: i64) -> ShanResult<u64> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM issues WHERE state = 'new' AND cooldown_until <= ?1",
+            [now_ms],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    fn snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IssueSnapshot> {
+        Ok(IssueSnapshot {
+            fingerprint: row.get(0)?,
+            title: row.get(1)?,
+            language: row.get(2)?,
+            repo: row.get(3)?,
+            severity: row.get(4)?,
+            occurrences: row.get(5)?,
+            stack_sample: row.get(6)?,
+        })
     }
 
     /// Atomically claim the highest-priority pickable issue: flips it to
@@ -464,29 +519,18 @@ impl Store {
         let conn = self.lock();
         let claimed: Option<IssueSnapshot> = conn
             .query_row(
-                "UPDATE issues SET state = 'triggered', cooldown_until = ?2, state_changed_at = ?1
-                 WHERE fingerprint = (
-                     SELECT fingerprint FROM issues
-                     WHERE state = 'new' AND cooldown_until <= ?1
-                     ORDER BY (CASE severity
-                         WHEN 'critical' THEN 10 WHEN 'high' THEN 5 WHEN 'medium' THEN 2 ELSE 1 END)
-                         * occurrences DESC,
-                         last_seen ASC
-                     LIMIT 1
-                 )
-                 RETURNING fingerprint, title, language, repo, severity, occurrences, stack_sample",
+                &format!(
+                    "UPDATE issues SET state = 'triggered', cooldown_until = ?2, state_changed_at = ?1
+                     WHERE fingerprint = (
+                         SELECT fingerprint FROM issues
+                         WHERE state = 'new' AND cooldown_until <= ?1
+                         ORDER BY {READY_ORDER}
+                         LIMIT 1
+                     )
+                     RETURNING fingerprint, title, language, repo, severity, occurrences, stack_sample"
+                ),
                 rusqlite::params![now_ms, cooldown_until_ms],
-                |row| {
-                    Ok(IssueSnapshot {
-                        fingerprint: row.get(0)?,
-                        title: row.get(1)?,
-                        language: row.get(2)?,
-                        repo: row.get(3)?,
-                        severity: row.get(4)?,
-                        occurrences: row.get(5)?,
-                        stack_sample: row.get(6)?,
-                    })
-                },
+                Self::snapshot_from_row,
             )
             .map(Some)
             .or_else(|e| match e {
@@ -792,6 +836,45 @@ impl Store {
         Ok(count as u64)
     }
 
+    /// Total reports across all fingerprints and repos on UTC `day`.
+    pub fn reports_on(&self, day: &str) -> ShanResult<u64> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(count), 0) FROM signal_daily WHERE day = ?1",
+            [day],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Events of the given kinds at or after `since_ms` — CI counters.
+    /// `kinds` are bound parameters; the placeholder list is built from
+    /// their count only, so no value ever reaches the SQL text.
+    pub fn count_events_since(&self, kinds: &[&str], since_ms: i64) -> ShanResult<u64> {
+        if kinds.is_empty() {
+            return Ok(0);
+        }
+        let placeholders: Vec<String> = (2..=kinds.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect();
+        let sql = format!(
+            "SELECT COUNT(*) FROM events WHERE ts >= ?1 AND kind IN ({})",
+            placeholders.join(", ")
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(kinds.len() + 1);
+        params.push(rusqlite::types::Value::Integer(since_ms));
+        params.extend(
+            kinds
+                .iter()
+                .map(|kind| rusqlite::types::Value::Text((*kind).to_string())),
+        );
+        let conn = self.lock();
+        let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(params), |row| {
+            row.get(0)
+        })?;
+        Ok(count as u64)
+    }
+
     pub fn get(&self, fingerprint: &str) -> ShanResult<Option<IssueSnapshot>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -800,44 +883,61 @@ impl Store {
         )?;
         let mut rows = stmt.query([fingerprint])?;
         match rows.next()? {
-            Some(row) => Ok(Some(IssueSnapshot {
-                fingerprint: row.get(0)?,
-                title: row.get(1)?,
-                language: row.get(2)?,
-                repo: row.get(3)?,
-                severity: row.get(4)?,
-                occurrences: row.get(5)?,
-                stack_sample: row.get(6)?,
-            })),
+            Some(row) => Ok(Some(Self::snapshot_from_row(row)?)),
             None => Ok(None),
         }
     }
 
     /// All issues, newest-sighting first — the `nuwa status` view.
     pub fn list_issues(&self) -> ShanResult<Vec<IssueRow>> {
+        self.issue_rows(&format!("{ISSUE_VIEW_SELECT} ORDER BY i.last_seen DESC"), [])
+    }
+
+    /// Issues sharing `title`, newest first, excluding `exclude_fp` itself —
+    /// the detail page's "similar problems" strip.
+    pub fn similar_issues(
+        &self,
+        title: &str,
+        exclude_fp: &str,
+        limit: u32,
+    ) -> ShanResult<Vec<IssueRow>> {
+        self.issue_rows(
+            &format!(
+                "{ISSUE_VIEW_SELECT}
+                 WHERE i.title = ?1 AND i.fingerprint <> ?2
+                 ORDER BY i.last_seen DESC LIMIT ?3"
+            ),
+            rusqlite::params![title, exclude_fp, limit],
+        )
+    }
+
+    fn issue_rows(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> ShanResult<Vec<IssueRow>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT fingerprint, title, language, repo, severity, state, occurrences,
-                    pr_url, first_seen, last_seen
-             FROM issues ORDER BY last_seen DESC",
-        )?;
-        let mut rows = stmt.query([])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(IssueRow {
-                fingerprint: row.get(0)?,
-                title: row.get(1)?,
-                language: row.get(2)?,
-                repo: row.get(3)?,
-                severity: row.get(4)?,
-                state: row.get(5)?,
-                occurrences: row.get(6)?,
-                pr_url: row.get(7)?,
-                first_seen: row.get(8)?,
-                last_seen: row.get(9)?,
-            });
-        }
-        Ok(out)
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params, Self::issue_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn issue_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IssueRow> {
+        Ok(IssueRow {
+            fingerprint: row.get(0)?,
+            title: row.get(1)?,
+            language: row.get(2)?,
+            repo: row.get(3)?,
+            severity: row.get(4)?,
+            state: row.get(5)?,
+            occurrences: row.get(6)?,
+            pr_url: row.get(7)?,
+            first_seen: row.get(8)?,
+            last_seen: row.get(9)?,
+            state_changed_at: row.get(10)?,
+            owner_runner_id: row.get(11)?,
+            ci_verdict: row.get(12)?,
+        })
     }
 
     /// Recent lifecycle events, newest first — the console activity feed.
@@ -887,6 +987,30 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    /// Newest event for one issue — detail header / attention reason.
+    pub fn latest_event(&self, fingerprint: &str) -> ShanResult<Option<EventRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
+                    COALESCE(e.repo, i.repo, ''), e.actor
+             FROM events e LEFT JOIN issues i ON i.fingerprint = e.fingerprint
+             WHERE e.fingerprint = ?1
+             ORDER BY e.ts DESC, e.id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([fingerprint])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(EventRow {
+                fingerprint: row.get(0)?,
+                ts: row.get(1)?,
+                kind: row.get(2)?,
+                detail: row.get(3)?,
+                repo: row.get(4)?,
+                actor: row.get(5)?,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// Runner liveness heartbeat — work loop upserts each iteration; the
@@ -1098,13 +1222,10 @@ impl Store {
 
     pub fn latest_run(&self, fingerprint: &str) -> ShanResult<Option<RunRow>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, harness_run_id, fingerprint, runner_id, repo, started_at, finished_at,
-                    phase, outcome, ci_verdict, turns, tokens_uncached, tokens_cached, provider,
-                    model, root_cause, change_stat, branch, commit_sha, pr_url, pr_opened_at,
-                    verification_ok, verification_detail, session_dir, error
-             FROM runs WHERE fingerprint=?1 ORDER BY started_at DESC LIMIT 1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs
+             WHERE fingerprint=?1 ORDER BY started_at DESC LIMIT 1"
+        ))?;
         let mut rows = stmt.query([fingerprint])?;
         match rows.next()? {
             Some(row) => Ok(Some(Self::run_from_row(row)?)),
@@ -1114,16 +1235,23 @@ impl Store {
 
     pub fn runs_for(&self, fingerprint: &str, limit: u32) -> ShanResult<Vec<RunRow>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, harness_run_id, fingerprint, runner_id, repo, started_at, finished_at,
-                    phase, outcome, ci_verdict, turns, tokens_uncached, tokens_cached, provider,
-                    model, root_cause, change_stat, branch, commit_sha, pr_url, pr_opened_at,
-                    verification_ok, verification_detail, session_dir, error
-             FROM runs WHERE fingerprint=?1 ORDER BY started_at DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![fingerprint, limit], |row| {
-            Self::run_from_row(row)
-        })?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs
+             WHERE fingerprint=?1 ORDER BY started_at DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![fingerprint, limit], Self::run_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Runs still in flight, newest first — the overview's active-run strip.
+    pub fn active_runs(&self) -> ShanResult<Vec<RunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs
+             WHERE finished_at IS NULL
+             ORDER BY started_at DESC, id DESC"
+        ))?;
+        let rows = stmt.query_map([], Self::run_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -1188,6 +1316,14 @@ mod tests {
             message: None,
             stack_trace: TRACE.to_string(),
         }
+    }
+
+    /// Same repo/language, distinct fingerprint (stack symbol) and title.
+    fn issue_signal(title: &str, symbol: &str) -> Signal {
+        let mut sig = signal();
+        sig.title = title.to_string();
+        sig.stack_trace = TRACE.replace("Average", symbol);
+        sig
     }
 
     #[test]
@@ -1960,6 +2096,344 @@ mod tests {
             .expect("issue row");
         assert_eq!(owner, None);
         assert_eq!(changed, 5);
+    }
+
+    #[test]
+    fn list_issues_exposes_lifecycle_owner_and_ci_verdict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t0 = 1_700_000_000_000;
+        store.report_signal(&signal(), t0).expect("report");
+        let fp = store
+            .claim_ready_issue(t0 + 10, t0 + 1_000_000)
+            .expect("claim")
+            .expect("issue")
+            .fingerprint;
+        store
+            .start_run(&RunStart {
+                id: "run-1".into(),
+                fingerprint: fp.clone(),
+                runner_id: "runner-1".into(),
+                repo: "example.com/spike-target".into(),
+                started_at: t0 + 20,
+                provider: None,
+                model: None,
+            })
+            .expect("start");
+        store
+            .update_run(
+                "run-1",
+                &RunUpdate { ci_verdict: Some("success".into()), ..RunUpdate::default() },
+            )
+            .expect("update");
+
+        let row = store.list_issues().expect("issues").pop().expect("issue");
+        assert_eq!(row.fingerprint, fp);
+        assert_eq!(row.state, "triggered");
+        assert_eq!(row.first_seen, t0);
+        assert_eq!(row.last_seen, t0);
+        assert_eq!(row.state_changed_at, t0 + 10);
+        assert_eq!(row.owner_runner_id.as_deref(), Some("runner-1"));
+        assert_eq!(row.ci_verdict.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn issue_ci_verdict_comes_from_latest_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t0 = 1_700_000_000_000;
+        store.report_signal(&signal(), t0).expect("report");
+        let fp = store
+            .claim_ready_issue(t0 + 10, t0 + 1_000_000)
+            .expect("claim")
+            .expect("issue")
+            .fingerprint;
+        for (id, started_at) in [("run-a", t0 + 20), ("run-b", t0 + 40)] {
+            store
+                .start_run(&RunStart {
+                    id: id.into(),
+                    fingerprint: fp.clone(),
+                    runner_id: format!("{id}-runner"),
+                    repo: "example.com/spike-target".into(),
+                    started_at,
+                    provider: None,
+                    model: None,
+                })
+                .expect("start");
+        }
+        store
+            .update_run(
+                "run-a",
+                &RunUpdate { ci_verdict: Some("success".into()), ..RunUpdate::default() },
+            )
+            .expect("ci a");
+        store
+            .finish_run(
+                "run-a",
+                &RunFinish {
+                    finished_at: t0 + 30,
+                    outcome: "success".into(),
+                    ci_verdict: None,
+                    error: None,
+                },
+            )
+            .expect("finish a");
+        store
+            .update_run(
+                "run-b",
+                &RunUpdate { ci_verdict: Some("failure".into()), ..RunUpdate::default() },
+            )
+            .expect("ci b");
+
+        let row = store.list_issues().expect("issues").pop().expect("issue");
+        assert_eq!(row.ci_verdict.as_deref(), Some("failure"), "newest run wins");
+        assert_eq!(row.owner_runner_id.as_deref(), Some("run-b-runner"));
+    }
+
+    #[test]
+    fn issue_row_serializes_ms_suffixed_timestamps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1_700_000_000_000).expect("report");
+        let row = store.list_issues().expect("issues").pop().expect("issue");
+        let value = serde_json::to_value(&row).expect("json");
+        for key in ["first_seen_ms", "last_seen_ms", "state_changed_at_ms"] {
+            assert!(value.get(key).is_some(), "missing {key} in {value}");
+        }
+        for key in ["first_seen", "last_seen", "state_changed_at"] {
+            assert!(value.get(key).is_none(), "{key} must stay renamed");
+        }
+        assert!(value.get("owner_runner_id").is_some());
+        assert!(value.get("ci_verdict").is_some());
+    }
+
+    #[test]
+    fn active_runs_excludes_finished_and_orders_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        for (id, started_at) in [("run-old", 100), ("run-new", 200)] {
+            store
+                .start_run(&RunStart {
+                    id: id.into(),
+                    fingerprint: fp.clone(),
+                    runner_id: "runner-1".into(),
+                    repo: "example.com/spike-target".into(),
+                    started_at,
+                    provider: None,
+                    model: None,
+                })
+                .expect("start");
+        }
+        let ids: Vec<String> = store
+            .active_runs()
+            .expect("active")
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        assert_eq!(ids, ["run-new", "run-old"]);
+
+        store
+            .finish_run(
+                "run-new",
+                &RunFinish {
+                    finished_at: 300,
+                    outcome: "success".into(),
+                    ci_verdict: None,
+                    error: None,
+                },
+            )
+            .expect("finish");
+        let ids: Vec<String> = store
+            .active_runs()
+            .expect("active")
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        assert_eq!(ids, ["run-old"], "finished runs leave the active view");
+
+        store
+            .finish_run(
+                "run-old",
+                &RunFinish {
+                    finished_at: 400,
+                    outcome: "success".into(),
+                    ci_verdict: None,
+                    error: None,
+                },
+            )
+            .expect("finish");
+        assert!(store.active_runs().expect("active").is_empty());
+    }
+
+    #[test]
+    fn ready_issues_mirrors_claim_priority_without_claiming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let low = Signal { severity: "low".into(), ..issue_signal("low", "Load") };
+        let critical = Signal { severity: "critical".into(), ..issue_signal("critical", "Submit") };
+        let fp_low = fingerprint::compute("go", None, &low.stack_trace);
+        store.report_signal(&low, 1).expect("low");
+        store.report_signal(&low, 2).expect("low again");
+        store.report_signal(&critical, 1).expect("critical");
+
+        let ready = store.ready_issues(3, 10).expect("ready");
+        let severities: Vec<&str> = ready.iter().map(|i| i.severity.as_str()).collect();
+        assert_eq!(severities, ["critical", "low"]);
+        assert_eq!(store.ready_issues(3, 1).expect("limited").len(), 1);
+        assert_eq!(store.count_ready(3).expect("count"), 2);
+        assert!(
+            store.list_issues().expect("issues").iter().all(|i| i.state == "new"),
+            "observing the queue must not flip states"
+        );
+
+        let claimed = store
+            .claim_ready_issue(3, 1_000_000)
+            .expect("claim")
+            .expect("issue");
+        assert_eq!(claimed.severity, "critical", "observation left priority intact");
+        assert_eq!(store.count_ready(3).expect("count"), 1);
+        let remaining: Vec<String> = store
+            .ready_issues(3, 10)
+            .expect("ready")
+            .into_iter()
+            .map(|i| i.fingerprint)
+            .collect();
+        assert_eq!(remaining, [fp_low], "the unclaimed issue is still ready");
+    }
+
+    #[test]
+    fn count_ready_honours_cooldown_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        store.set_cooldown(&fp, 1_000).expect("cooldown");
+
+        assert_eq!(store.count_ready(999).expect("count"), 0);
+        assert!(store.ready_issues(999, 10).expect("ready").is_empty());
+        assert_eq!(store.count_ready(1_000).expect("count"), 1);
+        assert_eq!(store.ready_issues(1_000, 10).expect("ready").len(), 1);
+    }
+
+    #[test]
+    fn count_events_since_filters_kinds_and_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t0 = 1_000_000;
+        store
+            .record_event("fp", t0 - 10, Some("r"), "system", "reported", "old")
+            .expect("old");
+        store
+            .record_event("fp", t0 + 5, Some("r"), "system", "ci_green", "a")
+            .expect("a");
+        store
+            .record_event("fp", t0 + 15, Some("r"), "system", "ci_green", "b")
+            .expect("b");
+        store
+            .record_event("fp", t0 + 20, Some("r"), "system", "ci_red", "c")
+            .expect("c");
+
+        assert_eq!(store.count_events_since(&["ci_green"], t0).expect("green"), 2);
+        assert_eq!(
+            store.count_events_since(&["ci_green", "ci_red"], t0).expect("both"),
+            3
+        );
+        assert_eq!(
+            store.count_events_since(&["ci_green"], t0 + 10).expect("window"),
+            1
+        );
+        assert_eq!(store.count_events_since(&[], 0).expect("empty"), 0);
+        assert_eq!(
+            store
+                .count_events_since(&["ci_green' OR 1=1 --"], 0)
+                .expect("injection-shaped kind"),
+            0,
+            "kind values stay bound parameters"
+        );
+    }
+
+    #[test]
+    fn latest_event_returns_newest_for_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        // Insert out of timestamp order to prove ordering is by ts, not row id.
+        store
+            .record_event("fp", 5, Some("r"), "runner", "state_changed", "late")
+            .expect("late");
+        store
+            .record_event("fp", 1, Some("r"), "system", "reported", "early")
+            .expect("early");
+        store
+            .record_event("other", 9, Some("r"), "system", "reported", "other")
+            .expect("other");
+
+        let event = store.latest_event("fp").expect("latest").expect("event");
+        assert_eq!(event.ts, 5);
+        assert_eq!(event.kind, "state_changed");
+        assert_eq!(event.detail, "late");
+        assert_eq!(event.repo, "r");
+        assert!(store.latest_event("missing").expect("latest").is_none());
+    }
+
+    #[test]
+    fn reports_on_sums_signal_daily_across_issues() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t0 = 1_700_000_000_000;
+        let day_ms = 86_400_000;
+        store.report_signal(&signal(), t0).expect("a1");
+        store.report_signal(&signal(), t0 + 1).expect("a2");
+        store.report_signal(&issue_signal("panic in Submit", "Submit"), t0 + 2).expect("b");
+        store
+            .report_signal(&issue_signal("panic in Load", "Load"), t0 + day_ms)
+            .expect("next day");
+
+        assert_eq!(store.reports_on(&utc_day(t0)).expect("today"), 3);
+        assert_eq!(store.reports_on(&utc_day(t0 + day_ms)).expect("tomorrow"), 1);
+        assert_eq!(store.reports_on("1999-01-01").expect("empty"), 0);
+    }
+
+    #[test]
+    fn similar_issues_matches_title_and_excludes_self() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let sig_a = issue_signal("panic in Average", "Average");
+        let sig_b = issue_signal("panic in Average", "Submit");
+        let sig_d = issue_signal("panic in Average", "Load");
+        let sig_c = issue_signal("panic in Load", "Enqueue");
+        let fp_a = fingerprint::compute("go", None, &sig_a.stack_trace);
+        let fp_b = fingerprint::compute("go", None, &sig_b.stack_trace);
+        let fp_d = fingerprint::compute("go", None, &sig_d.stack_trace);
+        store.report_signal(&sig_a, 1).expect("a");
+        store.report_signal(&sig_b, 2).expect("b");
+        store.report_signal(&sig_d, 3).expect("d");
+        store.report_signal(&sig_c, 4).expect("c");
+
+        let similar = store
+            .similar_issues("panic in Average", &fp_a, 10)
+            .expect("similar");
+        let fps: Vec<&str> = similar.iter().map(|i| i.fingerprint.as_str()).collect();
+        assert_eq!(fps, [fp_d.as_str(), fp_b.as_str()]);
+        assert!(similar.iter().all(|i| i.title == "panic in Average"));
+
+        let limited = store
+            .similar_issues("panic in Average", &fp_a, 1)
+            .expect("similar limited");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].fingerprint, fp_d);
+
+        let excluding_newest = store
+            .similar_issues("panic in Average", &fp_d, 10)
+            .expect("similar");
+        let fps: Vec<&str> = excluding_newest.iter().map(|i| i.fingerprint.as_str()).collect();
+        assert_eq!(fps, [fp_b.as_str(), fp_a.as_str()]);
+
+        assert!(store
+            .similar_issues("panic in Nonexistent", &fp_a, 10)
+            .expect("none")
+            .is_empty());
     }
 }
 
