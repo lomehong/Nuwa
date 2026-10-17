@@ -462,7 +462,7 @@ impl Store {
         let conn = self.lock();
         let claimed: Option<IssueSnapshot> = conn
             .query_row(
-                "UPDATE issues SET state = 'triggered', cooldown_until = ?2
+                "UPDATE issues SET state = 'triggered', cooldown_until = ?2, state_changed_at = ?1
                  WHERE fingerprint = (
                      SELECT fingerprint FROM issues
                      WHERE state = 'new' AND cooldown_until <= ?1
@@ -503,6 +503,56 @@ impl Store {
             )?;
         }
         Ok(claimed)
+    }
+
+    pub fn stuck(&self, fingerprint: &str, now_ms: i64, stuck_after_ms: i64) -> ShanResult<bool> {
+        let conn = self.lock();
+        let (state, state_changed_at, owner): (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT state, state_changed_at, owner_runner_id FROM issues WHERE fingerprint=?1",
+                [fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    ShanError::UnknownIssue(fingerprint.to_string())
+                }
+                other => ShanError::Db(other),
+            })?;
+        if state != "triggered" && state != "fixing" {
+            return Ok(false);
+        }
+
+        let owner_state: Option<(String, Option<String>, i64)> = match owner.as_deref() {
+            Some(id) => conn
+                .query_row(
+                    "SELECT status, current_fingerprint, heartbeat_at FROM runners WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(other),
+                })?,
+            None => None,
+        };
+
+        let (owner_heartbeat, healthy_owner) = match &owner_state {
+            Some((status, current, heartbeat)) => (
+                Some(*heartbeat),
+                status == "working"
+                    && current.as_deref() == Some(fingerprint)
+                    && now_ms - *heartbeat <= stuck_after_ms,
+            ),
+            None => (None, false),
+        };
+        if healthy_owner {
+            return Ok(false);
+        }
+
+        let last_progress = state_changed_at.max(owner_heartbeat.unwrap_or(0));
+        Ok(now_ms - last_progress > stuck_after_ms)
     }
 
     /// Validate + apply a state transition, journaling the event as `system`.
@@ -1312,6 +1362,85 @@ mod tests {
         assert_eq!(run.turns, 3);
         assert_eq!(run.tokens_uncached, 1200);
         assert_eq!(run.finished_at, Some(200));
+    }
+
+    #[test]
+    fn stuck_detection_uses_owner_heartbeat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let old = 1_000_000;
+        store.report_signal(&signal(), old).expect("report");
+        let fp = store
+            .claim_ready_issue(old, old + 10_000)
+            .expect("claim")
+            .expect("issue")
+            .fingerprint;
+        store
+            .start_run(&RunStart {
+                id: "run1".into(),
+                fingerprint: fp.clone(),
+                runner_id: "host:repo".into(),
+                repo: "example.com/spike-target".into(),
+                started_at: old,
+                provider: None,
+                model: None,
+            })
+            .expect("run");
+
+        store
+            .upsert_runner(&RunnerUpsert {
+                id: "host:repo".into(),
+                repo: "example.com/spike-target".into(),
+                host: "host".into(),
+                pid: Some(1),
+                started_at: old,
+                heartbeat_at: old,
+                status: "working".into(),
+                provider: None,
+                model: None,
+                daily_pr_limit: Some(5),
+                repo_path: None,
+                service_unit: None,
+                config_json: "{}".into(),
+            })
+            .expect("runner");
+
+        // 心跳新鲜且正在修这条单 → 不卡。
+        assert!(!store.stuck(&fp, old + 1_000, 300_000).expect("stuck"));
+        store
+            .heartbeat_runner(
+                "host:repo",
+                &RunnerHeartbeat {
+                    heartbeat_at: old + 1_000,
+                    status: "working".into(),
+                    current_fingerprint: Some(fp.clone()),
+                    phase: Some("repair".into()),
+                    config_json: None,
+                    last_error: None,
+                },
+            )
+            .expect("heartbeat");
+        assert!(!store.stuck(&fp, old + 2_000, 300_000).expect("stuck"));
+
+        // 心跳过期 → 卡。
+        assert!(store.stuck(&fp, old + 500_000, 300_000).expect("stuck"));
+
+        // runner 已 idle：从最后一次心跳起超过阈值才判卡。
+        store
+            .heartbeat_runner(
+                "host:repo",
+                &RunnerHeartbeat {
+                    heartbeat_at: old + 500_000,
+                    status: "idle".into(),
+                    current_fingerprint: None,
+                    phase: None,
+                    config_json: None,
+                    last_error: None,
+                },
+            )
+            .expect("heartbeat");
+        assert!(!store.stuck(&fp, old + 500_001, 300_000).expect("not yet"));
+        assert!(store.stuck(&fp, old + 800_001, 300_000).expect("stuck"));
     }
 
     #[test]
