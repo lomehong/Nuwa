@@ -21,6 +21,14 @@ pub struct DeliverReport {
     /// GitHub owner/repo of the delivery remote (None when no PR was created).
     pub slug: Option<String>,
     pub pr_number: Option<u64>,
+    /// Verification command plus combined output, bounded (see `truncate_evidence`).
+    // Read by the work-loop run telemetry (M1b Task 4).
+    #[allow(dead_code)]
+    pub verification_detail: String,
+    /// `git diff --stat` of the delivered branch, bounded (see `truncate_evidence`).
+    // Read by the work-loop run telemetry (M1b Task 4).
+    #[allow(dead_code)]
+    pub change_stat: String,
 }
 
 pub(crate) fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
@@ -63,6 +71,15 @@ fn run_check(repo: &Path, command: &str) -> anyhow::Result<CheckOutput> {
 }
 
 fn root_cause_excerpt(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(max_chars).collect();
+    format!("{cut}…")
+}
+
+fn truncate_evidence(text: &str, max_chars: usize) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= max_chars {
         return trimmed.to_string();
@@ -180,6 +197,10 @@ pub async fn deliver(
         format!("$ {}\n\n{}", issue.failing_check.command, check.output),
     )
     .context("write evidence")?;
+    let verification_detail = truncate_evidence(
+        &format!("$ {}\n\n{}", issue.failing_check.command, check.output),
+        16_000,
+    );
 
     // ---- 2. preconditions ----
     let status = git(repo, &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"])?;
@@ -222,6 +243,7 @@ pub async fn deliver(
     )?;
     let commit = git(repo, &["rev-parse", "HEAD"])?;
     let stat = git(repo, &["diff", "--stat", &format!("{base}...HEAD")])?;
+    let change_stat = truncate_evidence(&stat, 4_000);
 
     // ---- 4. push + PR ----
     let mut pr_url = None;
@@ -293,12 +315,23 @@ pub async fn deliver(
         pr_url,
         slug: slug_out,
         pr_number,
+        verification_detail,
+        change_stat,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_github_slug;
+    use super::{parse_github_slug, truncate_evidence};
+
+    #[test]
+    fn evidence_truncation_keeps_bounded_text() {
+        let long = "x".repeat(20_000);
+        let out = truncate_evidence(&long, 100);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 101);
+        assert_eq!(truncate_evidence("short", 100), "short");
+    }
 
     #[test]
     fn parses_ssh_remote() {
