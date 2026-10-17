@@ -203,6 +203,10 @@ CREATE TABLE IF NOT EXISTS events (
     detail      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_fp ON events(fingerprint);
+CREATE TABLE IF NOT EXISTS heartbeat (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    ts INTEGER NOT NULL
+);
 ";
 
 /// Claim cooldown: while a run is in flight, further reports of the same
@@ -262,7 +266,7 @@ impl Store {
                 ],
             )?;
             drop(conn);
-            self.record_event(&fp, now_ms, "reported", Some("first sighting"))?;
+            self.record_event(&fp, now_ms, "reported", "first sighting")?;
             return Ok(ReportOutcome::NewIssue { fingerprint: fp });
         };
 
@@ -288,7 +292,7 @@ impl Store {
                 retry_after_ms: cooldown_until - now_ms,
             });
         }
-        self.record_event(&fp, now_ms, "reported", Some("dedup"))?;
+        self.record_event(&fp, now_ms, "reported", "dedup")?;
         Ok(ReportOutcome::Deduped {
             fingerprint: fp,
             occurrences,
@@ -371,7 +375,7 @@ impl Store {
                 &snapshot.fingerprint,
                 now_ms,
                 "state_changed",
-                Some("claimed by runner"),
+                "claimed by runner",
             )?;
         }
         Ok(claimed)
@@ -407,7 +411,7 @@ impl Store {
             rusqlite::params![fingerprint, to.as_str()],
         )?;
         drop(conn);
-        self.record_event(fingerprint, now_ms, "state_changed", Some(detail.unwrap_or("")))
+        self.record_event(fingerprint, now_ms, "state_changed", detail.unwrap_or(""))
     }
 
     /// Put an issue into cooldown (used when a run starts: same fingerprint
@@ -437,7 +441,7 @@ impl Store {
         if changed == 0 {
             return Err(ShanError::UnknownIssue(fingerprint.to_string()));
         }
-        self.record_event(fingerprint, now_ms, "pr_opened", Some(pr_url))
+        self.record_event(fingerprint, now_ms, "pr_opened", pr_url)
     }
 
     /// PRs opened for `repo` since `since_ms` — the counter behind the
@@ -523,12 +527,61 @@ impl Store {
         Ok(out)
     }
 
-    fn record_event(
+    /// Per-issue lifecycle events, newest first — the detail page timeline.
+    pub fn events_for(&self, fingerprint: &str, limit: u32) -> ShanResult<Vec<EventRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
+                    COALESCE(i.repo, '')
+             FROM events e LEFT JOIN issues i ON i.fingerprint = e.fingerprint
+             WHERE e.fingerprint = ?1
+             ORDER BY e.id DESC LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![fingerprint, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(EventRow {
+                fingerprint: row.get(0)?,
+                ts: row.get(1)?,
+                kind: row.get(2)?,
+                detail: row.get(3)?,
+                repo: row.get(4)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Runner liveness heartbeat — work loop upserts each iteration; the
+    /// console shows "N 秒前" so a dead loop is visible within one interval.
+    pub fn heartbeat(&self, now_ms: i64) -> ShanResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO heartbeat(id, ts) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET ts = excluded.ts",
+            [now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn last_heartbeat(&self) -> ShanResult<Option<i64>> {
+        let conn = self.lock();
+        let ts: Option<i64> = conn
+            .query_row("SELECT ts FROM heartbeat WHERE id = 1", [], |row| row.get(0))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(ts)
+    }
+
+    /// Append a lifecycle event (console activity feed + per-issue timeline).
+    pub fn record_event(
         &self,
         fingerprint: &str,
         now_ms: i64,
         kind: &str,
-        detail: Option<&str>,
+        detail: &str,
     ) -> ShanResult<()> {
         let conn = self.lock();
         conn.execute(
@@ -749,5 +802,44 @@ mod tests {
 
         let top = store.ready_issue(3).expect("ready").expect("issue");
         assert_eq!(top.severity, "critical");
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_upserts_and_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        assert_eq!(store.last_heartbeat().expect("read"), None);
+        store.heartbeat(1_000).expect("beat");
+        store.heartbeat(2_000).expect("beat again");
+        assert_eq!(store.last_heartbeat().expect("read"), Some(2_000));
+    }
+
+    #[test]
+    fn events_for_returns_per_issue_timeline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let trace = "panic: runtime error: index out of range [3] with length 3\n\
+            goroutine 1 [running]:\n\
+            example.com/spike-target.Average(...)\n\
+            \t/app/calc.go:17 +0x8c";
+        let sig = Signal {
+            repo: "example.com/spike-target".into(),
+            language: "go".into(),
+            title: "panic in Average".into(),
+            severity: "high".into(),
+            message: None,
+            stack_trace: trace.into(),
+        };
+        store.report_signal(&sig, 1).expect("report");
+        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        store.set_state(&fp, State::Triggered, 2, Some("claimed")).expect("t");
+        let events = store.events_for(&fp, 10).expect("events");
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&"state_changed"), "{kinds:?}");
     }
 }

@@ -10,9 +10,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
-pub type Shared = (Arc<shanhaijing::Store>, Arc<Option<String>>);
+use crate::Shared;
 
 /// Basic auth: password must equal the ingest token. Local mode (no token
 /// configured) allows all — same trust domain as /ingest without a token.
@@ -105,6 +104,7 @@ pub struct DashData {
     pub events: Vec<shanhaijing::EventRow>,
     pub serve: String,
     pub work: String,
+    pub work_hb: Option<i64>,
     pub now: i64,
     pub filter_state: Option<String>,
     pub filter_repo: Option<String>,
@@ -262,6 +262,10 @@ pub fn render_dashboard(d: &DashData) -> String {
         .map(|m| format!("<div class=\"flash\">{}</div>", esc(m)))
         .unwrap_or_default();
 
+    let hb_txt = match d.work_hb {
+        Some(ts) => rel_time(ts, d.now),
+        None => "无记录".into(),
+    };
     let state_note = match (
         d.filter_state.as_deref(),
         d.filter_repo.as_deref(),
@@ -310,7 +314,7 @@ footer form{{display:inline}}
 </style></head><body>
 <header>
   <div><h1>女娲 · 山海经<span class="sub">自愈式修复 Agent · 运维台</span></h1></div>
-  <div class="svc">serve: <b class="{serve_cls}">{serve}</b> &nbsp; work: <b class="{work_cls}">{work}</b></div>
+  <div class="svc">serve: <b class="{serve_cls}">{serve}</b> &nbsp; work: <b class="{work_cls}">{work}</b> &nbsp; 心跳: {hb}</div>
 </header>
 <div class="pipeline">{pipeline}</div>
 {flash_html}
@@ -332,6 +336,7 @@ footer form{{display:inline}}
         serve_cls = if d.serve == "active" { "ok" } else { "bad" },
         work = esc(&d.work),
         work_cls = if d.work == "active" { "ok" } else { "bad" },
+        hb = esc(&hb_txt),
         pipeline = pipeline,
         flash_html = flash_html,
         state_note = state_note,
@@ -363,6 +368,7 @@ pub async fn dashboard(
     let serve = svc_active("nuwa-serve");
     let work = svc_active("nuwa-work");
     let data = DashData {
+        work_hb: store.last_heartbeat().unwrap_or(None),
         filter_state: q.get("state").cloned(),
         filter_repo: q.get("repo").cloned(),
         flash: q.get("msg").cloned(),
@@ -451,6 +457,113 @@ pub async fn ui_auth(
             .into_response();
     }
     next.run(req).await
+}
+
+pub fn render_issue_detail(
+    row: &shanhaijing::IssueRow,
+    stack: Option<&str>,
+    events: &[shanhaijing::EventRow],
+    now: i64,
+) -> String {
+    let sc = state_color(&row.state);
+    let mut timeline = String::new();
+    for e in events {
+        timeline.push_str(&format!(
+            "<li><span class=\"mono dim\">{}</span> <b>{}</b> {} <span class=\"dim\">{}</span></li>",
+            rel_time(e.ts, now),
+            esc(&e.kind),
+            if e.detail.is_empty() {
+                String::new()
+            } else {
+                format!("<span class=\"dim\">— {}</span>", esc(&e.detail))
+            },
+            esc(&e.repo),
+        ));
+    }
+    let timeline = if timeline.is_empty() {
+        "<li class=\"dim\">暂无事件</li>".into()
+    } else {
+        format!("<ul class=\"feed\">{timeline}</ul>")
+    };
+    let stack_html = match stack {
+        Some(s) if !s.is_empty() => format!("<pre class=\"stack\">{}</pre>", esc(s)),
+        _ => "<p class=\"dim\">无堆栈样本</p>".to_string(),
+    };
+    let pr_html = row
+        .pr_url
+        .as_deref()
+        .map(|u| format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a>", esc(u), esc(u)))
+        .unwrap_or_else(|| "<span class=\"dim\">-</span>".into());
+    let action = if matches!(row.state.as_str(), "escalated" | "rejected") {
+        format!(
+            "<form method=\"post\" action=\"/ui/reopen\" style=\"display:inline\">\
+             <input type=\"hidden\" name=\"fp\" value=\"{}\"><button>reopen 重新入队</button></form>",
+            esc(&row.fingerprint)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} · Nuwa</title><style>
+body{{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:24px;max-width:980px;margin-inline:auto}}
+a{{color:#58a6ff;text-decoration:none}}
+h1{{font-size:20px}} h2{{font-size:14px;color:#8b949e;text-transform:uppercase;letter-spacing:.08em;margin:24px 0 10px}}
+.badge{{color:#0d1117;padding:2px 9px;border-radius:10px;font-weight:600;font-size:12px}}
+.mono{{font-family:ui-monospace,monospace;font-size:12px}} .dim{{color:#8b949e}}
+.meta{{display:flex;gap:18px;flex-wrap:wrap;color:#8b949e;font-size:13px;margin:10px 0}}
+pre.stack{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;overflow-x:auto;font-size:12px;line-height:1.5}}
+ul.feed{{list-style:none;padding:0;margin:0;font-size:13px}} ul.feed li{{padding:6px 0;border-bottom:1px solid #21262d}}
+button{{background:#238636;color:#fff;border:0;border-radius:6px;padding:6px 14px;cursor:pointer}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:10px}}
+</style></head><body>
+<p><a href="/ui">← 控制台</a></p>
+<h1>{title} <span class="badge" style="background:{sc}">{state}</span></h1>
+<div class="meta">
+  <span class="mono">{fp}</span><span>严重度：{sev}</span><span>出现 {occ} 次</span>
+  <span>首现 {first}</span><span>最近 {last}</span><span>仓库：{repo}</span>
+</div>
+<h2>PR</h2><div class="card">{pr}</div>
+<h2>堆栈样本</h2>
+{stack_html}
+<h2>生命周期</h2>
+{timeline}
+<p>{action}</p>
+</body></html>"#,
+        title = esc(&row.title),
+        state = esc(&row.state),
+        sc = sc,
+        fp = esc(&row.fingerprint),
+        sev = esc(&row.severity),
+        occ = row.occurrences,
+        first = rel_time(row.first_seen, now),
+        last = rel_time(row.last_seen, now),
+        repo = esc(&row.repo),
+        pr = pr_html,
+        stack_html = stack_html,
+        timeline = timeline,
+        action = action,
+    )
+}
+
+/// 详情页 handler。
+pub async fn issue_detail(
+    State((store, _)): State<Shared>,
+    axum::extract::Path(fp): axum::extract::Path<String>,
+) -> Response {
+    let rows = store.list_issues().unwrap_or_default();
+    let Some(row) = rows.iter().find(|r| r.fingerprint == fp) else {
+        return (StatusCode::NOT_FOUND, "unknown fingerprint").into_response();
+    };
+    let stack = store
+        .get(&fp)
+        .ok()
+        .flatten()
+        .map(|s| s.stack_sample)
+        .unwrap_or_default();
+    let events = store.events_for(&fp, 100).unwrap_or_default();
+    Html(render_issue_detail(row, Some(&stack), &events, crate::now_ms())).into_response()
 }
 
 #[cfg(test)]

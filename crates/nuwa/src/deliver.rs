@@ -242,7 +242,12 @@ pub async fn deliver(
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
         }
-        push_result?;
+        // push 耗尽重试：checkout 送回 main（分支保留在本地供取证），
+        // 避免工作树停在半交付态导致 runner preflight 持续拒绝服务。
+        if let Err(e) = push_result {
+            let _ = git(repo, &["checkout", &base]);
+            return Err(e.context(format!("branch {branch} kept locally for forensics")));
+        }
         if create_pr {
             let origin = git(repo, &["remote", "get-url", "origin"])
                 .context("read origin remote (PR creation needs a GitHub remote)")?;
@@ -276,6 +281,10 @@ pub async fn deliver(
             pr_number = Some(number);
         }
     }
+
+    // 交付完成：checkout 归位 base 分支（远端分支已推送，work 下一轮
+    // preflight 需要 main 上的干净树）。
+    let _ = git(repo, &["checkout", &base]);
 
     Ok(DeliverReport {
         branch,
