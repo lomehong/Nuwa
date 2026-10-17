@@ -23,3 +23,6 @@ job-logs.txt
 /rel-logs.txt
 /job-logs.txt
 /run2.json
+
+# Superpowers SDD workspace (local scratch)
+/.superpowers/
