@@ -137,7 +137,10 @@ mod tests {
             .to_string()
     }
 
-    async fn assert_placeholder(response: Response) {
+    /// Status, content type and cache policy hold whether the shell is the
+    /// placeholder or the built `web/dist/index.html` (M3+). The body assertion
+    /// only applies while the dist folder has no index.html.
+    async fn assert_index_shell(response: Response) {
         assert_eq!(response.status(), StatusCode::OK);
         let content_type = header_str(&response, header::CONTENT_TYPE);
         assert!(
@@ -145,22 +148,35 @@ mod tests {
             "got content type {content_type}"
         );
         assert_eq!(header_str(&response, header::CACHE_CONTROL), "no-cache");
-        assert!(
-            body_text(response).await.contains("frontend not built"),
-            "expected the placeholder page while web/dist has no index.html"
-        );
+        if Assets::get("index.html").is_none() {
+            assert!(
+                body_text(response).await.contains("frontend not built"),
+                "expected the placeholder page while web/dist has no index.html"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn root_serves_placeholder_when_dist_is_empty() {
-        assert_placeholder(serve_request(Method::GET, "/").await).await;
+    async fn root_serves_the_spa_shell() {
+        assert_index_shell(serve_request(Method::GET, "/").await).await;
     }
 
     #[tokio::test]
     async fn extensionless_spa_routes_fall_back_to_index_or_placeholder() {
         for path in ["/issues/abc", "/settings/github", "/issues/"] {
-            assert_placeholder(serve_request(Method::GET, path).await).await;
+            assert_index_shell(serve_request(Method::GET, path).await).await;
         }
+    }
+
+    // Cover the placeholder generator directly so the route tests above stay
+    // build-independent once `web/dist/index.html` exists.
+    #[tokio::test]
+    async fn placeholder_generator_serves_the_unbuilt_page() {
+        let response = placeholder(&Method::GET);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(header_str(&response, header::CONTENT_TYPE).starts_with("text/html"));
+        assert_eq!(header_str(&response, header::CACHE_CONTROL), "no-cache");
+        assert!(body_text(response).await.contains("frontend not built"));
     }
 
     #[tokio::test]

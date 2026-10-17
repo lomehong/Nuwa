@@ -377,6 +377,36 @@ mod tests {
         assert!(body_text(response).await.contains("山海经"));
     }
 
+    // The M0 origin guard must remain wired around the legacy write routes:
+    // valid Basic auth alone must not let a cross-site POST through.
+    #[tokio::test]
+    async fn legacy_write_rejects_cross_origin_post_even_with_valid_basic_auth() {
+        use base64::Engine;
+        let (_dir, app) = test_app();
+        let credential = base64::engine::general_purpose::STANDARD.encode("owner:secret");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/settings/save")
+                    .header(header::HOST, "localhost:7321")
+                    .header(header::ORIGIN, "https://evil.example")
+                    .header(header::AUTHORIZATION, format!("Basic {credential}"))
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_common_security_headers(&response);
+        assert_eq!(
+            header_str(&response, header::CONTENT_SECURITY_POLICY),
+            LEGACY_CSP
+        );
+        assert!(body_text(response).await.contains("cross-origin"));
+    }
+
     #[tokio::test]
     async fn unknown_api_route_returns_json_404() {
         let (_dir, app) = test_app();
@@ -396,20 +426,22 @@ mod tests {
         assert_eq!(value["error"]["code"], "not_found");
     }
 
+    // Build-independent: once M3 ships `web/dist/index.html` this serves the
+    // real shell, so only status/content-type/cache are asserted here. The
+    // placeholder body is covered by the web.rs unit tests.
     #[tokio::test]
-    async fn root_serves_placeholder_console() {
+    async fn root_serves_the_spa_shell() {
         let (_dir, app) = test_app();
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).expect("request"))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("text/html")));
-        assert!(body_text(response).await.contains("Nuwa console"));
+        assert!(
+            header_str(&response, header::CONTENT_TYPE).starts_with("text/html"),
+            "the shell must be HTML whether it is the placeholder or a built index.html"
+        );
+        assert_eq!(header_str(&response, header::CACHE_CONTROL), "no-cache");
     }
 
     #[tokio::test]
@@ -462,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn static_placeholder_carries_strict_security_headers() {
+    async fn static_shell_carries_strict_security_headers() {
         let (_dir, app) = test_app();
         let response = app
             .oneshot(
@@ -702,6 +734,24 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let value = json_body(response).await;
         assert_eq!(value["error"]["code"], "forbidden");
+
+        // Present but mismatched header token: still 403.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .extension(peer())
+                    .header(header::HOST, "localhost:7321")
+                    .header(header::COOKIE, format!("{session_pair}; {csrf_pair}"))
+                    .header("x-nuwa-csrf", "mismatched-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         // Valid session + cookie/header token: 204 and both cookies cleared.
         let response = app

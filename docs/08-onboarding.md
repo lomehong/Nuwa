@@ -81,6 +81,8 @@ nuwa work --db shanhaijing.db \
 
 **Web 控制台**：`http://<server>:7321/ui`（Basic 鉴权，用户名任意，**密码 = NUWA_INGEST_TOKEN**）——问题单总览（状态徽章/PR 链接，60s 自刷）、escalated 一键 reopen、sync 对账按钮、serve/work 活性。服务端渲染，无 JS 框架；鉴权复用上报令牌（泄露后果同级、可轮换）。
 
+**API 登录（v3 控制台）**：`POST /api/v1/auth/login`，body `{"token":"<NUWA_UI_TOKEN>"}`；成功 204 并设置 `nuwa_session`（HttpOnly）与 `nuwa_csrf`。后续非 GET 请求带 `X-NUWA-CSRF` 头。旧 `/ui` Basic 鉴权保留至 M6。
+
 | 命令 | 用途 |
 |---|---|
 | `nuwa serve --db p [--listen 127.0.0.1:7321]` | HTTP ingest 服务端：`POST /ingest`（单信封或 JSONL，`application/json`），`GET /health`。青鸟 `HTTPSink` 直连 |
