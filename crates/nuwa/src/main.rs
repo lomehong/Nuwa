@@ -271,6 +271,15 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let mut daily_pr_limit: u64 = env_d("NUWA_DAILY_PR_LIMIT", "5").parse().unwrap_or(5);
     let mut max_tokens: u64 = env_d("NUWA_MAX_TOKENS", "1500000").parse().unwrap_or(1_500_000);
     let mut ci_timeout_secs: u64 = env_d("NUWA_CI_TIMEOUT", "600").parse().unwrap_or(600);
+    let mut runner_id_given: Option<String> =
+        std::env::var("NUWA_RUNNER_ID").ok().filter(|v| !v.is_empty());
+    let mut service_unit = std::env::var("NUWA_SERVICE_UNIT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "nuwa-work".to_string());
+    let event_retention_days: u32 = env_d("NUWA_EVENT_RETENTION_DAYS", "90")
+        .parse()
+        .unwrap_or(90);
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
         let mut value =
@@ -314,47 +323,251 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             "--daily-pr-limit" => daily_pr_limit = value("--daily-pr-limit")?.parse()?,
             "--max-tokens" => max_tokens = value("--max-tokens")?.parse()?,
             "--ci-timeout" => ci_timeout_secs = value("--ci-timeout")?.parse()?,
+            "--runner-id" => runner_id_given = Some(value("--runner-id")?),
+            "--service-unit" => service_unit = value("--service-unit")?,
             other => bail!("unknown work flag {other}"),
         }
     }
     let provider = provider_given.unwrap_or_else(env_provider_default);
     let instructions_path = instructions_path.context("--instructions <path> is required")?;
 
-    let store = shanhaijing::Store::open(&db_path)
-        .with_context(|| format!("open db {}", db_path.display()))?;
+    let store = Arc::new(
+        shanhaijing::Store::open(&db_path)
+            .with_context(|| format!("open db {}", db_path.display()))?,
+    );
     let (repo_config, repo_dir) = instructions::RepoInstructions::load(&instructions_path)?;
 
-    loop {
-        let worked = work_once(
-            &store,
-            &repo_config,
-            &repo_dir,
-            sessions_dir.clone(),
-            provider.clone(),
-            max_turns,
-            push,
-            create_pr,
-            daily_pr_limit,
-            max_tokens,
-            ci_timeout_secs,
-        )
-        .await?;
-        if !loop_run {
-            break;
+    let runner_id = runner_id_given
+        .map(|id| sanitize_runner_id(&id))
+        .unwrap_or_else(|| default_runner_id(&repo_config.repo));
+    let (provider_name, model_name) = provider_meta(&provider);
+    let config_json = effective_config_json(
+        &repo_config,
+        interval_secs,
+        ci_timeout_secs,
+        max_turns,
+        max_tokens,
+    );
+    let now = now_ms();
+    let _ = store.mark_interrupted(&runner_id, now);
+    let _ = store.prune(now, event_retention_days, 365);
+    if let Err(e) = store.upsert_runner(&shanhaijing::RunnerUpsert {
+        id: runner_id.clone(),
+        repo: repo_config.repo.clone(),
+        host: std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "host".to_string()),
+        pid: Some(std::process::id() as i64),
+        started_at: now,
+        heartbeat_at: now,
+        status: "starting".into(),
+        provider: Some(provider_name),
+        model: Some(model_name),
+        daily_pr_limit: Some(daily_pr_limit as i64),
+        repo_path: Some(repo_dir.display().to_string()),
+        service_unit: Some(service_unit),
+        config_json: config_json.clone(),
+    }) {
+        eprintln!("runner register failed (telemetry only): {e}");
+    }
+    let live = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
+    let heartbeat_interval = std::time::Duration::from_secs(interval_secs.clamp(5, 15));
+    let heartbeat = spawn_heartbeat(
+        Arc::clone(&store),
+        runner_id.clone(),
+        heartbeat_interval,
+        Arc::clone(&live),
+        config_json,
+    );
+    live_update(&store, &runner_id, &live, "starting", None, None, None).await;
+
+    let result: anyhow::Result<()> = async {
+        loop {
+            let worked = work_once(
+                &store,
+                &repo_config,
+                &repo_dir,
+                sessions_dir.clone(),
+                provider.clone(),
+                max_turns,
+                push,
+                create_pr,
+                daily_pr_limit,
+                max_tokens,
+                ci_timeout_secs,
+                &runner_id,
+                Arc::clone(&live),
+            )
+            .await?;
+            if !loop_run {
+                break;
+            }
+            if !worked {
+                // Idle poll: back off. A worked issue may have a successor ready.
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+            }
         }
-        if !worked {
-            // Idle poll: back off. A worked issue may have a successor ready.
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+        Ok(())
+    }
+    .await;
+    heartbeat.abort();
+    result
+}
+
+#[derive(Debug)]
+struct RunnerLive {
+    status: String,
+    current_fingerprint: Option<String>,
+    phase: Option<String>,
+    last_error: Option<String>,
+}
+
+impl RunnerLive {
+    fn new() -> Self {
+        Self {
+            status: "starting".into(),
+            current_fingerprint: None,
+            phase: None,
+            last_error: None,
         }
     }
-    Ok(())
+}
+
+type SharedLive = Arc<tokio::sync::Mutex<RunnerLive>>;
+
+fn sanitize_runner_id(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    let value = if trimmed.is_empty() { "runner" } else { trimmed };
+    value.chars().take(128).collect()
+}
+
+fn default_runner_id(repo: &str) -> String {
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "host".to_string());
+    sanitize_runner_id(&format!("{host}:{repo}"))
+}
+
+fn provider_meta(provider: &repair::ProviderKind) -> (String, String) {
+    match provider {
+        repair::ProviderKind::Faux => ("faux".into(), "faux".into()),
+        repair::ProviderKind::Anthropic { model } => (
+            "anthropic".into(),
+            model.clone().unwrap_or_else(|| "<default>".into()),
+        ),
+        repair::ProviderKind::Zai { model, .. } => (
+            "zai".into(),
+            model.clone().unwrap_or_else(|| "glm-5.3-flash".into()),
+        ),
+    }
+}
+
+fn effective_config_json(
+    repo_config: &instructions::RepoInstructions,
+    interval_secs: u64,
+    ci_timeout_secs: u64,
+    max_turns: u32,
+    max_tokens: u64,
+) -> String {
+    serde_json::json!({
+        "interval_secs": interval_secs,
+        "ci_timeout_secs": ci_timeout_secs,
+        "max_turns": max_turns,
+        "max_tokens": max_tokens,
+        "failing_check": repo_config.failing_check.command,
+        "forbidden_paths_count": repo_config.forbidden_paths.len(),
+    })
+    .to_string()
+}
+
+async fn live_snapshot(live: &SharedLive) -> (String, Option<String>, Option<String>, Option<String>) {
+    let state = live.lock().await;
+    (
+        state.status.clone(),
+        state.current_fingerprint.clone(),
+        state.phase.clone(),
+        state.last_error.clone(),
+    )
+}
+
+async fn beat_now(store: &Arc<shanhaijing::Store>, runner_id: &str, live: &SharedLive) {
+    let (status, fp, phase, error) = live_snapshot(live).await;
+    let _ = store.heartbeat_runner(
+        runner_id,
+        &shanhaijing::RunnerHeartbeat {
+            heartbeat_at: now_ms(),
+            status,
+            current_fingerprint: fp,
+            phase,
+            config_json: None,
+            last_error: error,
+        },
+    );
+    // v0.2.x 回滚保护：旧控制台仍读全局 heartbeat 表。
+    let _ = store.heartbeat(now_ms());
+}
+
+async fn live_update(
+    store: &Arc<shanhaijing::Store>,
+    runner_id: &str,
+    live: &SharedLive,
+    status: &str,
+    fp: Option<&str>,
+    phase: Option<&str>,
+    error: Option<String>,
+) {
+    {
+        let mut state = live.lock().await;
+        state.status = status.to_string();
+        state.current_fingerprint = fp.map(str::to_string);
+        state.phase = phase.map(str::to_string);
+        state.last_error = error;
+    }
+    beat_now(store, runner_id, live).await;
+}
+
+fn spawn_heartbeat(
+    store: Arc<shanhaijing::Store>,
+    runner_id: String,
+    interval: std::time::Duration,
+    live: SharedLive,
+    config_json: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (status, fp, phase, error) = live_snapshot(&live).await;
+            let _ = store.heartbeat_runner(
+                &runner_id,
+                &shanhaijing::RunnerHeartbeat {
+                    heartbeat_at: now_ms(),
+                    status,
+                    current_fingerprint: fp,
+                    phase,
+                    config_json: Some(config_json.clone()),
+                    last_error: error,
+                },
+            );
+            let _ = store.heartbeat(now_ms());
+            tokio::time::sleep(interval).await;
+        }
+    })
 }
 
 /// One pickup attempt. `Ok(true)` = an issue was claimed and driven to a
 /// terminal state this pass; `Ok(false)` = nothing pickable.
 #[allow(clippy::too_many_arguments)]
 async fn work_once(
-    store: &shanhaijing::Store,
+    store: &Arc<shanhaijing::Store>,
     repo_config: &instructions::RepoInstructions,
     repo_dir: &Path,
     sessions_dir: PathBuf,
@@ -365,6 +578,8 @@ async fn work_once(
     daily_pr_limit: u64,
     max_tokens: u64,
     ci_timeout_secs: u64,
+    _runner_id: &str,
+    _live: SharedLive,
 ) -> anyhow::Result<bool> {
     let now = now_ms();
     // 活性必须在任何早退之前可见：配额待定/预检失败都不是"进程死了"。
@@ -891,6 +1106,34 @@ mod tests {
     use crate::issue::FailingCheck;
 
     #[test]
+    fn runner_id_is_sanitized_and_stable() {
+        let id = sanitize_runner_id("host/repo name:日本");
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')));
+        assert!(id.len() <= 128);
+        assert!(!id.is_empty());
+        assert_eq!(sanitize_runner_id("---"), "runner");
+    }
+
+    #[test]
+    fn default_runner_id_contains_repo() {
+        let id = default_runner_id("example.com/spike-target");
+        assert!(id.contains("example.com") || id.contains("spike-target"));
+    }
+
+    #[test]
+    fn provider_labels_are_stable() {
+        assert_eq!(provider_meta(&repair::ProviderKind::Faux), ("faux".into(), "faux".into()));
+        assert_eq!(
+            provider_meta(&repair::ProviderKind::Zai { base_url: None, model: None }),
+            ("zai".into(), "glm-5.3-flash".into())
+        );
+        assert_eq!(
+            provider_meta(&repair::ProviderKind::Anthropic { model: None }),
+            ("anthropic".into(), "<default>".into())
+        );
+    }
+
+    #[test]
     fn migrate_env_command_normalizes_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nuwa.env");
@@ -905,7 +1148,7 @@ mod tests {
     #[tokio::test]
     async fn quota_stand_down_still_writes_heartbeat() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = shanhaijing::Store::open(dir.path().join("s.db")).expect("open");
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
         let now = now_ms();
         let signal = shanhaijing::Signal {
             repo: "example.com/spike".into(),
@@ -937,6 +1180,8 @@ mod tests {
             1,
             1_000_000,
             600,
+            "test:runner",
+            Arc::new(tokio::sync::Mutex::new(RunnerLive::new())),
         )
         .await
         .expect("work_once");
