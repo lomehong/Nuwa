@@ -578,8 +578,8 @@ async fn work_once(
     daily_pr_limit: u64,
     max_tokens: u64,
     ci_timeout_secs: u64,
-    _runner_id: &str,
-    _live: SharedLive,
+    runner_id: &str,
+    live: SharedLive,
 ) -> anyhow::Result<bool> {
     let now = now_ms();
     // 活性必须在任何早退之前可见：配额待定/预检失败都不是"进程死了"。
@@ -596,6 +596,7 @@ async fn work_once(
                 "quota      : {opened}/{daily_pr_limit} PRs today for {} — standing down until the window rolls",
                 repo_config.repo
             );
+            live_update(store, runner_id, &live, "standing_down", None, None, None).await;
             return Ok(false);
         }
     }
@@ -603,24 +604,40 @@ async fn work_once(
     // ---- repo preflight: a dirty or off-main checkout wastes a run ----
     // These are environment faults (a previous run left the checkout behind),
     // not issue faults — bail loudly instead of claiming and escalating.
-    let head = deliver::git(repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let head = match deliver::git(repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(head) => head,
+        Err(e) => {
+            live_update(store, runner_id, &live, "error", None, None, Some(format!("{e:#}"))).await;
+            return Err(e);
+        }
+    };
     if head != "main" && head != "master" {
-        bail!(
+        let message = format!(
             "repo {} is on branch `{}` — runner only works from main/master; reset the checkout",
             repo_dir.display(),
             head
         );
+        live_update(store, runner_id, &live, "error", None, None, Some(message.clone())).await;
+        bail!("{message}");
     }
-    let dirty = deliver::git(
+    let dirty = match deliver::git(
         repo_dir,
         &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
-    )?;
+    ) {
+        Ok(dirty) => dirty,
+        Err(e) => {
+            live_update(store, runner_id, &live, "error", None, None, Some(format!("{e:#}"))).await;
+            return Err(e);
+        }
+    };
     if !dirty.trim().is_empty() {
-        bail!(
+        let message = format!(
             "repo {} has an unclean working tree — reset before running:\n{}",
             repo_dir.display(),
             dirty.trim()
         );
+        live_update(store, runner_id, &live, "error", None, None, Some(message.clone())).await;
+        bail!("{message}");
     }
 
     // ---- claim (atomic: N runners can never share an issue) ----
@@ -628,17 +645,32 @@ async fn work_once(
         store.claim_ready_issue(now, now + shanhaijing::DEFAULT_COOLDOWN_MS)?
     else {
         println!("nothing ready for pickup");
+        live_update(store, runner_id, &live, "idle", None, None, None).await;
         return Ok(false);
     };
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let (provider_name, model_name) = provider_meta(&provider);
     if snapshot.repo != repo_config.repo {
-        bail!(
+        let message = format!(
             "repo mismatch: issue `{}` belongs to `{}`, instructions are for `{}` — refusing (ADR-004)",
             snapshot.fingerprint,
             snapshot.repo,
             repo_config.repo
         );
+        live_update(store, runner_id, &live, "error", Some(&snapshot.fingerprint), None, Some(message.clone())).await;
+        bail!("{message}");
     }
     let fp = snapshot.fingerprint.clone();
+    let _ = store.start_run(&shanhaijing::RunStart {
+        id: run_id.clone(),
+        fingerprint: fp.clone(),
+        runner_id: runner_id.to_string(),
+        repo: snapshot.repo.clone(),
+        started_at: now,
+        provider: Some(provider_name.clone()),
+        model: Some(model_name.clone()),
+    });
+    live_update(store, runner_id, &live, "working", Some(&fp), Some("claim"), None).await;
     println!(
         "claimed    : {} [{}] {} — {}x\nrepo       : {}\nprovider   : {}",
         fp,
@@ -658,7 +690,13 @@ async fn work_once(
             },
         },
     );
-    store.set_state(&fp, shanhaijing::State::Fixing, now, Some("repair run started"))?;
+    store.set_state_as(
+        &fp,
+        shanhaijing::State::Fixing,
+        now,
+        Some("repair run started"),
+        "runner",
+    )?;
 
     // ---- repair ----
     let prob = issue::Issue {
@@ -675,6 +713,20 @@ async fn work_once(
         forbidden_paths: repo_config.forbidden_paths.clone(),
     };
     let guards = std::sync::Arc::new(guard::Guards::new(repo_config.forbidden_paths.clone()));
+    let progress_store = Arc::clone(store);
+    let progress_run = run_id.clone();
+    let progress: Option<Arc<dyn Fn(repair::RepairProgress) + Send + Sync>> =
+        Some(Arc::new(move |p| {
+            let _ = progress_store.update_run(
+                &progress_run,
+                &shanhaijing::RunUpdate {
+                    turns: Some(i64::from(p.turns)),
+                    tokens_uncached: Some(p.uncached_tokens as i64),
+                    tokens_cached: Some(p.cached_tokens as i64),
+                    ..Default::default()
+                },
+            );
+        }));
     let job = repair::RepairJob {
         repo: repo_dir.to_path_buf(),
         issue: prob,
@@ -683,14 +735,25 @@ async fn work_once(
         max_turns,
         guards,
         notes: repo_config.notes.clone(),
-        progress: None,
+        progress,
     };
 
+    live_update(store, runner_id, &live, "working", Some(&fp), Some("repair"), None).await;
     let report = match repair::run(&job).await {
         Ok(r) => r,
         Err(e) => {
             let detail = format!("repair_failed: {e:#}");
-            store.set_state(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()))?;
+            let _ = store.finish_run(
+                &run_id,
+                &shanhaijing::RunFinish {
+                    finished_at: now_ms(),
+                    outcome: "repair_failed".into(),
+                    ci_verdict: None,
+                    error: Some(detail.clone()),
+                },
+            );
+            live_update(store, runner_id, &live, "error", Some(&fp), None, Some(detail.clone())).await;
+            store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
             bail!("repair failed — issue escalated: {e:#}");
         }
     };
@@ -701,18 +764,45 @@ async fn work_once(
         .unwrap_or("(no ROOT CAUSE line)");
     println!("root cause : {cause}");
 
+    // 事件排水在 prompt 返回时被 abort，尾部的 TurnEnd 可能缺失；以
+    // RepairReport 的累计值/轮数为准覆盖进度回调的中间态。
+    let _ = store.update_run(
+        &run_id,
+        &shanhaijing::RunUpdate {
+            phase: Some("verify".into()),
+            harness_run_id: Some(report.run_id.clone()),
+            turns: Some(i64::from(report.turns)),
+            tokens_uncached: Some(report.uncached_tokens as i64),
+            tokens_cached: Some(report.cached_tokens as i64),
+            root_cause: Some(report.root_cause_text.clone()),
+            session_dir: Some(report.session_dir.clone()),
+            ..Default::default()
+        },
+    );
+
     // ---- budget gate: per-issue token ceiling ----
     // The turn cap bounds the loop mid-run (RPI_MAX_TURNS_PER_RUN); this gate
     // is the spend ceiling — an over-budget run never reaches delivery.
     let spent = report.uncached_tokens + report.cached_tokens;
     if spent > max_tokens {
-        let detail = format!("token budget exceeded: {spent} > {max_tokens}");
-        store.set_state(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()))?;
+        let detail = format!("budget_exceeded: {spent} > {max_tokens}");
+        let _ = store.finish_run(
+            &run_id,
+            &shanhaijing::RunFinish {
+                finished_at: now_ms(),
+                outcome: "budget_exceeded".into(),
+                ci_verdict: None,
+                error: Some(detail.clone()),
+            },
+        );
+        live_update(store, runner_id, &live, "error", Some(&fp), None, Some(detail.clone())).await;
+        store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
         bail!("{detail} — issue escalated");
     }
     println!("tokens     : {spent} (cap {max_tokens})");
 
     // ---- deliver ----
+    live_update(store, runner_id, &live, "working", Some(&fp), Some("deliver"), None).await;
     let delivered = match deliver::deliver(
         &job.repo,
         &job.issue,
@@ -726,81 +816,217 @@ async fn work_once(
         Ok(d) => d,
         Err(e) => {
             let detail = format!("delivery_failed: {e:#}");
-            store.set_state(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()))?;
+            let _ = store.finish_run(
+                &run_id,
+                &shanhaijing::RunFinish {
+                    finished_at: now_ms(),
+                    outcome: "delivery_failed".into(),
+                    ci_verdict: None,
+                    error: Some(detail.clone()),
+                },
+            );
+            live_update(store, runner_id, &live, "error", Some(&fp), None, Some(detail.clone())).await;
+            store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
             bail!("delivery failed — issue escalated: {e:#}");
         }
     };
 
-    store.set_state(
+    let pr_opened_at = delivered.pr_url.as_ref().map(|_| now_ms());
+    let _ = store.update_run(
+        &run_id,
+        &shanhaijing::RunUpdate {
+            phase: Some("ci".into()),
+            branch: Some(delivered.branch.clone()),
+            commit_sha: Some(delivered.commit.clone()),
+            pr_url: delivered.pr_url.clone(),
+            pr_opened_at,
+            verification_ok: Some(true),
+            verification_detail: Some(delivered.verification_detail.clone()),
+            change_stat: Some(delivered.change_stat.clone()),
+            session_dir: Some(report.session_dir.clone()),
+            ..Default::default()
+        },
+    );
+
+    store.set_state_as(
         &fp,
         shanhaijing::State::PrOpen,
         now_ms(),
         Some(delivered.pr_url.as_deref().unwrap_or("branch pushed, no PR")),
+        "runner",
     )?;
     if let Some(url) = &delivered.pr_url {
         store.set_pr(&fp, url, now_ms())?;
     }
 
+    if !create_pr {
+        let _ = store.finish_run(
+            &run_id,
+            &shanhaijing::RunFinish {
+                finished_at: now_ms(),
+                outcome: "success".into(),
+                ci_verdict: None,
+                error: None,
+            },
+        );
+        live_update(store, runner_id, &live, "idle", None, None, None).await;
+        println!(
+            "delivered  : branch {} commit {} pr {}",
+            delivered.branch,
+            &delivered.commit[..12.min(delivered.commit.len())],
+            delivered.pr_url.as_deref().unwrap_or("-"),
+        );
+        return Ok(true);
+    }
+
     // ---- CI 闸门消费（docs/03 末段）：红 → 自动关 PR + rejected；绿/超时 → 留给人工合并 ----
-    if create_pr {
-        if let (Some(slug), Some(number)) = (&delivered.slug, delivered.pr_number) {
-            let token = std::env::var("NUWA_GITHUB_TOKEN")
-                .or_else(|_| std::env::var("GITHUB_TOKEN"))
-                .context("NUWA_GITHUB_TOKEN not set — cannot poll CI checks")?;
-            println!(
-                "ci gate   : polling checks for {} (timeout {ci_timeout_secs}s)…",
-                &delivered.commit[..12.min(delivered.commit.len())]
-            );
-            let checks = ci::wait_for_ci(&token, slug, &delivered.commit, ci_timeout_secs).await;
-            match checks {
-                Ok(ci::Verdict::Success) => {
-                    println!("ci gate   : all checks green — PR open, awaiting human merge");
-                    let _ = store.record_event(
-                        &fp,
-                        now_ms(),
-                        Some(&repo_config.repo),
-                        "runner",
-                        "ci_green",
-                        &format!("head {}", &delivered.commit[..12.min(delivered.commit.len())]),
+    live_update(store, runner_id, &live, "working", Some(&fp), Some("ci"), None).await;
+    if let (Some(slug), Some(number)) = (&delivered.slug, delivered.pr_number) {
+        let token = std::env::var("NUWA_GITHUB_TOKEN")
+            .or_else(|_| std::env::var("GITHUB_TOKEN"))
+            .context("NUWA_GITHUB_TOKEN not set — cannot poll CI checks")?;
+        println!(
+            "ci gate   : polling checks for {} (timeout {ci_timeout_secs}s)…",
+            &delivered.commit[..12.min(delivered.commit.len())]
+        );
+        let checks = ci::wait_for_ci(&token, slug, &delivered.commit, ci_timeout_secs).await;
+        match checks {
+            Ok(ci::Verdict::Success) => {
+                println!("ci gate   : all checks green — PR open, awaiting human merge");
+                let _ = store.update_run(
+                    &run_id,
+                    &shanhaijing::RunUpdate {
+                        ci_verdict: Some("success".into()),
+                        ..Default::default()
+                    },
+                );
+                let _ = store.finish_run(
+                    &run_id,
+                    &shanhaijing::RunFinish {
+                        finished_at: now_ms(),
+                        outcome: "success".into(),
+                        ci_verdict: Some("success".into()),
+                        error: None,
+                    },
+                );
+                let _ = store.record_event(
+                    &fp,
+                    now_ms(),
+                    Some(&repo_config.repo),
+                    "runner",
+                    "ci_green",
+                    &format!("head {}", &delivered.commit[..12.min(delivered.commit.len())]),
+                );
+            }
+            Ok(ci::Verdict::Failure) => {
+                if let Err(e) = ci::close_pr(&token, slug, number).await {
+                    let detail = format!("ci_red: close PR failed: {e:#}");
+                    let _ = store.finish_run(
+                        &run_id,
+                        &shanhaijing::RunFinish {
+                            finished_at: now_ms(),
+                            outcome: "ci_red".into(),
+                            ci_verdict: Some("failure".into()),
+                            error: Some(detail.clone()),
+                        },
                     );
+                    live_update(store, runner_id, &live, "error", Some(&fp), None, Some(detail)).await;
+                    return Err(e);
                 }
-                Ok(ci::Verdict::Failure) => {
-                    ci::close_pr(&token, slug, number).await?;
-                    let _ = store.record_event(
-                        &fp,
-                        now_ms(),
-                        Some(&repo_config.repo),
-                        "runner",
-                        "ci_red",
-                        &format!("head {} — PR #{number} closed", &delivered.commit[..12.min(delivered.commit.len())]),
-                    );
-                    store.set_state(
-                        &fp,
-                        shanhaijing::State::Rejected,
-                        now_ms(),
-                        Some(&format!("ci_red: CI red — PR #{number} closed, back to owner")),
-                    )?;
-                    bail!("CI red — PR #{number} closed, issue rejected (regression signal will reopen it)");
-                }
-                Ok(ci::Verdict::TimedOut) => {
-                    let _ = store.record_event(&fp, now_ms(), Some(&repo_config.repo), "runner", "ci_timeout", slug);
-                    println!(
-                        "ci gate   : checks unfinished in {ci_timeout_secs}s — PR left open, check manually"
-                    );
-                }
-                Err(e) => {
-                    // Checks unreadable (fine-grained PAT missing Actions/Checks
-                    // read on this repo): the PR stays open, the issue stays
-                    // pr_open — merging remains the human decision.
-                    println!(
-                        "ci gate   : checks unavailable ({e:#}) — PR left open; \
-                         grant the PAT Actions:Read-only + Contents:Read-only on this repo"
-                    );
-                }
+                let _ = store.update_run(
+                    &run_id,
+                    &shanhaijing::RunUpdate {
+                        ci_verdict: Some("failure".into()),
+                        ..Default::default()
+                    },
+                );
+                let _ = store.finish_run(
+                    &run_id,
+                    &shanhaijing::RunFinish {
+                        finished_at: now_ms(),
+                        outcome: "ci_red".into(),
+                        ci_verdict: Some("failure".into()),
+                        error: Some(format!("CI red — PR #{number} closed")),
+                    },
+                );
+                let _ = store.record_event(
+                    &fp,
+                    now_ms(),
+                    Some(&repo_config.repo),
+                    "runner",
+                    "ci_red",
+                    &format!("head {} — PR #{number} closed", &delivered.commit[..12.min(delivered.commit.len())]),
+                );
+                store.set_state_as(
+                    &fp,
+                    shanhaijing::State::Rejected,
+                    now_ms(),
+                    Some(&format!("ci_red: CI red — PR #{number} closed, back to owner")),
+                    "runner",
+                )?;
+                live_update(
+                    store,
+                    runner_id,
+                    &live,
+                    "error",
+                    Some(&fp),
+                    None,
+                    Some(format!("CI red — PR #{number} closed")),
+                )
+                .await;
+                bail!("CI red — PR #{number} closed, issue rejected (regression signal will reopen it)");
+            }
+            Ok(ci::Verdict::TimedOut) => {
+                let _ = store.record_event(&fp, now_ms(), Some(&repo_config.repo), "runner", "ci_timeout", slug);
+                let _ = store.update_run(
+                    &run_id,
+                    &shanhaijing::RunUpdate {
+                        ci_verdict: Some("timeout".into()),
+                        ..Default::default()
+                    },
+                );
+                let _ = store.finish_run(
+                    &run_id,
+                    &shanhaijing::RunFinish {
+                        finished_at: now_ms(),
+                        outcome: "success".into(),
+                        ci_verdict: Some("timeout".into()),
+                        error: None,
+                    },
+                );
+                println!(
+                    "ci gate   : checks unfinished in {ci_timeout_secs}s — PR left open, check manually"
+                );
+            }
+            Err(e) => {
+                // Checks unreadable (fine-grained PAT missing Actions/Checks
+                // read on this repo): the PR stays open, the issue stays
+                // pr_open — merging remains the human decision.
+                let _ = store.update_run(
+                    &run_id,
+                    &shanhaijing::RunUpdate {
+                        ci_verdict: Some("unavailable".into()),
+                        ..Default::default()
+                    },
+                );
+                let _ = store.finish_run(
+                    &run_id,
+                    &shanhaijing::RunFinish {
+                        finished_at: now_ms(),
+                        outcome: "success".into(),
+                        ci_verdict: Some("unavailable".into()),
+                        error: None,
+                    },
+                );
+                println!(
+                    "ci gate   : checks unavailable ({e:#}) — PR left open; \
+                     grant the PAT Actions:Read-only + Contents:Read-only on this repo"
+                );
             }
         }
     }
 
+    live_update(store, runner_id, &live, "idle", None, None, None).await;
     println!(
         "delivered  : branch {} commit {} pr {}",
         delivered.branch,
@@ -1189,5 +1415,104 @@ mod tests {
         assert!(!worked, "quota must stand down");
         let hb = store.last_heartbeat().expect("heartbeat").expect("some heartbeat");
         assert!((now_ms() - hb).abs() < 5_000, "heartbeat must be fresh");
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn git_output(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {:?} failed", args);
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    // The harness calls `block_in_place`, which panics on the default
+    // current-thread test runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn faux_run_writes_run_telemetry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::write(
+            repo.join("calc.go"),
+            "package main\n\nfunc Average(xs []float64) float64 {\n\
+             \tvar sum float64\n\
+             \tfor i := 0; i <= len(xs); i++ {\n\
+             \t\tsum += xs[i]\n\
+             \t}\n\
+             \treturn sum / float64(len(xs))\n\
+             }\n",
+        )
+        .expect("write");
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
+        );
+
+        let store = Arc::new(
+            shanhaijing::Store::open(dir.path().join("s.db")).expect("open"),
+        );
+        let now = now_ms();
+        let signal = shanhaijing::Signal {
+            repo: "example.com/spike".into(),
+            language: "go".into(),
+            title: "panic in Average".into(),
+            severity: "high".into(),
+            message: None,
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+        };
+        store.report_signal(&signal, now).expect("report");
+
+        let cfg = RepoInstructions {
+            repo: "example.com/spike".into(),
+            failing_check: FailingCheck { command: "echo ok".into(), target: None },
+            forbidden_paths: Vec::new(),
+            notes: String::new(),
+        };
+        let live: SharedLive = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
+        let worked = work_once(
+            &store,
+            &cfg,
+            &repo,
+            dir.path().join("sessions"),
+            repair::ProviderKind::Faux,
+            5,
+            false,
+            false,
+            5,
+            1_000_000,
+            600,
+            "test:runner",
+            Arc::clone(&live),
+        )
+        .await
+        .expect("work");
+        assert!(worked);
+
+        let issue = store.list_issues().expect("issues").pop().expect("issue");
+        let run = store.latest_run(&issue.fingerprint).expect("latest").expect("run");
+        assert_eq!(run.phase, "done");
+        assert_eq!(run.outcome.as_deref(), Some("success"));
+        assert!(run.turns >= 1, "faux run must record at least one turn");
+        assert!(run.session_dir.is_some());
+        assert!(run.verification_ok == Some(true));
+        assert!(run.branch.as_deref().unwrap_or("").starts_with("agent/fix/"));
+        assert_eq!(run.runner_id, "test:runner");
+        // 交付后工作树已切回 main；修复内容在 agent 分支上取证。
+        let branch = run.branch.clone().expect("branch");
+        let fixed = git_output(&repo, &["show", &format!("{branch}:calc.go")]);
+        assert!(fixed.contains("i < len(xs)"));
     }
 }

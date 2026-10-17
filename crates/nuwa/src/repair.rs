@@ -59,9 +59,6 @@ pub struct RepairJob {
 }
 
 /// Live progress snapshot handed to `RepairJob::progress` after each turn.
-// Fields gain their production reader when `work_once` wires the progress
-// sink (M1b Task 4); until then only tests read them.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct RepairProgress {
     pub turns: u32,
@@ -77,7 +74,6 @@ pub struct RepairReport {
     pub cached_tokens: u64,
     /// Absolute per-issue session directory (JSONL transcripts).
     // Read by the work-loop run telemetry (M1b Task 4).
-    #[allow(dead_code)]
     pub session_dir: String,
 }
 

@@ -23,11 +23,9 @@ pub struct DeliverReport {
     pub pr_number: Option<u64>,
     /// Verification command plus combined output, bounded (see `truncate_evidence`).
     // Read by the work-loop run telemetry (M1b Task 4).
-    #[allow(dead_code)]
     pub verification_detail: String,
     /// `git diff --stat` of the delivered branch, bounded (see `truncate_evidence`).
     // Read by the work-loop run telemetry (M1b Task 4).
-    #[allow(dead_code)]
     pub change_stat: String,
 }
 
