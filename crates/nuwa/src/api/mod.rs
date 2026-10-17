@@ -1,12 +1,13 @@
-// M2a Task 2 lands the error contract before the routes that consume it.
-// Remove this allow once the API handlers are wired.
-#![allow(dead_code)]
+pub mod auth;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::serve::AppState;
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -54,9 +55,13 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
+    // Consumed by the issue/deliver endpoints in M2b/M2c.
+    #[allow(dead_code)]
     pub fn invalid_state(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "invalid_state", message)
     }
+    // Consumed by the issue endpoints in M2b.
+    #[allow(dead_code)]
     pub fn validation(fields: BTreeMap<String, String>) -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -72,6 +77,8 @@ impl ApiError {
             format!("retry after {retry_after_ms}ms"),
         )
     }
+    // Consumed by the GitHub/LLM-backed endpoints in M2c.
+    #[allow(dead_code)]
     pub fn upstream(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, "upstream_error", message)
     }
@@ -85,13 +92,27 @@ impl IntoResponse for ApiError {
 }
 
 pub fn api_not_found() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, "not_found", "unknown API endpoint")
+    ApiError::not_found("unknown API endpoint")
 }
 
-/// `/api/v1` router. Task 4 replaces this fallback-only stub with the auth
-/// routes and the session/CSRF middleware.
-pub fn router(state: std::sync::Arc<crate::serve::AppState>) -> axum::Router {
-    axum::Router::new()
+/// `/api/v1` router: public login plus session/CSRF-protected routes.
+pub fn router(state: Arc<AppState>) -> axum::Router {
+    use axum::routing::{get, post};
+
+    let public = axum::Router::new().route("/auth/login", post(auth::login));
+    let protected = axum::Router::new()
+        .route("/auth/logout", post(auth::logout))
+        .route("/auth/me", get(auth::me))
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::session::require_session,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::session::csrf_guard,
+        ));
+    public
+        .merge(protected)
         .fallback(|| async { api_not_found() })
         .with_state((*state).clone())
 }

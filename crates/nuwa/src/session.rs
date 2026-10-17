@@ -1,11 +1,12 @@
-// M2a Task 1 lands the auth primitives before the routes that consume them.
-// Remove this allow once the auth/CSRF middleware and login handlers are wired.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderMap, Method};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum_extra::extract::cookie::CookieJar;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -22,7 +23,6 @@ pub struct SessionManager {
 pub struct IssuedSession {
     pub token: String,
     pub csrf: String,
-    pub expires_at_ms: i64,
 }
 
 impl SessionManager {
@@ -37,7 +37,7 @@ impl SessionManager {
         let payload = format!("v1.{expires_at_ms}.{nonce}");
         let token = format!("{payload}.{}", self.sign(&payload));
         let csrf = uuid::Uuid::new_v4().simple().to_string();
-        IssuedSession { token, csrf, expires_at_ms }
+        IssuedSession { token, csrf }
     }
 
     fn sign(&self, payload: &str) -> String {
@@ -134,7 +134,11 @@ fn authority(url: &str) -> Option<&str> {
 }
 
 pub fn origin_ok(origin: Option<&str>, referer: Option<&str>, host: Option<&str>) -> bool {
-    let Some(host) = host else { return false };
+    // An empty Host can never match a real authority, and accepting it would
+    // let a header-less request skip the same-origin check entirely.
+    let Some(host) = host.filter(|host| !host.is_empty()) else {
+        return false;
+    };
     let candidate = match origin {
         Some(o) => authority(o),
         None => referer.and_then(authority),
@@ -143,6 +147,60 @@ pub fn origin_ok(origin: Option<&str>, referer: Option<&str>, host: Option<&str>
         Some(h) => h.eq_ignore_ascii_case(host),
         None => origin.is_none() && referer.is_none(),
     }
+}
+
+/// Session gate for protected `/api/v1` routes. Local mode (no UI token) is
+/// implicitly authenticated; otherwise a valid signed `nuwa_session` cookie
+/// is required.
+pub async fn require_session(
+    State(state): State<Arc<crate::serve::AppState>>,
+    jar: CookieJar,
+    req: Request,
+    next: Next,
+) -> Response {
+    if state.ui_token.is_none() {
+        return next.run(req).await;
+    }
+    let Some(cookie) = jar.get("nuwa_session") else {
+        return crate::api::ApiError::unauthorized("not logged in").into_response();
+    };
+    if state.session.verify(cookie.value(), now_ms()).is_none() {
+        return crate::api::ApiError::unauthorized("session expired").into_response();
+    }
+    next.run(req).await
+}
+
+/// Double-submit CSRF gate: mutating requests need the `nuwa_csrf` cookie and
+/// the `X-NUWA-CSRF` header to match, plus an Origin/Referer (when present)
+/// whose authority equals Host. Local mode is *not* exempt.
+pub async fn csrf_guard(
+    State(_state): State<Arc<crate::serve::AppState>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    req: Request,
+    next: Next,
+) -> Response {
+    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return next.run(req).await;
+    }
+    let cookie = jar
+        .get("nuwa_csrf")
+        .map(|cookie| cookie.value())
+        .unwrap_or("");
+    let header = headers
+        .get("x-nuwa-csrf")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let origin = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok());
+    let referer = headers.get(header::REFERER).and_then(|value| value.to_str().ok());
+    let host = headers.get(header::HOST).and_then(|value| value.to_str().ok());
+    if cookie.is_empty()
+        || !SessionManager::token_eq(cookie, header)
+        || !origin_ok(origin, referer, host)
+    {
+        return crate::api::ApiError::forbidden("CSRF check failed").into_response();
+    }
+    next.run(req).await
 }
 
 #[cfg(test)]
@@ -189,5 +247,12 @@ mod tests {
         assert!(origin_ok(Some("https://h:1"), None, Some("h:1")));
         assert!(!origin_ok(Some("https://evil"), None, Some("h:1")));
         assert!(!origin_ok(Some("https://h:1"), None, None));
+    }
+
+    #[test]
+    fn origin_ok_rejects_empty_host() {
+        assert!(!origin_ok(None, None, Some("")));
+        assert!(!origin_ok(Some("https://h:1"), None, Some("")));
+        assert!(!origin_ok(None, Some("https://h:1/"), Some("")));
     }
 }

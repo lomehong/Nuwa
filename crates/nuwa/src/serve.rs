@@ -16,14 +16,6 @@ use axum::Router;
 use crate::{now_ms, parse_signals, report_one, Shared};
 
 /// State shared by the legacy console routes and the `/api/v1` surface.
-/// `session`, `limiter`, `started_at_ms` and `cookie_secure` are consumed by
-/// the Task 4 auth routes/middleware; `build_app` already wires the legacy
-/// routes from `store`/`ui_token`/`ingest_token`.
-//
-// Temporary: those four fields are constructed but not read until Task 4, so
-// the bin target would fail the zero-warning gate. Remove this allow when the
-// login/logout/me routes and session middleware land.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<shanhaijing::Store>,
@@ -32,6 +24,8 @@ pub struct AppState {
     pub ingest_token: Arc<Option<String>>,
     pub session: Arc<crate::session::SessionManager>,
     pub limiter: Arc<crate::session::LoginLimiter>,
+    /// Read by the M2c system-status endpoint.
+    #[allow(dead_code)]
     pub started_at_ms: i64,
     pub cookie_secure: bool,
 }
@@ -198,18 +192,28 @@ mod tests {
     use axum::http::{header, Request, StatusCode};
     use tower::ServiceExt;
 
-    fn test_app() -> (tempfile::TempDir, Router) {
+    fn test_state(ui_token: Option<&str>) -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
+        let ui_token = Arc::new(ui_token.map(str::to_string));
+        let session_key = ui_token.as_deref().unwrap_or("");
         let state = AppState {
             store,
-            ui_token: Arc::new(Some("secret".into())),
+            ui_token: Arc::clone(&ui_token),
             ingest_token: Arc::new(Some("ingest-secret".into())),
-            session: Arc::new(crate::session::SessionManager::new("secret", 86_400_000)),
+            session: Arc::new(crate::session::SessionManager::new(
+                session_key,
+                86_400_000,
+            )),
             limiter: Arc::new(crate::session::LoginLimiter::new()),
             started_at_ms: crate::now_ms(),
             cookie_secure: false,
         };
+        (dir, state)
+    }
+
+    fn test_app() -> (tempfile::TempDir, Router) {
+        let (dir, state) = test_state(Some("secret"));
         (dir, build_app(state))
     }
 
@@ -218,6 +222,51 @@ mod tests {
             .await
             .expect("body");
         String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        serde_json::from_str(&body_text(response).await).expect("json body")
+    }
+
+    fn peer() -> axum::extract::ConnectInfo<SocketAddr> {
+        axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 41234)))
+    }
+
+    async fn login(app: &Router, token: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .extension(peer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "token": token }).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    fn set_cookie(response: &Response, name: &str) -> String {
+        let prefix = format!("{name}=");
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("missing Set-Cookie for {name}"))
+            .to_string()
+    }
+
+    fn cookie_pair(set_cookie: &str) -> String {
+        set_cookie.split(';').next().expect("cookie pair").to_string()
+    }
+
+    fn cookie_token(pair: &str) -> &str {
+        pair.split_once('=').expect("cookie token").1
     }
 
     #[tokio::test]
@@ -332,5 +381,310 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body_text(response).await.contains("new issue"));
+    }
+
+    #[tokio::test]
+    async fn api_login_issues_cookies_and_me_reports_session() {
+        let (_dir, app) = test_app();
+        let response = login(&app, "secret").await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let session = set_cookie(&response, "nuwa_session");
+        let csrf = set_cookie(&response, "nuwa_csrf");
+        for attr in ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age=86400"] {
+            assert!(
+                session.contains(attr),
+                "session Set-Cookie missing {attr}: {session}"
+            );
+        }
+        assert!(
+            !session.contains("Secure"),
+            "plain HTTP must not mark the session Secure: {session}"
+        );
+        assert!(
+            !csrf.contains("HttpOnly"),
+            "csrf cookie must stay readable by the SPA: {csrf}"
+        );
+        for attr in ["SameSite=Strict", "Path=/", "Max-Age=86400"] {
+            assert!(csrf.contains(attr), "csrf Set-Cookie missing {attr}: {csrf}");
+        }
+        assert!(
+            !csrf.contains("Secure"),
+            "plain HTTP must not mark the csrf cookie Secure: {csrf}"
+        );
+
+        let cookie_header = format!("{}; {}", cookie_pair(&session), cookie_pair(&csrf));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .extension(peer())
+                    .header(header::COOKIE, cookie_header)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["authenticated"], true);
+        assert_eq!(value["local_mode"], false);
+        assert!(value["expires_at_ms"].is_i64(), "got {value}");
+    }
+
+    #[tokio::test]
+    async fn api_me_without_session_is_unauthorized() {
+        let (_dir, app) = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .extension(peer())
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn api_logout_requires_csrf_and_clears_cookies() {
+        let (_dir, app) = test_app();
+        let login_response = login(&app, "secret").await;
+        assert_eq!(login_response.status(), StatusCode::NO_CONTENT);
+        let session_pair = cookie_pair(&set_cookie(&login_response, "nuwa_session"));
+        let csrf_pair = cookie_pair(&set_cookie(&login_response, "nuwa_csrf"));
+        let csrf_token = cookie_token(&csrf_pair).to_string();
+
+        // Session present but the double-submit token missing: 403.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .extension(peer())
+                    .header(header::HOST, "localhost:7321")
+                    .header(header::COOKIE, &session_pair)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "forbidden");
+
+        // Valid session + cookie/header token: 204 and both cookies cleared.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .extension(peer())
+                    .header(header::HOST, "localhost:7321")
+                    .header(header::COOKIE, format!("{session_pair}; {csrf_pair}"))
+                    .header("x-nuwa-csrf", &csrf_token)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        for name in ["nuwa_session", "nuwa_csrf"] {
+            let cleared = set_cookie(&response, name);
+            assert!(
+                cleared.contains("Max-Age=0"),
+                "{name} removal missing Max-Age=0: {cleared}"
+            );
+            assert!(
+                cleared.contains("Path=/"),
+                "{name} removal missing Path=/: {cleared}"
+            );
+        }
+
+        // Valid CSRF without a session is still an auth failure.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .extension(peer())
+                    .header(header::HOST, "localhost:7321")
+                    .header(header::COOKIE, &csrf_pair)
+                    .header("x-nuwa-csrf", &csrf_token)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_login_rate_limits_after_five_failures_with_retry_after() {
+        let (_dir, app) = test_app();
+        for _ in 0..5 {
+            let response = login(&app, "wrong").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = login(&app, "wrong").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("Retry-After header")
+            .to_str()
+            .expect("ascii")
+            .parse::<u64>()
+            .expect("Retry-After seconds");
+        assert!(
+            (1..=600).contains(&retry_after),
+            "Retry-After out of window: {retry_after}"
+        );
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "rate_limited");
+    }
+
+    #[tokio::test]
+    async fn api_local_mode_is_authenticated_but_still_requires_csrf() {
+        let (_dir, state) = test_state(None);
+        let app = build_app(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/me")
+                    .extension(peer())
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let csrf = set_cookie(&response, "nuwa_csrf");
+        assert!(
+            !csrf.contains("HttpOnly"),
+            "local mode still hands the CSRF token to the SPA: {csrf}"
+        );
+        let value = json_body(response).await;
+        assert_eq!(value["authenticated"], true);
+        assert_eq!(value["local_mode"], true);
+        assert!(value["expires_at_ms"].is_null(), "got {value}");
+
+        let csrf_pair = cookie_pair(&csrf);
+        let csrf_token = cookie_token(&csrf_pair).to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .extension(peer())
+                    .header(header::HOST, "localhost:7321")
+                    .header(header::COOKIE, &csrf_pair)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "local mode must still demand the CSRF header"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .extension(peer())
+                    .header(header::HOST, "localhost:7321")
+                    .header(header::COOKIE, csrf_pair)
+                    .header("x-nuwa-csrf", csrf_token)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn api_login_marks_cookies_secure_behind_tls_proxy() {
+        let (_dir, app) = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .extension(peer())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::from(r#"{"token":"secret"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        for name in ["nuwa_session", "nuwa_csrf"] {
+            let cookie = set_cookie(&response, name);
+            assert!(
+                cookie.contains("; Secure"),
+                "{name} missing Secure behind TLS proxy: {cookie}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_csrf_checks_origin_and_rejects_empty_host() {
+        let (_dir, app) = test_app();
+        let login_response = login(&app, "secret").await;
+        let session_pair = cookie_pair(&set_cookie(&login_response, "nuwa_session"));
+        let csrf_pair = cookie_pair(&set_cookie(&login_response, "nuwa_csrf"));
+        let csrf_token = cookie_token(&csrf_pair).to_string();
+        let cookie_header = format!("{session_pair}; {csrf_pair}");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .extension(peer())
+                    .header(header::HOST, "localhost:7321")
+                    .header(header::ORIGIN, "https://evil.example")
+                    .header(header::COOKIE, &cookie_header)
+                    .header("x-nuwa-csrf", &csrf_token)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .extension(peer())
+                    .header(header::HOST, "")
+                    .header(header::COOKIE, cookie_header)
+                    .header("x-nuwa-csrf", csrf_token)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an empty Host header must not satisfy the origin check"
+        );
     }
 }

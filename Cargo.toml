@@ -74,6 +74,7 @@ axum = "0.8"
 hmac = "0.12"
 subtle = "2"
 axum-extra = { version = "0.10", features = ["cookie"] }
+cookie = "0.18"
 rust-embed = "8"
 mime_guess = "2"
 
