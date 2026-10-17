@@ -985,23 +985,31 @@ impl Store {
     }
 
     pub fn start_run(&self, r: &RunStart) -> ShanResult<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO runs(id, fingerprint, runner_id, repo, started_at, phase, provider, model)
              VALUES (?1, ?2, ?3, ?4, ?5, 'claim', ?6, ?7)",
             rusqlite::params![
                 r.id, r.fingerprint, r.runner_id, r.repo, r.started_at, r.provider, r.model
             ],
         )?;
-        conn.execute(
+        let changed = tx.execute(
             "UPDATE issues SET owner_runner_id = ?2 WHERE fingerprint = ?1",
             rusqlite::params![r.fingerprint, r.runner_id],
         )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownIssue(r.fingerprint.clone()));
+        }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn update_run(&self, id: &str, u: &RunUpdate) -> ShanResult<()> {
         let conn = self.lock();
+        // Finished runs are immutable: a late progress tick changes 0 rows and
+        // surfaces as UnknownRun. M1b's progress callback must ignore that
+        // error once the run has finished.
         let changed = conn.execute(
             "UPDATE runs SET
                 phase = COALESCE(?2, phase),
@@ -1020,7 +1028,7 @@ impl Store {
                 ci_verdict = COALESCE(?15, ci_verdict),
                 session_dir = COALESCE(?16, session_dir),
                 error = COALESCE(?17, error)
-             WHERE id = ?1",
+             WHERE id = ?1 AND finished_at IS NULL",
             rusqlite::params![
                 id, u.phase, u.turns, u.tokens_uncached, u.tokens_cached, u.harness_run_id,
                 u.root_cause, u.verification_ok, u.verification_detail, u.change_stat, u.branch,
@@ -1051,7 +1059,7 @@ impl Store {
         let conn = self.lock();
         let changed = conn.execute(
             "UPDATE runs SET finished_at=?2, phase='done', outcome='interrupted',
-                error='runner restarted before completion'
+                error=COALESCE(error, 'runner restarted before completion')
              WHERE runner_id=?1 AND finished_at IS NULL",
             rusqlite::params![runner_id, now_ms],
         )?;
@@ -1791,6 +1799,167 @@ mod tests {
             .filter(|e| e.kind == "reported")
             .count();
         assert_eq!(reported, 1, "only the first sighting writes a report event");
+    }
+
+    #[test]
+    fn start_run_requires_an_existing_issue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let err = store
+            .start_run(&RunStart {
+                id: "missing-run".into(),
+                fingerprint: "does-not-exist".into(),
+                runner_id: "r".into(),
+                repo: "repo".into(),
+                started_at: 1,
+                provider: None,
+                model: None,
+            })
+            .expect_err("missing issue must fail");
+        assert!(matches!(err, ShanError::UnknownIssue(_)));
+        assert!(store.runs_for("does-not-exist", 10).expect("runs").is_empty());
+    }
+
+    #[test]
+    fn mark_interrupted_preserves_existing_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        store
+            .start_run(&RunStart {
+                id: "run-err".into(),
+                fingerprint: fp.clone(),
+                runner_id: "r".into(),
+                repo: "example.com/spike-target".into(),
+                started_at: 1,
+                provider: None,
+                model: None,
+            })
+            .expect("start");
+        store
+            .update_run(
+                "run-err",
+                &RunUpdate { error: Some("provider exploded".into()), ..RunUpdate::default() },
+            )
+            .expect("update");
+        assert_eq!(store.mark_interrupted("r", 2).expect("mark"), 1);
+        let run = store.latest_run(&fp).expect("latest").expect("run");
+        assert_eq!(run.outcome.as_deref(), Some("interrupted"));
+        assert_eq!(run.error.as_deref(), Some("provider exploded"));
+    }
+
+    #[test]
+    fn update_run_rejects_finished_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        store
+            .start_run(&RunStart {
+                id: "run-done".into(),
+                fingerprint: fp,
+                runner_id: "r".into(),
+                repo: "example.com/spike-target".into(),
+                started_at: 1,
+                provider: None,
+                model: None,
+            })
+            .expect("start");
+        store
+            .finish_run(
+                "run-done",
+                &RunFinish {
+                    finished_at: 2,
+                    outcome: "success".into(),
+                    ci_verdict: None,
+                    error: None,
+                },
+            )
+            .expect("finish");
+        assert!(store
+            .update_run(
+                "run-done",
+                &RunUpdate { phase: Some("ci".into()), ..RunUpdate::default() },
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn re_upserting_a_runner_resets_live_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let base = RunnerUpsert {
+            id: "host:repo".into(),
+            repo: "r".into(),
+            host: "host".into(),
+            pid: Some(1),
+            started_at: 1,
+            heartbeat_at: 1,
+            status: "starting".into(),
+            provider: None,
+            model: None,
+            daily_pr_limit: Some(5),
+            repo_path: None,
+            service_unit: None,
+            config_json: "{}".into(),
+        };
+        store.upsert_runner(&base).expect("first");
+        store
+            .heartbeat_runner(
+                "host:repo",
+                &RunnerHeartbeat {
+                    heartbeat_at: 2,
+                    status: "working".into(),
+                    current_fingerprint: Some("fp".into()),
+                    phase: Some("repair".into()),
+                    config_json: Some("{\"v\":1}".into()),
+                    last_error: Some("boom".into()),
+                },
+            )
+            .expect("heartbeat");
+        store
+            .upsert_runner(&RunnerUpsert { config_json: "{\"v\":2}".into(), ..base })
+            .expect("second");
+        let row = store.list_runners().expect("list").pop().expect("runner");
+        assert_eq!(row.status, "starting");
+        assert_eq!(row.current_fingerprint, None);
+        assert_eq!(row.phase, None);
+        assert_eq!(row.last_error, None);
+        assert_eq!(row.config_json, "{\"v\":2}");
+    }
+
+    #[test]
+    fn set_state_as_clears_owner_and_stamps_time_on_new() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        store
+            .start_run(&RunStart {
+                id: "run-owner".into(),
+                fingerprint: fp.clone(),
+                runner_id: "runner-1".into(),
+                repo: "example.com/spike-target".into(),
+                started_at: 1,
+                provider: None,
+                model: None,
+            })
+            .expect("start");
+        store.set_state_as(&fp, State::Triggered, 2, None, "runner").expect("triggered");
+        store.set_state_as(&fp, State::Fixing, 3, None, "runner").expect("fixing");
+        store.set_state_as(&fp, State::Escalated, 4, None, "runner").expect("escalated");
+        store.set_state_as(&fp, State::New, 5, Some("reopen"), "owner").expect("new");
+        let conn = store.lock();
+        let (owner, changed): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT owner_runner_id, state_changed_at FROM issues WHERE fingerprint=?1",
+                [&fp],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("issue row");
+        assert_eq!(owner, None);
+        assert_eq!(changed, 5);
     }
 }
 
