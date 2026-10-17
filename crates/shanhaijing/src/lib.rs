@@ -174,6 +174,7 @@ pub struct EventRow {
     pub kind: String,
     pub detail: String,
     pub repo: String,
+    pub actor: Option<String>,
 }
 
 pub struct Store {
@@ -263,7 +264,7 @@ impl Store {
                 ],
             )?;
             drop(conn);
-            self.record_event(&fp, now_ms, "reported", "first sighting")?;
+            self.record_event(&fp, now_ms, Some(&signal.repo), "system", "reported", "first sighting")?;
             return Ok(ReportOutcome::NewIssue { fingerprint: fp });
         };
 
@@ -289,7 +290,7 @@ impl Store {
                 retry_after_ms: cooldown_until - now_ms,
             });
         }
-        self.record_event(&fp, now_ms, "reported", "dedup")?;
+        self.record_event(&fp, now_ms, Some(&signal.repo), "system", "reported", "dedup")?;
         Ok(ReportOutcome::Deduped {
             fingerprint: fp,
             occurrences,
@@ -371,6 +372,8 @@ impl Store {
             self.record_event(
                 &snapshot.fingerprint,
                 now_ms,
+                Some(&snapshot.repo),
+                "runner",
                 "state_changed",
                 "claimed by runner",
             )?;
@@ -378,7 +381,7 @@ impl Store {
         Ok(claimed)
     }
 
-    /// Validate + apply a state transition, journaling the event.
+    /// Validate + apply a state transition, journaling the event as `system`.
     pub fn set_state(
         &self,
         fingerprint: &str,
@@ -386,12 +389,24 @@ impl Store {
         now_ms: i64,
         detail: Option<&str>,
     ) -> ShanResult<()> {
+        self.set_state_as(fingerprint, to, now_ms, detail, "system")
+    }
+
+    /// [`Store::set_state`], attributing the journaled event to `actor`.
+    pub fn set_state_as(
+        &self,
+        fingerprint: &str,
+        to: State,
+        now_ms: i64,
+        detail: Option<&str>,
+        actor: &str,
+    ) -> ShanResult<()> {
         let conn = self.lock();
-        let from: String = conn
+        let (from, repo): (String, String) = conn
             .query_row(
-                "SELECT state FROM issues WHERE fingerprint = ?1",
+                "SELECT state, repo FROM issues WHERE fingerprint = ?1",
                 [fingerprint],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
@@ -404,11 +419,24 @@ impl Store {
             return Err(ShanError::InvalidTransition { from, to });
         }
         conn.execute(
-            "UPDATE issues SET state = ?2 WHERE fingerprint = ?1",
-            rusqlite::params![fingerprint, to.as_str()],
+            "UPDATE issues SET state = ?2, state_changed_at = ?3 WHERE fingerprint = ?1",
+            rusqlite::params![fingerprint, to.as_str(), now_ms],
         )?;
+        if to == State::New {
+            conn.execute(
+                "UPDATE issues SET owner_runner_id = NULL WHERE fingerprint = ?1",
+                [fingerprint],
+            )?;
+        }
         drop(conn);
-        self.record_event(fingerprint, now_ms, "state_changed", detail.unwrap_or(""))
+        self.record_event(
+            fingerprint,
+            now_ms,
+            Some(&repo),
+            actor,
+            "state_changed",
+            detail.unwrap_or(""),
+        )
     }
 
     /// Put an issue into cooldown (used when a run starts: same fingerprint
@@ -438,7 +466,15 @@ impl Store {
         if changed == 0 {
             return Err(ShanError::UnknownIssue(fingerprint.to_string()));
         }
-        self.record_event(fingerprint, now_ms, "pr_opened", pr_url)
+        let repo: String = {
+            let conn = self.lock();
+            conn.query_row(
+                "SELECT repo FROM issues WHERE fingerprint = ?1",
+                [fingerprint],
+                |row| row.get(0),
+            )?
+        };
+        self.record_event(fingerprint, now_ms, Some(&repo), "runner", "pr_opened", pr_url)
     }
 
     /// PRs opened for `repo` since `since_ms` — the counter behind the
@@ -506,7 +542,7 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
-                    COALESCE(i.repo, '')
+                    COALESCE(e.repo, i.repo, ''), e.actor
              FROM events e LEFT JOIN issues i ON i.fingerprint = e.fingerprint
              ORDER BY e.id DESC LIMIT ?1",
         )?;
@@ -519,6 +555,7 @@ impl Store {
                 kind: row.get(2)?,
                 detail: row.get(3)?,
                 repo: row.get(4)?,
+                actor: row.get(5)?,
             });
         }
         Ok(out)
@@ -529,7 +566,7 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
-                    COALESCE(i.repo, '')
+                    COALESCE(e.repo, i.repo, ''), e.actor
              FROM events e LEFT JOIN issues i ON i.fingerprint = e.fingerprint
              WHERE e.fingerprint = ?1
              ORDER BY e.id DESC LIMIT ?2",
@@ -543,6 +580,7 @@ impl Store {
                 kind: row.get(2)?,
                 detail: row.get(3)?,
                 repo: row.get(4)?,
+                actor: row.get(5)?,
             });
         }
         Ok(out)
@@ -577,13 +615,16 @@ impl Store {
         &self,
         fingerprint: &str,
         now_ms: i64,
+        repo: Option<&str>,
+        actor: &str,
         kind: &str,
         detail: &str,
     ) -> ShanResult<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO events(fingerprint, ts, kind, detail) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![fingerprint, now_ms, kind, detail],
+            "INSERT INTO events(fingerprint, ts, repo, actor, kind, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![fingerprint, now_ms, repo, actor, kind, detail],
         )?;
         Ok(())
     }
@@ -799,6 +840,35 @@ mod tests {
 
         let top = store.ready_issue(3).expect("ready").expect("issue");
         assert_eq!(top.severity, "critical");
+    }
+
+    #[test]
+    fn events_carry_repo_and_actor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store
+            .record_event("fp1", 1, Some("example.com/r"), "owner", "requeued", "manual")
+            .expect("event");
+        let events = store.recent_events(10).expect("events");
+        let event = events.first().expect("event");
+        assert_eq!(event.repo, "example.com/r");
+        assert_eq!(event.actor.as_deref(), Some("owner"));
+        assert_eq!(event.kind, "requeued");
+    }
+
+    #[test]
+    fn set_state_as_persists_actor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        store
+            .set_state_as(&fp, State::Triggered, 2, Some("claimed"), "runner")
+            .expect("state");
+        let events = store.events_for(&fp, 10).expect("events");
+        assert!(events
+            .iter()
+            .any(|e| e.kind == "state_changed" && e.actor.as_deref() == Some("runner")));
     }
 }
 

@@ -180,7 +180,7 @@ pub async fn save_settings(
 
     let now = crate::now_ms();
     for key in &changed {
-        let _ = store.record_event("__config__", now, "config_changed", key);
+        let _ = store.record_event("__config__", now, None, "owner", "config_changed", key);
     }
 
     let summary = if changed.is_empty() {

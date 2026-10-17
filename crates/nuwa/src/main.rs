@@ -144,7 +144,7 @@ fn run_reopen(args: Vec<String>) -> anyhow::Result<()> {
     let fp = fingerprint.context("--fingerprint is required")?;
     let store =
         shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
-    store.set_state(&fp, shanhaijing::State::New, now_ms(), Some("reopened by owner"))?;
+    store.set_state_as(&fp, shanhaijing::State::New, now_ms(), Some("reopened by owner"), "owner")?;
     store.set_cooldown(&fp, 0)?;
     println!("reopened   : {fp} — ready for pickup");
     Ok(())
@@ -542,6 +542,8 @@ async fn work_once(
                     let _ = store.record_event(
                         &fp,
                         now_ms(),
+                        Some(&repo_config.repo),
+                        "runner",
                         "ci_green",
                         &format!("head {}", &delivered.commit[..12.min(delivered.commit.len())]),
                     );
@@ -551,6 +553,8 @@ async fn work_once(
                     let _ = store.record_event(
                         &fp,
                         now_ms(),
+                        Some(&repo_config.repo),
+                        "runner",
                         "ci_red",
                         &format!("head {} — PR #{number} closed", &delivered.commit[..12.min(delivered.commit.len())]),
                     );
@@ -563,7 +567,7 @@ async fn work_once(
                     bail!("CI red — PR #{number} closed, issue rejected (regression signal will reopen it)");
                 }
                 Ok(ci::Verdict::TimedOut) => {
-                    let _ = store.record_event(&fp, now_ms(), "ci_timeout", slug);
+                    let _ = store.record_event(&fp, now_ms(), Some(&repo_config.repo), "runner", "ci_timeout", slug);
                     println!(
                         "ci gate   : checks unfinished in {ci_timeout_secs}s — PR left open, check manually"
                     );

@@ -408,7 +408,7 @@ pub async fn reopen(
         )
             .into_response();
     }
-    match store.set_state(fp, shanhaijing::State::New, crate::now_ms(), Some("reopened via web console")) {
+    match store.set_state_as(fp, shanhaijing::State::New, crate::now_ms(), Some("reopened via web console"), "owner") {
         Ok(()) => match store.set_cooldown(fp, 0) {
             Ok(()) => Redirect::to("/ui?msg=reopened").into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
