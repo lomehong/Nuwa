@@ -11,28 +11,28 @@ use crate::Shared;
 use axum::extract::{Form, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const ENV_KEYS: &[&str] = &[
-    "nuwa_github_token",
-    "zai_api_key",
-    "nuwa_ingest_token",
-    "nuwa_ui_token",
-    "nuwa_provider",
-    "nuwa_model",
-    "nuwa_base_url",
-    "nuwa_interval",
-    "nuwa_ci_timeout",
-    "nuwa_daily_pr_limit",
-    "nuwa_max_turns",
-    "nuwa_max_tokens",
+    "NUWA_GITHUB_TOKEN",
+    "ZAI_API_KEY",
+    "NUWA_INGEST_TOKEN",
+    "NUWA_UI_TOKEN",
+    "NUWA_PROVIDER",
+    "NUWA_MODEL",
+    "NUWA_BASE_URL",
+    "NUWA_INTERVAL",
+    "NUWA_CI_TIMEOUT",
+    "NUWA_DAILY_PR_LIMIT",
+    "NUWA_MAX_TURNS",
+    "NUWA_MAX_TOKENS",
 ];
 
 const SECRET_KEYS: &[&str] = &[
-    "nuwa_github_token",
-    "zai_api_key",
-    "nuwa_ingest_token",
-    "nuwa_ui_token",
+    "NUWA_GITHUB_TOKEN",
+    "ZAI_API_KEY",
+    "NUWA_INGEST_TOKEN",
+    "NUWA_UI_TOKEN",
 ];
 
 pub fn env_file_path() -> std::path::PathBuf {
@@ -53,6 +53,46 @@ pub fn parse_env(text: &str) -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+/// 把历史小写键并入规范大写键；大写优先，删除小写重复项。
+pub fn normalize_known_keys(map: &BTreeMap<String, String>) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut out = map.clone();
+    let mut changed = BTreeSet::new();
+    for key in ENV_KEYS {
+        let lower = key.to_ascii_lowercase();
+        if let Some(lower_value) = map.get(&lower).cloned() {
+            if !map.contains_key(*key) {
+                out.insert((*key).to_string(), lower_value);
+            }
+            out.remove(&lower);
+            changed.insert((*key).to_string());
+        }
+    }
+    (out, changed.into_iter().collect())
+}
+
+pub fn migrate_env_file_at(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let (new, changed) = normalize_known_keys(&parse_env(&text));
+    if changed.is_empty() {
+        return Ok(changed);
+    }
+    std::fs::write(path, render_env(&new)).map_err(|e| format!("write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(changed)
+}
+
+pub fn migrate_env_file() -> Result<Vec<String>, String> {
+    migrate_env_file_at(&env_file_path())
 }
 
 pub fn render_env(map: &BTreeMap<String, String>) -> String {
@@ -81,7 +121,7 @@ pub async fn get_settings(State((_, _)): State<Shared>) -> Response {
                 .into_response()
         }
     };
-    let map = parse_env(&text);
+    let (map, _) = normalize_known_keys(&parse_env(&text));
     let flash: Option<&str> = None;
     Html(render_settings(&map, flash)).into_response()
 }
@@ -100,7 +140,7 @@ pub async fn save_settings(
                 .into_response()
         }
     };
-    let old = parse_env(&text);
+    let (old, _) = normalize_known_keys(&parse_env(&text));
 
     let (new, changed) = match apply_form(&old, &form) {
         Ok((n, c)) => (n, c),
@@ -181,14 +221,14 @@ pub fn apply_form(
         }
 
         let value = match *key {
-            "nuwa_provider" => {
+            "NUWA_PROVIDER" => {
                 if !matches!(trimmed, "zai" | "anthropic" | "faux") {
-                    return Err(format!("nuwa_provider 非法：{trimmed}（zai|anthropic|faux）"));
+                    return Err(format!("NUWA_PROVIDER 非法：{trimmed}（zai|anthropic|faux）"));
                 }
                 trimmed.to_string()
             }
-            "nuwa_interval" | "nuwa_ci_timeout" | "nuwa_daily_pr_limit" | "nuwa_max_turns"
-            | "nuwa_max_tokens" => {
+            "NUWA_INTERVAL" | "NUWA_CI_TIMEOUT" | "NUWA_DAILY_PR_LIMIT" | "NUWA_MAX_TURNS"
+            | "NUWA_MAX_TOKENS" => {
                 let n: u64 = trimmed
                     .parse()
                     .map_err(|_| format!("{key} 必须是正整数，得到 {trimmed:?}"))?;
@@ -244,7 +284,7 @@ pub fn render_settings(map: &BTreeMap<String, String>, flash: Option<&str>) -> S
     let provider_options = ["zai", "anthropic", "faux"]
         .iter()
         .map(|p| {
-            let sel = if get("nuwa_provider") == *p { " selected" } else { "" };
+            let sel = if get("NUWA_PROVIDER") == *p { " selected" } else { "" };
             format!("<option value=\"{p}\"{sel}>{p}</option>")
         })
         .collect::<String>();
@@ -275,7 +315,7 @@ a{{color:#58a6ff}} .row{{display:flex;gap:10px;margin-top:18px}}
 </table>
 <h2>② LLM 修复模型</h2>
 <table>
-<tr><td>provider</td><td class="mono dim">nuwa_provider</td><td><select name="nuwa_provider">{provider_options}</select></td></tr>
+<tr><td>provider</td><td class="mono dim">NUWA_PROVIDER</td><td><select name="NUWA_PROVIDER">{provider_options}</select></td></tr>
 {text_row_model}{text_row_base}
 </table>
 <h2>③ Runner 运行参数</h2>
@@ -290,17 +330,84 @@ a{{color:#58a6ff}} .row{{display:flex;gap:10px;margin-top:18px}}
 </div>
 <p><a href="/ui">← 返回控制台</a></p>
 </body></html>"#,
-        secret_github = secret_row("nuwa_github_token", "GitHub PAT（Contents: RW + Actions: R）"),
-        secret_zai = secret_row("zai_api_key", "智谱 API Key"),
-        secret_ingest = secret_row("nuwa_ingest_token", "上报令牌（青鸟 X-NUWA-Token）"),
-        secret_ui = secret_row("nuwa_ui_token", "控制台密码（留空 = 同上报令牌）"),
+        secret_github = secret_row("NUWA_GITHUB_TOKEN", "GitHub PAT（Contents: RW + Actions: R）"),
+        secret_zai = secret_row("ZAI_API_KEY", "智谱 API Key"),
+        secret_ingest = secret_row("NUWA_INGEST_TOKEN", "上报令牌（青鸟 X-NUWA-Token）"),
+        secret_ui = secret_row("NUWA_UI_TOKEN", "控制台密码（留空 = 同上报令牌）"),
         provider_options = provider_options,
-        text_row_model = text_row("nuwa_model", "模型", "glm-5.3-flash"),
-        text_row_base = text_row("nuwa_base_url", "Base URL", "https://open.bigmodel.cn/api/coding/paas/v4"),
-        num_interval = num_row("nuwa_interval", "轮询间隔（秒）"),
-        num_ci = num_row("nuwa_ci_timeout", "CI 等待上限（秒）"),
-        num_limit = num_row("nuwa_daily_pr_limit", "每日 PR 上限"),
-        num_turns = num_row("nuwa_max_turns", "单问题单 turn 上限"),
-        num_tokens = num_row("nuwa_max_tokens", "单问题单 token 上限"),
+        text_row_model = text_row("NUWA_MODEL", "模型", "glm-5.3-flash"),
+        text_row_base = text_row("NUWA_BASE_URL", "Base URL", "https://open.bigmodel.cn/api/coding/paas/v4"),
+        num_interval = num_row("NUWA_INTERVAL", "轮询间隔（秒）"),
+        num_ci = num_row("NUWA_CI_TIMEOUT", "CI 等待上限（秒）"),
+        num_limit = num_row("NUWA_DAILY_PR_LIMIT", "每日 PR 上限"),
+        num_turns = num_row("NUWA_MAX_TURNS", "单问题单 turn 上限"),
+        num_tokens = num_row("NUWA_MAX_TOKENS", "单问题单 token 上限"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_form, migrate_env_file_at, normalize_known_keys, render_env};
+    use std::collections::{BTreeMap, HashMap};
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    }
+
+    #[test]
+    fn migration_moves_lowercase_known_keys_to_uppercase() {
+        let old = map(&[("nuwa_interval", "30"), ("nuwa_provider", "zai")]);
+        let (new, changed) = normalize_known_keys(&old);
+        assert_eq!(new.get("NUWA_INTERVAL").map(String::as_str), Some("30"));
+        assert_eq!(new.get("NUWA_PROVIDER").map(String::as_str), Some("zai"));
+        assert!(!new.contains_key("nuwa_interval"));
+        assert!(changed.contains(&"NUWA_INTERVAL".to_string()));
+        assert!(changed.contains(&"NUWA_PROVIDER".to_string()));
+    }
+
+    #[test]
+    fn uppercase_wins_over_lowercase_duplicate() {
+        let old = map(&[("NUWA_INTERVAL", "60"), ("nuwa_interval", "30")]);
+        let (new, _) = normalize_known_keys(&old);
+        assert_eq!(new.get("NUWA_INTERVAL").map(String::as_str), Some("60"));
+        assert!(!new.contains_key("nuwa_interval"));
+    }
+
+    #[test]
+    fn apply_form_reads_and_validates_uppercase_numbers() {
+        let old = map(&[("NUWA_INTERVAL", "30")]);
+        let form = HashMap::from([("NUWA_INTERVAL".to_string(), "60".to_string())]);
+        let (new, changed) = apply_form(&old, &form).expect("valid");
+        assert_eq!(new.get("NUWA_INTERVAL").map(String::as_str), Some("60"));
+        assert_eq!(changed, vec!["NUWA_INTERVAL".to_string()]);
+
+        let bad = HashMap::from([("NUWA_INTERVAL".to_string(), "0".to_string())]);
+        assert!(apply_form(&old, &bad).is_err());
+    }
+
+    #[test]
+    fn render_env_writes_uppercase_keys() {
+        let out = render_env(&map(&[("NUWA_INTERVAL", "60")]));
+        assert!(out.contains("NUWA_INTERVAL=60"));
+        assert!(!out.contains("nuwa_interval"));
+    }
+
+    #[test]
+    fn migrate_env_file_is_idempotent_and_keeps_uppercase_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nuwa.env");
+        std::fs::write(&path, "NUWA_INTERVAL=60\nnuwa_interval=30\nnuwa_provider=zai\n").expect("write");
+
+        let changed = migrate_env_file_at(&path).expect("migrate");
+        assert!(changed.contains(&"NUWA_INTERVAL".to_string()));
+        assert!(changed.contains(&"NUWA_PROVIDER".to_string()));
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("NUWA_INTERVAL=60"));
+        assert!(text.contains("NUWA_PROVIDER=zai"));
+        assert!(!text.contains("nuwa_interval"));
+        assert!(!text.contains("nuwa_provider"));
+
+        assert!(migrate_env_file_at(&path).expect("second").is_empty());
+    }
 }

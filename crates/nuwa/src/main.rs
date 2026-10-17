@@ -627,6 +627,13 @@ async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
             other => bail!("unknown serve flag {other}"),
         }
     }
+    match settings::migrate_env_file() {
+        Ok(changed) if !changed.is_empty() => {
+            println!("env        : migrated lowercase keys -> {}", changed.join(", "));
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("env migrate: {e}"),
+    }
     let store = Arc::new(
         shanhaijing::Store::open(&db_path)
             .with_context(|| format!("open db {}", db_path.display()))?,
