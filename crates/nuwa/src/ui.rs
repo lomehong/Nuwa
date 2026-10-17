@@ -386,6 +386,10 @@ pub async fn dashboard(
     Html(render_dashboard(&data)).into_response()
 }
 
+pub fn can_reopen(state: &str) -> bool {
+    matches!(state, "escalated" | "rejected")
+}
+
 pub async fn reopen(
     State((store, _)): State<Shared>,
     axum::extract::Form(form): axum::extract::Form<HashMap<String, String>>,
@@ -397,16 +401,18 @@ pub async fn reopen(
     let Some(row) = rows.iter().find(|r| r.fingerprint == *fp) else {
         return (StatusCode::NOT_FOUND, "unknown fingerprint").into_response();
     };
-    if row.state != "escalated" {
+    if !can_reopen(&row.state) {
         return (
             StatusCode::CONFLICT,
-            format!("state is {}, not escalated", row.state),
+            format!("state is {}, not escalated/rejected", row.state),
         )
             .into_response();
     }
-    match store.set_state(fp, shanhaijing::State::New, crate::now_ms(), Some("reopened via web console"))
-    {
-        Ok(()) => Redirect::to("/ui?msg=reopened").into_response(),
+    match store.set_state(fp, shanhaijing::State::New, crate::now_ms(), Some("reopened via web console")) {
+        Ok(()) => match store.set_cooldown(fp, 0) {
+            Ok(()) => Redirect::to("/ui?msg=reopened").into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }
@@ -573,7 +579,34 @@ pub async fn issue_detail(
 
 #[cfg(test)]
 mod tests {
-    use super::{basic_password_ok, esc, filter_note, rel_time};
+    use super::{basic_password_ok, can_reopen, esc, filter_note, rel_time, reopen};
+
+    use axum::extract::{Form, State};
+    use axum::http::StatusCode;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn test_signal() -> shanhaijing::Signal {
+        shanhaijing::Signal {
+            repo: "example.com/spike".into(),
+            language: "go".into(),
+            title: "panic: boom".into(),
+            severity: "high".into(),
+            message: None,
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.F()\n\t/app/a.go:1 +0x1".into(),
+        }
+    }
+
+    fn seed_issue(store: &shanhaijing::Store, states: &[shanhaijing::State]) -> String {
+        let now = crate::now_ms();
+        store.report_signal(&test_signal(), now).expect("report");
+        let fp = store.ready_issue(now).expect("ready").expect("issue").fingerprint;
+        for state in states {
+            store.set_state(&fp, *state, now, None).expect("state");
+        }
+        store.set_cooldown(&fp, now + 3_600_000).expect("cooldown");
+        fp
+    }
 
     #[test]
     fn basic_auth_accepts_matching_password() {
@@ -623,5 +656,61 @@ mod tests {
         assert!(!note.contains("<img"));
         assert!(!note.contains("<script>"));
         assert!(filter_note(None, None).is_empty());
+    }
+
+    #[test]
+    fn can_reopen_only_escalated_or_rejected() {
+        assert!(can_reopen("escalated"));
+        assert!(can_reopen("rejected"));
+        assert!(!can_reopen("new"));
+        assert!(!can_reopen("pr_open"));
+        assert!(!can_reopen("fixing"));
+    }
+
+    #[tokio::test]
+    async fn reopen_rejected_clears_cooldown() {
+        use shanhaijing::State as IssueState;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
+        let fp = seed_issue(
+            &store,
+            &[
+                IssueState::Triggered,
+                IssueState::Fixing,
+                IssueState::PrOpen,
+                IssueState::Rejected,
+            ],
+        );
+        let shared: crate::Shared = (Arc::clone(&store), Arc::new(None));
+
+        let response = reopen(
+            State(shared),
+            Form(HashMap::from([("fp".to_string(), fp.clone())])),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(store.ready_issue(crate::now_ms()).expect("ready").is_some());
+    }
+
+    #[tokio::test]
+    async fn reopen_escalated_clears_cooldown() {
+        use shanhaijing::State as IssueState;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
+        let fp = seed_issue(
+            &store,
+            &[IssueState::Triggered, IssueState::Fixing, IssueState::Escalated],
+        );
+        let shared: crate::Shared = (Arc::clone(&store), Arc::new(None));
+
+        let response = reopen(
+            State(shared),
+            Form(HashMap::from([("fp".to_string(), fp.clone())])),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(store.ready_issue(crate::now_ms()).expect("ready").is_some());
     }
 }

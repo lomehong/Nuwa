@@ -26,5 +26,8 @@ base64 = { workspace = true }
 anyhow = "1"
 reqwest = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
