@@ -17,6 +17,7 @@
 | [06-requirements.md](06-requirements.md) | 约束与要求（语言无关性、运行器工具链、仓库指令文件） |
 | [07-open-items.md](07-open-items.md) | 待详细设计与待办清单 |
 | [08-onboarding.md](08-onboarding.md) | 接入手册：四步接入一个系统 |
+| [09-web-console-design.md](09-web-console-design.md) | Web 控制台设计（v3）：SPA + JSON API + 会话鉴权 + runner 遥测 |
 
 ## 关键事实速览
 

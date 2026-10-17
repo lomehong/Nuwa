@@ -61,3 +61,27 @@
 - 保留：rpi-agent（agent loop，`#![forbid(unsafe_code)]`）、rpi-ai（8 个 provider 适配器，BYOK）、rpi-tools（bash/powershell/edit/read/grep/find/ls/write 工具带）、rpi-harness（crash-resumable 循环 + budget 钩子）。
 - 砍除：rpi-tui（27k）、rpi-cli（48.5k）、rpi-extensions、rpi-plugin-sdk、rpi-telemetry——约 10 万行终端产品面。
 - 依据：Nuwa 是"问题单进、PR 出"的无界面流水线；扩展机制用自定义 `AgentTool`（`pub trait AgentTool` + `AgentBuilder::tools`）而非 cdylib 插件 ABI。
+
+---
+
+## ADR-009 · Web 控制台 v3：SPA + JSON API + 会话鉴权 + runner 遥测
+
+- 状态：已接受（2026-10-17）
+- 背景：v2 三页 SSR 控制台已上线（v0.1.5），但实测暴露设置页 env 键大小写错误、反射型 XSS、无 CSRF、rejected 无法 reopen、配额待命被误判为死亡、全局单行心跳无法支撑多仓库、卡单无恢复路径等缺陷；同时需要会话转录、趋势与更好的运维交互。所有者决定采用 SPA 形态。
+- 决策：
+  1. 用 React 19 + TypeScript + Vite 单页应用替换 v2 SSR 三页；`nuwa serve` 托管静态资源与 `/api/v1` JSON API，前端产物 `rust-embed` 编入单二进制。
+  2. 鉴权改为登录页 + HMAC 签名 HttpOnly 会话 Cookie；写操作使用 double-submit CSRF + SameSite=Strict + 同源校验；不再使用 Basic Auth。
+  3. 一仓一进程不变；`nuwa work` 增加 runner 身份、后台心跳、run 生命周期与实时 turns/tokens 遥测；新增 `runners`/`runs`/`signal_daily` 表与 `events` 审计列。
+  4. 卡单只识别（owner 心跳 + state_changed_at），由所有者一键 requeue；不自动重排。
+  5. 先以 M0 独立热修线上 P0，再用一次大版本（v0.2.0）完成控制台替换；保留旧二进制/DB 备份与回滚演练。
+  6. 设置页继续以 `nuwa.env` 为唯一事实源；规范化为大写键并在启动时迁移历史小写键；重启由 systemd 编排并有活动 run 保护。
+- 理由：详情取证、会话转录、趋势与实时运行状态需要真正的客户端状态与组件化；JSON API 使前后端契约可测试；会话 Cookie 提供可退出、可轮换、可限速的鉴权模型；runner 遥测是"多仓库可观测 + 卡单处置"的前提。
+- 伴随义务（不可选）：安全头与严格 CSP、CSRF、登录限速、密钥不回显；遥测写入 best-effort 不阻断修复；数据库迁移幂等并可回滚；Node 构建进入 CI/release；发布前完成生产库副本演练与回滚演练。
+- 被否决备选：
+  - SSR + HTMX：可减少 JS，但转录查看器、趋势交互与跨页状态仍会堆叠大量原生脚本，长期维护性不如组件化 SPA。
+  - API 先行、UI 后置：后端契约更稳，但可见运维价值延迟，且旧 UI 可能被改两遍。
+  - 保留 Basic + CSRF：无法优雅退出/限速会话，浏览器弹窗体验差。
+  - 保留全局单行心跳：无法判断多仓库中哪个 runner 失效。
+  - 自动 requeue 卡单：无法证明其他 runner 不在工作，存在双开分支/PR 的竞争风险。
+  - 本期直接做多仓库并发池：属于 docs/07 A-3 后半，是独立的运行器架构项目，会稀释控制台交付。
+- 取代关系：取代 docs/09 v2 的 D1（serve 内服务端渲染、零 JS 框架）；保留 D2（UI 令牌与上报令牌分离）与 D3（env 文件 + 重启编排）。
