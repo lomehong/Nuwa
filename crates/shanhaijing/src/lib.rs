@@ -165,6 +165,16 @@ pub struct IssueRow {
     pub last_seen: i64,
 }
 
+/// One lifecycle event — console activity feed row.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventRow {
+    pub fingerprint: String,
+    pub ts: i64,
+    pub kind: String,
+    pub detail: String,
+    pub repo: String,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -485,6 +495,29 @@ impl Store {
                 pr_url: row.get(7)?,
                 first_seen: row.get(8)?,
                 last_seen: row.get(9)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Recent lifecycle events, newest first — the console activity feed.
+    pub fn recent_events(&self, limit: u32) -> ShanResult<Vec<EventRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
+                    COALESCE(i.repo, '')
+             FROM events e LEFT JOIN issues i ON i.fingerprint = e.fingerprint
+             ORDER BY e.id DESC LIMIT ?1",
+        )?;
+        let mut rows = stmt.query([limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(EventRow {
+                fingerprint: row.get(0)?,
+                ts: row.get(1)?,
+                kind: row.get(2)?,
+                detail: row.get(3)?,
+                repo: row.get(4)?,
             });
         }
         Ok(out)
