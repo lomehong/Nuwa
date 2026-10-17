@@ -339,6 +339,8 @@ async fn work_once(
     ci_timeout_secs: u64,
 ) -> anyhow::Result<bool> {
     let now = now_ms();
+    // 活性必须在任何早退之前可见：配额待定/预检失败都不是"进程死了"。
+    store.heartbeat(now)?;
 
     // ---- frequency gate: stand down when today's PR quota is spent ----
     // Checked BEFORE claiming so the issue stays `new` and is picked up
@@ -379,7 +381,6 @@ async fn work_once(
     }
 
     // ---- claim (atomic: N runners can never share an issue) ----
-    store.heartbeat(now)?;
     let Some(snapshot) =
         store.claim_ready_issue(now, now + shanhaijing::DEFAULT_COOLDOWN_MS)?
     else {
@@ -844,3 +845,54 @@ async fn run_fix() -> anyhow::Result<()> {
     Ok(())
 }
 pub const NUWA_BUILD_MARKER: &str = "MARKER-XYZ-9L";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instructions::RepoInstructions;
+    use crate::issue::FailingCheck;
+
+    #[tokio::test]
+    async fn quota_stand_down_still_writes_heartbeat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = shanhaijing::Store::open(dir.path().join("s.db")).expect("open");
+        let now = now_ms();
+        let signal = shanhaijing::Signal {
+            repo: "example.com/spike".into(),
+            language: "go".into(),
+            title: "panic: boom".into(),
+            severity: "high".into(),
+            message: None,
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.F()\n\t/app/a.go:1 +0x1".into(),
+        };
+        store.report_signal(&signal, now).expect("report");
+        let fp = store.ready_issue(now).expect("ready").expect("issue").fingerprint;
+        store.set_pr(&fp, "https://github.com/acme/spike/pull/1", now).expect("pr");
+
+        let cfg = RepoInstructions {
+            repo: "example.com/spike".into(),
+            failing_check: FailingCheck { command: "true".into(), target: None },
+            forbidden_paths: Vec::new(),
+            notes: String::new(),
+        };
+        let worked = work_once(
+            &store,
+            &cfg,
+            dir.path(),
+            dir.path().join("sessions"),
+            repair::ProviderKind::Faux,
+            30,
+            false,
+            true,
+            1,
+            1_000_000,
+            600,
+        )
+        .await
+        .expect("work_once");
+
+        assert!(!worked, "quota must stand down");
+        let hb = store.last_heartbeat().expect("heartbeat").expect("some heartbeat");
+        assert!((now_ms() - hb).abs() < 5_000, "heartbeat must be fresh");
+    }
+}
