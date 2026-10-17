@@ -1011,9 +1011,10 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 ### M0 · 线上 P0 热修（独立 patch，先于大版本）
 
 - 转义 `state_note`（或移除拼接），消除反射 XSS。
-- `reopen` 接受 `rejected` 与 `escalated`。
+- `reopen` 接受 `rejected` 与 `escalated`，成功后清冷却（与 `nuwa reopen` CLI 对齐）。
 - `settings.rs` 改用大写键并在启动时迁移历史小写键；修复数字项读空。
 - 配额检查前先写心跳（旧 UI 可立即看到活性）；待命语义由后续版本显式化。
+- 旧 POST 增加 Origin/Referer 同源校验（过渡缓解；v3 用完整 CSRF）。
 - 补测试；clippy/test 全绿；生产冒烟。
 
 退出标准：旧控制台在现有功能下无已知 P0；生产验证通过。
