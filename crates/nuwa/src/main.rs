@@ -1098,13 +1098,14 @@ async fn work_once(
                 )?;
                 // Trends bucket producer: the state change alone is not a
                 // merge/rejection signal (docs/09 §9.2).
-                let _ = store.record_event(
+                let _ = ci::journal_terminal(
+                    store,
                     &fp,
-                    now_ms(),
-                    Some(&repo_config.repo),
+                    &repo_config.repo,
                     "runner",
                     "rejected",
                     &format!("ci_red: PR #{number} closed without merge"),
+                    now_ms(),
                 );
                 live_update(
                     &live,

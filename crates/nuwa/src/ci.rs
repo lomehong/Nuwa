@@ -153,6 +153,21 @@ pub async fn pr_merge_state(token: &str, slug: &str, number: u64) -> anyhow::Res
     Ok(payload["state"].as_str().unwrap_or("unknown").to_string())
 }
 
+/// Journal a terminal lifecycle event (`merged`/`rejected`) that backs the
+/// trends buckets (docs/09 §9.2). The `sync` reconciler and the work CI gate
+/// share this helper so repo/actor/kind stay consistent.
+pub(crate) fn journal_terminal(
+    store: &shanhaijing::Store,
+    fingerprint: &str,
+    repo: &str,
+    actor: &str,
+    kind: &str,
+    detail: &str,
+    now: i64,
+) -> shanhaijing::ShanResult<()> {
+    store.record_event(fingerprint, now, Some(repo), actor, kind, detail)
+}
+
 /// 对账全部 pr_open 问题单（CLI `sync` 与 Web 控制台共用）。
 /// merged → `merged`；closed 且未合并 → `rejected`；仍 open → 不动。
 pub async fn reconcile_all(
@@ -178,9 +193,16 @@ pub async fn reconcile_all(
                     .map_err(|e| anyhow::anyhow!(e))?;
                 // Trends bucket producer: `state_changed` alone is not a
                 // merge signal (docs/09 §9.2 merged/rejected).
-                store
-                    .record_event(&row.fingerprint, now, Some(&row.repo), "system", "merged", url)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                journal_terminal(
+                    store,
+                    &row.fingerprint,
+                    &row.repo,
+                    "system",
+                    "merged",
+                    url,
+                    now,
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
                 out.push(format!("merged     : {} → {url}", row.fingerprint));
             }
             Ok(s) if s == "closed" => {
@@ -193,16 +215,16 @@ pub async fn reconcile_all(
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
                 let detail = format!("PR #{number} closed without merge");
-                store
-                    .record_event(
-                        &row.fingerprint,
-                        now,
-                        Some(&row.repo),
-                        "system",
-                        "rejected",
-                        &detail,
-                    )
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                journal_terminal(
+                    store,
+                    &row.fingerprint,
+                    &row.repo,
+                    "system",
+                    "rejected",
+                    &detail,
+                    now,
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
                 out.push(format!(
                     "rejected   : {} (PR #{number} closed without merge)",
                     row.fingerprint
@@ -217,6 +239,7 @@ pub async fn reconcile_all(
 #[cfg(test)]
 mod tests {
     use super::aggregate;
+    use super::journal_terminal;
     use super::Verdict;
 
     fn run(completed: bool, conclusion: Option<&str>) -> (bool, Option<&str>) {
@@ -254,5 +277,42 @@ mod tests {
     fn conclusion_missing_counts_unfinished() {
         let runs = [run(true, None)];
         assert_eq!(aggregate(1, &runs), None);
+    }
+
+    #[test]
+    fn journal_terminal_writes_repo_actor_and_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = shanhaijing::Store::open(dir.path().join("s.db")).expect("open");
+        let fp = "fp-terminal";
+        let repo = "example.com/app";
+
+        journal_terminal(&store, fp, repo, "system", "merged", "https://example.com/pull/1", 100)
+            .expect("merged event");
+        journal_terminal(
+            &store,
+            fp,
+            repo,
+            "runner",
+            "rejected",
+            "ci_red: PR #2 closed without merge",
+            200,
+        )
+        .expect("rejected event");
+
+        let events = store.events_for(fp, 10).expect("events");
+        assert_eq!(events.len(), 2);
+        // Newest first: the CI-red rejection.
+        assert_eq!(events[0].kind, "rejected");
+        assert_eq!(events[0].actor.as_deref(), Some("runner"));
+        assert_eq!(events[0].repo, repo);
+        assert_eq!(events[0].ts, 200);
+        assert_eq!(
+            events[0].detail,
+            "ci_red: PR #2 closed without merge"
+        );
+        assert_eq!(events[1].kind, "merged");
+        assert_eq!(events[1].actor.as_deref(), Some("system"));
+        assert_eq!(events[1].repo, repo);
+        assert_eq!(events[1].ts, 100);
     }
 }

@@ -387,7 +387,8 @@ const READY_ORDER: &str = "(CASE severity
 /// Full [`IssueRow`] projection; keep aligned with [`Store::issue_from_row`].
 const ISSUE_VIEW_SELECT: &str = "SELECT i.fingerprint, i.title, i.language, i.repo, i.severity,
         i.state, i.occurrences, i.pr_url, i.first_seen, i.last_seen,
-        i.state_changed_at, i.owner_runner_id,
+        CASE WHEN i.state_changed_at = 0 THEN i.first_seen ELSE i.state_changed_at END AS state_changed_at,
+        i.owner_runner_id,
         (SELECT r.ci_verdict FROM runs r
          WHERE r.fingerprint = i.fingerprint
          ORDER BY r.started_at DESC, r.id DESC LIMIT 1) AS ci_verdict
@@ -888,6 +889,19 @@ impl Store {
         Ok(count as u64)
     }
 
+    /// Total reports on UTC `day`, optionally scoped to one repo — the
+    /// console overview's repo-aware `reports_today`.
+    pub fn reports_on_repo(&self, day: &str, repo: Option<&str>) -> ShanResult<u64> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(count), 0) FROM signal_daily
+             WHERE day = ?1 AND (?2 IS NULL OR repo = ?2)",
+            rusqlite::params![day, repo],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// Daily aggregates for the console trends chart. Returns exactly `days`
     /// UTC day buckets ending on the day containing `now_ms`, oldest first;
     /// days without data are zero-filled. `repo` filters every source.
@@ -1093,6 +1107,46 @@ impl Store {
                 .iter()
                 .map(|kind| rusqlite::types::Value::Text((*kind).to_string())),
         );
+        let conn = self.lock();
+        let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(params), |row| {
+            row.get(0)
+        })?;
+        Ok(count as u64)
+    }
+
+    /// Events of the given kinds at or after `since_ms`, optionally scoped to
+    /// one repo — the console overview's repo-aware 24h CI counters. Legacy
+    /// rows with a NULL `events.repo` fall back to the issue's repo.
+    pub fn count_events_since_repo(
+        &self,
+        kinds: &[&str],
+        since_ms: i64,
+        repo: Option<&str>,
+    ) -> ShanResult<u64> {
+        if kinds.is_empty() {
+            return Ok(0);
+        }
+        // Only the placeholder list is interpolated; kind values stay bound.
+        let placeholders: Vec<String> = (2..=kinds.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect();
+        let mut sql = format!(
+            "SELECT COUNT(*) FROM events e
+             LEFT JOIN issues i ON i.fingerprint = e.fingerprint
+             WHERE e.ts >= ?1 AND e.kind IN ({})",
+            placeholders.join(", ")
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(kinds.len() + 2);
+        params.push(rusqlite::types::Value::Integer(since_ms));
+        params.extend(
+            kinds
+                .iter()
+                .map(|kind| rusqlite::types::Value::Text((*kind).to_string())),
+        );
+        if let Some(repo) = repo {
+            sql.push_str(" AND COALESCE(e.repo, i.repo, '') = ?");
+            params.push(rusqlite::types::Value::Text(repo.to_string()));
+        }
         let conn = self.lock();
         let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(params), |row| {
             row.get(0)
@@ -1479,7 +1533,7 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
             "SELECT {RUN_COLUMNS} FROM runs
-             WHERE fingerprint=?1 ORDER BY started_at DESC LIMIT 1"
+             WHERE fingerprint=?1 ORDER BY started_at DESC, id DESC LIMIT 1"
         ))?;
         let mut rows = stmt.query([fingerprint])?;
         match rows.next()? {
@@ -1492,7 +1546,7 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
             "SELECT {RUN_COLUMNS} FROM runs
-             WHERE fingerprint=?1 ORDER BY started_at DESC LIMIT ?2"
+             WHERE fingerprint=?1 ORDER BY started_at DESC, id DESC LIMIT ?2"
         ))?;
         let rows = stmt.query_map(rusqlite::params![fingerprint, limit], Self::run_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1984,6 +2038,56 @@ mod tests {
         assert_eq!(run.turns, 3);
         assert_eq!(run.tokens_uncached, 1200);
         assert_eq!(run.finished_at, Some(200));
+    }
+
+    #[test]
+    fn latest_run_and_runs_for_break_started_at_ties_by_newest_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+
+        // Insert out of id order so rowid alone cannot produce the result.
+        for id in ["run-b", "run-a", "run-c"] {
+            store
+                .start_run(&RunStart {
+                    id: id.into(),
+                    fingerprint: fp.clone(),
+                    runner_id: "host:repo".into(),
+                    repo: "example.com/spike-target".into(),
+                    started_at: 100,
+                    provider: None,
+                    model: None,
+                })
+                .expect("start");
+        }
+
+        let latest = store.latest_run(&fp).expect("latest").expect("run");
+        assert_eq!(latest.id, "run-c", "ties resolve to the newest id");
+        store
+            .update_run(
+                "run-c",
+                &RunUpdate {
+                    ci_verdict: Some("success".into()),
+                    ..RunUpdate::default()
+                },
+            )
+            .expect("update tied run");
+        let ids: Vec<String> = store
+            .runs_for(&fp, 10)
+            .expect("runs")
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        assert_eq!(ids, ["run-c", "run-b", "run-a"]);
+        // The issue's ci_verdict follows the same deterministic newest run.
+        let issue = store
+            .list_issues()
+            .expect("issues")
+            .into_iter()
+            .find(|issue| issue.fingerprint == fp)
+            .expect("issue row");
+        assert_eq!(issue.ci_verdict.as_deref(), Some("success"));
     }
 
     #[test]
@@ -2682,6 +2786,96 @@ mod tests {
         assert_eq!(store.reports_on(&utc_day(t0)).expect("today"), 3);
         assert_eq!(store.reports_on(&utc_day(t0 + day_ms)).expect("tomorrow"), 1);
         assert_eq!(store.reports_on("1999-01-01").expect("empty"), 0);
+    }
+
+    #[test]
+    fn repo_aware_counts_scope_reports_and_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t0 = 1_700_000_000_000;
+        let app_repo = "example.com/spike-target";
+        let other_repo = "example.com/other";
+
+        let app_fp = match store.report_signal(&signal(), t0).expect("app report") {
+            ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("expected a new issue, got {other:?}"),
+        };
+        store
+            .report_signal(&signal(), t0 + 1)
+            .expect("app repeat");
+        let mut other_signal = issue_signal("panic in Other", "Other");
+        other_signal.repo = other_repo.to_string();
+        let other_fp = match store
+            .report_signal(&other_signal, t0 + 2)
+            .expect("other report")
+        {
+            ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("expected a new issue, got {other:?}"),
+        };
+
+        let day = utc_day(t0);
+        assert_eq!(store.reports_on_repo(&day, None).expect("all"), 3);
+        assert_eq!(
+            store.reports_on_repo(&day, Some(app_repo)).expect("app"),
+            2
+        );
+        assert_eq!(
+            store.reports_on_repo(&day, Some(other_repo)).expect("other"),
+            1
+        );
+        assert_eq!(
+            store
+                .reports_on_repo(&day, Some("example.com/none"))
+                .expect("none"),
+            0
+        );
+
+        store
+            .record_event(&app_fp, t0 - 1, Some(app_repo), "runner", "ci_green", "old")
+            .expect("old app event");
+        store
+            .record_event(&app_fp, t0, Some(app_repo), "runner", "ci_green", "app")
+            .expect("app event");
+        store
+            .record_event(&other_fp, t0, Some(other_repo), "runner", "ci_green", "other")
+            .expect("other event");
+        // Legacy rows written before events.repo existed fall back to the
+        // owning issue's repo.
+        store
+            .record_event(&other_fp, t0, None, "runner", "ci_green", "legacy")
+            .expect("legacy event");
+
+        assert_eq!(
+            store
+                .count_events_since_repo(&["ci_green"], t0, None)
+                .expect("all"),
+            3
+        );
+        assert_eq!(
+            store
+                .count_events_since_repo(&["ci_green"], t0, Some(app_repo))
+                .expect("app"),
+            1
+        );
+        assert_eq!(
+            store
+                .count_events_since_repo(&["ci_green"], t0, Some(other_repo))
+                .expect("other"),
+            2,
+            "NULL-repo events belong to their issue's repo"
+        );
+        assert_eq!(
+            store
+                .count_events_since_repo(&["ci_red"], t0, None)
+                .expect("no red"),
+            0
+        );
+        assert_eq!(
+            store
+                .count_events_since_repo(&[], t0, None)
+                .expect("empty kinds"),
+            0
+        );
     }
 
     #[test]

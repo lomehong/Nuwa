@@ -407,9 +407,11 @@ stuck = state ∈ {triggered, fixing}
         AND NOT healthy_owner
         AND now - max(state_changed_at, owner.heartbeat_at or 0) > stuck_after
 
-stuck_after = max(3 × interval, 300s)   // NUWA_STUCK_AFTER_SECS 可覆盖
+stuck_after = min(max(3 × interval, floor), 72h)
+floor = NUWA_STUCK_AFTER_SECS（默认 300s，范围 60–86400）
 ```
 
+- `interval` 取 owner runner 的 `config_json.interval_secs`（缺失/非法回落 30s）。`NUWA_STUCK_AFTER_SECS` 只是窗口**下限覆盖**（默认 300s）：短轮询 runner 也至少等 floor，慢轮询 runner 仍按 `3 × interval` 抬高；取大后再封顶 72h。
 - owner 不存在（NULL 或 runner 已删除）时只用 `state_changed_at`。
 - owner 心跳新鲜、状态 working、`current_fingerprint` 匹配 → 不判卡单（长修复正常）。
 - owner 已 idle/standing_down/error 或已转向别的单，且超过阈值 → 判卡单。
@@ -558,8 +560,8 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 ```
 
 - `runs` 返回最近 10 次，按 `started_at` 降序；`session_dir` 仅服务端使用，不在此响应中返回。
-- `timeline` 默认最近 200 条；历史 `reported` 事件可按小时聚合并返回 `count` 字段（见 `/events?aggregate=1`）。
-- `similar` 用完全相同 title，排除自身，最多 5 条。
+- `timeline` 默认最近 200 条；当前返回原始事件（服务端不做聚合），历史上报的按小时聚合只在 `/events?aggregate=1` 提供；详情时间线是否复用该聚合留待 M3 决策。
+- `similar` 用完全相同 title，排除自身；`count` 为同名问题单总数，`items` 最多 5 条。
 
 `GET /issues/{fp}/transcript?run_id=&page=1&page_size=20`
 
@@ -635,6 +637,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 - `aggregate=1`：仅对 `kind=reported` 记录按 fingerprint + UTC 小时分组合并（同一 fingerprint 落在同一 UTC 小时的记录即归入同组，不要求记录在时间线上严格连续），返回 `count/first_ts_ms/last_ts_ms`；其他 kind 不参与分组、原样返回。
 - v0.2 起不再为 dedup 写 `reported`，所以聚合主要服务历史数据。
+- 过滤后最多扫描最近 5000 条事件（聚合与分页都基于该上限）；更早的数据不返回，M3 如需完整历史再引入游标/归档。
 
 #### 趋势
 

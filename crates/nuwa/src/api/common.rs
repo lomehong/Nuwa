@@ -8,8 +8,13 @@ use shanhaijing::{EventQuery, IssueRow, RunnerRow, ShanResult, Store};
 /// Poll interval assumed when a runner's `config_json` has no usable
 /// `interval_secs` (docs/09 §8.4).
 pub(crate) const DEFAULT_INTERVAL_SECS: u64 = 30;
-/// Stuck window floor: `stuck_after = max(3 × interval, 300s)` (docs/09 §8.4).
-pub(crate) const STUCK_AFTER_FLOOR_MS: i64 = 300_000;
+/// Stuck window floor: `stuck_after = max(3 × interval, floor)` (docs/09
+/// §8.4). `NUWA_STUCK_AFTER_SECS` overrides the floor; 300s is the default.
+pub(crate) const DEFAULT_STUCK_FLOOR_SECS: u64 = 300;
+/// Documented `NUWA_STUCK_AFTER_SECS` range (docs/09 §8.4).
+pub(crate) const STUCK_FLOOR_MIN_SECS: u64 = 60;
+pub(crate) const STUCK_FLOOR_MAX_SECS: u64 = 86_400;
+pub(crate) const STUCK_AFTER_FLOOR_MS: i64 = DEFAULT_STUCK_FLOOR_SECS as i64 * 1_000;
 /// `NUWA_INTERVAL` is documented at ≤ 86400s, so `3 × interval` tops out at
 /// 72h; clamp there so a corrupt config cannot disable stuck detection.
 pub(crate) const STUCK_AFTER_CEILING_MS: i64 = 259_200_000;
@@ -207,25 +212,41 @@ pub(crate) fn runner_interval_secs(config_json: &str) -> u64 {
         .unwrap_or(DEFAULT_INTERVAL_SECS)
 }
 
-/// `stuck_after = max(3 × interval, 300s)` (docs/09 §8.4), saturated and
-/// clamped so a corrupt interval can neither overflow nor disable detection.
-pub(crate) fn stuck_after_ms(interval_secs: u64) -> i64 {
-    let window_ms = interval_secs.saturating_mul(3).saturating_mul(1_000);
-    let window_ms = i64::try_from(window_ms).unwrap_or(i64::MAX);
-    window_ms.clamp(STUCK_AFTER_FLOOR_MS, STUCK_AFTER_CEILING_MS)
+/// Operator floor override for the stuck window (`NUWA_STUCK_AFTER_SECS`,
+/// docs/09 §8.4). Unset or malformed values keep the 300s default; parsed
+/// values clamp to the documented 60..=86400 range.
+pub(crate) fn stuck_floor_ms() -> i64 {
+    match std::env::var("NUWA_STUCK_AFTER_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|secs| secs.clamp(STUCK_FLOOR_MIN_SECS, STUCK_FLOOR_MAX_SECS))
+    {
+        Some(secs) => i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1_000),
+        None => STUCK_AFTER_FLOOR_MS,
+    }
 }
 
-/// Stuck window for one issue, sized by its owner runner's poll interval.
+/// `stuck_after = max(3 × interval, floor)` (docs/09 §8.4), saturated and
+/// clamped so a corrupt interval can neither overflow nor disable detection.
+pub(crate) fn stuck_after_ms(interval_secs: u64, floor_ms: i64) -> i64 {
+    let window_ms = interval_secs.saturating_mul(3).saturating_mul(1_000);
+    let window_ms = i64::try_from(window_ms).unwrap_or(i64::MAX);
+    window_ms.max(floor_ms).min(STUCK_AFTER_CEILING_MS)
+}
+
+/// Stuck window for one issue, sized by its owner runner's poll interval and
+/// raised to the operator floor.
 pub(crate) fn issue_stuck_after_ms(
     issue: &IssueRow,
     runner_intervals: &BTreeMap<&str, u64>,
+    floor_ms: i64,
 ) -> i64 {
     let interval_secs = issue
         .owner_runner_id
         .as_deref()
         .and_then(|owner| runner_intervals.get(owner).copied())
         .unwrap_or(DEFAULT_INTERVAL_SECS);
-    stuck_after_ms(interval_secs)
+    stuck_after_ms(interval_secs, floor_ms)
 }
 
 /// The per-issue stuck flag shared by the list, detail and overview: only
@@ -243,7 +264,7 @@ pub(crate) fn issue_is_stuck(
     store.stuck(
         &issue.fingerprint,
         now,
-        issue_stuck_after_ms(issue, runner_intervals),
+        issue_stuck_after_ms(issue, runner_intervals, stuck_floor_ms()),
     )
 }
 
@@ -344,10 +365,23 @@ mod tests {
     }
 
     #[test]
-    fn stuck_window_follows_the_runner_interval_with_a_300s_floor() {
-        assert_eq!(stuck_after_ms(30), STUCK_AFTER_FLOOR_MS);
-        assert_eq!(stuck_after_ms(600), 1_800_000);
-        assert_eq!(stuck_after_ms(u64::MAX), STUCK_AFTER_CEILING_MS);
+    fn stuck_window_follows_the_runner_interval_and_floor_override() {
+        // The documented default floor is 300s.
+        assert_eq!(stuck_after_ms(30, STUCK_AFTER_FLOOR_MS), 300_000);
+        assert_eq!(stuck_after_ms(600, STUCK_AFTER_FLOOR_MS), 1_800_000);
+        // A `NUWA_STUCK_AFTER_SECS` floor raises short-interval windows...
+        assert_eq!(stuck_after_ms(30, 600_000), 600_000);
+        // ...but a slower owner interval still wins over a lower floor.
+        assert_eq!(stuck_after_ms(600, 300_000), 1_800_000);
+        // Both ends stay clamped.
+        assert_eq!(
+            stuck_after_ms(u64::MAX, STUCK_AFTER_FLOOR_MS),
+            STUCK_AFTER_CEILING_MS
+        );
+        assert_eq!(
+            stuck_after_ms(30, STUCK_AFTER_CEILING_MS * 2),
+            STUCK_AFTER_CEILING_MS
+        );
         assert_eq!(
             runner_interval_secs(r#"{"interval_secs":600}"#),
             600,

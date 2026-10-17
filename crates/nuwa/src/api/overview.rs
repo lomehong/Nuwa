@@ -149,7 +149,7 @@ fn build_overview(store: &Store, repo: Option<&str>, now: i64) -> ShanResult<Ove
         attention: build_attention(store, &issues, &runner_intervals(&runners), now)?,
         queue: build_queue(store, now)?,
         health: build_health(store, &runners, repo, now)?,
-        ci_24h: build_ci(store, &active_runs, now)?,
+        ci_24h: build_ci(store, &active_runs, repo, now)?,
         active_runs,
     })
 }
@@ -279,7 +279,7 @@ fn build_health(
         idle: 0,
         standing_down: 0,
         error: 0,
-        reports_today: store.reports_on(&shanhaijing::utc_day(now))?,
+        reports_today: store.reports_on_repo(&shanhaijing::utc_day(now), repo)?,
         prs_today: 0,
     };
     for runner in &runners {
@@ -317,12 +317,17 @@ fn runner_is_online(heartbeat_at: i64, now: i64) -> bool {
     now.saturating_sub(heartbeat_at) <= RUNNER_OFFLINE_MS
 }
 
-fn build_ci(store: &Store, active_runs: &[ActiveRun], now: i64) -> ShanResult<CiCounts> {
+fn build_ci(
+    store: &Store,
+    active_runs: &[ActiveRun],
+    repo: Option<&str>,
+    now: i64,
+) -> ShanResult<CiCounts> {
     let since = now - DAY_MS;
     Ok(CiCounts {
-        green: store.count_events_since(&["ci_green"], since)?,
-        red: store.count_events_since(&["ci_red"], since)?,
-        timeout: store.count_events_since(&["ci_timeout"], since)?,
+        green: store.count_events_since_repo(&["ci_green"], since, repo)?,
+        red: store.count_events_since_repo(&["ci_red"], since, repo)?,
+        timeout: store.count_events_since_repo(&["ci_timeout"], since, repo)?,
         pending: active_runs.iter().filter(|run| run.phase == "ci").count(),
     })
 }

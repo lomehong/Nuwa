@@ -1477,6 +1477,17 @@ mod tests {
                 "head-red",
             )
             .expect("ci red event");
+        // An other-repo CI event proves `ci_24h` follows the `?repo=` filter.
+        store
+            .record_event(
+                &other_pr_open,
+                now - 2_000,
+                Some(OVERVIEW_OTHER_REPO),
+                "runner",
+                "ci_green",
+                "other-green",
+            )
+            .expect("other ci green event");
 
         OverviewSeed {
             now,
@@ -1615,7 +1626,7 @@ mod tests {
 
         // CI 24h counters: the expired ci_timeout is outside the window.
         let ci = &value["ci_24h"];
-        assert_eq!(ci["green"].as_u64(), Some(1));
+        assert_eq!(ci["green"].as_u64(), Some(2));
         assert_eq!(ci["red"].as_u64(), Some(1));
         assert_eq!(ci["timeout"].as_u64(), Some(1));
         assert_eq!(ci["pending"].as_u64(), Some(1));
@@ -1649,8 +1660,17 @@ mod tests {
         assert_eq!(health["idle"].as_u64(), Some(1));
         assert_eq!(health["standing_down"].as_u64(), Some(1));
         assert_eq!(health["error"].as_u64(), Some(1));
-        assert_eq!(health["reports_today"].as_u64(), Some(16));
+        assert_eq!(
+            health["reports_today"].as_u64(),
+            Some(13),
+            "reports_today follows the repo filter"
+        );
         assert_eq!(health["prs_today"].as_u64(), Some(1));
+        assert_eq!(
+            value["ci_24h"]["green"].as_u64(),
+            Some(1),
+            "the other repo's ci_green must not leak into the scoped counts"
+        );
         assert_eq!(value["ci_24h"]["timeout"].as_u64(), Some(1));
         assert_eq!(value["ci_24h"]["pending"].as_u64(), Some(1));
 
@@ -1670,8 +1690,15 @@ mod tests {
         assert_eq!(health["runners_online"].as_u64(), Some(1));
         assert_eq!(health["working"].as_u64(), Some(1));
         assert_eq!(health["idle"].as_u64(), Some(0));
-        assert_eq!(health["reports_today"].as_u64(), Some(16));
+        assert_eq!(
+            health["reports_today"].as_u64(),
+            Some(3),
+            "only the other repo's reports count"
+        );
         assert_eq!(health["prs_today"].as_u64(), Some(0));
+        assert_eq!(value["ci_24h"]["green"].as_u64(), Some(1));
+        assert_eq!(value["ci_24h"]["red"].as_u64(), Some(0));
+        assert_eq!(value["ci_24h"]["timeout"].as_u64(), Some(0));
 
         // `?repo=` (blank) means no filter.
         let response = overview_request(&app, "/api/v1/overview?repo=").await;

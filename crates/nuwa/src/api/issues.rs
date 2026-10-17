@@ -1069,12 +1069,42 @@ mod tests {
         assert_eq!(first["first_seen_ms"].as_i64(), Some(seed.now - 32_400_000));
         assert_eq!(first["last_seen_ms"].as_i64(), Some(seed.now - 3_600_000));
         // A fresh `new` issue has not crossed the state machine yet; the
-        // column default until the first transition is 0 (pre-existing store
-        // behavior, surfaced verbatim by the read API).
-        assert_eq!(first["state_changed_at_ms"].as_i64(), Some(0));
+        // column is still 0, so the read view projects first_seen instead of
+        // exposing the 1970 epoch.
+        assert_eq!(
+            first["state_changed_at_ms"].as_i64(),
+            Some(seed.now - 32_400_000)
+        );
         assert!(
             first.get("first_seen").is_none(),
             "snake_case ms columns must not leak: {first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_issue_state_changed_at_falls_back_to_first_seen() {
+        let (_dir, app, seed) = seeded_app();
+
+        let response = get(&app, &format!("/api/v1/issues?repo={OTHER}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        let row = &value["data"][0];
+        assert_eq!(row["fingerprint"].as_str(), Some(seed.other.as_str()));
+        assert_eq!(row["state"].as_str(), Some("new"));
+        assert_eq!(row["first_seen_ms"].as_i64(), Some(seed.now - 70_000));
+        assert_eq!(
+            row["state_changed_at_ms"].as_i64(),
+            Some(seed.now - 70_000),
+            "a fresh issue must not render a 1970 state change"
+        );
+
+        // The detail endpoint shares the same projection.
+        let response = get(&app, &format!("/api/v1/issues/{}", seed.other)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(
+            value["issue"]["state_changed_at_ms"].as_i64(),
+            Some(seed.now - 70_000)
         );
     }
 
