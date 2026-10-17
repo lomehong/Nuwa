@@ -6,6 +6,22 @@
 
 ## 0 · 服务端一次性准备
 
+生产形态 = 一台 Linux 服务器承载 serve + work + SQLite（ADR-005）。已验证的部署（腾讯云 OpenCloudOS 9.4 / 2C7.5G）：
+
+```
+/opt/nuwa/
+├── bin/nuwa              # release 产物（v0.1.2+，含 serve 鉴权/sync/ci gate）
+├── repo/spike-target/    # 目标仓工作副本（含 nuwa.repo.json）
+├── sessions/             # 修复会话转录
+├── env/{gh-token,zai-key,ingest-token}
+└── nuwa.env              # systemd EnvironmentFile（三把 token）
+```
+
+- systemd 单元：`nuwa-serve`（`serve --listen 0.0.0.0:7321`）+ `nuwa-work`（`work --loop --interval 60 --pr`），均 `Restart=on-failure`
+- 已知噪音：ubuntu 构建的产物在旧 glibc 上有 weak-version 警告（不致命）——待办：musl 静态构建
+- 腾讯云控制台安全组：放行 **TCP 7321**（来源限采集器网段）
+- 传输注意：CN→GitHub 大文件（>12MB）下载会被掐断——release 产物下载用**分块 Range 循环**，或本机经 SSH 直传（SSH 隧道稳定）
+
 | 项 | 说明 |
 |---|---|
 | 工具链 | Rust（cargo 1.93+，构建 nuwa）、Git；每个目标仓库的技术栈工具链（runner 要能跑它的测试命令） |
