@@ -16,9 +16,14 @@ use shanhaijing::{EventQuery, IssueRow, RunnerRow, ShanResult, Store};
 
 /// A runner is offline once its heartbeat is older than this (docs/09 §9.2).
 const RUNNER_OFFLINE_MS: i64 = 90_000;
-/// Store-level stuck window. Docs/09 §8.4 defines `max(3 × interval, 300s)`;
-/// the console checks the per-issue predicate at the 300s floor.
-const STUCK_AFTER_MS: i64 = 300_000;
+/// Poll interval assumed when a runner's `config_json` has no usable
+/// `interval_secs` (docs/09 §8.4).
+const DEFAULT_INTERVAL_SECS: u64 = 30;
+/// Stuck window floor: `stuck_after = max(3 × interval, 300s)` (docs/09 §8.4).
+const STUCK_AFTER_FLOOR_MS: i64 = 300_000;
+/// `NUWA_INTERVAL` is documented at ≤ 86400s, so `3 × interval` tops out at
+/// 72h; clamp there so a corrupt config cannot disable stuck detection.
+const STUCK_AFTER_CEILING_MS: i64 = 259_200_000;
 const DAY_MS: i64 = 86_400_000;
 const QUEUE_NEXT_LIMIT: u32 = 3;
 
@@ -162,12 +167,15 @@ fn build_overview(store: &Store, repo: Option<&str>, now: i64) -> ShanResult<Ove
         .iter()
         .map(|issue| (issue.fingerprint.as_str(), issue))
         .collect();
+    // Both the health panel and the per-issue stuck window need the runner
+    // rows; read them once per request.
+    let runners = store.list_runners()?;
     let active_runs = build_active_runs(store, &by_fingerprint, repo)?;
     Ok(OverviewResponse {
         counts: build_counts(&issues),
-        attention: build_attention(store, &issues, now)?,
+        attention: build_attention(store, &issues, &runner_intervals(&runners), now)?,
         queue: build_queue(store, now)?,
-        health: build_health(store, repo, now)?,
+        health: build_health(store, &runners, repo, now)?,
         ci_24h: build_ci(store, &active_runs, now)?,
         active_runs,
     })
@@ -191,8 +199,14 @@ struct AttentionCandidate {
 
 /// Attention = escalated, stuck, rejected, or pr_open with a `ci_timeout`
 /// event in the last 24h. Order: escalated > stuck > rejected > ci_timeout,
-/// then oldest `last_seen` first (docs/09 §9.2).
-fn build_attention(store: &Store, issues: &[IssueRow], now: i64) -> ShanResult<Vec<AttentionItem>> {
+/// then oldest `last_seen` first (docs/09 §9.2). The stuck window follows the
+/// owning runner's configured poll interval (docs/09 §8.4).
+fn build_attention(
+    store: &Store,
+    issues: &[IssueRow],
+    runner_intervals: &BTreeMap<&str, u64>,
+    now: i64,
+) -> ShanResult<Vec<AttentionItem>> {
     let mut candidates = Vec::new();
     for issue in issues {
         let (rank, stuck, (reason_code, reason_text)) = match issue.state.as_str() {
@@ -205,7 +219,12 @@ fn build_attention(store: &Store, issues: &[IssueRow], now: i64) -> ShanResult<V
                 (rank, false, reason_for_detail(&detail, &issue.state))
             }
             "triggered" | "fixing" => {
-                if !store.stuck(&issue.fingerprint, now, STUCK_AFTER_MS)? {
+                let interval_secs = issue
+                    .owner_runner_id
+                    .as_deref()
+                    .and_then(|owner| runner_intervals.get(owner).copied())
+                    .unwrap_or(DEFAULT_INTERVAL_SECS);
+                if !store.stuck(&issue.fingerprint, now, stuck_after_ms(interval_secs))? {
                     continue;
                 }
                 (1, true, REASON_STUCK)
@@ -245,6 +264,41 @@ fn build_attention(store: &Store, issues: &[IssueRow], now: i64) -> ShanResult<V
         .into_iter()
         .map(|candidate| candidate.item)
         .collect())
+}
+
+/// Owner runner id → configured poll interval, used to size each issue's
+/// stuck window. Runners with absent/malformed configs keep the 30s default.
+fn runner_intervals(runners: &[RunnerRow]) -> BTreeMap<&str, u64> {
+    runners
+        .iter()
+        .map(|runner| {
+            (
+                runner.id.as_str(),
+                runner_interval_secs(&runner.config_json),
+            )
+        })
+        .collect()
+}
+
+/// Read `interval_secs` from a runner's effective `config_json`; anything
+/// missing, malformed or non-numeric falls back to the 30s default.
+fn runner_interval_secs(config_json: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(config_json)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("interval_secs")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(DEFAULT_INTERVAL_SECS)
+}
+
+/// `stuck_after = max(3 × interval, 300s)` (docs/09 §8.4), saturated and
+/// clamped so a corrupt interval can neither overflow nor disable detection.
+fn stuck_after_ms(interval_secs: u64) -> i64 {
+    let window_ms = interval_secs.saturating_mul(3).saturating_mul(1_000);
+    let window_ms = i64::try_from(window_ms).unwrap_or(i64::MAX);
+    window_ms.clamp(STUCK_AFTER_FLOOR_MS, STUCK_AFTER_CEILING_MS)
 }
 
 /// Map the newest event detail to a stable reason. Escalation details carry
@@ -325,10 +379,14 @@ fn build_queue(store: &Store, now: i64) -> ShanResult<Queue> {
     })
 }
 
-fn build_health(store: &Store, repo: Option<&str>, now: i64) -> ShanResult<Health> {
-    let runners: Vec<RunnerRow> = store
-        .list_runners()?
-        .into_iter()
+fn build_health(
+    store: &Store,
+    runners: &[RunnerRow],
+    repo: Option<&str>,
+    now: i64,
+) -> ShanResult<Health> {
+    let runners: Vec<&RunnerRow> = runners
+        .iter()
         .filter(|runner| repo.map_or(true, |repo| runner.repo == repo))
         .collect();
     let mut health = Health {
@@ -456,6 +514,120 @@ mod tests {
         for state in STATES {
             assert_eq!(counts[state], 0, "{state}");
         }
+    }
+
+    #[test]
+    fn stuck_window_follows_the_runner_interval_with_a_300s_floor() {
+        assert_eq!(stuck_after_ms(30), STUCK_AFTER_FLOOR_MS);
+        assert_eq!(stuck_after_ms(600), 1_800_000);
+        assert_eq!(stuck_after_ms(u64::MAX), STUCK_AFTER_CEILING_MS);
+        assert_eq!(
+            runner_interval_secs(r#"{"interval_secs":600}"#),
+            600,
+            "the configured interval is honoured"
+        );
+        for config in ["{}", "", "not json", r#"{"interval_secs":"600"}"#, "[]"] {
+            assert_eq!(
+                runner_interval_secs(config),
+                DEFAULT_INTERVAL_SECS,
+                "config {config:?} falls back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn stuck_attention_uses_the_owner_runner_interval() {
+        use shanhaijing::{ReportOutcome, RunStart, RunnerUpsert, Signal, State};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let now = 10_000_000_000;
+        // Older than the 300s floor, younger than the 1800s slow-runner window.
+        let stale = now - 500_000;
+
+        let report = |title: &str| -> String {
+            match store
+                .report_signal(
+                    &Signal {
+                        repo: "example.com/app".to_string(),
+                        language: "go".to_string(),
+                        title: title.to_string(),
+                        severity: "high".to_string(),
+                        message: None,
+                        stack_trace: format!("panic: {title}"),
+                    },
+                    stale,
+                )
+                .expect("report")
+            {
+                ReportOutcome::NewIssue { fingerprint } => fingerprint,
+                other => panic!("expected a new issue, got {other:?}"),
+            }
+        };
+        let own = |fingerprint: &str, runner_id: &str| {
+            store
+                .set_state(fingerprint, State::Triggered, stale, None)
+                .expect("triggered");
+            store
+                .set_state(fingerprint, State::Fixing, stale, None)
+                .expect("fixing");
+            // start_run stamps owner_runner_id on the issue.
+            store
+                .start_run(&RunStart {
+                    id: format!("run-{runner_id}"),
+                    fingerprint: fingerprint.to_string(),
+                    runner_id: runner_id.to_string(),
+                    repo: "example.com/app".to_string(),
+                    started_at: stale,
+                    provider: None,
+                    model: None,
+                })
+                .expect("start run");
+        };
+        let runner = |id: &str, config_json: &str| {
+            store
+                .upsert_runner(&RunnerUpsert {
+                    id: id.to_string(),
+                    repo: "example.com/app".to_string(),
+                    host: "test-host".to_string(),
+                    pid: None,
+                    started_at: stale,
+                    heartbeat_at: stale,
+                    status: "working".to_string(),
+                    provider: None,
+                    model: None,
+                    daily_pr_limit: None,
+                    repo_path: None,
+                    service_unit: None,
+                    config_json: config_json.to_string(),
+                })
+                .expect("upsert runner");
+        };
+
+        // 600s interval → 1800s window: 500s of silence is not stuck.
+        runner("runner-slow", r#"{"interval_secs":600}"#);
+        let slow = report("slow interval");
+        own(&slow, "runner-slow");
+        // No config → 30s interval → 300s floor: the same silence is stuck.
+        runner("runner-default", "{}");
+        let default = report("default interval");
+        own(&default, "runner-default");
+
+        let issues = store.list_issues().expect("issues");
+        let runners = store.list_runners().expect("runners");
+        let attention =
+            build_attention(&store, &issues, &runner_intervals(&runners), now).expect("attention");
+
+        assert!(
+            attention.iter().all(|item| item.fingerprint != slow),
+            "a 500s-old issue owned by a 600s-interval runner must not be attention: {attention:?}"
+        );
+        let stuck = attention
+            .iter()
+            .find(|item| item.fingerprint == default)
+            .expect("the default-interval issue stays attention");
+        assert!(stuck.stuck);
+        assert_eq!(stuck.reason_code, "stuck");
     }
 
     #[test]
