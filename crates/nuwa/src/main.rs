@@ -1096,6 +1096,16 @@ async fn work_once(
                     Some(&format!("ci_red: CI red — PR #{number} closed, back to owner")),
                     "runner",
                 )?;
+                // Trends bucket producer: the state change alone is not a
+                // merge/rejection signal (docs/09 §9.2).
+                let _ = store.record_event(
+                    &fp,
+                    now_ms(),
+                    Some(&repo_config.repo),
+                    "runner",
+                    "rejected",
+                    &format!("ci_red: PR #{number} closed without merge"),
+                );
                 live_update(
                     &live,
                     "error",

@@ -16,7 +16,7 @@
 pub mod fingerprint;
 mod migration;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -967,10 +967,20 @@ impl Store {
             }
         }
 
-        // PRs opened: bucket pr_opened_at in Rust.
+        // PRs opened: the run ledger plus the legacy issue row for PRs opened
+        // before runs recorded them (pre-migration data). A PR is counted once
+        // per day/repo even when both sources carry it; rows without a URL
+        // fall back to their own identity so they are never silently dropped.
         {
             let mut stmt = conn.prepare(
-                "SELECT pr_opened_at FROM runs
+                "SELECT pr_opened_at, repo, COALESCE(pr_url, 'run:' || id)
+                 FROM runs
+                 WHERE pr_opened_at IS NOT NULL
+                   AND pr_opened_at >= :from AND pr_opened_at < :to
+                   AND (:repo IS NULL OR repo = :repo)
+                 UNION ALL
+                 SELECT pr_opened_at, repo, COALESCE(pr_url, 'issue:' || fingerprint)
+                 FROM issues
                  WHERE pr_opened_at IS NOT NULL
                    AND pr_opened_at >= :from AND pr_opened_at < :to
                    AND (:repo IS NULL OR repo = :repo)",
@@ -981,11 +991,22 @@ impl Store {
                     ":to": window_end,
                     ":repo": repo,
                 },
-                |row| row.get::<_, i64>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )?;
-            for ts in rows {
-                if let Some(bucket) = buckets.get_mut(&utc_day(ts?)) {
-                    bucket.prs_opened += 1;
+            let mut prs: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+            for row in rows {
+                let (ts, repo, identity) = row?;
+                prs.entry(utc_day(ts)).or_default().insert((repo, identity));
+            }
+            for (day, identities) in prs {
+                if let Some(bucket) = buckets.get_mut(&day) {
+                    bucket.prs_opened = identities.len() as u64;
                 }
             }
         }
@@ -1113,6 +1134,18 @@ impl Store {
             ),
             rusqlite::params![title, exclude_fp, limit],
         )
+    }
+
+    /// Total issues sharing `title`, excluding `exclude_fp` — the detail
+    /// page's uncapped "similar problems" count (the strip itself is limited).
+    pub fn similar_count(&self, title: &str, exclude_fp: &str) -> ShanResult<u64> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM issues WHERE title = ?1 AND fingerprint <> ?2",
+            rusqlite::params![title, exclude_fp],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
     }
 
     fn issue_rows(
@@ -2680,6 +2713,26 @@ mod tests {
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].fingerprint, fp_d);
 
+        // The strip is capped, the count is the whole same-title population.
+        assert_eq!(
+            store
+                .similar_count("panic in Average", &fp_a)
+                .expect("similar count"),
+            2
+        );
+        assert_eq!(
+            store
+                .similar_count("panic in Average", &fp_d)
+                .expect("similar count excluding newest"),
+            2
+        );
+        assert_eq!(
+            store
+                .similar_count("panic in Nonexistent", &fp_a)
+                .expect("empty count"),
+            0
+        );
+
         let excluding_newest = store
             .similar_issues("panic in Average", &fp_d, 10)
             .expect("similar");
@@ -3094,6 +3147,139 @@ mod tests {
         assert_eq!(after[1].day, utc_day(midnight));
         assert_eq!(after[1].reports, 1);
         assert_eq!(after[1].new_issues, 1);
+    }
+
+    #[test]
+    fn trends_count_legacy_issue_prs_without_runs_and_dedupe_run_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let day_ms = 86_400_000i64;
+        let now = 1_700_000_000_000i64;
+        let today = now - now.rem_euclid(day_ms);
+        let repo = "example.com/spike-target";
+        let other = "example.com/other";
+        let t_start = today + 3_600_000;
+        let t_pr = today + 7_200_000;
+        let url_dup = "https://github.com/acme/spike/pull/10";
+
+        let sig = signal();
+        let fp = fingerprint::compute("go", None, &sig.stack_trace);
+        store.report_signal(&sig, t_start).expect("report");
+        // Pre-migration fallback: only the issue row carries the PR.
+        store.set_pr(&fp, url_dup, t_pr).expect("set pr");
+        // The same PR is also on a run (and its issue): count it once.
+        store
+            .start_run(&RunStart {
+                id: "run-dup".to_string(),
+                fingerprint: fp.clone(),
+                runner_id: "host:runner".to_string(),
+                repo: repo.to_string(),
+                started_at: t_start,
+                provider: None,
+                model: None,
+            })
+            .expect("start run");
+        store
+            .update_run(
+                "run-dup",
+                &RunUpdate {
+                    pr_url: Some(url_dup.to_string()),
+                    pr_opened_at: Some(t_pr),
+                    ..RunUpdate::default()
+                },
+            )
+            .expect("update run");
+
+        // A legacy-only issue PR (no run) must still count.
+        let sig_legacy = issue_signal("panic in Submit", "Submit");
+        let fp_legacy = fingerprint::compute("go", None, &sig_legacy.stack_trace);
+        store
+            .report_signal(&sig_legacy, t_start)
+            .expect("legacy report");
+        store
+            .set_pr(&fp_legacy, "https://github.com/acme/spike/pull/11", t_pr)
+            .expect("legacy pr");
+
+        // Another repo's PR must not leak into the repo filter.
+        let mut sig_other = issue_signal("panic in Load", "Load");
+        sig_other.repo = other.to_string();
+        let fp_other = fingerprint::compute("go", None, &sig_other.stack_trace);
+        store
+            .report_signal(&sig_other, t_start)
+            .expect("other report");
+        store
+            .set_pr(&fp_other, "https://github.com/acme/other/pull/1", t_pr)
+            .expect("other pr");
+
+        let buckets = store.trends(1, Some(repo), now).expect("trends");
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(
+            buckets[0].prs_opened, 2,
+            "legacy issue PRs count and duplicates collapse by URL"
+        );
+        assert_eq!(
+            store.prs_opened_since(repo, today).expect("quota"),
+            2,
+            "trends and the daily quota agree"
+        );
+        assert_eq!(
+            store.trends(1, Some(other), now).expect("other")[0].prs_opened,
+            1
+        );
+    }
+
+    #[test]
+    fn trends_count_terminal_events_journalled_by_sync_and_ci() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let day_ms = 86_400_000i64;
+        let now = 1_700_000_000_000i64;
+        let today = now - now.rem_euclid(day_ms);
+        let repo = "example.com/spike-target";
+        let other = "example.com/other";
+
+        // The kinds and actors the sync path (system) and the CI-red gate
+        // (runner) now journal.
+        store
+            .record_event(
+                "fp-merged",
+                today + 3_600_000,
+                Some(repo),
+                "system",
+                "merged",
+                "https://github.com/acme/spike/pull/1",
+            )
+            .expect("merged");
+        store
+            .record_event(
+                "fp-rejected",
+                today + 7_200_000,
+                Some(repo),
+                "runner",
+                "rejected",
+                "ci_red: PR #2 closed without merge",
+            )
+            .expect("rejected");
+        store
+            .record_event(
+                "fp-other",
+                today + 1_800_000,
+                Some(other),
+                "system",
+                "merged",
+                "https://github.com/acme/other/pull/9",
+            )
+            .expect("other merged");
+
+        let bucket = &store.trends(1, Some(repo), now).expect("trends")[0];
+        assert_eq!(bucket.merged, 1);
+        assert_eq!(bucket.rejected, 1);
+        assert_eq!(bucket.ci_green, 0);
+        assert_eq!(bucket.ci_red, 0);
+        assert_eq!(store.trends(1, Some(other), now).expect("other")[0].merged, 1);
+        let all = &store.trends(1, None, now).expect("all")[0];
+        assert_eq!(all.merged, 2);
+        assert_eq!(all.rejected, 1);
     }
 }
 

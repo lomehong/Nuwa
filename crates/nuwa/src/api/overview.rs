@@ -11,14 +11,12 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::api::common::{
-    attention_kind, issue_is_stuck, runner_intervals, DAY_MS, STATES,
+    attention_kind, issue_is_stuck, runner_intervals, DAY_MS, RUNNER_OFFLINE_MS, STATES,
 };
 use crate::api::ApiError;
 use crate::serve::AppState;
 use shanhaijing::{IssueRow, RunnerRow, ShanResult, Store};
 
-/// A runner is offline once its heartbeat is older than this (docs/09 §9.2).
-const RUNNER_OFFLINE_MS: i64 = 90_000;
 const QUEUE_NEXT_LIMIT: u32 = 3;
 
 /// `?repo=` scopes issues, runners and active runs; an empty value means all.

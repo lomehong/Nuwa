@@ -1,7 +1,10 @@
 pub mod auth;
 pub mod common;
+pub mod events;
 pub mod issues;
 pub mod overview;
+pub mod runners;
+pub mod trends;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -111,6 +114,9 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/overview", get(overview::overview))
         .route("/issues", get(issues::list))
         .route("/issues/{fp}", get(issues::detail))
+        .route("/runners", get(runners::list))
+        .route("/events", get(events::list))
+        .route("/metrics/trends", get(trends::trends))
         .route_layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::session::require_session,

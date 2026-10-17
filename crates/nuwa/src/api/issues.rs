@@ -11,7 +11,10 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::api::common::{attention_kind, issue_is_stuck, runner_intervals, STATES};
+use crate::api::common::{
+    attention_kind, issue_is_stuck, non_empty, parse_flag, parse_page_number, runner_intervals,
+    PageMeta, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, STATES,
+};
 use crate::api::ApiError;
 use crate::serve::AppState;
 use shanhaijing::{EventRow, IssueRow, RunRow, ShanResult, Store};
@@ -23,8 +26,6 @@ const RUNS_LIMIT: u32 = 10;
 /// Detail "similar problems" cap (docs/09 §9.2).
 const SIMILAR_LIMIT: u32 = 5;
 
-const DEFAULT_PAGE_SIZE: u64 = 50;
-const MAX_PAGE_SIZE: u64 = 200;
 /// `q` stops at 128 characters so a hostile query cannot scan huge blobs.
 const MAX_Q_CHARS: usize = 128;
 
@@ -182,10 +183,6 @@ impl ListParams {
     }
 }
 
-fn non_empty(raw: Option<&str>) -> Option<String> {
-    raw.filter(|value| !value.is_empty()).map(str::to_string)
-}
-
 fn parse_states(raw: Option<&str>, fields: &mut BTreeMap<String, String>) -> BTreeSet<String> {
     let Some(raw) = raw else {
         return BTreeSet::new();
@@ -227,56 +224,10 @@ fn parse_choice(
     }
 }
 
-fn parse_flag(field: &str, raw: Option<&str>, fields: &mut BTreeMap<String, String>) -> bool {
-    match raw.map(str::trim).filter(|value| !value.is_empty()) {
-        None => false,
-        Some("1" | "true") => true,
-        Some("0" | "false") => false,
-        Some(other) => {
-            fields.insert(field.to_string(), format!("must be 0 or 1, got {other}"));
-            false
-        }
-    }
-}
-
-fn parse_page_number(
-    field: &str,
-    raw: Option<&str>,
-    default: u64,
-    max: Option<u64>,
-    fields: &mut BTreeMap<String, String>,
-) -> u64 {
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return default;
-    };
-    match raw.parse::<u64>() {
-        Ok(value) if value >= 1 && max.map_or(true, |max| value <= max) => value,
-        Ok(_) => {
-            let message = match max {
-                Some(max) => format!("must be between 1 and {max}"),
-                None => "must be a positive integer".to_string(),
-            };
-            fields.insert(field.to_string(), message);
-            default
-        }
-        Err(_) => {
-            fields.insert(field.to_string(), "must be a positive integer".to_string());
-            default
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 pub struct IssueListResponse {
     pub data: Vec<IssueListItem>,
     pub meta: PageMeta,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PageMeta {
-    pub page: u64,
-    pub page_size: u64,
-    pub total: usize,
 }
 
 /// The list/detail issue shape: `IssueRow` (already ms-suffixed) plus the
@@ -553,6 +504,7 @@ fn build_detail(
         .into_iter()
         .map(RunDto::from)
         .collect();
+    let similar_count = store.similar_count(&issue.title, fingerprint)?;
     let similar = store.similar_issues(&issue.title, fingerprint, SIMILAR_LIMIT)?;
     Ok(Some(IssueDetailResponse {
         stack_sample: snapshot.stack_sample,
@@ -560,7 +512,7 @@ fn build_detail(
         timeline,
         runs,
         similar: SimilarIssues {
-            count: similar.len(),
+            count: usize::try_from(similar_count).unwrap_or(usize::MAX),
             items: similar.into_iter().map(SimilarItem::from).collect(),
         },
     }))
@@ -691,6 +643,7 @@ mod tests {
         sort_c: String,
         sim_new: String,
         sim_merged: String,
+        sim_extras: Vec<String>,
         heavy: String,
     }
 
@@ -979,6 +932,20 @@ mod tests {
         set_state(store, &sim_merged, State::PrOpen, now - 443_000, None);
         set_state(store, &sim_merged, State::Merged, now - 440_000, None);
 
+        // Four more same-title neighbours: the strip caps at five items while
+        // the count reports the whole population.
+        let sim_extras: Vec<String> = [460_000, 470_000, 480_000, 490_000]
+            .iter()
+            .enumerate()
+            .map(|(index, offset)| {
+                report(
+                    store,
+                    &signal("detail crash", SIMILAR, "go", "low", &format!("simx{index}")),
+                    now - offset,
+                )
+            })
+            .collect();
+
         // `q=sort` isolates this trio for the sort/pagination matrix.
         let sort_a = report(
             store,
@@ -1051,6 +1018,7 @@ mod tests {
             sort_c,
             sim_new,
             sim_merged,
+            sim_extras,
             heavy,
         }
     }
@@ -1457,20 +1425,29 @@ mod tests {
         assert!(!run_object.contains_key("fingerprint"));
         assert!(!run_object.contains_key("runner_id"));
 
-        // Similar: exact title, self excluded, newest first, max 5.
+        // Similar: exact title, self excluded, newest first. The strip caps
+        // at 5 items, the count is the whole same-title population.
         let similar = &value["similar"];
-        assert_eq!(similar["count"].as_u64(), Some(2));
+        assert_eq!(similar["count"].as_u64(), Some(6));
         let items = similar["items"].as_array().expect("similar items");
+        assert_eq!(items.len(), 5);
         assert_eq!(
             items
                 .iter()
                 .map(|item| item["fingerprint"].as_str().expect("fp"))
                 .collect::<Vec<_>>(),
-            vec![seed.sim_new.as_str(), seed.sim_merged.as_str()]
+            vec![
+                seed.sim_new.as_str(),
+                seed.sim_merged.as_str(),
+                seed.sim_extras[0].as_str(),
+                seed.sim_extras[1].as_str(),
+                seed.sim_extras[2].as_str(),
+            ]
         );
         assert_eq!(items[0]["state"].as_str(), Some("new"));
         assert_eq!(items[1]["state"].as_str(), Some("merged"));
         assert_eq!(items[0]["last_seen_ms"].as_i64(), Some(seed.now - 400_000));
+        assert_eq!(items[4]["last_seen_ms"].as_i64(), Some(seed.now - 480_000));
         assert!(
             !items[0].as_object().expect("item").contains_key("title"),
             "similar rows share the detail title already"

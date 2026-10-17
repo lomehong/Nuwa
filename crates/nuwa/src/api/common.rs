@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::Serialize;
 use shanhaijing::{EventQuery, IssueRow, RunnerRow, ShanResult, Store};
 
 /// Poll interval assumed when a runner's `config_json` has no usable
@@ -13,6 +14,88 @@ pub(crate) const STUCK_AFTER_FLOOR_MS: i64 = 300_000;
 /// 72h; clamp there so a corrupt config cannot disable stuck detection.
 pub(crate) const STUCK_AFTER_CEILING_MS: i64 = 259_200_000;
 pub(crate) const DAY_MS: i64 = 86_400_000;
+
+/// A runner is offline once its heartbeat is older than this (docs/09 §9.2).
+pub(crate) const RUNNER_OFFLINE_MS: i64 = 90_000;
+
+/// Global read-endpoint pagination contract (docs/09 §10).
+pub(crate) const DEFAULT_PAGE_SIZE: u64 = 50;
+pub(crate) const MAX_PAGE_SIZE: u64 = 200;
+
+/// `{page, page_size, total}` meta shared by the paginated list endpoints.
+#[derive(Debug, Serialize)]
+pub struct PageMeta {
+    pub page: u64,
+    pub page_size: u64,
+    pub total: usize,
+}
+
+pub(crate) fn non_empty(raw: Option<&str>) -> Option<String> {
+    raw.filter(|value| !value.is_empty()).map(str::to_string)
+}
+
+/// `1|true` / `0|false` query flags; anything else is a field error.
+pub(crate) fn parse_flag(
+    field: &str,
+    raw: Option<&str>,
+    fields: &mut BTreeMap<String, String>,
+) -> bool {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => false,
+        Some("1" | "true") => true,
+        Some("0" | "false") => false,
+        Some(other) => {
+            fields.insert(field.to_string(), format!("must be 0 or 1, got {other}"));
+            false
+        }
+    }
+}
+
+pub(crate) fn parse_page_number(
+    field: &str,
+    raw: Option<&str>,
+    default: u64,
+    max: Option<u64>,
+    fields: &mut BTreeMap<String, String>,
+) -> u64 {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return default;
+    };
+    match raw.parse::<u64>() {
+        Ok(value) if value >= 1 && max.map_or(true, |max| value <= max) => value,
+        Ok(_) => {
+            let message = match max {
+                Some(max) => format!("must be between 1 and {max}"),
+                None => "must be a positive integer".to_string(),
+            };
+            fields.insert(field.to_string(), message);
+            default
+        }
+        Err(_) => {
+            fields.insert(field.to_string(), "must be a positive integer".to_string());
+            default
+        }
+    }
+}
+
+/// Parse an epoch-ms query bound; invalid numbers become a field error.
+pub(crate) fn parse_ms(
+    field: &str,
+    raw: Option<&str>,
+    fields: &mut BTreeMap<String, String>,
+) -> Option<i64> {
+    let raw = non_empty(raw)?;
+    match raw.trim().parse::<i64>() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            fields.insert(
+                field.to_string(),
+                "must be an integer epoch milliseconds value".to_string(),
+            );
+            None
+        }
+    }
+}
 
 /// Funnel keys; every key is present even when its count is zero.
 pub(crate) const STATES: [&str; 7] = [

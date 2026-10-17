@@ -176,6 +176,11 @@ pub async fn reconcile_all(
                 store
                     .set_state(&row.fingerprint, State::Merged, now, Some(url))
                     .map_err(|e| anyhow::anyhow!(e))?;
+                // Trends bucket producer: `state_changed` alone is not a
+                // merge signal (docs/09 §9.2 merged/rejected).
+                store
+                    .record_event(&row.fingerprint, now, Some(&row.repo), "system", "merged", url)
+                    .map_err(|e| anyhow::anyhow!(e))?;
                 out.push(format!("merged     : {} → {url}", row.fingerprint));
             }
             Ok(s) if s == "closed" => {
@@ -185,6 +190,17 @@ pub async fn reconcile_all(
                         State::Rejected,
                         now,
                         Some("PR closed without merge"),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let detail = format!("PR #{number} closed without merge");
+                store
+                    .record_event(
+                        &row.fingerprint,
+                        now,
+                        Some(&row.repo),
+                        "system",
+                        "rejected",
+                        &detail,
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
                 out.push(format!(
