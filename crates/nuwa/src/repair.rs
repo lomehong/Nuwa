@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
 use rpi_agent::events::{AgentEvent, BroadcastEmitter};
@@ -54,6 +54,19 @@ pub struct RepairJob {
     pub guards: Arc<Guards>,
     /// Repo-instruction notes appended to the runner system prompt.
     pub notes: String,
+    /// Live progress sink, invoked on every completed turn that carries usage.
+    pub progress: Option<Arc<dyn Fn(RepairProgress) + Send + Sync>>,
+}
+
+/// Live progress snapshot handed to `RepairJob::progress` after each turn.
+// Fields gain their production reader when `work_once` wires the progress
+// sink (M1b Task 4); until then only tests read them.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct RepairProgress {
+    pub turns: u32,
+    pub uncached_tokens: u64,
+    pub cached_tokens: u64,
 }
 
 pub struct RepairReport {
@@ -62,12 +75,20 @@ pub struct RepairReport {
     pub turns: u32,
     pub uncached_tokens: u64,
     pub cached_tokens: u64,
+    /// Absolute per-issue session directory (JSONL transcripts).
+    // Read by the work-loop run telemetry (M1b Task 4).
+    #[allow(dead_code)]
+    pub session_dir: String,
 }
 
 pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
     // Turn budget (rpi-harness RunBudget reads this per run). Token-level caps
     // land with the 运行器池 scheduler; the turn cap bounds runaway loops now.
     std::env::set_var("RPI_MAX_TURNS_PER_RUN", job.max_turns.to_string());
+
+    let progress = job.progress.clone();
+    let uncached = Arc::new(AtomicU64::new(0));
+    let cached = Arc::new(AtomicU64::new(0));
 
     let repo = std::path::absolute(&job.repo)
         .with_context(|| format!("resolve repo {}", job.repo.display()))?;
@@ -235,10 +256,25 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
                     }
                     AgentEvent::TurnEnd { ref message, .. } => {
                         eprintln!("  -- turn end --");
-                        turn_counter.fetch_add(1, Ordering::Relaxed);
+                        let turns = turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
                         if let rpi_agent::AgentMessage::Assistant(assistant) = message {
                             let usage = assistant.usage.clone();
+                            let uncached_total = uncached.fetch_add(
+                                (usage.input + usage.cache_write).max(0) as u64,
+                                Ordering::Relaxed,
+                            ) + (usage.input + usage.cache_write).max(0) as u64;
+                            let cached_total = cached.fetch_add(
+                                usage.cache_read.max(0) as u64,
+                                Ordering::Relaxed,
+                            ) + usage.cache_read.max(0) as u64;
                             let _ = drain_harness.record_usage(usage, None, None).await;
+                            if let Some(cb) = &progress {
+                                cb(RepairProgress {
+                                    turns,
+                                    uncached_tokens: uncached_total,
+                                    cached_tokens: cached_total,
+                                });
+                            }
                         }
                     }
                     AgentEvent::RetryScheduled { attempt, max_retries, ref error, .. } => {
@@ -283,5 +319,76 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         turns: turns.load(Ordering::Relaxed),
         uncached_tokens: stats.as_ref().map(|s| s.uncached_tokens as u64).unwrap_or(0),
         cached_tokens: stats.as_ref().map(|s| s.cached_tokens as u64).unwrap_or(0),
+        session_dir: sessions_dir.to_string_lossy().into_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn issue() -> Issue {
+        Issue {
+            fingerprint: "fp".into(),
+            title: "panic in Average".into(),
+            language: "go".into(),
+            occurrences: 1,
+            severity: "high".into(),
+            first_seen: String::new(),
+            last_seen: String::new(),
+            stack_trace: "panic: boom".into(),
+            log_window: Vec::new(),
+            failing_check: crate::issue::FailingCheck {
+                command: "echo ok".into(),
+                target: None,
+            },
+            forbidden_paths: Vec::new(),
+        }
+    }
+
+    // The harness calls `block_in_place` (rpi-harness agent_harness.rs), which
+    // panics on the default current-thread test runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn faux_run_reports_progress_and_session_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let source = repo.join("calc.go");
+        std::fs::write(
+            &source,
+            "package main\n\nfunc Average(xs []float64) float64 {\n\
+             \tvar sum float64\n\
+             \tfor i := 0; i <= len(xs); i++ {\n\
+             \t\tsum += xs[i]\n\
+             \t}\n\
+             \treturn sum / float64(len(xs))\n\
+             }\n",
+        )
+        .expect("write");
+
+        let seen = Arc::new(Mutex::new(Vec::<RepairProgress>::new()));
+        let seen_cb = Arc::clone(&seen);
+        let job = RepairJob {
+            repo: repo.clone(),
+            issue: issue(),
+            sessions_dir: dir.path().join("sessions"),
+            provider: ProviderKind::Faux,
+            max_turns: 5,
+            guards: Arc::new(Guards::new(Vec::new())),
+            notes: String::new(),
+            progress: Some(Arc::new(move |p| {
+                seen_cb.lock().expect("lock").push(p);
+            })),
+        };
+
+        let report = run(&job).await.expect("run");
+        assert!(!report.session_dir.is_empty());
+        let events = seen.lock().expect("lock");
+        assert!(!events.is_empty(), "progress callback must fire at least once");
+        assert!(events.last().expect("last").turns >= 1);
+
+        let fixed = std::fs::read_to_string(&source).expect("read");
+        assert!(fixed.contains("i < len(xs)"), "faux edit must land");
+    }
 }

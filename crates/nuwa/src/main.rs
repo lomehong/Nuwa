@@ -468,6 +468,7 @@ async fn work_once(
         max_turns,
         guards,
         notes: repo_config.notes.clone(),
+        progress: None,
     };
 
     let report = match repair::run(&job).await {
@@ -843,6 +844,7 @@ async fn run_fix() -> anyhow::Result<()> {
         max_turns: cli.max_turns,
         guards: guards.clone(),
         notes: String::new(),
+        progress: None,
     };
     let report = repair::run(&job).await.context("repair run")?;
 
