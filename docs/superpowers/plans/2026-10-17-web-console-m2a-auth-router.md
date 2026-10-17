@@ -513,11 +513,12 @@ git commit -m "refactor(serve): app assembly with API and legacy routers"
 
 ---
 
-### Task 4: 登录/退出/me 与 Cookie
+### Task 4: 登录/退出/me、会话与 CSRF 中间件
 
 **Files:**
 - Create: `crates/nuwa/src/api/auth.rs`
 - Modify: `crates/nuwa/src/api/mod.rs`（router）
+- Modify: `crates/nuwa/src/session.rs`（`require_session`/`csrf_guard`）
 - Test: `api/auth.rs` tests + `serve.rs` integration
 
 **Interfaces:**
@@ -656,9 +657,56 @@ pub fn now_ms() -> i64 {
 }
 ```
 
-- [ ] **Step 2: API 路由**
+- [ ] **Step 2: 会话/CSRF 中间件**
 
-在 `api/mod.rs` 增加：
+在 `session.rs` 增加（替代 Task 5 中的同名实现；Task 5 只做安全头与测试）：
+
+```rust
+pub async fn require_session(
+    State(state): State<Arc<crate::serve::AppState>>,
+    jar: CookieJar,
+    req: Request,
+    next: Next,
+) -> Response {
+    if state.ui_token.is_none() {
+        return next.run(req).await;
+    }
+    let Some(cookie) = jar.get("nuwa_session") else {
+        return crate::api::ApiError::unauthorized("not logged in").into_response();
+    };
+    if state.session.verify(cookie.value(), now_ms()).is_none() {
+        return crate::api::ApiError::unauthorized("session expired").into_response();
+    }
+    next.run(req).await
+}
+
+pub async fn csrf_guard(
+    State(_state): State<Arc<crate::serve::AppState>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    req: Request,
+    next: Next,
+) -> Response {
+    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return next.run(req).await;
+    }
+    let cookie = jar.get("nuwa_csrf").map(|c| c.value()).unwrap_or("");
+    let header = headers.get("x-nuwa-csrf").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    if cookie.is_empty() || !SessionManager::token_eq(cookie, header) || !origin_ok(origin, referer, host) {
+        return crate::api::ApiError::forbidden("CSRF check failed").into_response();
+    }
+    next.run(req).await
+}
+```
+
+Use imports: `axum::extract::{Request, State}`, `axum::http::{header, HeaderMap, Method}`, `axum::middleware::Next`, `axum::response::{IntoResponse, Response}`, `axum_extra::extract::cookie::CookieJar`, `std::sync::Arc`.
+
+- [ ] **Step 3: API 路由**
+
+在 `api/mod.rs` 增加（替换 Task 3 的 stub）：
 
 ```rust
 pub mod auth;
@@ -685,7 +733,7 @@ pub fn router(state: Arc<crate::serve::AppState>) -> axum::Router {
 }
 ```
 
-- [ ] **Step 3: 测试**
+- [ ] **Step 4: 测试**
 
 `serve.rs` integration:
 - login with correct token returns 204 and Set-Cookie has `nuwa_session` (HttpOnly) and `nuwa_csrf`.
@@ -697,71 +745,28 @@ pub fn router(state: Arc<crate::serve::AppState>) -> axum::Router {
 - Cookie attributes: session HttpOnly; csrf not HttpOnly (Set-Cookie string checks).
 - Use `ConnectInfo` extension on requests.
 
-- [ ] **Step 4: 提交**
+- [ ] **Step 5: 提交**
 
 ```bash
 git add crates/nuwa/src/api/auth.rs crates/nuwa/src/api/mod.rs crates/nuwa/src/session.rs crates/nuwa/src/serve.rs
-git commit -m "feat(api): session login, logout and me endpoints"
+git commit -m "feat(api): session login, logout, me and CSRF middleware"
 ```
 
 ---
 
-### Task 5: 会话/CSRF/安全头中间件
+### Task 5: 安全响应头与安全测试
 
 **Files:**
-- Modify: `crates/nuwa/src/session.rs`（`require_session`/`csrf_guard`）
-- Modify: `crates/nuwa/src/serve.rs`（`security_headers`）
-- Test: `session.rs` + `serve.rs`
+- Modify: `crates/nuwa/src/serve.rs`（`security_headers` + build_app layer）
+- Test: `serve.rs`
 
 **Interfaces:**
-- `require_session(State<Arc<AppState>>, jar, req, next)`
-- `csrf_guard(State<Arc<AppState>>, headers, jar, req, next)`
 - `security_headers(req, next)`
+- Strict CSP for API/SPA; relaxed CSP for legacy `/ui`/`/issue`/`/settings`.
 
-- [ ] **Step 1: 中间件**
+- [ ] **Step 1: 安全头**
 
-Add `.layer(axum::middleware::from_fn(crate::serve::security_headers))` to `build_app` (after the static fallback) once `security_headers` is defined. The legacy path CSP keeps `style-src 'self' 'unsafe-inline'`; API/SPA uses the strict policy.
-
-```rust
-pub async fn require_session(
-    State(state): State<Arc<crate::serve::AppState>>,
-    jar: CookieJar,
-    req: Request,
-    next: Next,
-) -> Response {
-    if state.ui_token.is_none() {
-        return next.run(req).await;
-    }
-    let Some(cookie) = jar.get("nuwa_session") else {
-        return crate::api::ApiError::unauthorized("not logged in").into_response();
-    };
-    if state.session.verify(cookie.value(), now_ms()).is_none() {
-        return crate::api::ApiError::unauthorized("session expired").into_response();
-    }
-    next.run(req).await
-}
-
-pub async fn csrf_guard(
-    State(state): State<Arc<crate::serve::AppState>>,
-    headers: HeaderMap,
-    jar: CookieJar,
-    req: Request,
-    next: Next,
-) -> Response {
-    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
-        return next.run(req).await;
-    }
-    let cookie = jar.get("nuwa_csrf").map(|c| c.value()).unwrap_or("");
-    let header = headers.get("x-nuwa-csrf").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-    let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    if cookie.is_empty() || !SessionManager::token_eq(cookie, header) || !origin_ok(origin, referer, host) {
-        return crate::api::ApiError::forbidden("CSRF check failed").into_response();
-    }
-    next.run(req).await
-}
-```
+Add `.layer(axum::middleware::from_fn(crate::serve::security_headers))` to `build_app` (after the static fallback) and implement:
 
 `security_headers` in `serve.rs`:
 
@@ -788,15 +793,15 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
 - [ ] **Step 2: 测试**
 
 - API response has CSP/nosniff/DENY.
-- Legacy `/ui` response CSP contains `unsafe-inline` (after Basic auth? Use no token to get 401; headers still applied? The middleware applies headers to the 401 response; test that).
-- CSRF: POST logout without header 403; with header/cookie 204.
-- Session expiry/tamper 401.
+- Legacy `/ui` response CSP contains `unsafe-inline` (even a 401 response should carry the headers).
+- Static/placeholder response has the strict CSP.
+- CSRF behavior is covered in Task 4; do not duplicate it here.
 
 - [ ] **Step 3: 提交**
 
 ```bash
-git add crates/nuwa/src/session.rs crates/nuwa/src/serve.rs
-git commit -m "feat(auth): session and CSRF middleware with security headers"
+git add crates/nuwa/src/serve.rs
+git commit -m "feat(security): response headers with legacy/API CSP split"
 ```
 
 ---
