@@ -75,6 +75,8 @@ nuwa work --db shanhaijing.db \
 
 ## 4 · 日常运维命令
 
+**Web 控制台**：`http://<server>:7321/ui`（Basic 鉴权，用户名任意，**密码 = NUWA_INGEST_TOKEN**）——问题单总览（状态徽章/PR 链接，60s 自刷）、escalated 一键 reopen、sync 对账按钮、serve/work 活性。服务端渲染，无 JS 框架；鉴权复用上报令牌（泄露后果同级、可轮换）。
+
 | 命令 | 用途 |
 |---|---|
 | `nuwa serve --db p [--listen 127.0.0.1:7321]` | HTTP ingest 服务端：`POST /ingest`（单信封或 JSONL，`application/json`），`GET /health`。青鸟 `HTTPSink` 直连 |
