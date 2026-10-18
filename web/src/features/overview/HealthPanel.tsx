@@ -93,16 +93,18 @@ interface CiSegment {
   dot: string;
 }
 
-const CI_SEGMENTS: readonly CiSegment[] = [
+/** 24h event counters. `pending` is a current snapshot and sits apart below. */
+const CI_24H_SEGMENTS: readonly CiSegment[] = [
   { key: "green", label: "通过", fill: "fill-success", dot: "bg-success" },
   { key: "red", label: "失败", fill: "fill-danger", dot: "bg-danger" },
   { key: "timeout", label: "超时", fill: "fill-warning", dot: "bg-warning" },
-  { key: "pending", label: "待定", fill: "fill-info", dot: "bg-info" },
 ];
 
+const CI_PENDING_DOT = "bg-info";
+
 function CiBar({ counts }: { counts: OverviewCiCounts }) {
-  const total = CI_SEGMENTS.reduce((sum, segment) => sum + counts[segment.key], 0);
-  const summary = CI_SEGMENTS.map(
+  const total = CI_24H_SEGMENTS.reduce((sum, segment) => sum + counts[segment.key], 0);
+  const summary = CI_24H_SEGMENTS.map(
     (segment) => `${segment.label} ${formatNumber(counts[segment.key])}`,
   ).join("，");
   let offset = 0;
@@ -119,7 +121,7 @@ function CiBar({ counts }: { counts: OverviewCiCounts }) {
       {total === 0 ? (
         <rect x={0} y={0} width={100} height={8} className="fill-border" />
       ) : (
-        CI_SEGMENTS.map((segment) => {
+        CI_24H_SEGMENTS.map((segment) => {
           const width = (counts[segment.key] / total) * 100;
           const x = offset;
           offset += width;
@@ -206,8 +208,8 @@ export function HealthPanel({ health, ci }: HealthPanelProps) {
               <div className="mt-3">
                 <CiBar counts={ci} />
               </div>
-              <dl className="mt-3 grid grid-cols-4 gap-2">
-                {CI_SEGMENTS.map((segment) => (
+              <dl className="mt-3 grid grid-cols-3 gap-2">
+                {CI_24H_SEGMENTS.map((segment) => (
                   <div key={segment.key} className="min-w-0">
                     <dt className="flex items-center gap-1.5 text-caption text-text-secondary">
                       <span
@@ -222,6 +224,15 @@ export function HealthPanel({ health, ci }: HealthPanelProps) {
                   </div>
                 ))}
               </dl>
+              <p className="mt-2 flex flex-wrap items-center gap-1.5 text-caption text-text-secondary">
+                <span
+                  aria-hidden="true"
+                  className={`size-1.5 shrink-0 rounded-full ${CI_PENDING_DOT}`}
+                />
+                当前待定
+                <span className="font-mono tabular-nums text-text">{formatNumber(ci.pending)}</span>
+                <span className="text-text-muted">（处于 CI 阶段的运行，不计入 24 小时累计）</span>
+              </p>
             </CardContent>
           </Card>
 

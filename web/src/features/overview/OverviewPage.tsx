@@ -34,11 +34,13 @@ function CoreSkeleton() {
  *
  * `/overview` drives attention, runs, health and the funnel; trends and events
  * load independently so a failure of one read endpoint never blanks the page.
- * The three hooks poll at 10s/60s/30s, pause while the tab is hidden and
- * refresh on focus (see `queries.ts`).
+ * The always-mounted shell health strip owns the single 10s `/overview`
+ * interval (this observer shares the key but passes `refetchInterval: false`);
+ * trends and events poll at 60s/30s. All pause while hidden and refresh on
+ * focus (see `queries.ts`).
  */
 export function OverviewPage() {
-  const overview = useOverviewQuery();
+  const overview = useOverviewQuery(null, { refetchInterval: false });
   const trends = useTrendsQuery();
   const events = useRecentEventsQuery();
 
@@ -50,7 +52,7 @@ export function OverviewPage() {
           需要你处理的事项、正在发生的运行、系统健康与最近 14 天的趋势。
         </p>
         <p className="mt-1 text-caption text-text-muted">
-          总览数据每 10 秒自动刷新；窗口重新聚焦时立即更新。
+          核心数据每 10 秒自动刷新，趋势每 60 秒、最近活动每 30 秒；窗口重新聚焦时立即更新。
         </p>
       </header>
 

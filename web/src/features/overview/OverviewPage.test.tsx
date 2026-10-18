@@ -1,6 +1,6 @@
 import { fireEvent, screen, within } from "@testing-library/react";
 import { http, HttpResponse, delay } from "msw";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type {
   EventsResponse,
@@ -190,6 +190,9 @@ describe("OverviewPage", () => {
       "href",
       "/issues/fp-run-001",
     );
+    expect(
+      within(active).getByRole("link", { name: "查看详情：Crash on empty input" }),
+    ).toHaveAttribute("href", "/issues/fp-run-001");
     expect(within(active).getByText("6")).toBeInTheDocument();
     expect(within(active).getByText("17.5k")).toBeInTheDocument();
     expect(within(active).getByText(/2 分/)).toBeInTheDocument();
@@ -204,8 +207,11 @@ describe("OverviewPage", () => {
     );
     expect(health.querySelector('[data-runner-tile="error"]')).toHaveTextContent("异常0");
     expect(
-      within(health).getByRole("img", { name: /最近 24 小时 CI：通过 12，失败 1，超时 2，待定 1/ }),
+      within(health).getByRole("img", { name: "最近 24 小时 CI：通过 12，失败 1，超时 2" }),
     ).toBeInTheDocument();
+    expect(within(health).getByText("当前待定")).toHaveTextContent(
+      "当前待定1（处于 CI 阶段的运行，不计入 24 小时累计）",
+    );
     expect(within(health).getByText("今日上报").parentElement).toHaveTextContent("今日上报12");
     expect(within(health).getByText("今日 PR").parentElement).toHaveTextContent("今日 PR2");
 
@@ -224,6 +230,10 @@ describe("OverviewPage", () => {
     });
     expect(reportsChart.querySelectorAll("rect")).toHaveLength(14);
     expect(reportsChart).toHaveAttribute("tabindex", "0");
+    const reportsTable = within(trends).getByRole("table", { name: "上报 每日数值（14 天）" });
+    expect(reportsChart).toHaveAttribute("aria-describedby", reportsTable.id);
+    expect(within(reportsTable).getByRole("rowheader", { name: "10-01" })).toBeInTheDocument();
+    expect(within(reportsTable).getByRole("rowheader", { name: "10-14" })).toBeInTheDocument();
     expect(within(trends).getByText("tokens")).toBeInTheDocument();
     expect(within(trends).getByText("105.0k")).toBeInTheDocument();
 
@@ -290,8 +300,9 @@ describe("OverviewPage", () => {
     );
     expect(within(active).getByText("9 次")).toBeInTheDocument();
 
-    expect(within(screen.getByRole("region", { name: "趋势" })).getByText("暂无趋势数据"))
-      .toBeInTheDocument();
+    const trendsRegion = screen.getByRole("region", { name: "趋势" });
+    expect(within(trendsRegion).getByText("最近 14 天 · 按 UTC 日分桶")).toBeInTheDocument();
+    expect(within(trendsRegion).getByText("暂无趋势数据")).toBeInTheDocument();
     expect(within(screen.getByRole("region", { name: "最近活动" })).getByText("暂无活动记录"))
       .toBeInTheDocument();
   });
@@ -343,6 +354,36 @@ describe("OverviewPage", () => {
       await screen.findByRole("region", { name: "需要你处理" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Average panics on empty slice")).toBeInTheDocument();
+  });
+
+  it("polls the shared overview key once per interval", async () => {
+    let overviewRequests = 0;
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      server.use(
+        mockMe(),
+        http.get("/api/v1/overview", () => {
+          overviewRequests += 1;
+          return HttpResponse.json(richOverview());
+        }),
+        mockTrends(richTrends()),
+        mockEvents(richEvents()),
+      );
+
+      renderApp("/");
+      await screen.findByRole("region", { name: "需要你处理" });
+      expect(overviewRequests).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(10_500);
+      // The shell health strip owns the 10s timer; the page observer only
+      // shares the key, so each cycle issues exactly one request.
+      expect(overviewRequests).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(10_500);
+      expect(overviewRequests).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("maps the active run phases onto the five-step stepper", () => {

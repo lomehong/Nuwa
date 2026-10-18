@@ -55,17 +55,11 @@ interface TrendsPanelProps {
  * list is handled explicitly so a fresh database never renders NaN geometry.
  */
 export function TrendsPanel({ trends, isPending, error, onRetry }: TrendsPanelProps) {
-  const dayCount = trends?.buckets.length ?? 0;
-
   return (
     <OverviewSection
       id="overview-trends"
       title="趋势"
-      description={
-        trends
-          ? `最近 ${dayCount} 天 · 按 UTC 日分桶`
-          : "最近 14 天 · 按 UTC 日分桶"
-      }
+      description="最近 14 天 · 按 UTC 日分桶"
       aside={<Badge>14 天</Badge>}
     >
       <Card>

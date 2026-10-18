@@ -3,6 +3,9 @@
  *
  * Polling semantics are explicit here so the page and the shell's health strip
  * do not depend on app-wide defaults (docs/09 §10.9):
+ *   - the always-mounted shell health strip owns the single `/overview`
+ *     interval; the page passes `refetchInterval: false` for the same key so
+ *     staggered mounts cannot produce two requests per cycle;
  *   - intervals pause while the tab is hidden (`refetchIntervalInBackground`
  *     defaults to false, but the page states it for clarity);
  *   - regaining focus refreshes immediately, overriding the app-wide
@@ -33,13 +36,24 @@ function scopedPath(path: string, repo?: string | null): string {
   return repo ? `${path}?repo=${encodeURIComponent(repo)}` : path;
 }
 
+interface OverviewQueryOptions {
+  /**
+   * Owning observer sets the timer (the shell uses the 10s default); the page
+   * disables its copy so one key has exactly one interval.
+   */
+  refetchInterval?: number | false;
+}
+
 /** `/overview` for the page and the AppShell health strip (shared key). */
-export function useOverviewQuery(repo?: string | null) {
+export function useOverviewQuery(
+  repo?: string | null,
+  { refetchInterval = OVERVIEW_POLL_MS }: OverviewQueryOptions = {},
+) {
   return useQuery({
     queryKey: overviewQueryKey(repo),
     queryFn: ({ signal }) => apiFetch<OverviewResponse>(scopedPath("/overview", repo), { signal }),
     staleTime: OVERVIEW_POLL_MS,
-    refetchInterval: OVERVIEW_POLL_MS,
+    refetchInterval,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
   });

@@ -232,7 +232,7 @@ export function ActiveRuns({ runs, queue }: ActiveRunsProps) {
                   <div className="mt-auto flex justify-end border-t border-border pt-2 text-caption">
                     <Link
                       to={issueDetailPath(run.fingerprint)}
-                      aria-label={`查看运行详情：${run.title || run.fingerprint}`}
+                      aria-label={`查看详情：${run.title || run.fingerprint}`}
                       className="inline-flex items-center gap-1 rounded-sm font-medium text-text-secondary transition-colors hover:text-accent"
                     >
                       查看详情
