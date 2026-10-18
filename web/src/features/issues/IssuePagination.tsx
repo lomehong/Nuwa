@@ -10,6 +10,8 @@ interface IssuePaginationProps {
   page: number;
   fetching: boolean;
   onPageChange: (page: number) => void;
+  /** Accessible name; other list pages pass their own label. */
+  label?: string;
 }
 
 /**
@@ -17,13 +19,19 @@ interface IssuePaginationProps {
  * prev/next. Page changes write the URL, which drives the request. Buttons are
  * disabled at the bounds and while a page is in flight.
  */
-export function IssuePagination({ meta, page, fetching, onPageChange }: IssuePaginationProps) {
+export function IssuePagination({
+  meta,
+  page,
+  fetching,
+  onPageChange,
+  label = "问题单分页",
+}: IssuePaginationProps) {
   const pageSize = meta.page_size > 0 ? meta.page_size : 1;
   const pageCount = Math.max(1, Math.ceil(meta.total / pageSize));
 
   return (
     <nav
-      aria-label="问题单分页"
+      aria-label={label}
       className="flex flex-wrap items-center justify-between gap-3 rounded-card border border-border bg-surface px-4 py-3"
     >
       <p className="text-body-sm text-text-secondary">
