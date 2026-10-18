@@ -1,9 +1,9 @@
 /**
  * Types and vocabulary for the issue list (docs/09 §10.4, §9.2).
  *
- * The list endpoint is read-only in M3: filters, sorting and pagination are
- * mirrored in the URL (`useSearchParams`) so a reload or a shared link restores
- * exactly the same server query. Row actions (reopen/requeue) arrive with M4.
+ * The list endpoint is read-only: filters, sorting and pagination are mirrored
+ * in the URL (`useSearchParams`) so a reload or a shared link restores exactly
+ * the same server query. Row actions reuse the issue mutation hooks.
  */
 
 import type { IssueState, Severity } from "../../components/ui";

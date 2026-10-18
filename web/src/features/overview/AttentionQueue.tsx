@@ -10,6 +10,7 @@ import {
   StateBadge,
   type BadgeVariant,
 } from "../../components/ui";
+import { IssueActionButton } from "../issues/IssueActionButton";
 import { formatAge, formatDateTime, isoDateTime, shortFingerprint } from "./format";
 import { OverviewSection } from "./PanelChrome";
 import type { OverviewAttentionItem } from "./types";
@@ -34,8 +35,8 @@ interface AttentionQueueProps {
 
 /**
  * "需要你处理" (docs/09 §10.3.1). Cards carry the server-provided reason text,
- * repository and age; the only action in M3 is opening the issue detail —
- * reopen/requeue arrive with M4.
+ * repository and age; the footer offers the state-aware owner action and the
+ * link into the issue detail.
  */
 export function AttentionQueue({ items }: AttentionQueueProps) {
   return (
@@ -140,14 +141,21 @@ export function AttentionQueue({ items }: AttentionQueueProps) {
                       ) : (
                         <span aria-hidden="true" />
                       )}
-                      <Link
-                        to={detailPath}
-                        aria-label={`查看详情：${item.title || item.fingerprint}`}
-                        className="inline-flex items-center gap-1 rounded-sm font-medium text-text-secondary transition-colors hover:text-accent"
-                      >
-                        查看详情
-                        <ArrowRight aria-hidden="true" className="size-3.5" />
-                      </Link>
+                      <div className="flex shrink-0 items-center gap-1">
+                        <IssueActionButton
+                          fingerprint={item.fingerprint}
+                          state={item.state}
+                          stuck={item.stuck}
+                        />
+                        <Link
+                          to={detailPath}
+                          aria-label={`查看详情：${item.title || item.fingerprint}`}
+                          className="inline-flex items-center gap-1 rounded-sm px-1.5 font-medium text-text-secondary transition-colors hover:text-accent"
+                        >
+                          查看详情
+                          <ArrowRight aria-hidden="true" className="size-3.5" />
+                        </Link>
+                      </div>
                     </div>
                   </CardContent>
                 </Card>

@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 
 import { SeverityStone, StateBadge } from "../../components/ui";
 import { CiVerdictBadge, StuckBadge } from "../issues/IssueBadges";
+import { IssueActionButton } from "../issues/IssueActionButton";
 import type { IssueListItem } from "../issues/types";
 import {
   formatAge,
@@ -33,7 +34,8 @@ function MetaTime({ label, tsMs }: { label: string; tsMs: number }) {
 /**
  * Detail header (docs/09 §10.5): severity, title, state, repo/language,
  * copyable fingerprint, occurrence count, first/last seen and the PR/CI
- * outcome. M3 stays read-only; reopen/requeue actions arrive with M4.
+ * outcome. The owner action (reopen/requeue) sits next to the state and is
+ * offered only for the transitions the server accepts.
  */
 export function IssueHeader({ issue }: IssueHeaderProps) {
   const title = issue.title || "（无标题）";
@@ -61,6 +63,11 @@ export function IssueHeader({ issue }: IssueHeaderProps) {
           <StateBadge state={issue.state} />
           {issue.stuck ? <StuckBadge /> : null}
           <CiVerdictBadge verdict={issue.ci_verdict} />
+          <IssueActionButton
+            fingerprint={fingerprint}
+            state={issue.state}
+            stuck={issue.stuck}
+          />
         </div>
       </div>
 

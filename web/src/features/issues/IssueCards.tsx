@@ -17,6 +17,7 @@ import {
   shortFingerprint,
 } from "./format";
 import { CiVerdictBadge, PrLink, StuckBadge } from "./IssueBadges";
+import { IssueActionButton } from "./IssueActionButton";
 import type { IssueListItem } from "./types";
 
 interface IssueCardsProps {
@@ -26,8 +27,9 @@ interface IssueCardsProps {
 
 /**
  * Mobile issue list (<768px, docs/09 §11.7). Cards keep severity, state,
- * title, last-seen time and the two read-only actions; the table is hidden at
- * this breakpoint and vice versa, so the accessibility tree only contains one.
+ * title, last-seen time, the state-aware owner action and the read-only copy
+ * and detail actions; the table is hidden at this breakpoint and vice versa,
+ * so the accessibility tree only contains one.
  */
 export function IssueCards({ issues, onCopyFingerprint }: IssueCardsProps) {
   return (
@@ -118,6 +120,11 @@ export function IssueCards({ issues, onCopyFingerprint }: IssueCardsProps) {
                     <Copy aria-hidden="true" className="size-4" />
                     复制指纹
                   </Button>
+                  <IssueActionButton
+                    fingerprint={issue.fingerprint}
+                    state={issue.state}
+                    stuck={issue.stuck}
+                  />
                   <Link
                     to={detailPath}
                     aria-label={`查看详情：${title}`}

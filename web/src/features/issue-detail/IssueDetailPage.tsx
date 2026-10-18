@@ -26,8 +26,8 @@ function parseTranscriptPage(raw: string | null): number {
  * Layout: header, then a two-column main/sidebar grid that collapses to one
  * column below 1024px. The page polls the detail endpoint every 15s. The
  * transcript run selection and page live in the URL (`run_id`, `page`) so a
- * link restores exactly the audited conversation. M3 is read-only: no
- * reopen/requeue controls yet (M4).
+ * link restores exactly the audited conversation. The header owns the
+ * state-aware reopen/requeue action.
  */
 export function IssueDetailPage() {
   const { fp = "" } = useParams<{ fp: string }>();

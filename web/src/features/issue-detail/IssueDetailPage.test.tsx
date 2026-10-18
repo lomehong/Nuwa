@@ -5,7 +5,7 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 
 import { ToastProvider } from "../../components/ui";
-import { makeIssue, makeIssueDetail, makeRun, makeTranscript, server } from "../../test/msw";
+import { makeIssue, makeIssueDetail, makeRun, makeTranscript, mockIssueDetail, mockTranscript, server } from "../../test/msw";
 import { createTestQueryClient } from "../../test/render";
 import { formatDateTime } from "./format";
 import type { IssueDetailResponse } from "./types";
@@ -428,5 +428,59 @@ describe("IssueDetailPage", () => {
     expect(screen.getByText("暂无运行记录，等待 runner 领取。")).toBeInTheDocument();
     expect(screen.getByText("暂无时间线事件。")).toBeInTheDocument();
     expect(screen.getByText("没有同名问题单。")).toBeInTheDocument();
+  });
+
+  it("offers no owner action for an issue in a state that disallows it", async () => {
+    server.use(
+      mockIssueDetail({
+        issue: makeIssue({
+          fingerprint: "fp-detail-001",
+          title: "Average panics on empty slice",
+          state: "new",
+          stuck: false,
+          pr_url: null,
+          ci_verdict: null,
+        }),
+      }),
+      mockTranscript(),
+    );
+
+    renderDetail();
+
+    const title = await screen.findByRole("heading", {
+      level: 2,
+      name: "Average panics on empty slice",
+    });
+    const header = title.closest("header") as HTMLElement;
+    expect(within(header).queryByRole("button", { name: "重新打开" })).not.toBeInTheDocument();
+    expect(within(header).queryByRole("button", { name: "重排" })).not.toBeInTheDocument();
+  });
+
+  it("reopens an escalated issue from the header", async () => {
+    document.cookie = "nuwa_csrf=csrf-token; path=/";
+    let posted: string | null = null;
+    server.use(
+      mockIssueDetail({ issue: fixtureIssue() }),
+      mockTranscript(),
+      http.post("/api/v1/issues/:fp/reopen", ({ request, params }) => {
+        posted = `${String(params.fp)}:${request.headers.get("x-nuwa-csrf")}`;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+
+    renderDetail();
+
+    const title = await screen.findByRole("heading", {
+      level: 2,
+      name: "Average panics on empty slice",
+    });
+    const header = title.closest("header") as HTMLElement;
+    expect(within(header).queryByRole("button", { name: "重排" })).not.toBeInTheDocument();
+
+    fireEvent.click(within(header).getByRole("button", { name: "重新打开" }));
+
+    await waitFor(() => expect(posted).toBe("fp-detail-001:csrf-token"));
+    expect(await screen.findByText("已重新入队")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 });

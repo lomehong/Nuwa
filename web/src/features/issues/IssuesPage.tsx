@@ -24,7 +24,8 @@ import type { IssueListItem, IssueListFilters, IssueSort } from "./types";
  * `?state=&severity=&repo=&language=&q=&stuck=&attention=&sort=&order=&page=&page_size=`
  * and the query key follows, so reload/share/back all reproduce the same view.
  * Filter changes reset `page` to 1; only the pagination controls change it.
- * M3 is read-only: rows copy the fingerprint or open the detail page.
+ * Rows copy the fingerprint, open the detail page, or offer the state-aware
+ * reopen/requeue action.
  */
 export function IssuesPage() {
   const [searchParams, setSearchParams] = useSearchParams();

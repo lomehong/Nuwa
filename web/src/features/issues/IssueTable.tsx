@@ -21,6 +21,7 @@ import {
   shortFingerprint,
 } from "./format";
 import { CiVerdictBadge, PrLink, StuckBadge } from "./IssueBadges";
+import { IssueActionButton } from "./IssueActionButton";
 import type { IssueListItem, IssueSort, IssueSortOrder } from "./types";
 
 const ICON_ACTION =
@@ -75,8 +76,9 @@ interface IssueTableProps {
 
 /**
  * Desktop issue table (docs/09 §10.4). The severity/title cell carries the
- * short fingerprint; the action column stays read-only in M3 (copy + detail).
- * Sortable headers write the same `sort`/`order` URL params as the filter bar.
+ * short fingerprint; the action column offers the state-aware owner action
+ * (reopen/requeue) plus copy and detail. Sortable headers write the same
+ * `sort`/`order` URL params as the filter bar.
  */
 export function IssueTable({ issues, sort, order, onSort, onCopyFingerprint }: IssueTableProps) {
   return (
@@ -195,6 +197,11 @@ export function IssueTable({ issues, sort, order, onSort, onCopyFingerprint }: I
               </TableCell>
               <TableCell className="text-right">
                 <div className="flex items-center justify-end gap-1">
+                  <IssueActionButton
+                    fingerprint={issue.fingerprint}
+                    state={issue.state}
+                    stuck={issue.stuck}
+                  />
                   <button
                     type="button"
                     onClick={() => onCopyFingerprint(issue)}

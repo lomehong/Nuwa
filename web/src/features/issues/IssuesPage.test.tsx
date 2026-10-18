@@ -538,6 +538,34 @@ describe("IssuesPage", () => {
     ).toBeInTheDocument();
   });
 
+  it("offers the owner action only for states that allow it", async () => {
+    document.cookie = "nuwa_csrf=csrf-token; path=/";
+    let posted: string | null = null;
+    server.use(
+      http.get("/api/v1/issues", ({ request }) =>
+        HttpResponse.json(pageResponse(new URL(request.url))),
+      ),
+      http.post("/api/v1/issues/:fp/reopen", ({ request, params }) => {
+        posted = `${String(params.fp)}:${request.headers.get("x-nuwa-csrf")}`;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderIssues();
+
+    const table = await screen.findByRole("region", { name: "问题单列表" });
+    // The escalated row can reopen; the healthy fixing row has no action.
+    expect(within(table).getAllByRole("button", { name: "重新打开" })).toHaveLength(1);
+    expect(within(table).queryByRole("button", { name: "重排" })).not.toBeInTheDocument();
+
+    const cards = screen.getByRole("list", { name: "问题单卡片列表" });
+    expect(within(cards).getAllByRole("button", { name: "重新打开" })).toHaveLength(1);
+
+    fireEvent.click(within(table).getByRole("button", { name: "重新打开" }));
+
+    await waitFor(() => expect(posted).toBe("fp-escalated-001:csrf-token"));
+    expect(await screen.findByText("已重新入队")).toBeInTheDocument();
+  });
+
   it("shows a loading skeleton while the first page is pending", async () => {
     server.use(
       http.get("/api/v1/issues", async () => {
