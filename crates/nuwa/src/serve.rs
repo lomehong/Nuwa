@@ -103,7 +103,8 @@ pub fn build_app(state: AppState) -> Router {
             "/issue/",
             get(|| async { Redirect::permanent("/issues") }).post(not_found),
         )
-        .route("/issue/{fp}", get(issue_redirect).post(not_found));
+        .route("/issue/{fp}", get(issue_redirect).post(not_found))
+        .route("/issue/{fp}/", get(issue_redirect).post(not_found));
 
     let api = crate::api::router(Arc::new(state.clone()));
     Router::new()
@@ -133,15 +134,13 @@ async fn issue_redirect(Path(fp): Path<String>) -> Response {
     }
 }
 
-/// ASCII alphanumeric plus `-_.:` only; dot segments are rejected so browser
-/// path normalisation cannot turn `/issues/..` into something else.
+/// ASCII alphanumeric plus `-_:` only. Dots are rejected so a dotted segment
+/// cannot be redirected into `web.rs`'s dotfile 404.
 fn is_safe_fingerprint(fp: &str) -> bool {
     !fp.is_empty()
-        && fp != "."
-        && fp != ".."
         && fp
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
 }
 
 /// Response hardening for every route. All responses use the strict CSP.
@@ -317,10 +316,10 @@ fn event_retention_days() -> u32 {
 
 /// `NUWA_EVENT_RETENTION_DAYS` — normal events roll off after this many days.
 /// Malformed values fall back to the documented 90-day default; out-of-range
-/// values clamp to 1–3650.
+/// values (including negatives) clamp to 1–3650.
 pub(crate) fn retention_days_from_env(raw: Option<&str>) -> u32 {
-    raw.and_then(|value| value.trim().parse::<u32>().ok())
-        .map(|days| days.clamp(1, 3_650))
+    raw.and_then(|value| value.trim().parse::<i64>().ok())
+        .map(|days| days.clamp(1, 3_650) as u32)
         .unwrap_or(90)
 }
 
@@ -565,6 +564,7 @@ mod tests {
             ("/ui/sync", "/"),
             ("/issue/", "/issues"),
             ("/issue/abc123", "/issues/abc123"),
+            ("/issue/abc/", "/issues/abc"),
         ] {
             let response = app
                 .clone()
@@ -582,6 +582,10 @@ mod tests {
                 location,
                 "{uri}"
             );
+            let csp = header_str(&response, header::CONTENT_SECURITY_POLICY);
+            assert!(csp.contains("style-src 'self'"), "{uri}: {csp}");
+            assert!(!csp.contains("unsafe-inline"), "{uri}: {csp}");
+            assert_eq!(header_str(&response, header::X_FRAME_OPTIONS), "DENY", "{uri}");
         }
     }
 
@@ -594,6 +598,7 @@ mod tests {
             "/ui/sync",
             "/issue/",
             "/issue/abc123",
+            "/issue/abc123/",
             "/settings/save",
             "/settings/restart",
         ] {
@@ -619,7 +624,9 @@ mod tests {
             "/issue/%0d%0aX",  // decoded CR/LF must never reach `Location`
             "/issue/..",       // dot segments would be normalised by browsers
             "/issue/%2e%2e",
-            "/issue/a%20b",    // outside the alphanumeric/-_.: set
+            "/issue/a.b",      // dots are rejected: `web.rs` would dotfile-404
+            "/issue/abc.def",
+            "/issue/a%20b",    // outside the alphanumeric/-_: set
             "/issue/a%2fb",    // encoded slash
         ] {
             let response = app
@@ -642,10 +649,10 @@ mod tests {
 
     #[test]
     fn is_safe_fingerprint_accepts_plain_ids_only() {
-        for fp in ["abc123", "ab-cd_ef.1:2", "A0"] {
+        for fp in ["abc123", "ab-cd_ef:12", "A0"] {
             assert!(is_safe_fingerprint(fp), "{fp}");
         }
-        for fp in ["", ".", "..", "a b", "a/b", "a\r\nb", "a\u{00e9}"] {
+        for fp in ["", ".", "..", "ab-cd_ef.1:2", "a.b", "a b", "a/b", "a\r\nb", "a\u{00e9}"] {
             assert!(!is_safe_fingerprint(fp), "{fp:?}");
         }
     }
@@ -1511,7 +1518,9 @@ mod tests {
     fn event_retention_days_defaults_and_clamps() {
         assert_eq!(retention_days_from_env(None), 90);
         assert_eq!(retention_days_from_env(Some("garbage")), 90);
+        assert_eq!(retention_days_from_env(Some("abc")), 90);
         assert_eq!(retention_days_from_env(Some("0")), 1);
+        assert_eq!(retention_days_from_env(Some("-5")), 1);
         assert_eq!(retention_days_from_env(Some("4000")), 3_650);
         assert_eq!(retention_days_from_env(Some(" 30 ")), 30);
     }

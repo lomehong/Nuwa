@@ -361,7 +361,9 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     );
     let now = now_ms();
     let _ = store.mark_interrupted(&runner_id, now);
-    let _ = crate::serve::prune_retention(&store, now, event_retention_days);
+    if let Err(error) = crate::serve::prune_retention(&store, now, event_retention_days) {
+        eprintln!("warning : retention prune failed: {error}");
+    }
     if let Err(e) = store.upsert_runner(&shanhaijing::RunnerUpsert {
         id: runner_id.clone(),
         repo: repo_config.repo.clone(),

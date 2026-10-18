@@ -159,7 +159,7 @@ cd web && NUWA_E2E_BASE_URL=http://127.0.0.1:7404 NUWA_E2E_TOKEN=dummy npm run t
 - 缺 token → 502 `upstream_error`；已有 sync 在跑 → 409 `conflict`；30s 超时 → 502。`reconcile_all` 的本地存储失败是 500 `internal`（不是 GitHub 上游故障）。
 - 通过设置页写入 `NUWA_GITHUB_TOKEN` 后，**serve 进程要重启才读得到**（env 在进程启动时注入）；未重启前 sync 仍按旧值/缺 token 处理。
 
-`POST /api/v1/runners/{id}/restart`：重启该 runner 存储的 `service_unit`（`nuwa work --service-unit` 上报）。成功 202（`systemd-run --on-active=2 systemctl restart <unit>` 已编排，2 秒后执行）。runner 不存在 404；`service_unit` 缺失/空白或不在白名单（字母数字与 `@ . _ : -`，且不得以 `-` 开头）→ 422 `validation_failed`（`fields.service_unit`）；`systemd-run` 不可用或 3 秒内未返回 → 501 `not_supported` 并给出 `systemctl restart <unit>` 手动命令。`/settings/restart` 与 `/runners/{id}/restart` 共享进程内重启互斥：已有重启在编排时 → 409 `conflict`（不写审计、不再起子进程）。同一 unit 承载多个 runner 时会一起重启，部署建议一 runner 一 unit。
+`POST /api/v1/runners/{id}/restart`：重启该 runner 存储的 `service_unit`（`nuwa work --service-unit` 上报）。成功 202（`systemd-run --on-active=2 systemctl restart <unit>` 已编排，2 秒后执行）。runner 不存在 404；`service_unit` 缺失/空白或不在白名单（字母数字与 `@ . _ : -`，且不得以 `-` 开头）→ 422 `validation_failed`（`fields.service_unit`）；`systemd-run` 不可用或 3 秒内未返回 → 501 `not_supported` 并给出 `systemctl restart <unit>` 手动命令。`/api/v1/settings/restart` 与 `/runners/{id}/restart` 共享进程内重启互斥：已有重启在编排时 → 409 `conflict`（不写审计、不再起子进程）。同一 unit 承载多个 runner 时会一起重启，部署建议一 runner 一 unit。
 
 ### 6.3 设置
 

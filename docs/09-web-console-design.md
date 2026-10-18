@@ -209,7 +209,7 @@ Permissions-Policy: camera=(), microphone=(), geolocation=()
 
 - 前端不使用内联 `<script>` / `style`；动态颜色通过类名或数据属性，不用 `style=`。
 - 主题初始化用独立的 `theme-init.js`（`public/`，由 Rust 以静态资源提供）。
-- 开发模式（Vite 5173）不施加生产 CSP；生产由 `web.rs` 统一加。
+- 开发模式（Vite 5173）不施加生产 CSP；生产由 `serve.rs::security_headers` 统一施加。
 
 ### 6.6 密钥处理
 

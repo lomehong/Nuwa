@@ -91,4 +91,5 @@
 - **已实现**：M0–M2（热修、数据层/遥测、`/api/v1` 与会话鉴权）、M3–M5（SPA 骨架、只读页面、动作与设置）、M6（命令面板/轮询退避/无障碍打磨、启动遥测保留清理、切流）。
 - **旧控制台已移除**：`ui.rs` 与 Basic 鉴权删除；`/` 是唯一控制台，`/ui*` 308 到 `/`、`/issue/{fp}` 308 到 `/issues/{fp}`、`/settings` 为 SPA 设置页；全站严格 CSP。
 - **版本 0.2.0**：`crates/nuwa` 与 `Cargo.lock` 已更新；未打 tag、未 push、未部署。
-- **发布门（pending explicit approval）**：axe、5k 基准与生产副本/回滚演练完成后，由所有者明确批准方可 tag/push/deploy。
+- **验证已完成（2026-10-18）**：axe WCAG 2.0/2.1 A+AA 26 个组合 0 violation；5k issues / 17k events 性能基准达标；回滚演练通过。生产库副本未提供，按计划以 5k 种子库替代（schema v1 兼容）。
+- **发布门（仅待所有者授权）**：tag `v0.2.0`、push 与部署须由所有者明确批准后执行。

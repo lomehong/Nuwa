@@ -107,11 +107,10 @@ function throwIfAborted(signal?: AbortSignal): void {
 }
 
 /**
- * Navigate to the SPA root after recovery. Deliberately not a reload of the
- * current path: `/settings` is still the legacy server-rendered Basic-auth
- * page until M6, so reloading there would drop out of the console. Isolated so
- * the restart flow's decision is observable in tests without jsdom's
- * unimplemented navigation.
+ * Navigate to the SPA root after recovery. This is a full-page load of `/`,
+ * not a reload of the current path, so a restart that rotated the session
+ * cannot strand the browser on a stale route. Isolated so the restart flow's
+ * decision is observable in tests without jsdom's unimplemented navigation.
  */
 export function reloadConsole(): void {
   window.location.assign("/");
