@@ -1,5 +1,5 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -163,6 +163,51 @@ describe("IssueActionButton", () => {
     fireEvent.click(button);
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(posts).toBe(1);
+  });
+
+  it("re-enables the action when the row reports a different actionable state", async () => {
+    server.use(
+      http.post(
+        "/api/v1/issues/:fp/reopen",
+        () => new HttpResponse(null, { status: 204 }),
+      ),
+    );
+
+    const { rerender } = renderAction({ state: "rejected" });
+    const button = screen.getByRole("button", { name: "重新打开：fp-1" });
+
+    fireEvent.click(button);
+    await waitFor(() => expect(button).toBeDisabled());
+
+    // rejected -> escalated still offers reopen, so the same mounted button
+    // must become usable again instead of latching disabled forever.
+    rerender({ state: "escalated" });
+    expect(button).toBeEnabled();
+  });
+
+  it("clears the cooldown on its own after 3s", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      server.use(
+        http.post(
+          "/api/v1/issues/:fp/reopen",
+          () => new HttpResponse(null, { status: 204 }),
+        ),
+      );
+
+      renderAction({ state: "rejected" });
+      const button = screen.getByRole("button", { name: "重新打开：fp-1" });
+
+      fireEvent.click(button);
+      await waitFor(() => expect(button).toBeDisabled());
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(button).toBeEnabled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each(["new", "pr_open", "merged"] as const)(

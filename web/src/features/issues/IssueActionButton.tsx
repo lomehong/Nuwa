@@ -16,6 +16,9 @@ interface IssueActionButtonProps {
   className?: string;
 }
 
+/** How long a successful write keeps the button disabled while views refetch. */
+const COOLDOWN_MS = 3000;
+
 /** Error text plus any `fields` the server attached (e.g. a 409 state hint). */
 function actionErrorDescription(error: unknown): string {
   const message = describeError(error);
@@ -34,7 +37,7 @@ function actionErrorDescription(error: unknown): string {
  * State-aware owner action (docs/09 §8.5): reopen a rejected/escalated issue
  * without a confirmation, or requeue a stuck issue behind a destructive
  * confirmation. Placed in the detail header (§10.5), the issue list (§10.4)
- * and the overview attention queue (§10.3.1). Renders nothing when the state
+ * and the overview attention queue (§10.3). Renders nothing when the state
  * allows neither.
  */
 export function IssueActionButton({
@@ -49,6 +52,7 @@ export function IssueActionButton({
   const reopen = useReopenIssue(fingerprint);
   const requeue = useRequeueIssue(fingerprint);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [cooldown, setCooldown] = useState(false);
 
   // A poll can drop `stuck` (the action disappears) and re-add it later; the
   // stale open flag must not resurrect the confirmation for the new state.
@@ -57,6 +61,23 @@ export function IssueActionButton({
       setConfirmOpen(false);
     }
   }, [action]);
+
+  // A successful write latches a short cooldown so a double click cannot POST
+  // the same transition twice while the invalidated views catch up. Resetting
+  // on every identity change keeps it self-healing: if a poll never reports the
+  // new state (or the row is recycled for another issue), the button still
+  // comes back instead of staying disabled forever.
+  useEffect(() => {
+    setCooldown(false);
+  }, [fingerprint, state, stuck]);
+
+  useEffect(() => {
+    if (!cooldown) {
+      return;
+    }
+    const timer = window.setTimeout(() => setCooldown(false), COOLDOWN_MS);
+    return () => window.clearTimeout(timer);
+  }, [cooldown]);
 
   if (!action) {
     return null;
@@ -74,9 +95,9 @@ export function IssueActionButton({
     });
   };
 
-  // A successful write disables the button (like `pending`) until the
-  // invalidated views report the new state, so a double click cannot POST the
-  // same transition twice.
+  // A successful write disables the button (like `pending`) for a short
+  // cooldown until the invalidated views report the new state, so a double
+  // click cannot POST the same transition twice.
   if (action === "reopen") {
     return (
       <Button
@@ -84,11 +105,12 @@ export function IssueActionButton({
         size={size}
         className={clsx("whitespace-nowrap", className)}
         pending={reopen.isPending}
-        disabled={reopen.isSuccess}
+        disabled={cooldown}
         aria-label={actionName}
         onClick={() => {
           reopen.mutate(undefined, {
             onSuccess: () => {
+              setCooldown(true);
               toast({
                 title: "已重新入队",
                 description: "问题单已回到 new，等待 runner 领取。",
@@ -112,7 +134,7 @@ export function IssueActionButton({
         size={size}
         className={clsx("whitespace-nowrap", className)}
         pending={requeue.isPending}
-        disabled={requeue.isSuccess}
+        disabled={cooldown}
         aria-label={actionName}
         onClick={() => setConfirmOpen(true)}
       >
@@ -131,6 +153,7 @@ export function IssueActionButton({
           requeue.mutate(undefined, {
             onSuccess: () => {
               setConfirmOpen(false);
+              setCooldown(true);
               toast({
                 title: "已重排",
                 description: "问题单已清除归属并回到 new，等待 runner 重新领取。",
