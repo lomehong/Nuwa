@@ -38,12 +38,25 @@ describe("AppShell", () => {
       "page",
     );
     expect(within(nav).getByRole("link", { name: "问题单" })).toBeInTheDocument();
-
-    for (const label of ["运行器", "活动", "设置"]) {
-      const item = within(nav).getByText(label).closest("[aria-disabled='true']");
-      expect(item).not.toBeNull();
+    for (const label of ["运行器", "活动"]) {
+      expect(within(nav).getByRole("link", { name: label })).toBeInTheDocument();
     }
-    expect(within(nav).getAllByText("Soon")).toHaveLength(3);
+    expect(within(nav).getByText("设置").closest("[aria-disabled='true']")).not.toBeNull();
+    expect(within(nav).getAllByText("Soon")).toHaveLength(1);
+  });
+
+  it("activates runners and events navigation and marks settings as soon", async () => {
+    signedIn();
+    renderApp("/");
+
+    const nav = await screen.findByRole("navigation", { name: "主导航" });
+    expect(within(nav).getByRole("link", { name: "运行器" })).toHaveAttribute(
+      "href",
+      "/runners",
+    );
+    expect(within(nav).getByRole("link", { name: "活动" })).toHaveAttribute("href", "/events");
+    expect(within(nav).getByText("设置").closest("[aria-disabled='true']")).not.toBeNull();
+    expect(within(nav).getAllByText("Soon")).toHaveLength(1);
   });
 
   it("renders the health strip from /overview", async () => {
@@ -154,8 +167,14 @@ describe("AppShell", () => {
       "page",
     );
     expect(within(mobileNav).getByRole("link", { name: "问题单" })).toBeInTheDocument();
-    expect(within(mobileNav).getByText(/^运行器/)).toBeInTheDocument();
-    expect(within(mobileNav).getByText(/^活动/)).toBeInTheDocument();
+    expect(within(mobileNav).getByRole("link", { name: "运行器" })).toHaveAttribute(
+      "href",
+      "/runners",
+    );
+    expect(within(mobileNav).getByRole("link", { name: "活动" })).toHaveAttribute(
+      "href",
+      "/events",
+    );
     expect(container.querySelector("[style]")).toBeNull();
   });
 
@@ -198,7 +217,7 @@ describe("AppShell", () => {
     expect(document.querySelector("[style]")).toBeNull();
 
     // Tab from the last focusable element wraps to the first (close).
-    within(drawer).getByRole("link", { name: "问题单" }).focus();
+    within(drawer).getByRole("link", { name: "活动" }).focus();
     fireEvent.keyDown(drawer, { key: "Tab" });
     expect(close).toHaveFocus();
 

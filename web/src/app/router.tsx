@@ -2,10 +2,12 @@ import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 
 import { AuthErrorState } from "../components/AuthErrorState";
 import { AuthLoading } from "../components/AuthLoading";
+import { EventsPage } from "../features/events/EventsPage";
 import { IssueDetailPage } from "../features/issue-detail/IssueDetailPage";
 import { IssuesPage } from "../features/issues/IssuesPage";
 import { LoginPage } from "../features/login/LoginPage";
 import { OverviewPage } from "../features/overview/OverviewPage";
+import { RunnersPage } from "../features/runners/RunnersPage";
 import { useAuth } from "../lib/auth";
 import { AppShell } from "./AppShell";
 
@@ -33,8 +35,9 @@ function RequireAuth() {
 
 /**
  * Route table (docs/09 §10): `/login`, `/` overview, `/issues` list and
- * `/issues/:fp` detail. `/runners`, `/events` and `/settings` stay disabled
- * navigation entries until M4/M5; unknown paths return to the overview.
+ * `/issues/:fp` detail, plus the read-only `/runners` and `/events` pages.
+ * `/settings` stays a disabled navigation entry until M5; unknown paths return
+ * to the overview.
  */
 export function AppRoutes() {
   return (
@@ -45,6 +48,8 @@ export function AppRoutes() {
           <Route index element={<OverviewPage />} />
           <Route path="issues" element={<IssuesPage />} />
           <Route path="issues/:fp" element={<IssueDetailPage />} />
+          <Route path="runners" element={<RunnersPage />} />
+          <Route path="events" element={<EventsPage />} />
         </Route>
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

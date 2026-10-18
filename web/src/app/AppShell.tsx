@@ -37,8 +37,8 @@ interface NavItem {
 const NAV_ITEMS: readonly NavItem[] = [
   { label: "总览", icon: LayoutDashboard, to: "/", end: true },
   { label: "问题单", icon: ListTodo, to: "/issues" },
-  { label: "运行器", icon: Cpu, soon: "运行器页面将在 M4 提供" },
-  { label: "活动", icon: Activity, soon: "活动页面将在 M4 提供" },
+  { label: "运行器", icon: Cpu, to: "/runners" },
+  { label: "活动", icon: Activity, to: "/events" },
   { label: "设置", icon: Settings, soon: "设置页面将在 M5 提供" },
 ];
 
@@ -58,6 +58,12 @@ function pageMeta(pathname: string): PageMeta {
   }
   if (pathname === "/issues" || pathname === "/issues/") {
     return { title: "问题单", breadcrumb: null };
+  }
+  if (pathname === "/runners" || pathname === "/runners/") {
+    return { title: "运行器", breadcrumb: null };
+  }
+  if (pathname === "/events" || pathname === "/events/") {
+    return { title: "活动", breadcrumb: null };
   }
   if (pathname.startsWith("/issues/")) {
     const raw = pathname.slice("/issues/".length);
