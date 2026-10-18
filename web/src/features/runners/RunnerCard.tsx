@@ -17,6 +17,7 @@ import {
   runnerStatusLabel,
   runnerStatusVariant,
 } from "./format";
+import { RestartRunnerButton } from "./RestartRunnerButton";
 import type { RunnerDto } from "./types";
 
 /** Chinese phase label for a current run; unknown values stay verbatim. */
@@ -32,9 +33,9 @@ interface RunnerCardProps {
 }
 
 /**
- * One runner in the fleet grid (docs/09 §10.6). Read-only in M4: identity and
- * actions copy to the clipboard or link to the issue being worked on; the
- * restart command arrives with M5.
+ * One runner in the fleet grid (docs/09 §10.6). Identity and actions copy to
+ * the clipboard, link to the issue being worked on, or schedule a restart of
+ * the runner's systemd unit behind an impact confirmation.
  */
 export function RunnerCard({ runner, nowMs }: RunnerCardProps) {
   const offline = runnerIsOffline(runner, nowMs);
@@ -63,6 +64,7 @@ export function RunnerCard({ runner, nowMs }: RunnerCardProps) {
                 {runner.id}
               </span>
               <CopyButton value={runner.id} label={`复制运行器 ID：${runner.id}`} />
+              <RestartRunnerButton runner={runner} />
               <Badge variant={runnerStatusVariant(runner, nowMs)} className="ml-auto">
                 {runnerStatusLabel(runner, nowMs)}
               </Badge>
