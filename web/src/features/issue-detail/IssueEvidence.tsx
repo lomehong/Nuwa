@@ -4,6 +4,7 @@ import { CopyButton } from "./CopyButton";
 import {
   formatAge,
   formatDateTime,
+  isoDateTime,
   runDurationMs,
   runOutcomeLabel,
   runOutcomeVariant,
@@ -146,7 +147,7 @@ export function IssueEvidence({ run }: IssueEvidenceProps) {
                   <span>{runPhaseLabel(run.phase)}</span>
                   <span aria-hidden="true">·</span>
                   <time
-                    dateTime={new Date(run.started_at_ms).toISOString()}
+                    dateTime={isoDateTime(run.started_at_ms)}
                     title={formatDateTime(run.started_at_ms)}
                   >
                     {formatAge(run.started_at_ms)}
@@ -193,7 +194,7 @@ export function IssueEvidence({ run }: IssueEvidenceProps) {
                   <p className="mt-1 text-caption text-text-muted">
                     PR 打开于{" "}
                     <time
-                      dateTime={new Date(run.pr_opened_at_ms).toISOString()}
+                      dateTime={isoDateTime(run.pr_opened_at_ms)}
                       title={formatDateTime(run.pr_opened_at_ms)}
                     >
                       {formatAge(run.pr_opened_at_ms)}

@@ -10,7 +10,7 @@ import {
   StateBadge,
   type BadgeVariant,
 } from "../../components/ui";
-import { formatAge, formatDateTime, shortFingerprint } from "./format";
+import { formatAge, formatDateTime, isoDateTime, shortFingerprint } from "./format";
 import { OverviewSection } from "./PanelChrome";
 import type { OverviewAttentionItem } from "./types";
 
@@ -74,7 +74,7 @@ export function AttentionQueue({ items }: AttentionQueueProps) {
                         title={formatDateTime(item.last_seen_ms)}
                       >
                         <Clock3 aria-hidden="true" className="size-3.5" />
-                        <time dateTime={new Date(item.last_seen_ms).toISOString()}>
+                        <time dateTime={isoDateTime(item.last_seen_ms)}>
                           {formatAge(item.last_seen_ms)}
                         </time>
                       </span>

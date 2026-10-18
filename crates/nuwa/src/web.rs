@@ -10,6 +10,8 @@ use rust_embed::RustEmbed;
 
 /// Frontend build output (M3). The folder is kept in git via `.gitkeep` so a
 /// fresh clone compiles; debug builds read it from disk, release embeds it.
+/// `build.rs` fails a release build without `index.html` so a placeholder is
+/// never shipped.
 #[derive(RustEmbed)]
 #[folder = "../../web/dist/"]
 struct Assets;

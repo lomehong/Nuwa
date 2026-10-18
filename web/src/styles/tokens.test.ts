@@ -115,6 +115,21 @@ function textPairs(theme: ThemeName): ContrastPair[] {
       background: color("raised"),
     },
     {
+      label: "muted text on background",
+      foreground: color("text-muted"),
+      background: color("bg"),
+    },
+    {
+      label: "muted text on surface",
+      foreground: color("text-muted"),
+      background: color("surface"),
+    },
+    {
+      label: "muted text on raised",
+      foreground: color("text-muted"),
+      background: color("raised"),
+    },
+    {
       label: "table header text (raised/60 over surface)",
       foreground: color("text-secondary"),
       background: mixOver(color("raised"), color("surface"), 0.6),

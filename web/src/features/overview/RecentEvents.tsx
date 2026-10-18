@@ -15,6 +15,7 @@ import {
   formatAge,
   formatDateTime,
   isSystemFingerprint,
+  isoDateTime,
   shortFingerprint,
 } from "./format";
 import { OverviewSection, PanelError } from "./PanelChrome";
@@ -128,7 +129,7 @@ export function RecentEvents({ events, isPending, error, onRetry }: RecentEvents
                         </Link>
                       )}
                       <time
-                        dateTime={new Date(event.ts_ms).toISOString()}
+                        dateTime={isoDateTime(event.ts_ms)}
                         title={formatDateTime(event.ts_ms)}
                         className="shrink-0 text-caption text-text-muted"
                       >

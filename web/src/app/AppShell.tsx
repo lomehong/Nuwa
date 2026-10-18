@@ -21,6 +21,7 @@ import { OfflineBanner } from "../components/OfflineBanner";
 import { ThemeToggle } from "../components/ThemeToggle";
 import { Badge, Button, Skeleton, useToast } from "../components/ui";
 import { useOverviewQuery } from "../features/overview/queries";
+import { ApiError } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { useModalBehavior } from "../lib/modal";
 
@@ -230,12 +231,20 @@ export function HealthStrip() {
             {health.runners_online}/{health.runners_total}
           </span>
         </span>
-        <Link to="/issues" className={PILL_LINK_CLASS} title="查看待领取的问题单">
+        <Link
+          to="/issues?state=new"
+          className={PILL_LINK_CLASS}
+          title="查看待领取的问题单"
+        >
           <ListTodo aria-hidden="true" className="size-3.5 text-text-muted" />
           <span>队列</span>
           <span className="font-mono tabular-nums">{queue.ready_count}</span>
         </Link>
-        <Link to="/issues" className={PILL_LINK_CLASS} title="查看运行中的问题单">
+        <Link
+          to="/issues?state=triggered,fixing"
+          className={PILL_LINK_CLASS}
+          title="查看运行中的问题单"
+        >
           <Activity aria-hidden="true" className="size-3.5 text-text-muted" />
           <span>运行中</span>
           <span className="font-mono tabular-nums">{activeRuns.length}</span>
@@ -336,10 +345,13 @@ export function AppShell() {
     setLoggingOut(true);
     try {
       await logout();
-    } catch {
+    } catch (error) {
       toast({
         title: "退出失败",
-        description: "无法联系服务器，请检查网络后重试。",
+        description:
+          error instanceof ApiError
+            ? error.message || "服务器拒绝了退出请求，请稍后重试。"
+            : "无法联系服务器，请检查网络后重试。",
         variant: "danger",
       });
     } finally {

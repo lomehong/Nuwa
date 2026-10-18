@@ -3,6 +3,7 @@ import { useEffect, useRef } from "react";
 
 import { Badge, Button, Skeleton, type BadgeVariant } from "../../components/ui";
 import { ApiError } from "../../lib/api";
+import { isoDateTime } from "../../lib/time";
 import {
   formatAge,
   formatToolArguments,
@@ -193,7 +194,7 @@ function MessageCard({ message }: { message: TranscriptMessage }) {
       <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-text-muted">
         <span className="font-mono">#{message.seq}</span>
         <time
-          dateTime={new Date(message.ts_ms).toISOString()}
+          dateTime={isoDateTime(message.ts_ms)}
           title={messageTimeTitle(message.ts_ms)}
         >
           {formatAge(message.ts_ms)}

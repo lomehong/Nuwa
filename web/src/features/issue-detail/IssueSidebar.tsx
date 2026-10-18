@@ -10,6 +10,7 @@ import {
   formatDateTime,
   formatDuration,
   formatTokens,
+  isoDateTime,
   runDurationMs,
   runOutcomeLabel,
   runOutcomeVariant,
@@ -71,7 +72,7 @@ function SimilarItemRow({ item }: SimilarItemRowProps) {
         )}
         <span aria-hidden="true">·</span>
         <time
-          dateTime={new Date(item.last_seen_ms).toISOString()}
+          dateTime={isoDateTime(item.last_seen_ms)}
           title={formatDateTime(item.last_seen_ms)}
         >
           {formatAge(item.last_seen_ms)}
@@ -123,7 +124,7 @@ export function IssueSidebar({ issue, latestRun, similarCount, similarItems }: I
                 <dt className="text-text-muted">状态变更于</dt>
                 <dd className="mt-0.5 text-text-secondary">
                   <time
-                    dateTime={new Date(issue.state_changed_at_ms).toISOString()}
+                    dateTime={isoDateTime(issue.state_changed_at_ms)}
                     title={formatDateTime(issue.state_changed_at_ms)}
                   >
                     {formatAge(issue.state_changed_at_ms)}
@@ -161,7 +162,7 @@ export function IssueSidebar({ issue, latestRun, similarCount, similarItems }: I
                     <dt className="text-text-muted">开始</dt>
                     <dd className="mt-0.5 text-text-secondary">
                       <time
-                        dateTime={new Date(latestRun.started_at_ms).toISOString()}
+                        dateTime={isoDateTime(latestRun.started_at_ms)}
                         title={formatDateTime(latestRun.started_at_ms)}
                       >
                         {formatAge(latestRun.started_at_ms)}

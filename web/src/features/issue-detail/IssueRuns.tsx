@@ -7,6 +7,7 @@ import {
   formatDateTime,
   formatDuration,
   formatTokens,
+  isoDateTime,
   runDurationMs,
   runOutcomeLabel,
   runOutcomeVariant,
@@ -71,7 +72,7 @@ function RunRow({
           <dt className="text-text-muted">开始</dt>
           <dd className="mt-0.5 text-text-secondary">
             <time
-              dateTime={new Date(run.started_at_ms).toISOString()}
+              dateTime={isoDateTime(run.started_at_ms)}
               title={formatDateTime(run.started_at_ms)}
             >
               {formatAge(run.started_at_ms)}

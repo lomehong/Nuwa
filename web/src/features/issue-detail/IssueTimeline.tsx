@@ -4,6 +4,7 @@ import {
   formatAge,
   formatDateTime,
   isSystemFingerprint,
+  isoDateTime,
   timelineKindVariant,
   eventKindLabel,
 } from "./format";
@@ -67,7 +68,7 @@ export function IssueTimeline({ items }: IssueTimelineProps) {
                         </Badge>
                       ) : null}
                       <time
-                        dateTime={new Date(item.ts_ms).toISOString()}
+                        dateTime={isoDateTime(item.ts_ms)}
                         title={formatDateTime(item.ts_ms)}
                         className="text-caption whitespace-nowrap text-text-muted"
                       >

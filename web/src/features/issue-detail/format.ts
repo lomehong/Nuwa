@@ -14,6 +14,7 @@ import {
   formatDuration,
   formatTokens,
   isSystemFingerprint,
+  isoDateTime,
 } from "../overview/format";
 import type { RunDto } from "./types";
 
@@ -25,6 +26,7 @@ export {
   formatDuration,
   formatTokens,
   isSystemFingerprint,
+  isoDateTime,
   shortFingerprint,
 };
 
@@ -130,9 +132,6 @@ const ACTOR_LABELS: Record<string, string> = {
 export function actorLabel(actor: string | null): string | null {
   if (!actor) {
     return null;
-  }
-  if (isSystemFingerprint(actor)) {
-    return "系统";
   }
   return ACTOR_LABELS[actor] ?? actor;
 }

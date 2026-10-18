@@ -4,18 +4,18 @@
  * three one-line formatters.
  */
 
+import { isValidTimestamp, isoDateTime } from "../../lib/time";
+
+export { isoDateTime };
+
 const NUMBER_FORMAT = new Intl.NumberFormat("zh-CN");
 
 export function formatCount(value: number): string {
   return NUMBER_FORMAT.format(Number.isFinite(value) ? value : 0);
 }
 
-export function isoDateTime(tsMs: number): string | undefined {
-  return Number.isFinite(tsMs) ? new Date(tsMs).toISOString() : undefined;
-}
-
 export function formatDateTime(tsMs: number): string {
-  if (!Number.isFinite(tsMs)) {
+  if (!isValidTimestamp(tsMs)) {
     return "—";
   }
   return new Intl.DateTimeFormat("zh-CN", {
@@ -30,7 +30,7 @@ export function formatDateTime(tsMs: number): string {
 
 /** Relative age: 刚刚 / 5 分钟前 / 3 天前 (absolute value in the tooltip). */
 export function formatAge(tsMs: number, now: number = Date.now()): string {
-  const diff = Number.isFinite(tsMs) ? Math.max(0, now - tsMs) : 0;
+  const diff = isValidTimestamp(tsMs) ? Math.max(0, now - tsMs) : 0;
   const seconds = Math.floor(diff / 1_000);
   if (seconds < 60) {
     return "刚刚";

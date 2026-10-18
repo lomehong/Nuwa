@@ -4,6 +4,10 @@
  * library (the page only needs counts, durations and relative timestamps).
  */
 
+import { isValidTimestamp } from "../../lib/time";
+
+export { isoDateTime } from "../../lib/time";
+
 const NUMBER_FORMAT = new Intl.NumberFormat("zh-CN");
 
 export function formatNumber(value: number): string {
@@ -44,7 +48,7 @@ export function formatDuration(ms: number): string {
 
 /** Relative age for attention cards and events: 刚刚 / 5 分钟前 / 3 天前. */
 export function formatAge(tsMs: number, now: number = Date.now()): string {
-  const diff = Number.isFinite(tsMs) ? Math.max(0, now - tsMs) : 0;
+  const diff = isValidTimestamp(tsMs) ? Math.max(0, now - tsMs) : 0;
   const seconds = Math.floor(diff / 1_000);
   if (seconds < 60) {
     return "刚刚";
@@ -65,7 +69,7 @@ export function formatAge(tsMs: number, now: number = Date.now()): string {
 }
 
 export function formatDate(tsMs: number): string {
-  if (!Number.isFinite(tsMs)) {
+  if (!isValidTimestamp(tsMs)) {
     return "—";
   }
   return new Intl.DateTimeFormat("zh-CN", {
@@ -76,7 +80,7 @@ export function formatDate(tsMs: number): string {
 }
 
 export function formatDateTime(tsMs: number): string {
-  if (!Number.isFinite(tsMs)) {
+  if (!isValidTimestamp(tsMs)) {
     return "—";
   }
   return new Intl.DateTimeFormat("zh-CN", {

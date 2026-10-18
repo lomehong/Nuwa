@@ -25,6 +25,7 @@ Nuwa = 自愈式修复 agent：运行时问题信号 → 山海经问题单（SQ
 cargo clippy --workspace --all-targets   # 自建 crate 必须零 warning
 cargo test --workspace                   # 上游 1662 测试是安全网
 go test ./...                            # 在 sdk/qingniao-go 下
+cd web && npm ci && npm run typecheck && npm run lint && npm test && npm run build
 ```
 
 冒烟/演示命令见 docs/08 与 README 快速上手。

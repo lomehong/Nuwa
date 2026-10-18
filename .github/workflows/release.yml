@@ -38,6 +38,7 @@ jobs:
       - name: package
         shell: bash
         run: |
+          test -f web/dist/index.html
           mkdir -p dist
           if [ -f target/release/nuwa.exe ]; then
             cp target/release/nuwa.exe "dist/${{ matrix.artifact }}.exe"

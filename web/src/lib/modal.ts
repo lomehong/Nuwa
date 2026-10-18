@@ -31,12 +31,6 @@ function focusableElements(container: HTMLElement | null): HTMLElement[] {
   );
 }
 
-/** Focuses the first focusable element inside `container` (or the container). */
-export function focusFirst(container: HTMLElement | null): void {
-  const target = focusableElements(container)[0] ?? container;
-  target?.focus();
-}
-
 /** Keeps Tab focus inside `container`; call from the panel's onKeyDown. */
 export function trapTabKey(event: KeyboardEvent<HTMLElement>, container: HTMLElement | null): void {
   const focusable = focusableElements(container);

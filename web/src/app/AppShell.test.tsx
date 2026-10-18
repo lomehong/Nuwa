@@ -80,8 +80,12 @@ describe("AppShell", () => {
     expect(await within(region).findByText("serve 正常")).toBeInTheDocument();
     expect(within(region).getByText("在线")).toBeInTheDocument();
     expect(within(region).getByText("1/2")).toBeInTheDocument();
-    expect(within(region).getByRole("link", { name: /^队列\s*3$/ })).toBeInTheDocument();
-    expect(within(region).getByRole("link", { name: /^运行中\s*1$/ })).toBeInTheDocument();
+    expect(
+      within(region).getByRole("link", { name: /^队列\s*3$/ }),
+    ).toHaveAttribute("href", "/issues?state=new");
+    expect(
+      within(region).getByRole("link", { name: /^运行中\s*1$/ }),
+    ).toHaveAttribute("href", "/issues?state=triggered,fixing");
     expect(within(region).getByText("今日 PR").parentElement).toHaveTextContent("今日 PR2");
     expect(within(region).getByText("配额待命").parentElement).toHaveTextContent("配额待命1");
   });
@@ -103,6 +107,30 @@ describe("AppShell", () => {
 
     expect(await screen.findByRole("heading", { name: "女娲 · 补天" })).toBeInTheDocument();
     expect(csrfHeader).toBe("logout-token");
+  });
+
+  it("shows the server message when logout is rejected", async () => {
+    signedIn();
+    document.cookie = "nuwa_csrf=logout-token; path=/";
+    server.use(
+      http.post("/api/v1/auth/logout", () =>
+        HttpResponse.json(
+          { error: { code: "forbidden", message: "csrf check failed" } },
+          { status: 403 },
+        ),
+      ),
+    );
+
+    renderApp("/");
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+    fireEvent.click(screen.getByRole("button", { name: "退出登录" }));
+
+    expect(await screen.findByText("csrf check failed")).toBeInTheDocument();
+    expect(screen.getByText("退出失败")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "女娲 · 补天" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: "总览" })).toBeInTheDocument();
   });
 
   it("keeps the theme toggle working inside the shell", async () => {

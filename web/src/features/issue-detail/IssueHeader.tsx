@@ -8,6 +8,7 @@ import {
   formatAge,
   formatCount,
   formatDateTime,
+  isoDateTime,
   shortFingerprint,
 } from "./format";
 import { CopyButton } from "./CopyButton";
@@ -21,7 +22,7 @@ function MetaTime({ label, tsMs }: { label: string; tsMs: number }) {
     <div className="min-w-0">
       <dt className="text-caption text-text-muted">{label}</dt>
       <dd className="mt-0.5 text-body-sm text-text-secondary">
-        <time dateTime={new Date(tsMs).toISOString()} title={formatDateTime(tsMs)}>
+        <time dateTime={isoDateTime(tsMs)} title={formatDateTime(tsMs)}>
           {formatAge(tsMs)}
         </time>
       </dd>
@@ -130,7 +131,7 @@ export function IssueHeader({ issue }: IssueHeaderProps) {
         <span aria-hidden="true">·</span>
         <span>最近更新</span>
         <time
-          dateTime={new Date(issue.last_seen_ms).toISOString()}
+          dateTime={isoDateTime(issue.last_seen_ms)}
           title={formatDateTime(issue.last_seen_ms)}
         >
           {formatAge(issue.last_seen_ms)}
