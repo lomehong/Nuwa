@@ -6,12 +6,12 @@ import {
   CardContent,
   TableCell,
   TableRow,
-  type BadgeVariant,
 } from "../../components/ui";
 import { actorLabel } from "../issue-detail/format";
 import { issueDetailPath } from "../issues/format";
 import {
   eventKindLabel,
+  eventKindVariant,
   formatAge,
   formatDateTime,
   isSystemFingerprint,
@@ -19,23 +19,6 @@ import {
   shortFingerprint,
 } from "../overview/format";
 import type { EventItem } from "./types";
-
-const KIND_VARIANTS: Record<string, BadgeVariant> = {
-  ci_green: "success",
-  merged: "success",
-  pr_merged: "success",
-  ci_red: "danger",
-  runner_error: "danger",
-  ci_timeout: "warning",
-  restart_requested: "warning",
-  pr_opened: "info",
-  state_changed: "info",
-  requeued: "info",
-};
-
-function kindVariant(kind: string): BadgeVariant {
-  return KIND_VARIANTS[kind] ?? "neutral";
-}
 
 /** `__config__` / `__runner__:<id>` / `__system__` have no issue page. */
 function systemFingerprintLabel(fingerprint: string): string {
@@ -52,7 +35,9 @@ function EventFingerprint({ fingerprint }: { fingerprint: string }) {
   if (isSystemFingerprint(fingerprint)) {
     return (
       <Badge title={fingerprint} className="shrink-0">
-        {systemFingerprintLabel(fingerprint)}
+        <span>{systemFingerprintLabel(fingerprint)}</span>
+        {/* The label alone drops the id; announce the full fingerprint instead. */}
+        <span className="sr-only">（{fingerprint}）</span>
       </Badge>
     );
   }
@@ -70,7 +55,7 @@ function EventFingerprint({ fingerprint }: { fingerprint: string }) {
 function KindCell({ event }: { event: EventItem }) {
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      <Badge variant={kindVariant(event.kind)} title={event.kind}>
+      <Badge variant={eventKindVariant(event.kind)} title={event.kind}>
         {eventKindLabel(event.kind)}
       </Badge>
       {event.count > 1 ? (

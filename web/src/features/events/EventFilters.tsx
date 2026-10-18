@@ -134,9 +134,14 @@ export function EventFilters({ filters, onChange }: EventFiltersProps) {
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <span className="text-caption font-medium text-text-secondary">预设</span>
+        {/*
+         * An action, not a toggle: clicking always applies the audit filter and
+         * has no off state, so the pressed style is informational only and the
+         * button carries no `aria-pressed`. The header's "审计视图" badge is the
+         * accessible source of truth, derived from the exact filter state.
+         */}
         <button
           type="button"
-          aria-pressed={auditView}
           onClick={() => onChange({ kinds: [...AUDIT_KINDS], range: "30d", page: 1 })}
           className={chipClass(auditView)}
         >
@@ -156,7 +161,7 @@ export function EventFilters({ filters, onChange }: EventFiltersProps) {
         <CommitInput
           label="指纹"
           value={filters.fingerprint}
-          placeholder="问题单指纹前缀或完整值"
+          placeholder="完整问题单指纹"
           onCommit={(fingerprint) => onChange({ fingerprint })}
         />
         <Select

@@ -4,6 +4,7 @@
  * library (the page only needs counts, durations and relative timestamps).
  */
 
+import type { BadgeVariant } from "../../components/ui";
 import { isValidTimestamp } from "../../lib/time";
 
 export { isoDateTime } from "../../lib/time";
@@ -141,4 +142,25 @@ const EVENT_KIND_LABELS: Record<string, string> = {
 
 export function eventKindLabel(kind: string): string {
   return EVENT_KIND_LABELS[kind] ?? kind;
+}
+
+/**
+ * Badge tone shared by the activity feed and the overview's recent-events
+ * panel. Unknown kinds stay neutral so a new backend kind never breaks the UI.
+ */
+const EVENT_KIND_VARIANTS: Record<string, BadgeVariant> = {
+  ci_green: "success",
+  merged: "success",
+  pr_merged: "success",
+  ci_red: "danger",
+  runner_error: "danger",
+  ci_timeout: "warning",
+  restart_requested: "warning",
+  pr_opened: "info",
+  state_changed: "info",
+  requeued: "info",
+};
+
+export function eventKindVariant(kind: string): BadgeVariant {
+  return EVENT_KIND_VARIANTS[kind] ?? "neutral";
 }

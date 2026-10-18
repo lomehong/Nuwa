@@ -50,7 +50,7 @@ const TREND_RANGES: readonly { value: TrendsRange; label: string; days: number }
   { value: "90d", label: "90 天", days: 90 },
 ];
 
-export function trendRangeDays(range: TrendsRange): number {
+function trendRangeDays(range: TrendsRange): number {
   return TREND_RANGES.find((entry) => entry.value === range)?.days ?? 14;
 }
 

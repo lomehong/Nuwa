@@ -1,4 +1,4 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { delay, http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 
@@ -72,6 +72,12 @@ describe("EventsPage", () => {
           actor: "system",
         }),
         makeEvent({
+          fingerprint: "__system__",
+          kind: "sync",
+          detail: "reconcile queue",
+          actor: "system",
+        }),
+        makeEvent({
           fingerprint: issueFingerprint,
           kind: "state_changed",
           detail: "new -> triggered",
@@ -87,11 +93,20 @@ describe("EventsPage", () => {
 
     expect(within(table).getByText("系统 · 配置")).toBeInTheDocument();
     expect(within(table).getByText("系统 · 运行器")).toBeInTheDocument();
+    expect(within(table).getByTitle("__system__")).toHaveTextContent("系统");
+    // The visible label drops the id, so the full fingerprint is announced via
+    // an sr-only suffix (same pattern as the overview's recent events).
+    expect(within(table).getByText("（__config__）")).toBeInTheDocument();
+    expect(within(table).getByText("（__runner__:worker-1）")).toBeInTheDocument();
+    expect(within(table).getByText("（__system__）")).toBeInTheDocument();
     expect(
       within(table).queryByRole("link", { name: /__config__/ }),
     ).not.toBeInTheDocument();
     expect(
       within(table).queryByRole("link", { name: /__runner__/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(table).queryByRole("link", { name: "__system__" }),
     ).not.toBeInTheDocument();
 
     const issueLink = within(table).getByRole("link", {
@@ -111,7 +126,7 @@ describe("EventsPage", () => {
     expect(requests[0].searchParams.get("from_ms")).not.toBeNull();
   });
 
-  it("applies the audit preset and exposes the audit badge", async () => {
+  it("applies the audit preset as an action and exposes the audit badge", async () => {
     const requests = useEventsHandler(() =>
       eventsResponse([makeEvent({ fingerprint: "__config__", kind: "config_changed" })]),
     );
@@ -119,7 +134,8 @@ describe("EventsPage", () => {
 
     await screen.findByRole("region", { name: "活动列表" });
     const preset = screen.getByRole("button", { name: "配置审计" });
-    expect(preset).toHaveAttribute("aria-pressed", "false");
+    // A preset is an action, not a toggle: it never advertises a pressed state.
+    expect(preset).not.toHaveAttribute("aria-pressed");
     expect(screen.queryByText("审计视图")).not.toBeInTheDocument();
 
     fireEvent.click(preset);
@@ -132,9 +148,18 @@ describe("EventsPage", () => {
     expect(last.searchParams.get("page")).toBe("1");
     expect(last.searchParams.get("from_ms")).not.toBeNull();
 
-    expect(preset).toHaveAttribute("aria-pressed", "true");
+    expect(preset).not.toHaveAttribute("aria-pressed");
     expect(screen.getByText("审计视图")).toBeInTheDocument();
     expect(screen.getByLabelText("时间范围")).toHaveValue("30d");
+
+    // The badge is driven by the exact filter state: dropping one audit kind
+    // leaves the 30-day window intact but the page is no longer the audit view.
+    fireEvent.click(screen.getByRole("button", { name: "配置变更" }));
+    await waitFor(() => expect(screen.queryByText("审计视图")).not.toBeInTheDocument());
+    expect(screen.getByLabelText("时间范围")).toHaveValue("30d");
+    expect(requests[requests.length - 1].searchParams.get("kind")).toBe(
+      "config_migrated,restart_requested",
+    );
   });
 
   it("commits text filters on Enter/blur, resets the page and aggregates", async () => {
@@ -184,32 +209,109 @@ describe("EventsPage", () => {
     expect(screen.getByLabelText("仓库")).toHaveValue("");
   });
 
+  it("restores kind and range filters from the URL", async () => {
+    const requests = useEventsHandler(() => eventsResponse([makeEvent({ kind: "ci_red" })]));
+    renderApp("/events?kind=ci_red&range=7d");
+
+    await screen.findByRole("region", { name: "活动列表" });
+    expect(screen.getByRole("button", { name: "CI 失败" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "上报" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+
+    const range = screen.getByLabelText("时间范围") as HTMLSelectElement;
+    expect(range).toHaveValue("7d");
+    expect(range.selectedOptions[0]).toHaveTextContent("最近 7 天");
+
+    expect(requests[0].searchParams.get("kind")).toBe("ci_red");
+    const fromMs = Number(requests[0].searchParams.get("from_ms"));
+    expect(Date.now() - fromMs).toBeGreaterThan(6 * 86_400_000);
+    expect(Date.now() - fromMs).toBeLessThan(8 * 86_400_000);
+  });
+
+  it("restores the aggregate flag from the URL", async () => {
+    useEventsHandler(() => eventsResponse([makeEvent()]));
+    renderApp("/events?aggregate=1");
+
+    await screen.findByRole("region", { name: "活动列表" });
+    expect(
+      screen.getByRole("checkbox", { name: "聚合历史上报（按小时）" }),
+    ).toBeChecked();
+  });
+
   it("toggles kind chips", async () => {
     const requests = useEventsHandler(() => eventsResponse([makeEvent()]));
     renderApp("/events");
 
     await screen.findByRole("region", { name: "活动列表" });
-    const chip = screen.getByRole("button", { name: "CI 失败" });
-    expect(chip).toHaveAttribute("aria-pressed", "false");
-
-    fireEvent.click(chip);
-    await waitFor(() => expect(requests).toHaveLength(2));
-    expect(requests[1].searchParams.get("kind")).toBe("ci_red");
+    const lastKind = () => requests[requests.length - 1].searchParams.get("kind");
     expect(screen.getByRole("button", { name: "CI 失败" })).toHaveAttribute(
       "aria-pressed",
-      "true",
+      "false",
     );
 
     fireEvent.click(screen.getByRole("button", { name: "CI 失败" }));
-    // Removing the chip returns to the already-cached default query, so no
-    // third request is issued; the pressed state proves the URL round-trip.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "CI 失败" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      ),
+    );
+    expect(lastKind()).toBe("ci_red");
+
+    // Selecting a second chip keeps the canonical order.
+    fireEvent.click(screen.getByRole("button", { name: "上报" }));
+    await waitFor(() => expect(lastKind()).toBe("reported,ci_red"));
+
+    // Untoggling a chip removes only that kind; anchor on the pressed state and
+    // the resulting request URL instead of a total request count, which used to
+    // depend on whether the default query happened to be cached.
+    fireEvent.click(screen.getByRole("button", { name: "CI 失败" }));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "CI 失败" })).toHaveAttribute(
         "aria-pressed",
         "false",
       ),
     );
-    expect(requests).toHaveLength(2);
+    await waitFor(() => expect(lastKind()).toBe("reported"));
+  });
+
+  it("keeps cached rows and shows a stale notice when a refetch fails", async () => {
+    const fingerprint = "abcdef1234567890";
+    let calls = 0;
+    server.use(
+      mockMe(),
+      mockOverview(),
+      http.get("/api/v1/events", () => {
+        calls += 1;
+        if (calls > 1) {
+          return HttpResponse.json(
+            { error: { code: "internal", message: "store read failed" } },
+            { status: 500 },
+          );
+        }
+        return HttpResponse.json(eventsResponse([makeEvent({ fingerprint })]));
+      }),
+    );
+    const { queryClient } = renderApp("/events");
+
+    const table = await screen.findByRole("region", { name: "活动列表" });
+    await act(async () => {
+      await queryClient.refetchQueries().catch(() => undefined);
+    });
+
+    expect(
+      await screen.findByText("活动更新失败，显示的是上次数据。"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    // The cached rows stay visible below the stale notice.
+    expect(
+      within(table).getByRole("link", { name: shortFingerprint(fingerprint) }),
+    ).toBeInTheDocument();
   });
 
   it("shows the aggregated count and the hour range", async () => {

@@ -252,7 +252,7 @@ describe("OverviewPage", () => {
     expect(within(events).queryByRole("link", { name: /__config__/ })).not.toBeInTheDocument();
     expect(within(events).getByRole("link", { name: "查看全部" })).toHaveAttribute(
       "href",
-      "/events",
+      "/events?range=7d",
     );
 
     expect(container.querySelector("[style]")).toBeNull();

@@ -7,11 +7,11 @@ import {
   CardContent,
   EmptyState,
   Skeleton,
-  type BadgeVariant,
 } from "../../components/ui";
 import { issueDetailPath } from "./AttentionQueue";
 import {
   eventKindLabel,
+  eventKindVariant,
   formatAge,
   formatDateTime,
   isSystemFingerprint,
@@ -20,18 +20,6 @@ import {
 } from "./format";
 import { OverviewSection, PanelError } from "./PanelChrome";
 import type { EventsResponse } from "../events/types";
-
-const KIND_VARIANTS: Record<string, BadgeVariant> = {
-  ci_green: "success",
-  pr_merged: "success",
-  merged: "success",
-  ci_red: "danger",
-  runner_error: "danger",
-  ci_timeout: "warning",
-  restart_requested: "warning",
-  pr_opened: "info",
-  state_changed: "info",
-};
 
 const SKELETON_ROWS = 5;
 
@@ -58,8 +46,10 @@ export function RecentEvents({ events, isPending, error, onRetry }: RecentEvents
       aside={
         <>
           <Badge>最新 8 条</Badge>
+          {/* The panel shows the latest rows regardless of age; the feed's
+              default 24h window could be empty, so land on 7 days instead. */}
           <Link
-            to="/events"
+            to="/events?range=7d"
             className="inline-flex min-h-11 items-center gap-1 rounded-card px-2 text-caption font-medium text-text-secondary transition-colors hover:text-accent pointer-fine:min-h-8"
           >
             查看全部
@@ -105,7 +95,7 @@ export function RecentEvents({ events, isPending, error, onRetry }: RecentEvents
                       className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 first:pt-0 last:pb-0"
                     >
                       <Badge
-                        variant={KIND_VARIANTS[event.kind] ?? "neutral"}
+                        variant={eventKindVariant(event.kind)}
                         title={event.kind}
                         className="shrink-0"
                       >
