@@ -77,6 +77,15 @@ nuwa work --db shanhaijing.db \
 - `--runner-id`：控制台可见的 runner 身份，默认 `hostname:repo`；仅保留字母数字与 `.:_-`，超长截断
 - `--service-unit`：记录 systemd 单元名（默认 `nuwa-work`）。控制台的「重启 unit」动作会消费它（缺失/非法时该动作禁用或 422）
 
+## 5 · 第一个真实系统接入（mindloop，进行中）
+
+| 项 | 值 |
+|---|---|
+| 仓库 | `github.com/lomehong/mindloop`（私有） |
+| 采集点 | `cmd/robotd`（桌面 MCP 守护进程，无人值守形态）——`qingniao.Capture` + HTTPSink |
+| 指令文件 | 仓库根 `nuwa.repo.json`（failing_check 排除 web/static npm 噪音） |
+| 待办 | 所有者：推送 mindloop 至 GitHub + token 仓库列表加 mindloop；runner 服务器 clone + work 指向 |
+
 ## 4 · 日常运维命令
 
 **Web 控制台（v3 SPA，0.2.0 起是唯一控制台）**：`http://<server>:7321/`，在 `/login` 用 `NUWA_UI_TOKEN` 换取 HttpOnly 会话（**不再使用 Basic 头**）。`/` 就是 SPA 控制台；`/ui*` 308 永久重定向到 `/`，`/issue/{fp}` 重定向到 `/issues/{fp}`，`/settings` 直接由 SPA 提供；`/ingest` 与 `/health` 的路径和鉴权不变。SPA 提供总览、问题单列表/详情（含会话转录）、运行器、活动与设置。
