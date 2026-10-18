@@ -32,6 +32,7 @@ export interface ApiErrorEnvelope {
 interface ApiErrorOptions {
   fields?: Record<string, string>;
   retryAfterSeconds?: number;
+  body?: unknown;
 }
 
 /** A non-2xx API response, or a transport/parse failure (status 0). */
@@ -41,6 +42,11 @@ export class ApiError extends Error {
   readonly fields?: Record<string, string>;
   /** Parsed `Retry-After` header, in whole seconds (429 rate limits). */
   readonly retryAfterSeconds?: number;
+  /**
+   * The full parsed JSON body. Kept because some 409s carry data beside the
+   * `error` envelope (a settings restart lists `active_runs`, for example).
+   */
+  readonly body?: unknown;
 
   constructor(status: number, code: string, message: string, options: ApiErrorOptions = {}) {
     super(message);
@@ -49,6 +55,7 @@ export class ApiError extends Error {
     this.code = code;
     this.fields = options.fields;
     this.retryAfterSeconds = options.retryAfterSeconds;
+    this.body = options.body;
   }
 }
 
@@ -155,20 +162,22 @@ async function apiErrorFromResponse(response: Response): Promise<ApiError> {
   let fields: Record<string, string> | undefined;
 
   const raw = await response.text().catch(() => "");
+  let body: unknown;
   if (raw) {
     try {
-      const body: unknown = JSON.parse(raw);
-      if (isErrorEnvelope(body)) {
-        code = body.error.code;
-        message = body.error.message;
-        fields = body.error.fields;
-      }
+      body = JSON.parse(raw);
     } catch {
       // Not JSON (proxy error page, empty body): keep the status fallback.
+      body = undefined;
     }
   }
+  if (body && isErrorEnvelope(body)) {
+    code = body.error.code;
+    message = body.error.message;
+    fields = body.error.fields;
+  }
 
-  return new ApiError(response.status, code, message, { fields, retryAfterSeconds });
+  return new ApiError(response.status, code, message, { fields, retryAfterSeconds, body });
 }
 
 /**

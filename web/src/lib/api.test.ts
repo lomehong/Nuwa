@@ -98,6 +98,36 @@ describe("apiFetch", () => {
     expect(apiError.fields).toEqual({ state: "expected escalated or rejected" });
   });
 
+  it("keeps extra 409 fields on the error body", async () => {
+    server.use(
+      http.post("/api/v1/settings/restart", () =>
+        HttpResponse.json(
+          {
+            error: { code: "conflict", message: "active runs" },
+            active_runs: [
+              {
+                id: "run-1",
+                fingerprint: "fp-1",
+                runner_id: "r1",
+                repo: "a/b",
+                phase: "repair",
+                started_at_ms: 1,
+              },
+            ],
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+
+    await expect(
+      apiFetch("/settings/restart", { method: "POST", body: "{}" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      body: { active_runs: [{ id: "run-1" }] },
+    });
+  });
+
   it("exposes Retry-After seconds on rate-limit errors", async () => {
     server.use(
       http.post("/api/v1/auth/login", () =>
