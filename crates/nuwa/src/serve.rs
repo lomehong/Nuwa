@@ -41,17 +41,14 @@ pub struct AppState {
     /// `NUWA_ENV_FILE` (default `/opt/nuwa/nuwa.env`) — read and written by
     /// the settings API.
     pub env_path: PathBuf,
-    /// `--db` path; shown by the M2c system endpoint (Task 4).
-    #[allow(dead_code)]
+    /// `--db` path; shown by the system endpoint.
     pub db_path: PathBuf,
     pub cookie_secure: bool,
-    /// `NUWA_SERVE_UNIT` (default `nuwa-serve`); read by the M2c settings
-    /// restart endpoint.
-    #[allow(dead_code)]
+    /// `NUWA_SERVE_UNIT` (default `nuwa-serve`); restart target and the
+    /// system endpoint's first service.
     pub serve_unit: String,
-    /// `NUWA_RUNNER_UNITS` comma list (default `["nuwa-work"]`); read by the
-    /// M2c settings restart endpoint.
-    #[allow(dead_code)]
+    /// `NUWA_RUNNER_UNITS` comma list (default `["nuwa-work"]`); restart
+    /// targets and the system endpoint's remaining services.
     pub runner_units: Vec<String>,
 }
 

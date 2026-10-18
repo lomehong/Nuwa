@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
@@ -12,12 +13,22 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use shanhaijing::{EventRow, RunnerRow, Store};
+use shanhaijing::{EventRow, RunRow, RunnerRow, Store};
 
-use crate::api::common::{parse_json_body, valid_systemd_unit};
-use crate::api::ApiError;
+use crate::api::common::{
+    configured_units, parse_json_body, schedule_restart, valid_systemd_unit,
+};
+use crate::api::{ApiError, ErrorBody, ErrorDetail};
 use crate::serve::AppState;
 use crate::settings::{self, SettingSpec};
+
+/// Network budget for the `POST /settings/test` probes (docs/09 §9.2).
+const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_RATE_LIMIT_URL: &str = "https://api.github.com/rate_limit";
+const ZAI_DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+const ZAI_DEFAULT_MODEL: &str = "glm-5.3-flash";
+const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Audit rows scanned for `restart_pending` / `last_changes` /
 /// `updated_at_ms`. `__config__` only carries settings events, so this covers
@@ -130,6 +141,47 @@ pub struct PutSettingsResponse {
     pub restart_required: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct TestSettingsRequest {
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Unsaved candidate values; an explicit entry wins over the environment
+    /// so the console tests exactly what the operator typed (docs/09 §9.2).
+    #[serde(default)]
+    pub values: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TestSettingsResponse {
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RestartRequest {
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// One in-flight run, enough for the console to render the 409 guard dialog.
+#[derive(Debug, Serialize)]
+struct ActiveRunSummary {
+    id: String,
+    fingerprint: String,
+    runner_id: String,
+    repo: String,
+    phase: String,
+    started_at_ms: i64,
+}
+
+/// The documented error envelope plus the `active_runs` list a guarded
+/// restart returns (docs/09 §9.2).
+#[derive(Serialize)]
+struct RestartConflictBody {
+    error: ErrorDetail,
+    active_runs: Vec<ActiveRunSummary>,
+}
+
 /// `GET /api/v1/settings` — schema plus the effective configuration.
 pub async fn get(State(state): State<AppState>) -> Response {
     let path = state.env_path.clone();
@@ -175,6 +227,314 @@ pub async fn put(
 
 fn internal_error(message: &'static str) -> ApiError {
     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+}
+
+// ---- POST /settings/test ---------------------------------------------------
+
+/// `POST /api/v1/settings/test` — probe the GitHub token or the LLM endpoint
+/// with unsaved candidate values (docs/09 §9.2). Nothing is persisted and no
+/// value is ever logged.
+pub async fn test(payload: Result<Json<TestSettingsRequest>, JsonRejection>) -> Response {
+    let request = match parse_json_body(payload) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let target = request.target.as_deref().map(str::trim).unwrap_or("");
+    let result = match target {
+        "github" => probe_github(&request.values).await,
+        "llm" => probe_llm(&request.values).await,
+        _ => Err(field_error("target", "must be github or llm")),
+    };
+    match result {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+fn field_error(field: &str, message: impl Into<String>) -> ApiError {
+    let mut fields = BTreeMap::new();
+    fields.insert(field.to_string(), message.into());
+    ApiError::validation(fields)
+}
+
+/// An explicit `values` entry wins over the environment, even when empty: the
+/// operator is testing the value on screen, not the running process default.
+fn provided_value(values: &BTreeMap<String, Value>, key: &str) -> Result<Option<String>, ApiError> {
+    match values.get(key) {
+        Some(Value::String(text)) => Ok(Some(text.trim().to_string())),
+        Some(Value::Number(number)) => Ok(Some(number.to_string())),
+        Some(_) => Err(field_error(key, "must be a string")),
+        None => Ok(None),
+    }
+}
+
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Candidate value, else process env, else `default`.
+fn resolve_value(
+    values: &BTreeMap<String, Value>,
+    key: &str,
+    default: &str,
+) -> Result<String, ApiError> {
+    if let Some(value) = provided_value(values, key)? {
+        return Ok(value);
+    }
+    Ok(env_value(key).unwrap_or_else(|| default.to_string()))
+}
+
+fn test_http_client() -> Result<reqwest::Client, ApiError> {
+    reqwest::Client::builder()
+        .timeout(TEST_TIMEOUT)
+        .build()
+        .map_err(|error| ApiError::upstream(format!("HTTP client setup failed: {error}")))
+}
+
+/// Send one probe with a hard timeout; non-2xx is a 502, never a body echo
+/// (provider error payloads can quote the request).
+async fn send_probe(service: &str, request: reqwest::RequestBuilder) -> Result<Value, ApiError> {
+    let response = match tokio::time::timeout(TEST_TIMEOUT, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            return Err(ApiError::upstream(format!(
+                "{service} is unreachable: {error}"
+            )))
+        }
+        Err(_) => return Err(ApiError::upstream(format!("{service} check timed out"))),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ApiError::upstream(format!(
+            "{service} request failed ({status})"
+        )));
+    }
+    Ok(response.json().await.unwrap_or_default())
+}
+
+/// `GET /rate_limit` proves the token itself; it spends no API quota.
+async fn probe_github(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
+    let token = match provided_value(values, "NUWA_GITHUB_TOKEN")? {
+        Some(token) => token,
+        None => env_value("NUWA_GITHUB_TOKEN")
+            .or_else(|| env_value("GITHUB_TOKEN"))
+            .unwrap_or_default(),
+    };
+    if token.is_empty() {
+        return Err(field_error("NUWA_GITHUB_TOKEN", "token is required"));
+    }
+    let request = test_http_client()?
+        .get(GITHUB_RATE_LIMIT_URL)
+        .bearer_auth(&token)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "nuwa");
+    let payload = send_probe("GitHub", request).await?;
+    let rate = payload.get("rate");
+    let remaining = rate
+        .and_then(|rate| rate.get("remaining"))
+        .and_then(Value::as_u64);
+    let limit = rate.and_then(|rate| rate.get("limit")).and_then(Value::as_u64);
+    let detail = match (remaining, limit) {
+        (Some(remaining), Some(limit)) => {
+            format!("token accepted; {remaining}/{limit} requests remaining")
+        }
+        _ => "token accepted".to_string(),
+    };
+    Ok(TestSettingsResponse { ok: true, detail })
+}
+
+async fn probe_llm(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
+    let provider = resolve_value(values, "NUWA_PROVIDER", "anthropic")?;
+    match provider.as_str() {
+        "faux" => Ok(TestSettingsResponse {
+            ok: true,
+            detail: "faux provider needs no network".to_string(),
+        }),
+        "zai" => probe_zai(values).await,
+        "anthropic" => probe_anthropic(values).await,
+        other => Err(field_error(
+            "NUWA_PROVIDER",
+            format!("must be one of zai|anthropic|faux, got {other:?}"),
+        )),
+    }
+}
+
+fn llm_key(values: &BTreeMap<String, Value>, key: &str) -> Result<String, ApiError> {
+    let value = resolve_value(values, key, "")?;
+    if value.is_empty() {
+        return Err(field_error(key, "API key is required"));
+    }
+    Ok(value)
+}
+
+fn llm_model(values: &BTreeMap<String, Value>, default: &str) -> Result<String, ApiError> {
+    let model = resolve_value(values, "NUWA_MODEL", default)?;
+    if model.is_empty() {
+        return Err(field_error("NUWA_MODEL", "model is required"));
+    }
+    Ok(model)
+}
+
+fn llm_base(values: &BTreeMap<String, Value>, default: &str) -> Result<String, ApiError> {
+    let base = resolve_value(values, "NUWA_BASE_URL", default)?;
+    if !valid_http_url(&base) {
+        return Err(field_error("NUWA_BASE_URL", "must be an http(s) URL"));
+    }
+    Ok(base.trim_end_matches('/').to_string())
+}
+
+/// First catalog model, mirroring the anthropic default in `repair::run`.
+fn default_anthropic_model() -> String {
+    rpi_ai::providers::anthropic::models::anthropic_models()
+        .into_iter()
+        .next()
+        .map(|model| model.id)
+        .unwrap_or_else(|| "claude-opus-4-8".to_string())
+}
+
+/// Minimal non-streaming completion (`max_tokens = 1`) — the cheapest proof
+/// the key, base URL and model work together (docs/09 §9.2).
+async fn probe_zai(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
+    let key = llm_key(values, "ZAI_API_KEY")?;
+    let model = llm_model(values, ZAI_DEFAULT_MODEL)?;
+    let base = llm_base(values, ZAI_DEFAULT_BASE_URL)?;
+    let request = test_http_client()?
+        .post(format!("{base}/chat/completions"))
+        .bearer_auth(key)
+        .json(&serde_json::json!({
+            "model": model,
+            "max_tokens": 1,
+            "stream": false,
+            "messages": [{ "role": "user", "content": "ping" }],
+        }));
+    send_probe("LLM (zai)", request).await?;
+    Ok(TestSettingsResponse {
+        ok: true,
+        detail: format!("zai model {model} responded"),
+    })
+}
+
+async fn probe_anthropic(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
+    let key = llm_key(values, "ANTHROPIC_API_KEY")?;
+    let model = llm_model(values, &default_anthropic_model())?;
+    let base = llm_base(values, ANTHROPIC_DEFAULT_BASE_URL)?;
+    let request = test_http_client()?
+        .post(format!("{base}/v1/messages"))
+        .header("x-api-key", key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .json(&serde_json::json!({
+            "model": model,
+            "max_tokens": 1,
+            "stream": false,
+            "messages": [{ "role": "user", "content": "ping" }],
+        }));
+    send_probe("LLM (anthropic)", request).await?;
+    Ok(TestSettingsResponse {
+        ok: true,
+        detail: format!("anthropic model {model} responded"),
+    })
+}
+
+// ---- POST /settings/restart ------------------------------------------------
+
+/// `POST /api/v1/settings/restart` — schedule `systemctl restart` for the
+/// serve unit plus every runner unit (docs/09 §9.2, §13.3). In-flight runs
+/// need `force`; invalid units never reach systemd.
+pub async fn restart(
+    State(state): State<AppState>,
+    payload: Result<Json<RestartRequest>, JsonRejection>,
+) -> Response {
+    let request = match parse_json_body(payload) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let store = Arc::clone(&state.store);
+    let active = match tokio::task::spawn_blocking(move || store.active_runs()).await {
+        Ok(Ok(runs)) => runs,
+        Ok(Err(error)) => {
+            eprintln!("settings restart: active run lookup failed: {error}");
+            return internal_error("failed to read active runs").into_response();
+        }
+        Err(error) => {
+            eprintln!("settings restart: blocking task failed: {error}");
+            return internal_error("failed to read active runs").into_response();
+        }
+    };
+    let active_runs = active_run_summaries(&active);
+    if !request.force && !active_runs.is_empty() {
+        let error = ErrorBody::from(ApiError::conflict(format!(
+            "{} active run(s) in flight; retry with force=true",
+            active_runs.len()
+        )))
+        .error;
+        return (
+            StatusCode::CONFLICT,
+            Json(RestartConflictBody { error, active_runs }),
+        )
+            .into_response();
+    }
+
+    let units = configured_units(&state.serve_unit, &state.runner_units);
+    if units.is_empty() {
+        return ApiError::not_supported(
+            "no systemd units configured; restart the services manually",
+        )
+        .into_response();
+    }
+    if let Some(unit) = units.iter().find(|unit| !valid_systemd_unit(unit)) {
+        let mut fields = BTreeMap::new();
+        fields.insert("units".to_string(), format!("invalid systemd unit {unit:?}"));
+        return ApiError::validation(fields).into_response();
+    }
+
+    let forced = request.force && !active.is_empty();
+    let scheduled_units = units.clone();
+    let scheduled = tokio::task::spawn_blocking(move || schedule_restart(&scheduled_units)).await;
+    match scheduled {
+        Ok(true) => {
+            let detail = if forced {
+                format!("{} (forced)", units.join(","))
+            } else {
+                units.join(",")
+            };
+            let store = Arc::clone(&state.store);
+            let now = crate::now_ms();
+            let audited = tokio::task::spawn_blocking(move || {
+                store.record_event("__system__", now, None, "owner", "restart_requested", &detail)
+            })
+            .await;
+            match audited {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("settings restart: audit failed: {error}"),
+                Err(error) => eprintln!("settings restart: audit task failed: {error}"),
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        Ok(false) => ApiError::not_supported(
+            "systemd-run is unavailable; restart the units manually",
+        )
+        .into_response(),
+        Err(error) => {
+            eprintln!("settings restart: blocking task failed: {error}");
+            internal_error("failed to schedule restart").into_response()
+        }
+    }
+}
+
+fn active_run_summaries(runs: &[RunRow]) -> Vec<ActiveRunSummary> {
+    runs.iter()
+        .map(|run| ActiveRunSummary {
+            id: run.id.clone(),
+            fingerprint: run.fingerprint.clone(),
+            runner_id: run.runner_id.clone(),
+            repo: run.repo.clone(),
+            phase: run.phase.clone(),
+            started_at_ms: run.started_at,
+        })
+        .collect()
 }
 
 fn read_settings(
@@ -601,7 +961,7 @@ mod tests {
     use axum::http::{header, Request, StatusCode};
     use axum::response::Response;
     use axum::Router;
-    use shanhaijing::{RunnerUpsert, Store};
+    use shanhaijing::{ReportOutcome, RunStart, RunnerUpsert, Signal, Store};
     use tower::ServiceExt;
 
     use super::last_four;
@@ -637,6 +997,15 @@ mod tests {
         env_text: Option<&str>,
         started_at_ms: i64,
     ) -> (tempfile::TempDir, Router, Arc<Store>, PathBuf) {
+        test_app_custom(env_text, started_at_ms, "nuwa-serve", &["nuwa-work"])
+    }
+
+    fn test_app_custom(
+        env_text: Option<&str>,
+        started_at_ms: i64,
+        serve_unit: &str,
+        runner_units: &[&str],
+    ) -> (tempfile::TempDir, Router, Arc<Store>, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let env_path = dir.path().join("nuwa.env");
         if let Some(text) = env_text {
@@ -660,8 +1029,11 @@ mod tests {
             env_path: env_path.clone(),
             db_path,
             cookie_secure: false,
-            serve_unit: "nuwa-serve".to_string(),
-            runner_units: vec!["nuwa-work".to_string()],
+            serve_unit: serve_unit.to_string(),
+            runner_units: runner_units
+                .iter()
+                .map(|unit| (*unit).to_string())
+                .collect(),
         };
         let app = build_app(state);
         (dir, app, store, env_path)
@@ -705,6 +1077,23 @@ mod tests {
         let mut request = Request::builder()
             .method("PUT")
             .uri("/api/v1/settings")
+            .header(header::HOST, "localhost:7321")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = csrf {
+            request = request
+                .header(header::COOKIE, format!("nuwa_csrf={token}"))
+                .header("x-nuwa-csrf", token);
+        }
+        app.clone()
+            .oneshot(request.body(Body::from(body.to_string())).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    async fn post_json(app: &Router, uri: &str, csrf: Option<&str>, body: &str) -> Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri)
             .header(header::HOST, "localhost:7321")
             .header(header::CONTENT_TYPE, "application/json");
         if let Some(token) = csrf {
@@ -1309,5 +1698,195 @@ mod tests {
                 .any(|key| key.contains("TOKEN") || key.ends_with("API_KEY")),
             "secrets never participate in effective_diff"
         );
+    }
+
+    // ---- settings test / restart ------------------------------------------
+
+    #[tokio::test]
+    async fn settings_test_and_restart_require_csrf() {
+        let (_dir, app, _store, _env_path) = test_app(None);
+
+        for uri in ["/api/v1/settings/test", "/api/v1/settings/restart"] {
+            let response = post_json(&app, uri, None, "{}").await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "forbidden");
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_test_rejects_invalid_targets_and_empty_credentials_without_network() {
+        let (_dir, app, _store, _env_path) = test_app(None);
+        let csrf = csrf_token(&app).await;
+
+        // A syntactically valid body with a mistyped field is a 422.
+        let response = post_json(
+            &app,
+            "/api/v1/settings/test",
+            Some(&csrf),
+            r#"{"target":"bogus"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "validation_failed");
+        assert!(value["error"]["fields"]["target"].is_string(), "{value}");
+
+        let response = post_json(&app, "/api/v1/settings/test", Some(&csrf), "{}").await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value = json_body(response).await;
+        assert!(value["error"]["fields"]["target"].is_string(), "{value}");
+
+        // An explicitly empty token never falls back to the environment and
+        // never reaches the network.
+        let response = post_json(
+            &app,
+            "/api/v1/settings/test",
+            Some(&csrf),
+            r#"{"target":"github","values":{"NUWA_GITHUB_TOKEN":""}}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "validation_failed");
+        assert!(
+            value["error"]["fields"]["NUWA_GITHUB_TOKEN"].is_string(),
+            "{value}"
+        );
+
+        let response = post_json(
+            &app,
+            "/api/v1/settings/test",
+            Some(&csrf),
+            r#"{"target":"llm","values":{"NUWA_PROVIDER":"zai","ZAI_API_KEY":""}}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value = json_body(response).await;
+        assert!(value["error"]["fields"]["ZAI_API_KEY"].is_string(), "{value}");
+
+        let response = post_json(
+            &app,
+            "/api/v1/settings/test",
+            Some(&csrf),
+            r#"{"target":"llm","values":{"NUWA_PROVIDER":"anthropic","ANTHROPIC_API_KEY":""}}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value = json_body(response).await;
+        assert!(
+            value["error"]["fields"]["ANTHROPIC_API_KEY"].is_string(),
+            "{value}"
+        );
+
+        // faux is the offline provider: it succeeds without a key or network.
+        let response = post_json(
+            &app,
+            "/api/v1/settings/test",
+            Some(&csrf),
+            r#"{"target":"llm","values":{"NUWA_PROVIDER":"faux"}}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["ok"], true);
+        assert!(value["detail"].as_str().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn restart_is_guarded_by_active_runs() {
+        let now = crate::now_ms();
+        let (_dir, app, store, _env_path) = test_app(None);
+        let signal = Signal {
+            repo: "example.com/app".to_string(),
+            language: "go".to_string(),
+            title: "restart guard".to_string(),
+            severity: "high".to_string(),
+            message: Some("boom".to_string()),
+            stack_trace: "panic: restart guard\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/app.go:1 +0x1"
+                .to_string(),
+        };
+        let fingerprint = match store.report_signal(&signal, now).expect("signal") {
+            ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("must be a new issue, got {other:?}"),
+        };
+        store
+            .start_run(&RunStart {
+                id: "run-active".to_string(),
+                fingerprint: fingerprint.clone(),
+                runner_id: "runner-1".to_string(),
+                repo: "example.com/app".to_string(),
+                started_at: now,
+                provider: None,
+                model: None,
+            })
+            .expect("start run");
+        let csrf = csrf_token(&app).await;
+
+        let response = post_json(&app, "/api/v1/settings/restart", Some(&csrf), "{}").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "conflict");
+        let active = value["active_runs"]
+            .as_array()
+            .expect("a guarded restart lists its active runs");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["id"], "run-active");
+        assert_eq!(active[0]["fingerprint"], fingerprint);
+        assert_eq!(active[0]["runner_id"], "runner-1");
+        assert!(
+            store
+                .events_for("__system__", 10)
+                .expect("events")
+                .is_empty(),
+            "a guarded restart must not journal restart_requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_with_invalid_units_is_422() {
+        for (serve_unit, runner_units) in [
+            ("nuwa serve", vec!["nuwa-work"]),
+            ("nuwa-serve", vec!["nuwa-work", "../etc/passwd"]),
+        ] {
+            let (_dir, app, store, _env_path) = test_app_custom(
+                None,
+                crate::now_ms(),
+                serve_unit,
+                &runner_units,
+            );
+            let csrf = csrf_token(&app).await;
+
+            let response = post_json(&app, "/api/v1/settings/restart", Some(&csrf), "{}").await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{serve_unit} {runner_units:?}"
+            );
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "validation_failed");
+            assert!(
+                value["error"]["fields"]["units"].is_string(),
+                "an invalid unit must name the field: {value}"
+            );
+            assert!(
+                store
+                    .events_for("__system__", 10)
+                    .expect("events")
+                    .is_empty(),
+                "a rejected restart must not journal restart_requested"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_without_configured_units_is_501() {
+        let (_dir, app, _store, _env_path) = test_app_custom(None, crate::now_ms(), "", &[]);
+        let csrf = csrf_token(&app).await;
+
+        let response = post_json(&app, "/api/v1/settings/restart", Some(&csrf), "{}").await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "not_supported");
     }
 }

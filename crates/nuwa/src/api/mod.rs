@@ -6,6 +6,7 @@ pub mod issues;
 pub mod overview;
 pub mod runners;
 pub mod settings;
+pub mod system;
 pub mod trends;
 
 use axum::http::StatusCode;
@@ -127,6 +128,9 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/runners/{id}/restart", post(actions::restart_runner))
         .route("/sync", post(actions::sync))
         .route("/settings", get(settings::get).put(settings::put))
+        .route("/settings/test", post(settings::test))
+        .route("/settings/restart", post(settings::restart))
+        .route("/system", get(system::system))
         .route("/events", get(events::list))
         .route("/metrics/trends", get(trends::trends))
         .route_layer(axum::middleware::from_fn_with_state(

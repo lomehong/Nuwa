@@ -316,6 +316,37 @@ pub(crate) fn valid_systemd_unit(unit: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | ':' | '-'))
 }
 
+/// Serve unit followed by the runner units, deduplicated in order. Blank
+/// entries are skipped: "no unit configured", not an invalid unit.
+pub(crate) fn configured_units(serve_unit: &str, runner_units: &[String]) -> Vec<String> {
+    let mut units: Vec<String> = Vec::new();
+    for unit in std::iter::once(serve_unit).chain(runner_units.iter().map(String::as_str)) {
+        if unit.is_empty() || units.iter().any(|existing| existing == unit) {
+            continue;
+        }
+        units.push(unit.to_string());
+    }
+    units
+}
+
+/// `systemd-run --on-active=2 systemctl restart <units...>`: the systemd
+/// manager performs the restart after the HTTP response is written, so
+/// restarting `nuwa-serve` cannot cut off its own reply. Units stay separate
+/// arguments; nothing is ever concatenated into shell text.
+pub(crate) fn schedule_restart(units: &[String]) -> bool {
+    std::process::Command::new("systemd-run")
+        .arg("--on-active=2")
+        .arg("systemctl")
+        .arg("restart")
+        .args(units)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// Keep extractor failures inside the JSON error contract: syntax errors stay
 /// 400, well-formed bodies with wrong field types become 422 field errors.
 pub(crate) fn parse_json_body<T: DeserializeOwned>(

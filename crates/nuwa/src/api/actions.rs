@@ -12,7 +12,8 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::api::common::{
-    issue_stuck_after_ms, parse_json_body, runner_intervals, stuck_floor_ms, valid_systemd_unit,
+    issue_stuck_after_ms, parse_json_body, runner_intervals, schedule_restart, stuck_floor_ms,
+    valid_systemd_unit,
 };
 use crate::api::ApiError;
 use crate::ci;
@@ -171,7 +172,7 @@ fn restart_runner_now(store: &Store, runner_id: &str) -> Result<(), ApiError> {
             "service_unit may only contain letters, digits and @ . _ : -",
         ));
     }
-    if !schedule_restart(unit) {
+    if !schedule_restart(&[unit.to_string()]) {
         return Err(ApiError::not_supported(
             "systemd-run is unavailable; restart the unit manually",
         ));
@@ -183,19 +184,6 @@ fn unit_error(message: &str) -> ApiError {
     let mut fields = BTreeMap::new();
     fields.insert("service_unit".to_string(), message.to_string());
     ApiError::validation(fields)
-}
-
-/// `systemd-run --on-active=2 systemctl restart <unit>`: the systemd manager
-/// performs the restart after the HTTP response is written, so restarting
-/// `nuwa-serve` cannot cut off its own reply.
-fn schedule_restart(unit: &str) -> bool {
-    std::process::Command::new("systemd-run")
-        .args(["--on-active=2", "systemctl", "restart", unit])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 fn requeue_issue(
