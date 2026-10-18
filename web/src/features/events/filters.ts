@@ -7,11 +7,15 @@
  * writing only emits non-default values so links stay short.
  */
 
+/**
+ * Event kinds the backend actually writes. Anything else (runner_*, sync,
+ * reopened, pr_merged, pr_closed) is either not persisted or not covered by the
+ * activity page, so offering it would only produce empty results.
+ */
 export const EVENT_KINDS = [
   "reported",
   "state_changed",
   "requeued",
-  "reopened",
   "pr_opened",
   "merged",
   "rejected",
@@ -21,10 +25,6 @@ export const EVENT_KINDS = [
   "config_changed",
   "config_migrated",
   "restart_requested",
-  "runner_started",
-  "runner_stopped",
-  "runner_error",
-  "sync",
 ] as const;
 
 /** System/audit records shown by the activity page's second tab. */
@@ -32,9 +32,6 @@ export const AUDIT_KINDS = [
   "config_changed",
   "config_migrated",
   "restart_requested",
-  "runner_started",
-  "runner_stopped",
-  "runner_error",
 ] as const;
 
 export type EventRange = "24h" | "7d" | "30d" | "all";
@@ -65,12 +62,16 @@ export const DEFAULT_EVENT_FILTERS: EventFilters = {
 };
 
 export function parseEventFilters(search: URLSearchParams): EventFilters {
-  const kinds = (search.get("kind") ?? "")
-    .split(",")
-    .map((part) => part.trim())
-    .filter((part): part is (typeof EVENT_KINDS)[number] =>
-      (EVENT_KINDS as readonly string[]).includes(part),
-    );
+  const kinds = Array.from(
+    new Set(
+      (search.get("kind") ?? "")
+        .split(",")
+        .map((part) => part.trim())
+        .filter((part): part is (typeof EVENT_KINDS)[number] =>
+          (EVENT_KINDS as readonly string[]).includes(part),
+        ),
+    ),
+  );
   const range = EVENT_RANGES.some((entry) => entry.value === search.get("range"))
     ? (search.get("range") as EventRange)
     : DEFAULT_EVENT_FILTERS.range;

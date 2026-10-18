@@ -96,7 +96,7 @@ function RunnersEmpty() {
 }
 
 /**
- * Runner fleet (docs/09 §10.5). The roster is read-only in M4; each card shows
+ * Runner fleet (docs/09 §10.6). The roster is read-only in M4; each card shows
  * liveness, current issue, quota and the last error, and the page polls every
  * 10s so heartbeat ages and statuses stay honest.
  */

@@ -32,7 +32,7 @@ interface RunnerCardProps {
 }
 
 /**
- * One runner in the fleet grid (docs/09 §10.5). Read-only in M4: identity and
+ * One runner in the fleet grid (docs/09 §10.6). Read-only in M4: identity and
  * actions copy to the clipboard or link to the issue being worked on; the
  * restart command arrives with M5.
  */
@@ -59,19 +59,9 @@ export function RunnerCard({ runner, nowMs }: RunnerCardProps) {
           </span>
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-1.5">
-              {currentPath ? (
-                <Link
-                  to={currentPath}
-                  title={`当前问题：${runner.current_fingerprint}`}
-                  className="rounded-sm font-mono text-body-sm font-semibold text-text transition-colors hover:text-accent"
-                >
-                  {runner.id}
-                </Link>
-              ) : (
-                <span className="font-mono text-body-sm font-semibold text-text">
-                  {runner.id}
-                </span>
-              )}
+              <span className="font-mono text-body-sm font-semibold text-text">
+                {runner.id}
+              </span>
               <CopyButton value={runner.id} label={`复制运行器 ID：${runner.id}`} />
               <Badge variant={runnerStatusVariant(runner, nowMs)} className="ml-auto">
                 {runnerStatusLabel(runner, nowMs)}
@@ -105,7 +95,8 @@ export function RunnerCard({ runner, nowMs }: RunnerCardProps) {
               <Link
                 to={currentPath}
                 title={runner.current_fingerprint ?? undefined}
-                className="rounded-sm font-mono text-text-secondary transition-colors hover:text-accent"
+                aria-label={`查看当前单：${runner.current_fingerprint}`}
+                className="inline-flex min-h-11 items-center rounded-sm font-mono text-text-secondary transition-colors hover:text-accent pointer-fine:min-h-9"
               >
                 {shortFingerprint(runner.current_fingerprint ?? "")}
               </Link>
@@ -167,12 +158,14 @@ export function RunnerCard({ runner, nowMs }: RunnerCardProps) {
               ) : null}
             </span>
           </div>
-          <progress
-            aria-label="今日 PR 配额"
-            value={runner.prs_today}
-            max={runner.daily_pr_limit ?? 1}
-            className="h-1.5 w-full accent-accent"
-          />
+          {quotaLimit !== null ? (
+            <progress
+              aria-label="今日 PR 配额"
+              value={runner.prs_today}
+              max={quotaLimit}
+              className="h-1.5 w-full accent-accent"
+            />
+          ) : null}
         </div>
 
         {runner.last_error ? (

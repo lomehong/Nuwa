@@ -40,7 +40,13 @@ describe("event filters", () => {
     const filters = parseEventFilters(
       new URLSearchParams("kind=bogus,reported,runner_error"),
     );
-    expect(filters.kinds).toEqual(["reported", "runner_error"]);
+    expect(filters.kinds).toEqual(["reported"]);
+  });
+
+  it("deduplicates repeated kinds in the canonical path", () => {
+    const filters = parseEventFilters(new URLSearchParams("kind=reported,reported"));
+    expect(filters.kinds).toEqual(["reported"]);
+    expect(eventPagePath(filters)).toBe("/events?kind=reported");
   });
 
   it("falls back for a non-numeric page and trims text filters", () => {

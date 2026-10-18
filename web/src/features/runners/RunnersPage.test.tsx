@@ -45,11 +45,12 @@ describe("RunnersPage", () => {
 
     const cardA = await screen.findByTestId("runner-card-runner-a");
     expect(screen.getAllByTestId(/^runner-card-/)).toHaveLength(3);
-    expect(screen.getByRole("link", { name: /runner-a/ })).toHaveAttribute(
+    expect(within(cardA).getByText("runner-a")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /runner-a/ })).not.toBeInTheDocument();
+    expect(within(cardA).getByRole("link", { name: "查看当前单：fp-1" })).toHaveAttribute(
       "href",
       "/issues/fp-1",
     );
-
     expect(within(cardA).getByRole("link", { name: /fp-1/ })).toHaveAttribute(
       "href",
       "/issues/fp-1",
@@ -81,6 +82,20 @@ describe("RunnersPage", () => {
     const stale = await screen.findByTestId("runner-card-runner-stale");
     expect(within(stale).getByText("离线")).toBeInTheDocument();
     expect(screen.getByTestId("runner-summary-online")).toHaveTextContent(/在线\s*1\/2/);
+  });
+
+  it("shows only the missing-quota text when no limit is reported", async () => {
+    signedIn([
+      makeRunner({ id: "runner-no-quota", daily_pr_limit: null, prs_today: 3 }),
+    ]);
+
+    renderApp("/runners");
+
+    const card = await screen.findByTestId("runner-card-runner-no-quota");
+    expect(within(card).getByText("未上报配额")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("progressbar", { name: "今日 PR 配额" }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows a start command when no runner has registered", async () => {
