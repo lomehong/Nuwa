@@ -8,6 +8,7 @@ import type {
 } from "../features/overview/types";
 import type { IssueDetailResponse, RunDto } from "../features/issue-detail/types";
 import type { IssueListItem, IssueListResponse } from "../features/issues/types";
+import type { RunnerDto, RunnerListResponse } from "../features/runners/types";
 import type { TranscriptResponse } from "../features/transcript/types";
 import type { MeResponse } from "../lib/auth";
 
@@ -220,6 +221,42 @@ export function makeTranscript(
 export function mockTranscript(overrides: Partial<TranscriptResponse> = {}) {
   const body = makeTranscript(overrides);
   return http.get("/api/v1/issues/:fp/transcript", () => HttpResponse.json(body));
+}
+
+export function makeRunner(overrides: Partial<RunnerDto> = {}): RunnerDto {
+  return {
+    id: "runner-1",
+    repo: "example.com/app",
+    host: "host-a",
+    pid: 1234,
+    started_at_ms: Date.now() - 3_600_000,
+    heartbeat_at_ms: Date.now(),
+    status: "idle",
+    offline: false,
+    current_fingerprint: null,
+    phase: null,
+    provider: "zai",
+    model: "glm-5.3-flash",
+    daily_pr_limit: 5,
+    prs_today: 1,
+    repo_path: "/srv/app",
+    service_unit: "nuwa-work",
+    last_error: null,
+    effective: {
+      interval_secs: 30,
+      ci_timeout_secs: 600,
+      max_turns: 30,
+      max_tokens: 1_500_000,
+      failing_check: "go test ./...",
+      forbidden_paths_count: 3,
+    },
+    ...overrides,
+  };
+}
+
+export function mockRunners(runners: RunnerDto[] = [makeRunner()]) {
+  const body: RunnerListResponse = { data: runners };
+  return http.get("/api/v1/runners", () => HttpResponse.json(body));
 }
 
 /**
