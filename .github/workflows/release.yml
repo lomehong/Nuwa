@@ -30,7 +30,7 @@ jobs:
         working-directory: web
         run: npm ci
       # `web/dist` (gitignored) must exist before rust-embed compiles the
-      # release binary; the build script also typechecks the app.
+      # release binary; `npm run build` typechecks the app and bundles it.
       - name: build web console
         working-directory: web
         run: npm run build
