@@ -22,13 +22,18 @@ describe("backoffDelay", () => {
 });
 
 describe("backoffInterval", () => {
-  it("reads the query's consecutive failure count", () => {
+  it("maps failure counts 0/1/2/3 to 10s/20s/40s/60s", () => {
     const interval = backoffInterval(10_000);
 
     expect(interval({ state: { fetchFailureCount: 0 } })).toBe(10_000);
     expect(interval({ state: { fetchFailureCount: 1 } })).toBe(20_000);
     expect(interval({ state: { fetchFailureCount: 2 } })).toBe(40_000);
     expect(interval({ state: { fetchFailureCount: 3 } })).toBe(60_000);
+  });
+
+  it("caps at 60s after many consecutive failures", () => {
+    const interval = backoffInterval(10_000);
+
     expect(interval({ state: { fetchFailureCount: 50 } })).toBe(60_000);
   });
 });

@@ -45,10 +45,11 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
       <div className="flex min-h-screen items-center justify-center bg-bg px-4 py-10">
         <main className="w-full max-w-md">
           <section
-            role="alert"
             className="rounded-card border border-danger/40 bg-surface p-6 text-text"
           >
-            <div className="flex items-start gap-3">
+            {/* The alert announces the failure only; the recovery actions are
+                siblings so they are not part of the live region. */}
+            <div role="alert" className="flex items-start gap-3">
               <span
                 aria-hidden="true"
                 className="flex size-10 shrink-0 items-center justify-center rounded-full bg-danger/10 text-danger"

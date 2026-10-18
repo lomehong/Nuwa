@@ -1,9 +1,15 @@
-import { fireEvent, screen } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
 import { mockIssues, mockMe, mockOverview, mockOverviewResources, mockUnauthorizedMe, server } from "../../test/msw";
 import { renderApp } from "../../test/render";
+
+beforeEach(() => {
+  // `document.title` survives between tests in the same jsdom environment;
+  // reset it so this assertion cannot pass on a previous test's value.
+  document.title = "";
+});
 
 describe("LoginPage", () => {
   it("sets the login document title", async () => {
@@ -12,7 +18,8 @@ describe("LoginPage", () => {
     renderApp("/login");
 
     await screen.findByLabelText("访问令牌");
-    expect(document.title).toBe("登录 · 女娲");
+    // The title is set from an effect, so allow it to flush after the paint.
+    await waitFor(() => expect(document.title).toBe("登录 · 女娲"));
   });
 
   it("signs in and returns to the intended route", async () => {

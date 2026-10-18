@@ -1,4 +1,4 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { http, HttpResponse, delay } from "msw";
 import { describe, expect, it, vi } from "vitest";
 
@@ -8,6 +8,7 @@ import type {
   TrendBucket,
   TrendsResponse,
 } from "./types";
+import { overviewQueryKey } from "./types";
 import { makeEvents, makeOverview, makeTrends, mockEvents, mockMe, mockOverview, mockTrends, server } from "../../test/msw";
 import { renderApp } from "../../test/render";
 import { RUN_PHASES, runPhaseIndex } from "./ActiveRuns";
@@ -429,6 +430,42 @@ describe("OverviewPage", () => {
     expect(
       await screen.findByRole("region", { name: "需要你处理" }),
     ).toBeInTheDocument();
+    expect(screen.getByText("Average panics on empty slice")).toBeInTheDocument();
+  });
+
+  it("keeps the stale-data retry outside the status live region", async () => {
+    let fail = false;
+    server.use(
+      mockMe(),
+      http.get("/api/v1/overview", () =>
+        fail
+          ? HttpResponse.json(
+              { error: { code: "internal", message: "store read failed" } },
+              { status: 500 },
+            )
+          : HttpResponse.json(richOverview()),
+      ),
+      mockTrends(richTrends()),
+      mockEvents(richEvents()),
+    );
+
+    const { queryClient } = renderApp("/");
+    await screen.findByRole("region", { name: "需要你处理" });
+
+    fail = true;
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: overviewQueryKey(null) }).catch(() => undefined);
+    });
+
+    const message = await screen.findByText("总览更新失败，正在显示上次数据。");
+    const status = message.closest<HTMLElement>('[role="status"]');
+    if (!status) {
+      throw new Error("stale-data banner is not inside a status region");
+    }
+    // The retry button lives outside the live region.
+    expect(within(status).queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    // Cached content stays visible below the banner.
     expect(screen.getByText("Average panics on empty slice")).toBeInTheDocument();
   });
 

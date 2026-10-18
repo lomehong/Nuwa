@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "../../lib/api";
@@ -211,8 +211,11 @@ describe("TranscriptViewer", () => {
       runId: "run-missing",
     });
 
-    expect(screen.getByRole("alert")).toHaveTextContent("所选运行没有会话转录");
-    expect(screen.getByRole("alert")).toHaveTextContent("not_found");
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("所选运行没有会话转录");
+    expect(alert).toHaveTextContent("not_found");
+    // Recovery actions stay outside the live region.
+    expect(within(alert).queryByRole("button")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "查看最近会话" }));
     expect(props.onClearRun).toHaveBeenCalledTimes(1);

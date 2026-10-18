@@ -343,12 +343,16 @@ export function TranscriptViewer({
     const copy = errorCopy(error, runId);
     const missingRun = error instanceof ApiError && error.status === 404 && runId !== null;
     return (
-      <div role="alert" className="rounded-card border border-danger/40 bg-danger/10 p-4">
-        <p className="text-body font-medium text-text">{copy.title}</p>
-        <p className="mt-0.5 text-body-sm text-text-secondary">{copy.message}</p>
-        {copy.code ? (
-          <p className="mt-1 font-mono text-caption text-text-muted">{copy.code}</p>
-        ) : null}
+      <div className="rounded-card border border-danger/40 bg-danger/10 p-4">
+        {/* The live region carries the message only; the recovery actions stay
+            outside it so they keep their own focus and labels. */}
+        <div role="alert">
+          <p className="text-body font-medium text-text">{copy.title}</p>
+          <p className="mt-0.5 text-body-sm text-text-secondary">{copy.message}</p>
+          {copy.code ? (
+            <p className="mt-1 font-mono text-caption text-text-muted">{copy.code}</p>
+          ) : null}
+        </div>
         <div className="mt-3 flex flex-wrap gap-2">
           {missingRun ? (
             <Button variant="secondary" size="sm" onClick={onClearRun}>
@@ -418,16 +422,20 @@ export function TranscriptViewer({
         </div>
       ) : (
         <div className="flex flex-col items-center gap-2 rounded-card border border-dashed border-border px-4 py-8 text-center">
-          <MessageSquareText
-            aria-hidden="true"
-            className="size-5 text-text-muted"
-          />
-          <p className="text-body font-medium text-text">暂无会话转录</p>
-          <p className="max-w-prose text-body-sm text-text-secondary">
-            {runId
-              ? "所选运行没有可显示的会话消息，可能未产生转录文件。"
-              : "该问题单还没有可读取的会话转录。运行产生会话后会自动出现在这里。"}
-          </p>
+          {/* Announce the empty result without swallowing the surrounding
+              context; no action lives inside the live region. */}
+          <div role="status" className="flex flex-col items-center gap-2">
+            <MessageSquareText
+              aria-hidden="true"
+              className="size-5 text-text-muted"
+            />
+            <p className="text-body font-medium text-text">暂无会话转录</p>
+            <p className="max-w-prose text-body-sm text-text-secondary">
+              {runId
+                ? "所选运行没有可显示的会话消息，可能未产生转录文件。"
+                : "该问题单还没有可读取的会话转录。运行产生会话后会自动出现在这里。"}
+            </p>
+          </div>
         </div>
       )}
 

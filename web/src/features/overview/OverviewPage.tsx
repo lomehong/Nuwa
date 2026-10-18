@@ -62,11 +62,10 @@ export function OverviewPage() {
       {overview.data ? (
         <>
           {overview.isError ? (
-            <div
-              role="status"
-              className="flex flex-wrap items-center justify-between gap-2 rounded-card border border-warning/40 bg-warning/10 px-4 py-2 text-body-sm text-text"
-            >
-              <span>总览更新失败，正在显示上次数据。</span>
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-card border border-warning/40 bg-warning/10 px-4 py-2 text-body-sm text-text">
+              {/* Only the message is a live region; the retry button stays an
+                  ordinary control outside it. */}
+              <span role="status">总览更新失败，正在显示上次数据。</span>
               <Button variant="ghost" size="sm" onClick={() => void overview.refetch()}>
                 <RefreshCw aria-hidden="true" className="size-3.5" />
                 重试

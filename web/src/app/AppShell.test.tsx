@@ -22,6 +22,9 @@ function signedIn(overrides: Parameters<typeof makeOverview>[0] = {}) {
 beforeEach(() => {
   window.localStorage.clear();
   document.documentElement.removeAttribute("data-theme");
+  // `document.title` survives between tests in the same jsdom environment;
+  // reset it so a title assertion cannot pass on a previous test's value.
+  document.title = "";
 });
 
 afterEach(() => {
@@ -76,7 +79,8 @@ describe("AppShell", () => {
     expect(
       await screen.findByRole("heading", { level: 1, name: title }),
     ).toBeInTheDocument();
-    expect(document.title).toBe(`${title} · 女娲`);
+    // The title is set from an effect, so allow it to flush after the paint.
+    await waitFor(() => expect(document.title).toBe(`${title} · 女娲`));
   });
 
   it("updates the document title after client-side navigation", async () => {
@@ -84,13 +88,13 @@ describe("AppShell", () => {
     server.use(mockIssues());
     renderApp("/");
     await screen.findByRole("heading", { level: 1, name: "总览" });
-    expect(document.title).toBe("总览 · 女娲");
+    await waitFor(() => expect(document.title).toBe("总览 · 女娲"));
 
     const nav = screen.getByRole("navigation", { name: "主导航" });
     fireEvent.click(within(nav).getByRole("link", { name: "问题单" }));
 
     await screen.findByRole("heading", { level: 2, name: "问题单" });
-    expect(document.title).toBe("问题单 · 女娲");
+    await waitFor(() => expect(document.title).toBe("问题单 · 女娲"));
   });
 
   it("marks the settings nav link current on /settings", async () => {
@@ -348,6 +352,12 @@ describe("AppShell", () => {
 
     expect(await screen.findByText(/无法连接服务器。/)).toBeInTheDocument();
     expect(await screen.findByText("serve 不可达")).toBeInTheDocument();
+    const offline = screen.getByText(/无法连接服务器。/).closest<HTMLElement>('[role="alert"]');
+    if (!offline) {
+      throw new Error("offline banner is not an alert");
+    }
+    // The retry button lives outside the alert live region.
+    expect(within(offline).queryByRole("button")).not.toBeInTheDocument();
 
     server.use(...mockOverviewResources());
     fireEvent.click(screen.getByRole("button", { name: "立即重试" }));
