@@ -842,11 +842,19 @@ impl Store {
     /// Delete telemetry past its retention window and return the total number
     /// of removed rows. Normal events roll off after `event_days`, audit
     /// events (`config_changed` / `config_migrated` / `restart_requested`)
-    /// are kept for 365 days, runs after `run_days`, and runner rows whose
-    /// last heartbeat is older than 30 days. Callers schedule this (M1b/M2).
-    pub fn prune(&self, now_ms: i64, event_days: u32, run_days: u32) -> ShanResult<u64> {
+    /// after `audit_days` (callers pass `event_days.max(365)` so audit history
+    /// is never shorter than normal telemetry), runs after `run_days`, and
+    /// runner rows whose last heartbeat is older than 30 days. Callers
+    /// schedule this (M1b/M2).
+    pub fn prune(
+        &self,
+        now_ms: i64,
+        event_days: u32,
+        audit_days: u32,
+        run_days: u32,
+    ) -> ShanResult<u64> {
         let event_cutoff = now_ms - i64::from(event_days) * 86_400_000;
-        let audit_cutoff = now_ms - 365 * 86_400_000;
+        let audit_cutoff = now_ms - i64::from(audit_days) * 86_400_000;
         let run_cutoff = now_ms - i64::from(run_days) * 86_400_000;
         let runner_cutoff = now_ms - 30 * 86_400_000;
         let conn = self.lock();
@@ -1958,13 +1966,34 @@ mod tests {
                 service_unit: None, config_json: "{}".into(),
             })
             .expect("runner");
-        let deleted = store.prune(now, 90, 365).expect("prune");
+        let deleted = store.prune(now, 90, 365, 365).expect("prune");
         assert!(deleted >= 3);
         let events = store.recent_events(100).expect("events");
         assert!(events.iter().any(|e| e.kind == "config_changed" && e.detail == "k"));
         assert!(!events.iter().any(|e| e.detail == "old"));
         assert!(!events.iter().any(|e| e.detail == "old-audit"));
         assert!(store.list_runners().expect("runners").is_empty());
+    }
+
+    #[test]
+    fn prune_honours_the_audit_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let day = 86_400_000;
+        let now = 500 * day;
+        store
+            .record_event("fp", now - 410 * day, Some("r"), "system", "reported", "old")
+            .expect("e");
+        store
+            .record_event("fp", now - 380 * day, Some("r"), "owner", "config_changed", "audit")
+            .expect("audit");
+        // audit_days=400 must outlive both the normal-event window and the
+        // historical 365-day audit default.
+        let deleted = store.prune(now, 400, 400, 365).expect("prune");
+        assert_eq!(deleted, 1);
+        let events = store.recent_events(100).expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail, "audit");
     }
 
     #[test]

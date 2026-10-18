@@ -285,9 +285,9 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "nuwa-work".to_string());
-    let event_retention_days: u32 = env_d("NUWA_EVENT_RETENTION_DAYS", "90")
-        .parse()
-        .unwrap_or(90);
+    let event_retention_days = crate::serve::retention_days_from_env(
+        std::env::var("NUWA_EVENT_RETENTION_DAYS").ok().as_deref(),
+    );
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
         let mut value =
@@ -361,7 +361,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     );
     let now = now_ms();
     let _ = store.mark_interrupted(&runner_id, now);
-    let _ = store.prune(now, event_retention_days, 365);
+    let _ = crate::serve::prune_retention(&store, now, event_retention_days);
     if let Err(e) = store.upsert_runner(&shanhaijing::RunnerUpsert {
         id: runner_id.clone(),
         repo: repo_config.repo.clone(),

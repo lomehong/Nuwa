@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -24,6 +24,9 @@ const CSP_STRICT: &str = "default-src 'self'; script-src 'self'; style-src 'self
 const SESSION_TTL_DEFAULT_SECS: i64 = 86_400;
 const SESSION_TTL_MIN_SECS: i64 = 300;
 const SESSION_TTL_MAX_SECS: i64 = 2_592_000;
+
+/// Background retention sweep cadence for a long-running `serve`.
+const RETENTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// State shared by the legacy console routes and the `/api/v1` surface.
 #[derive(Clone)]
@@ -87,28 +90,19 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(|| async { "nuwa serve ok" }))
         .with_state(ingest_state);
     // Bookmark compatibility from the retired console (M6): `/ui*` returns
-    // to the SPA root, `/issue/{fp}` to its new detail route. `/settings`
-    // needs no redirect — it is the same SPA path.
+    // to the SPA root and `/issue/{fp}` to its new detail route; the bare
+    // trailing-slash forms point at the canonical pages. `/settings` needs no
+    // redirect — it is the same SPA path. Non-GET methods stay 404 instead of
+    // becoming a 405 or falling through to the SPA shell.
     let redirects = Router::new()
+        .route("/ui", get(legacy_console_redirect).post(not_found))
+        .route("/ui/", get(legacy_console_redirect).post(not_found))
+        .route("/ui/{*rest}", get(legacy_console_redirect).post(not_found))
         .route(
-            "/ui",
-            get(|| async { Redirect::permanent("/") })
-                .post(|| async { StatusCode::NOT_FOUND }),
+            "/issue/",
+            get(|| async { Redirect::permanent("/issues") }).post(not_found),
         )
-        .route(
-            "/ui/{*rest}",
-            get(|| async { Redirect::permanent("/") })
-                .post(|| async { StatusCode::NOT_FOUND }),
-        )
-        .route(
-            "/issue/{fp}",
-            get(
-                |axum::extract::Path(fp): axum::extract::Path<String>| async move {
-                    Redirect::permanent(&format!("/issues/{fp}"))
-                },
-            )
-            .post(|| async { StatusCode::NOT_FOUND }),
-        );
+        .route("/issue/{fp}", get(issue_redirect).post(not_found));
 
     let api = crate::api::router(Arc::new(state.clone()));
     Router::new()
@@ -117,6 +111,36 @@ pub fn build_app(state: AppState) -> Router {
         .nest("/api/v1", api)
         .fallback(crate::web::serve)
         .layer(axum::middleware::from_fn(crate::serve::security_headers))
+}
+
+async fn legacy_console_redirect() -> Redirect {
+    Redirect::permanent("/")
+}
+
+async fn not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
+/// `/issue/{fp}` → `/issues/{fp}`. Fingerprints are opaque ids, so anything
+/// outside the safe ASCII set is a 404 rather than a `Location` a browser
+/// could reinterpret (a decoded CR/LF would otherwise panic the redirect).
+async fn issue_redirect(Path(fp): Path<String>) -> Response {
+    if is_safe_fingerprint(&fp) {
+        Redirect::permanent(&format!("/issues/{fp}")).into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+/// ASCII alphanumeric plus `-_.:` only; dot segments are rejected so browser
+/// path normalisation cannot turn `/issues/..` into something else.
+fn is_safe_fingerprint(fp: &str) -> bool {
+    !fp.is_empty()
+        && fp != "."
+        && fp != ".."
+        && fp
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
 }
 
 /// Response hardening for every route. All responses use the strict CSP.
@@ -178,11 +202,12 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         shanhaijing::Store::open(&db_path)
             .with_context(|| format!("open db {}", db_path.display()))?,
     );
-    match prune_on_start(&store, now_ms(), event_retention_days()) {
-        Ok(deleted) if deleted > 0 => println!("retention : pruned {deleted} rows"),
-        Ok(_) => {}
-        Err(error) => eprintln!("warning    : retention prune failed: {error}"),
-    }
+    let event_days = event_retention_days();
+    report_prune(prune_retention(&store, now_ms(), event_days));
+    // A long-running serve must not grow forever between restarts: re-run the
+    // same sweep daily from the tokio runtime. The returned handle is dropped
+    // on purpose — the task runs until the runtime shuts down.
+    spawn_daily_prune(Arc::clone(&store), event_days, RETENTION_PERIOD);
     let env_path = crate::settings::env_file_path();
     // Shared collector token (NUWA_INGEST_TOKEN). Set it when serving beyond
     // localhost: without it anyone can spam the issue store. This is a
@@ -290,16 +315,58 @@ fn event_retention_days() -> u32 {
     retention_days_from_env(std::env::var("NUWA_EVENT_RETENTION_DAYS").ok().as_deref())
 }
 
-fn retention_days_from_env(raw: Option<&str>) -> u32 {
+/// `NUWA_EVENT_RETENTION_DAYS` — normal events roll off after this many days.
+/// Malformed values fall back to the documented 90-day default; out-of-range
+/// values clamp to 1–3650.
+pub(crate) fn retention_days_from_env(raw: Option<&str>) -> u32 {
     raw.and_then(|value| value.trim().parse::<u32>().ok())
         .map(|days| days.clamp(1, 3_650))
         .unwrap_or(90)
 }
 
-/// Best-effort startup retention sweep: telemetry past its window goes away,
-/// audit events keep their own 365-day window inside `Store::prune`.
-fn prune_on_start(store: &shanhaijing::Store, now: i64, days: u32) -> anyhow::Result<u64> {
-    store.prune(now, days, 365).map_err(Into::into)
+/// Audit events keep at least their historical 365-day window, and outlive
+/// normal events when `NUWA_EVENT_RETENTION_DAYS` is raised beyond a year.
+fn audit_days_for(event_days: u32) -> u32 {
+    event_days.max(365)
+}
+
+/// One best-effort retention sweep, shared by startup, the daily task and
+/// `work` so every caller uses the same audit window.
+pub(crate) fn prune_retention(
+    store: &shanhaijing::Store,
+    now: i64,
+    event_days: u32,
+) -> anyhow::Result<u64> {
+    store
+        .prune(now, event_days, audit_days_for(event_days), 365)
+        .map_err(Into::into)
+}
+
+fn report_prune(result: anyhow::Result<u64>) {
+    match result {
+        Ok(deleted) if deleted > 0 => println!("retention : pruned {deleted} rows"),
+        Ok(_) => {}
+        Err(error) => eprintln!("warning    : retention prune failed: {error}"),
+    }
+}
+
+/// Spawn the once-a-day retention sweep. `tokio::time::interval` fires an
+/// immediate first tick, which is consumed here because `run_serve` already
+/// pruned on startup.
+fn spawn_daily_prune(
+    store: Arc<shanhaijing::Store>,
+    event_days: u32,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            report_prune(prune_retention(&store, now_ms(), event_days));
+        }
+    })
 }
 
 /// Whether the configured listen address stays on this host. Used only for
@@ -493,8 +560,10 @@ mod tests {
         let (_dir, app) = test_app();
         for (uri, location) in [
             ("/ui", "/"),
+            ("/ui/", "/"),
             ("/ui/reopen", "/"),
             ("/ui/sync", "/"),
+            ("/issue/", "/issues"),
             ("/issue/abc123", "/issues/abc123"),
         ] {
             let response = app
@@ -519,7 +588,15 @@ mod tests {
     #[tokio::test]
     async fn legacy_write_routes_are_gone() {
         let (_dir, app) = test_app();
-        for uri in ["/ui/reopen", "/ui/sync", "/settings/save", "/settings/restart"] {
+        for uri in [
+            "/ui/",
+            "/ui/reopen",
+            "/ui/sync",
+            "/issue/",
+            "/issue/abc123",
+            "/settings/save",
+            "/settings/restart",
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -532,6 +609,44 @@ mod tests {
                 .await
                 .expect("response");
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_redirect_rejects_unsafe_fingerprints() {
+        let (_dir, app) = test_app();
+        for uri in [
+            "/issue/%0d%0aX",  // decoded CR/LF must never reach `Location`
+            "/issue/..",       // dot segments would be normalised by browsers
+            "/issue/%2e%2e",
+            "/issue/a%20b",    // outside the alphanumeric/-_.: set
+            "/issue/a%2fb",    // encoded slash
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(
+                response.headers().get(header::LOCATION).is_none(),
+                "{uri} must not set Location"
+            );
+        }
+    }
+
+    #[test]
+    fn is_safe_fingerprint_accepts_plain_ids_only() {
+        for fp in ["abc123", "ab-cd_ef.1:2", "A0"] {
+            assert!(is_safe_fingerprint(fp), "{fp}");
+        }
+        for fp in ["", ".", "..", "a b", "a/b", "a\r\nb", "a\u{00e9}"] {
+            assert!(!is_safe_fingerprint(fp), "{fp:?}");
         }
     }
 
@@ -1290,16 +1405,106 @@ mod tests {
                 "keep",
             )
             .expect("audit event");
+        // Older than the 90-day event window but inside the 365-day audit
+        // window: audit history must survive.
+        store
+            .record_event(
+                "fp",
+                now - 200 * 86_400_000,
+                Some("example.com/spike"),
+                "owner",
+                "config_changed",
+                "audit-200d",
+            )
+            .expect("old audit event");
 
-        let deleted = prune_on_start(&store, now, 90).expect("prune");
+        let deleted = prune_retention(&store, now, 90).expect("prune");
         assert_eq!(deleted, 1);
 
         let events = store
             .list_events(&Default::default(), 100)
             .expect("events");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.kind == "config_changed"));
+        assert!(events.iter().any(|e| e.detail == "keep"));
+        assert!(events.iter().any(|e| e.detail == "audit-200d"));
+    }
+
+    #[test]
+    fn retention_keeps_audit_rows_when_event_window_exceeds_a_year() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = shanhaijing::Store::open(dir.path().join("long.db")).expect("open");
+        let now = crate::now_ms();
+        store
+            .record_event(
+                "fp",
+                now - 410 * 86_400_000,
+                Some("r"),
+                "system",
+                "reported",
+                "old-normal",
+            )
+            .expect("normal event");
+        store
+            .record_event(
+                "fp",
+                now - 380 * 86_400_000,
+                Some("r"),
+                "owner",
+                "config_changed",
+                "audit",
+            )
+            .expect("audit event");
+
+        let deleted = prune_retention(&store, now, 400).expect("prune");
+        assert_eq!(deleted, 1);
+        let events = store
+            .list_events(&Default::default(), 100)
+            .expect("events");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, "config_changed");
-        assert_eq!(events[0].detail, "keep");
+        assert_eq!(events[0].detail, "audit");
+    }
+
+    #[tokio::test]
+    async fn daily_prune_task_sweeps_after_the_first_period() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            shanhaijing::Store::open(dir.path().join("daily.db")).expect("open"),
+        );
+        store
+            .record_event(
+                "fp",
+                crate::now_ms() - 120 * 86_400_000,
+                Some("r"),
+                "system",
+                "reported",
+                "old",
+            )
+            .expect("old event");
+
+        // A short period keeps this deterministic without tokio's test-util
+        // feature: the first tick is consumed, so the first sweep lands after
+        // one period.
+        let task = spawn_daily_prune(
+            Arc::clone(&store),
+            retention_days_from_env(Some("90")),
+            std::time::Duration::from_millis(20),
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let events = store
+                .list_events(&Default::default(), 100)
+                .expect("events");
+            if events.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "daily prune did not run within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        task.abort();
     }
 
     #[test]
