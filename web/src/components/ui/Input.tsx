@@ -45,7 +45,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
         {...props}
         className={clsx(
           "min-h-11 w-full rounded-card border bg-surface px-3 py-2 text-body text-text",
-          "placeholder:text-text-muted transition-colors duration-150",
+          "placeholder:text-text-secondary transition-colors duration-150 ease-out",
           "disabled:cursor-not-allowed disabled:opacity-60",
           error
             ? "border-danger"
@@ -56,7 +56,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
         aria-describedby={describedBy || undefined}
       />
       {hint ? (
-        <p id={hintId} className="text-caption text-text-muted">
+        <p id={hintId} className="text-caption text-text-secondary">
           {hint}
         </p>
       ) : null}

@@ -8,6 +8,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type FocusEvent,
   type ReactNode,
 } from "react";
 
@@ -32,6 +33,16 @@ interface ToastContextValue {
   dismiss: (id: number) => void;
 }
 
+/** Auto-dismiss pauses independently for pointer hover, focus and a hidden tab. */
+type PauseReason = "pointer" | "focus" | "visibility";
+
+interface TimerRecord {
+  handle: number | null;
+  remaining: number;
+  startedAt: number;
+  paused: Set<PauseReason>;
+}
+
 const ToastContext = createContext<ToastContextValue | null>(null);
 
 const VARIANT_ICONS: Record<ToastVariant, LucideIcon> = {
@@ -50,52 +61,120 @@ const VARIANT_ICON_CLASSES: Record<ToastVariant, string> = {
 
 const DEFAULT_DURATION = 5000;
 
+function isInside(event: FocusEvent<HTMLElement>): boolean {
+  const next = event.relatedTarget;
+  return next instanceof Node && event.currentTarget.contains(next);
+}
+
 /**
  * Toast provider. The live region is mounted up front (empty) so assistive
  * technology reliably announces additions; announcements are polite because
  * toasts are informational, not a replacement for inline errors.
+ *
+ * Auto-dismiss (WCAG 2.2.1) stops while the pointer is over the toast, while
+ * focus is inside it, and while the tab is hidden, then resumes with the
+ * remaining time. `duration: 0` toasts stay until explicitly closed.
  */
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<ToastRecord[]>([]);
   const nextId = useRef(0);
-  const timers = useRef(new Map<number, number>());
+  const timers = useRef(new Map<number, TimerRecord>());
 
   const dismiss = useCallback((id: number) => {
     const timer = timers.current.get(id);
-    if (timer !== undefined) {
-      window.clearTimeout(timer);
-      timers.current.delete(id);
+    if (timer && timer.handle !== null) {
+      window.clearTimeout(timer.handle);
     }
+    timers.current.delete(id);
     setToasts((current) => current.filter((item) => item.id !== id));
   }, []);
 
-  const toast = useCallback((options: ToastOptions) => {
-    const id = ++nextId.current;
-    const record: ToastRecord = {
-      ...options,
-      id,
-      variant: options.variant ?? "info",
-      duration: options.duration ?? DEFAULT_DURATION,
-    };
+  const pause = useCallback((id: number, reason: PauseReason) => {
+    const timer = timers.current.get(id);
+    if (!timer) {
+      return;
+    }
+    timer.paused.add(reason);
+    if (timer.handle === null) {
+      return;
+    }
+    window.clearTimeout(timer.handle);
+    timer.handle = null;
+    timer.remaining = Math.max(0, timer.remaining - (Date.now() - timer.startedAt));
+  }, []);
 
-    setToasts((current) => [...current, record]);
+  const resume = useCallback(
+    (id: number, reason: PauseReason) => {
+      const timer = timers.current.get(id);
+      if (!timer) {
+        return;
+      }
+      timer.paused.delete(reason);
+      if (timer.paused.size > 0 || timer.handle !== null || timer.remaining <= 0) {
+        return;
+      }
+      timer.startedAt = Date.now();
+      timer.handle = window.setTimeout(() => dismiss(id), timer.remaining);
+    },
+    [dismiss],
+  );
 
-    if (record.duration > 0) {
-      const timer = window.setTimeout(() => {
-        timers.current.delete(id);
-        setToasts((current) => current.filter((item) => item.id !== id));
-      }, record.duration);
-      timers.current.set(id, timer);
+  const toast = useCallback(
+    (options: ToastOptions) => {
+      const id = ++nextId.current;
+      const record: ToastRecord = {
+        ...options,
+        id,
+        variant: options.variant ?? "info",
+        duration: options.duration ?? DEFAULT_DURATION,
+      };
+
+      setToasts((current) => [...current, record]);
+
+      if (record.duration > 0) {
+        const paused = new Set<PauseReason>();
+        if (document.hidden) {
+          paused.add("visibility");
+        }
+        const timer: TimerRecord = {
+          handle: null,
+          remaining: record.duration,
+          startedAt: Date.now(),
+          paused,
+        };
+        timers.current.set(id, timer);
+        if (paused.size === 0) {
+          timer.handle = window.setTimeout(() => dismiss(id), record.duration);
+        }
+      }
+
+      return id;
+    },
+    [dismiss],
+  );
+
+  useEffect(() => {
+    function handleVisibilityChange() {
+      for (const id of timers.current.keys()) {
+        if (document.hidden) {
+          pause(id, "visibility");
+        } else {
+          resume(id, "visibility");
+        }
+      }
     }
 
-    return id;
-  }, []);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [pause, resume]);
 
   useEffect(() => {
     const pending = timers.current;
     return () => {
       for (const timer of pending.values()) {
-        window.clearTimeout(timer);
+        if (timer.handle !== null) {
+          window.clearTimeout(timer.handle);
+        }
       }
       pending.clear();
     };
@@ -118,6 +197,19 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           return (
             <div
               key={item.id}
+              data-toast={item.id}
+              onPointerEnter={() => pause(item.id, "pointer")}
+              onPointerLeave={() => resume(item.id, "pointer")}
+              onFocus={(event) => {
+                if (!isInside(event)) {
+                  pause(item.id, "focus");
+                }
+              }}
+              onBlur={(event) => {
+                if (!isInside(event)) {
+                  resume(item.id, "focus");
+                }
+              }}
               className="nuwa-toast pointer-events-auto flex w-full max-w-sm items-start gap-3 rounded-modal border border-border-strong bg-raised p-3 text-text shadow-overlay"
             >
               <Icon
@@ -134,7 +226,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 type="button"
                 aria-label={`关闭通知：${item.title}`}
                 onClick={() => dismiss(item.id)}
-                className="-mr-1 -mt-1 flex size-11 shrink-0 items-center justify-center rounded-card text-text-muted transition-colors duration-150 hover:bg-surface hover:text-text"
+                className="-mr-1 -mt-1 flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-surface hover:text-text"
               >
                 <X aria-hidden="true" className="size-4" />
               </button>

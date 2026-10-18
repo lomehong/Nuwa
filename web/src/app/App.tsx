@@ -234,7 +234,7 @@ function Showcase() {
                   {SAMPLE_ISSUES.map((issue) => (
                     <TableRow key={issue.id}>
                       <TableCell>
-                        <span className="block font-mono text-caption text-text-muted">{issue.id}</span>
+                        <span className="block font-mono text-caption text-text-secondary">{issue.id}</span>
                         <span className="block text-body">{issue.title}</span>
                       </TableCell>
                       <TableCell>
@@ -308,7 +308,7 @@ function Showcase() {
           </Card>
         </main>
 
-        <footer className="border-t border-border pt-4 text-caption text-text-muted">
+        <footer className="border-t border-border pt-4 text-caption text-text-secondary">
           颜色来自 docs/09 §11；所有示例均无内联样式，可在严格 CSP 下运行。
         </footer>
       </div>

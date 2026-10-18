@@ -46,4 +46,23 @@ describe("ConfirmDialog", () => {
 
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
+
+  it("wraps Tab and Shift+Tab inside the dialog", () => {
+    render(<ConfirmDialog open title="删除问题单？" onConfirm={() => {}} onCancel={() => {}} />);
+
+    const dialog = screen.getByRole("dialog");
+    const close = screen.getByRole("button", { name: "关闭对话框" });
+    const cancel = screen.getByRole("button", { name: "取消" });
+    const confirm = screen.getByRole("button", { name: "确认" });
+
+    expect(cancel).toHaveFocus();
+
+    confirm.focus();
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(close).toHaveFocus();
+
+    close.focus();
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+    expect(confirm).toHaveFocus();
+  });
 });

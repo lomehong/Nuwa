@@ -116,7 +116,7 @@ export function ConfirmDialog({
             type="button"
             aria-label="关闭对话框"
             onClick={onCancel}
-            className="-mr-2 -mt-2 flex size-11 shrink-0 items-center justify-center rounded-card text-text-muted transition-colors duration-150 hover:bg-raised hover:text-text"
+            className="-mr-2 -mt-2 flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-raised hover:text-text"
           >
             <X aria-hidden="true" className="size-4" />
           </button>

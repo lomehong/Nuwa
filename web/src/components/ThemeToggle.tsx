@@ -30,7 +30,7 @@ export function ThemeToggle({ className }: ThemeToggleProps) {
       }}
       className={clsx(
         "inline-flex size-11 shrink-0 items-center justify-center rounded-card border border-border",
-        "bg-surface text-text-secondary transition-colors duration-150",
+        "bg-surface text-text-secondary transition-colors duration-150 ease-out",
         "hover:border-border-strong hover:text-text",
         className,
       )}

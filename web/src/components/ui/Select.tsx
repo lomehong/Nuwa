@@ -57,7 +57,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(function Select
           {...props}
           className={clsx(
             "min-h-11 w-full appearance-none rounded-card border bg-surface py-2 pl-3 pr-9 text-body text-text",
-            "transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-60",
+            "transition-colors duration-150 ease-out disabled:cursor-not-allowed disabled:opacity-60",
             error
               ? "border-danger"
               : "border-border hover:border-border-strong focus-visible:border-accent",
@@ -84,7 +84,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(function Select
         />
       </div>
       {hint ? (
-        <p id={hintId} className="text-caption text-text-muted">
+        <p id={hintId} className="text-caption text-text-secondary">
           {hint}
         </p>
       ) : null}

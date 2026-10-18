@@ -63,7 +63,7 @@ export function TableHead({ className, children, ...props }: HTMLAttributes<HTML
   return (
     <thead
       className={clsx(
-        "border-b border-border bg-raised/60 text-caption font-medium text-text-muted",
+        "border-b border-border bg-raised/60 text-caption font-medium text-text-secondary",
         className,
       )}
       {...props}
@@ -83,7 +83,7 @@ export function TableBody({ className, children, ...props }: HTMLAttributes<HTML
 
 export function TableRow({ className, children, ...props }: HTMLAttributes<HTMLTableRowElement>) {
   return (
-    <tr className={clsx("transition-colors duration-150 hover:bg-raised/50", className)} {...props}>
+    <tr className={clsx("transition-colors duration-150 ease-out hover:bg-raised/50", className)} {...props}>
       {children}
     </tr>
   );
