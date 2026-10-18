@@ -1,6 +1,7 @@
 /**
  * Activity feed data hook (`GET /events`). Polling mirrors the operations
- * pages: 30s while visible, paused in a hidden tab, immediate refresh on focus.
+ * pages: 30s while visible, paused in a hidden tab, immediate refresh on focus,
+ * and exponential backoff (up to 60s) while consecutive fetches fail.
  *
  * The query key is the filter tuple only — never `Date.now()` — so polls reuse
  * one cache entry; `from_ms` is computed inside the queryFn.
@@ -9,6 +10,7 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { apiFetch } from "../../lib/api";
+import { backoffInterval } from "../../lib/polling";
 import { eventQueryString, type EventFilters } from "./filters";
 import type { EventsResponse } from "./types";
 
@@ -39,7 +41,7 @@ export function useEventsQuery(filters: EventFilters) {
     // feed never flashes the skeleton; `isInitialLoading` still only covers the
     // very first request (no cached data at all).
     placeholderData: keepPreviousData,
-    refetchInterval: EVENTS_POLL_MS,
+    refetchInterval: backoffInterval(EVENTS_POLL_MS),
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
   });

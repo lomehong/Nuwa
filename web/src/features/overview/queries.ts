@@ -10,12 +10,15 @@
  *     defaults to false, but the page states it for clarity);
  *   - regaining focus refreshes immediately, overriding the app-wide
  *     `refetchOnWindowFocus: false` (a page that shows operations status must
- *     not display minutes-old data right after the operator returns).
+ *     not display minutes-old data right after the operator returns);
+ *   - consecutive fetch failures back off exponentially up to 60s
+ *     (`lib/polling`) and snap back to the base interval after a success.
  */
 
 import { useQuery } from "@tanstack/react-query";
 
 import { apiFetch } from "../../lib/api";
+import { backoffInterval } from "../../lib/polling";
 import type { EventsResponse } from "../events/types";
 import {
   DEFAULT_TRENDS_RANGE,
@@ -41,13 +44,16 @@ interface OverviewQueryOptions {
    * Owning observer sets the timer (the shell uses the 10s default); the page
    * disables its copy so one key has exactly one interval.
    */
-  refetchInterval?: number | false;
+  refetchInterval?:
+    | number
+    | false
+    | ((query: { state: { fetchFailureCount: number } }) => number | false);
 }
 
 /** `/overview` for the page and the AppShell health strip (shared key). */
 export function useOverviewQuery(
   repo?: string | null,
-  { refetchInterval = OVERVIEW_POLL_MS }: OverviewQueryOptions = {},
+  { refetchInterval = backoffInterval(OVERVIEW_POLL_MS) }: OverviewQueryOptions = {},
 ) {
   return useQuery({
     queryKey: overviewQueryKey(repo),
@@ -71,7 +77,7 @@ export function useTrendsQuery(range: TrendsRange = DEFAULT_TRENDS_RANGE, repo?:
       return apiFetch<TrendsResponse>(`/metrics/trends?${params.toString()}`, { signal });
     },
     staleTime: TRENDS_POLL_MS,
-    refetchInterval: TRENDS_POLL_MS,
+    refetchInterval: backoffInterval(TRENDS_POLL_MS),
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
   });
@@ -84,7 +90,7 @@ export function useRecentEventsQuery(pageSize: number = RECENT_EVENT_COUNT) {
     queryFn: ({ signal }) =>
       apiFetch<EventsResponse>(`/events?page_size=${pageSize}`, { signal }),
     staleTime: EVENTS_POLL_MS,
-    refetchInterval: EVENTS_POLL_MS,
+    refetchInterval: backoffInterval(EVENTS_POLL_MS),
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
   });
