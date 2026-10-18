@@ -5,11 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { THEME_STORAGE_KEY } from "../lib/theme";
 import {
   makeOverview,
-  mockEvents,
   mockIssues,
   mockMe,
   mockOverviewResources,
-  mockTrends,
   server,
 } from "../test/msw";
 import { renderApp } from "../test/render";
@@ -210,11 +208,15 @@ describe("AppShell", () => {
   });
 
   it("shows an offline banner when the transport fails and clears it on retry", async () => {
+    // A real transport outage fails every request; if the sibling trends/events
+    // queries were left succeeding they could clear the banner before the
+    // assertion and make the test order-sensitive.
+    const unreachable = () => HttpResponse.error();
     server.use(
       mockMe(),
-      mockTrends(),
-      mockEvents(),
-      http.get("/api/v1/overview", () => HttpResponse.error()),
+      http.get("/api/v1/overview", unreachable),
+      http.get("/api/v1/metrics/trends", unreachable),
+      http.get("/api/v1/events", unreachable),
     );
 
     renderApp("/");
