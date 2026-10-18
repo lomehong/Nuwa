@@ -1,6 +1,6 @@
 # Web Console M4 — Read-only pages Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Complete the read-only console: runners fleet page, activity/audit feed, and the 7/14/30/90-day trend switch, without any write actions.
 
@@ -57,7 +57,7 @@
 - Produces: routes `/runners` and `/events`; `pageMeta` titles `运行器` and `活动`.
 - Consumes: `RunnersPage`, `EventsPage` default exports from Tasks 3 and 6 (imports added in this task; use placeholder components created here and replaced later).
 
-- [ ] **Step 1: Write the failing shell test**
+- [x] **Step 1: Write the failing shell test**
 
 Add to `AppShell.test.tsx`:
 
@@ -77,12 +77,12 @@ it("activates runners and events navigation and marks settings as soon", async (
 });
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cd web && npx vitest run src/app/AppShell.test.tsx -t "activates runners"`
 Expected: FAIL because 运行器/活动 render as disabled spans.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `AppShell.tsx`:
 
@@ -130,12 +130,12 @@ export function EventsPage() {
 }
 ```
 
-- [ ] **Step 4: Run the shell test**
+- [x] **Step 4: Run the shell test**
 
 Run: `cd web && npx vitest run src/app/AppShell.test.tsx`
 Expected: PASS (the existing “Soon” count assertion must be updated from 3 to 1).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/app/AppShell.tsx web/src/app/router.tsx web/src/app/AppShell.test.tsx web/src/features/runners/RunnersPage.tsx web/src/features/events/EventsPage.tsx
@@ -157,7 +157,7 @@ git commit -m "feat(web): activate runners and events routes"
 - Produces: `RunnerDto`, `RunnerListResponse`, `runnerStatusLabel(runner, nowMs)`, `runnerStatusVariant(runner)`, `runnerQuotaPercent(runner)`, `useRunnersQuery()`.
 - Consumes: `GET /api/v1/runners` response from `crates/nuwa/src/api/runners.rs`.
 
-- [ ] **Step 1: Write the failing format test**
+- [x] **Step 1: Write the failing format test**
 
 ```ts
 import { describe, expect, it } from "vitest";
@@ -191,12 +191,12 @@ describe("runner status", () => {
 });
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cd web && npx vitest run src/features/runners/format.test.ts`
 Expected: FAIL — module not found.
 
-- [ ] **Step 3: Implement types, format, queries**
+- [x] **Step 3: Implement types, format, queries**
 
 `types.ts` mirrors the API exactly:
 
@@ -351,12 +351,12 @@ export function mockRunners(runners: RunnerDto[] = [makeRunner()]) {
 }
 ```
 
-- [ ] **Step 4: Run the format test**
+- [x] **Step 4: Run the format test**
 
 Run: `cd web && npx vitest run src/features/runners/format.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/features/runners web/src/test/msw.ts
@@ -376,7 +376,7 @@ git commit -m "feat(web): runner types, status semantics and query"
 - Consumes: `useRunnersQuery`, `runnerStatusLabel/Variant`, `runnerQuotaPercent`, `useNow`? Use `Date.now()` at render; poll re-renders refresh it.
 - Produces: the real `RunnersPage` used by Task 1.
 
-- [ ] **Step 1: Write the failing page test**
+- [x] **Step 1: Write the failing page test**
 
 ```tsx
 import { screen, within } from "@testing-library/react";
@@ -419,12 +419,12 @@ describe("RunnersPage", () => {
 });
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cd web && npx vitest run src/features/runners/RunnersPage.test.tsx`
 Expected: FAIL — heading-only placeholder, no cards.
 
-- [ ] **Step 3: Implement the page**
+- [x] **Step 3: Implement the page**
 
 `RunnersPage.tsx` structure:
 
@@ -464,12 +464,12 @@ Render:
 - Copy buttons use the existing `CopyButton` (`features/issue-detail/CopyButton.tsx`) for id/service unit.
 - M5 adds the restart button; M4 must not import it.
 
-- [ ] **Step 4: Run the page test**
+- [x] **Step 4: Run the page test**
 
 Run: `cd web && npx vitest run src/features/runners`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/features/runners
@@ -500,7 +500,7 @@ git commit -m "feat(web): runners fleet page"
   - `useEventsQuery(filters)`.
 - Consumes: `GET /api/v1/events` (`kind`, `repo`, `fingerprint`, `from_ms`, `to_ms`, `aggregate`, `page`, `page_size`).
 
-- [ ] **Step 1: Write the failing filter tests**
+- [x] **Step 1: Write the failing filter tests**
 
 ```ts
 import { describe, expect, it } from "vitest";
@@ -535,12 +535,12 @@ describe("event filters", () => {
 });
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cd web && npx vitest run src/features/events/filters.test.ts`
 Expected: FAIL — module not found.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Move the three interfaces verbatim from `overview/types.ts` to `events/types.ts`; update imports in `overview/queries.ts`, `overview/RecentEvents.tsx`, and `test/msw.ts` to `../events/types`.
 
@@ -651,7 +651,7 @@ export function eventQueryString(filters: EventFilters, nowMs = Date.now()): str
 
 `queries.ts` mirrors the other hooks (30s poll, focus refetch).
 
-- [ ] **Step 4: Run the filter tests and the existing overview tests**
+- [x] **Step 4: Run the filter tests and the existing overview tests**
 
 Run:
 ```bash
@@ -659,7 +659,7 @@ cd web && npx vitest run src/features/events/filters.test.ts src/features/overvi
 ```
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/features/events web/src/features/overview web/src/test/msw.ts
@@ -680,7 +680,7 @@ git commit -m "feat(web): event types, URL filters and query"
 - Consumes: `useEventsQuery`, filters helpers, `isSystemFingerprint`, `eventKindLabel`, `formatAge`, `formatDateTime`, `shortFingerprint`.
 - Produces: the real `EventsPage` used by Task 1.
 
-- [ ] **Step 1: Write the failing page test**
+- [x] **Step 1: Write the failing page test**
 
 Register a dynamic MSW handler:
 
@@ -738,12 +738,12 @@ it("syncs filters to the URL and renders system events without links", async () 
 
 `MemoryRouter` does not change `window.location`; assert the page's filter state through the request and a visible “审计视图” badge instead.
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cd web && npx vitest run src/features/events/EventsPage.test.tsx`
 Expected: FAIL — placeholder page.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `EventsPage`:
 - `useSearchParams()`; `filters = parseEventFilters(searchParams)`.
@@ -770,12 +770,12 @@ Expected: FAIL — placeholder page.
 - Aggregated rows show `×{count}` and the hour range (`formatDateTime(first_ts_ms)` – `formatDateTime(last_ts_ms)`).
 - `detail` in monospace, wrapped, max 2 lines? Use `break-words`.
 
-- [ ] **Step 4: Run the page tests**
+- [x] **Step 4: Run the page tests**
 
 Run: `cd web && npx vitest run src/features/events`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/features/events
@@ -798,7 +798,7 @@ git commit -m "feat(web): activity and audit feed"
 - Overview uses `useState<TrendsRange>("14d")` and `useTrendsQuery(range)`.
 - Health panel links to `/runners`; recent events links to `/events`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```tsx
 it("refetches trends for the selected range", async () => {
@@ -824,12 +824,12 @@ it("refetches trends for the selected range", async () => {
 });
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cd web && npx vitest run src/features/overview/OverviewPage.test.tsx -t "trends for the selected range"`
 Expected: FAIL — no 30-day button.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `TrendsPanel`:
 - Description: `最近 ${days} 天 · 按 UTC 日分桶`.
@@ -847,12 +847,12 @@ const trends = useTrendsQuery(range);
 
 In `HealthPanel` add a link `查看运行器` to `/runners` in the section aside; in `RecentEvents` add `查看全部` to `/events`.
 
-- [ ] **Step 4: Run overview tests**
+- [x] **Step 4: Run overview tests**
 
 Run: `cd web && npx vitest run src/features/overview`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/features/overview
@@ -867,7 +867,7 @@ git commit -m "feat(web): trend range switch and page deep links"
 - Modify: `docs/07-open-items.md`
 - (No code changes expected; fix anything verification finds.)
 
-- [ ] **Step 1: Run the full frontend suite**
+- [x] **Step 1: Run the full frontend suite**
 
 ```bash
 cd web
@@ -878,7 +878,7 @@ npm run build
 ```
 Expected: 28+ files pass; build writes `dist/index.html`.
 
-- [ ] **Step 2: Run self-owned Rust checks**
+- [x] **Step 2: Run self-owned Rust checks**
 
 ```bash
 cargo clippy --no-deps -p nuwa -p shanhaijing --all-targets -- -D warnings
@@ -886,7 +886,7 @@ cargo test -p nuwa -p shanhaijing
 ```
 Expected: zero warnings; 197 + 60 tests pass (no backend changes).
 
-- [ ] **Step 3: Browser UAT**
+- [x] **Step 3: Browser UAT**
 
 Use a temp DB (`nuwa ingest` + seeded runners/events) and `NUWA_UI_TOKEN=<dummy>`:
 - `/runners`: summary, one card per status, offline override, quota, empty state.
@@ -895,11 +895,11 @@ Use a temp DB (`nuwa ingest` + seeded runners/events) and `NUWA_UI_TOKEN=<dummy>
 - 390/1024/1440, light/dark, keyboard only.
 - Zero horizontal overflow, zero inline styles, zero console errors.
 
-- [ ] **Step 4: Update docs**
+- [x] **Step 4: Update docs**
 
 Append to the M3 bullet in `docs/07-open-items.md` (or add an M4 bullet) with: runners/events pages, trend ranges, test counts, UAT evidence, and the remaining M5/M6 items.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/07-open-items.md
