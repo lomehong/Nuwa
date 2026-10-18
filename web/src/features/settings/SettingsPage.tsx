@@ -1,7 +1,7 @@
 import { clsx } from "clsx";
-import { FlaskConical, Power, ShieldCheck } from "lucide-react";
+import { ChevronRight, FlaskConical, GitBranch, Power, ShieldCheck } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import {
   Badge,
@@ -12,14 +12,19 @@ import {
   CardHeader,
   CardTitle,
   ConfirmDialog,
+  EmptyState,
   Skeleton,
   useToast,
 } from "../../components/ui";
 import { ApiError } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { SyncButton } from "../actions/SyncButton";
-import { formatDateTime, formatDuration, isoDateTime } from "../overview/format";
+import { issueDetailPath } from "../issues/format";
+import { formatDateTime, formatDuration, isoDateTime, shortFingerprint } from "../overview/format";
 import { PanelError } from "../overview/PanelChrome";
+import { runnerIsOffline } from "../runners/format";
+import { useRunnersQuery } from "../runners/queries";
+import type { RunnerDto } from "../runners/types";
 import { RestartDialog } from "./RestartDialog";
 import { SettingField } from "./SettingField";
 import {
@@ -84,6 +89,77 @@ const SECTIONS: readonly SectionDef[] = [
     description: "env 文件位置、权限与审计记录。",
   },
 ];
+
+/** Settings sections plus the read-only repository and about cards. */
+type SectionId = SettingGroup | "repo" | "about";
+
+const NAV_ITEMS: readonly { id: SectionId; label: string }[] = [
+  { id: "credentials", label: "凭据" },
+  { id: "model", label: "模型" },
+  { id: "runner", label: "Runner" },
+  { id: "repo", label: "仓库" },
+  { id: "service", label: "服务控制" },
+  { id: "security", label: "安全" },
+  { id: "ops", label: "运维" },
+  { id: "advanced", label: "高级" },
+  { id: "about", label: "关于" },
+];
+
+/** Long sections start collapsed so the page opens at a readable length. */
+const INITIAL_OPEN: Record<SectionId, boolean> = {
+  credentials: true,
+  model: true,
+  runner: true,
+  repo: true,
+  service: true,
+  security: false,
+  ops: false,
+  advanced: false,
+  about: false,
+};
+
+function isSchemaGroup(id: SectionId): id is SettingGroup {
+  return id !== "repo" && id !== "about";
+}
+
+function sectionElementId(id: SectionId): string {
+  return `settings-${id}`;
+}
+
+function panelElementId(id: SectionId): string {
+  return `settings-${id}-panel`;
+}
+
+/** Unique, non-empty values in encounter order; `null`/blank entries drop out. */
+function distinctStrings(values: (string | null | undefined)[]): string[] {
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (value) {
+      seen.add(value);
+    }
+  }
+  return [...seen];
+}
+
+interface RepoGroup {
+  repo: string;
+  runners: RunnerDto[];
+}
+
+/** Runners report a repo each heartbeat; the repository view groups by it. */
+function groupRunnersByRepo(runners: RunnerDto[]): RepoGroup[] {
+  const groups = new Map<string, RunnerDto[]>();
+  for (const runner of runners) {
+    const repo = runner.repo || "（未上报仓库）";
+    const bucket = groups.get(repo);
+    if (bucket) {
+      bucket.push(runner);
+    } else {
+      groups.set(repo, [runner]);
+    }
+  }
+  return [...groups].map(([repo, members]) => ({ repo, runners: members }));
+}
 
 const REPO_URL = "https://github.com/lomehong/nuwa";
 
@@ -156,45 +232,109 @@ function SettingsSkeleton() {
 }
 
 interface SectionProps {
+  id: SectionId;
   title: string;
   description: string;
-  specs: SettingDto[];
+  open: boolean;
+  onToggle: () => void;
+  /** Schema rows; omit for custom read-only panels instead of an empty hint. */
+  specs?: SettingDto[];
   values: Record<string, SettingValueDto>;
   diffs: Record<string, DiffDto>;
   drafts: Record<string, string>;
   errors: Record<string, string>;
   onDraftChange: (spec: SettingDto, raw: string) => void;
+  /** Field layout on wide screens; long groups pair up to stay scannable. */
+  columns?: "one" | "two";
   aside?: ReactNode;
   children?: ReactNode;
 }
 
-function SettingsSection({
+function SectionHeader({
   title,
   description,
+  open,
+  controls,
+  onToggle,
+  aside,
+}: {
+  title: string;
+  description: string;
+  open: boolean;
+  controls: string;
+  onToggle: () => void;
+  aside?: ReactNode;
+}) {
+  return (
+    <CardHeader>
+      <div className="min-w-0 flex-1">
+        <CardTitle as="h2">
+          <button
+            type="button"
+            aria-expanded={open}
+            aria-controls={controls}
+            onClick={onToggle}
+            className="flex min-h-11 w-full items-center gap-2 rounded-card text-left text-heading-sm font-semibold text-text"
+          >
+            <ChevronRight
+              aria-hidden="true"
+              className={clsx(
+                "size-4 shrink-0 text-text-muted transition-transform duration-150 ease-out",
+                open && "rotate-90",
+              )}
+            />
+            <span className="min-w-0">{title}</span>
+          </button>
+        </CardTitle>
+        <CardDescription className="pl-6">{description}</CardDescription>
+      </div>
+      {aside ? <div className="flex flex-wrap items-center gap-2">{aside}</div> : null}
+    </CardHeader>
+  );
+}
+
+function SettingsSection({
+  id,
+  title,
+  description,
+  open,
+  onToggle,
   specs,
   values,
   diffs,
   drafts,
   errors,
   onDraftChange,
+  columns = "one",
   aside,
   children,
 }: SectionProps) {
   return (
-    <Card>
-      <CardHeader>
-        <div className="min-w-0">
-          <CardTitle as="h2">{title}</CardTitle>
-          <CardDescription>{description}</CardDescription>
-        </div>
-        {aside ? <div className="flex flex-wrap items-center gap-2">{aside}</div> : null}
-      </CardHeader>
-      <CardContent className="space-y-5">
+    <Card id={sectionElementId(id)} className="scroll-mt-24">
+      <SectionHeader
+        title={title}
+        description={description}
+        open={open}
+        controls={panelElementId(id)}
+        onToggle={onToggle}
+        aside={aside}
+      />
+      <CardContent
+        id={panelElementId(id)}
+        hidden={!open}
+        className="space-y-5"
+      >
         {children}
-        {specs.length === 0 ? (
+        {specs === undefined ? null : specs.length === 0 ? (
           <p className="text-body-sm text-text-secondary">该分组暂无可用字段。</p>
         ) : (
-          <div className="space-y-5">
+          <div
+            className={clsx(
+              columns === "two"
+                ? "grid gap-5 xl:grid-cols-2"
+                : "space-y-5",
+            )}
+          >
             {specs.map((spec) => (
               <SettingField
                 key={spec.key}
@@ -353,6 +493,152 @@ function AdvancedDetails({ data }: { data: SettingsResponse }) {
   );
 }
 
+function RepoGroupCard({ group, nowMs }: { group: RepoGroup; nowMs: number }) {
+  const { runners } = group;
+  const online = runners.filter((runner) => !runnerIsOffline(runner, nowMs)).length;
+  const checkoutPaths = distinctStrings(runners.map((runner) => runner.repo_path));
+  const failingChecks = distinctStrings(
+    runners.map((runner) => runner.effective.failing_check),
+  );
+  const forbiddenCounts = distinctStrings(
+    runners.map((runner) =>
+      runner.effective.forbidden_paths_count === null
+        ? null
+        : String(runner.effective.forbidden_paths_count),
+    ),
+  );
+  const limited = runners.filter(
+    (runner) => runner.daily_pr_limit !== null && runner.daily_pr_limit > 0,
+  );
+  const quota =
+    limited.length > 0
+      ? `${limited.reduce((sum, runner) => sum + runner.prs_today, 0)}/${limited.reduce(
+          (sum, runner) => sum + (runner.daily_pr_limit ?? 0),
+          0,
+        )}`
+      : "未上报配额";
+  const working = runners.filter((runner) => runner.current_fingerprint);
+  const lastErrors = distinctStrings(runners.map((runner) => runner.last_error));
+  const variant = online === runners.length ? "success" : online === 0 ? "danger" : "warning";
+
+  return (
+    <div
+      data-testid={`repo-group-${group.repo}`}
+      className="rounded-card border border-border"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
+        <p className="min-w-0 break-all font-mono text-body-sm font-semibold text-text">
+          {group.repo}
+        </p>
+        <Badge variant={variant}>
+          {online}/{runners.length} 在线
+        </Badge>
+      </div>
+      <dl className="grid gap-x-4 gap-y-3 px-3 py-3 sm:grid-cols-2 xl:grid-cols-4">
+        <InfoItem label="检出路径" mono>
+          {checkoutPaths.length > 0 ? checkoutPaths.join(" · ") : "—"}
+        </InfoItem>
+        <InfoItem label="Failing check" mono>
+          {failingChecks.length > 0 ? failingChecks.join(" · ") : "—"}
+        </InfoItem>
+        <InfoItem label="禁改路径">
+          {forbiddenCounts.length > 0 ? `${forbiddenCounts.join(" / ")} 个` : "—"}
+        </InfoItem>
+        <InfoItem label="今日 PR 配额" mono>
+          {quota}
+        </InfoItem>
+        <InfoItem label="当前指纹">
+          {working.length > 0 ? (
+            <span className="flex flex-wrap gap-x-3 gap-y-1">
+              {working.map((runner) => (
+                <Link
+                  key={runner.id}
+                  to={issueDetailPath(runner.current_fingerprint ?? "")}
+                  title={runner.current_fingerprint ?? undefined}
+                  aria-label={`查看当前单：${runner.current_fingerprint}`}
+                  className="inline-flex min-h-11 items-center rounded-sm font-mono text-text-secondary transition-colors hover:text-accent pointer-fine:min-h-9"
+                >
+                  {shortFingerprint(runner.current_fingerprint ?? "")}
+                </Link>
+              ))}
+            </span>
+          ) : (
+            "队列为空"
+          )}
+        </InfoItem>
+      </dl>
+      {lastErrors.length > 0 ? (
+        <div className="mx-3 mb-3 rounded-card border border-danger/40 bg-danger/10 px-3 py-2">
+          <p className="text-caption text-text-muted">最近错误</p>
+          <ul className="mt-0.5 space-y-1">
+            {lastErrors.map((error) => (
+              <li key={error} className="break-words font-mono text-caption text-text">
+                {error}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Read-only repository summary derived from the runner roster (docs/09 §10.8):
+ * the API only reports repos through heartbeats, so this section groups the
+ * same `useRunnersQuery` data instead of adding a new endpoint.
+ */
+function RepositoryBody({ query }: { query: ReturnType<typeof useRunnersQuery> }) {
+  const data = query.data;
+  const runners = data?.data ?? [];
+  const nowMs = Date.now();
+
+  if (query.isPending && !data) {
+    return (
+      <div role="status" aria-busy="true" className="space-y-3">
+        <span className="sr-only">正在加载仓库</span>
+        <Skeleton className="h-16 w-full" />
+        <Skeleton className="h-16 w-full" />
+      </div>
+    );
+  }
+  if (query.isError && !data) {
+    return (
+      <PanelError
+        title="无法加载仓库"
+        error={query.error}
+        onRetry={() => void query.refetch()}
+      />
+    );
+  }
+  return (
+    <div className="space-y-3">
+      {query.isError ? (
+        <div className="flex flex-wrap items-start justify-between gap-2 rounded-card border border-warning/40 bg-warning/10 px-4 py-2 text-body-sm text-text">
+          <p role="status" className="min-w-0 flex-1">
+            仓库信息更新失败，显示的是上次数据。
+            <span className="ml-1 text-text-secondary">{describeError(query.error)}</span>
+          </p>
+          <Button variant="secondary" size="sm" onClick={() => void query.refetch()}>
+            重试
+          </Button>
+        </div>
+      ) : null}
+      {runners.length === 0 ? (
+        <EmptyState
+          icon={GitBranch}
+          title="还没有仓库注册"
+          description="仓库来自运行器心跳上报：在目标主机启动 nuwa work，首拍心跳后这里会按仓库汇总检出路径、验证配置与配额。"
+        />
+      ) : (
+        groupRunnersByRepo(runners).map((group) => (
+          <RepoGroupCard key={group.repo} group={group} nowMs={nowMs} />
+        ))
+      )}
+    </div>
+  );
+}
+
 /**
  * Schema-driven settings editor (docs/09 §10.8, §13). Every group renders from
  * `schema`; the page only tracks drafts, so a refresh never discards an
@@ -361,6 +647,7 @@ function AdvancedDetails({ data }: { data: SettingsResponse }) {
 export function SettingsPage() {
   const settings = useSettingsQuery();
   const system = useSystemQuery();
+  const runners = useRunnersQuery();
   const save = useSaveSettingsMutation();
   const testGithub = useTestSettingsMutation();
   const testLlm = useTestSettingsMutation();
@@ -371,6 +658,9 @@ export function SettingsPage() {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [pendingHref, setPendingHref] = useState<string | null>(null);
   const [restartOpen, setRestartOpen] = useState(false);
+  const [openSections, setOpenSections] = useState<Record<SectionId, boolean>>({
+    ...INITIAL_OPEN,
+  });
   const [lastSave, setLastSave] = useState<{
     changed: string[];
     restartRequired: boolean;
@@ -489,6 +779,19 @@ export function SettingsPage() {
   function handleDiscard() {
     setDrafts({});
     setFieldErrors({});
+  }
+
+  function toggleSection(id: SectionId) {
+    setOpenSections((current) => ({ ...current, [id]: !current[id] }));
+  }
+
+  function setAllSections(open: boolean) {
+    setOpenSections(
+      Object.fromEntries(NAV_ITEMS.map((item) => [item.id, open])) as Record<
+        SectionId,
+        boolean
+      >,
+    );
   }
 
   function handleSave() {
@@ -658,9 +961,30 @@ export function SettingsPage() {
 
   const specsOf = (group: SettingGroup) => data.schema.filter((spec) => spec.group === group);
   const section = (group: SettingGroup) => SECTIONS.find((entry) => entry.group === group)!;
+  const groupOfKey = new Map(data.schema.map((spec) => [spec.key, spec.group]));
+  const dirtyGroups = new Set<SettingGroup>();
+  for (const key of Object.keys(drafts)) {
+    const group = groupOfKey.get(key);
+    if (group) {
+      dirtyGroups.add(group);
+    }
+  }
+  // Only groups whose saved keys actually require a restart earn the nav badge.
+  const restartGroups = new Set<SettingGroup>();
+  if (lastSave?.restartRequired) {
+    for (const key of lastSave.changed) {
+      const group = groupOfKey.get(key);
+      if (group) {
+        restartGroups.add(group);
+      }
+    }
+  }
   const sectionProps = (group: SettingGroup) => ({
+    id: group,
     title: section(group).title,
     description: section(group).description,
+    open: openSections[group],
+    onToggle: () => toggleSection(group),
     specs: specsOf(group),
     values: data.values,
     diffs: data.effective_diff,
@@ -669,6 +993,14 @@ export function SettingsPage() {
     onDraftChange: handleDraftChange,
   });
   const restartPending = data.restart_pending || lastSave?.restartRequired === true;
+
+  const panelProps = {
+    values: data.values,
+    diffs: data.effective_diff,
+    drafts,
+    errors: fieldErrors,
+    onDraftChange: handleDraftChange,
+  };
 
   return (
     <div className="space-y-4">
@@ -683,7 +1015,18 @@ export function SettingsPage() {
           </p>
         </div>
         {dirtyCount > 0 ? (
-          <Badge variant="warning">未保存 {dirtyCount} 项</Badge>
+          <div
+            data-testid="settings-header-actions"
+            className="flex flex-wrap items-center gap-2"
+          >
+            <Badge variant="warning">{dirtyCount} 项未保存</Badge>
+            <Button variant="ghost" size="sm" onClick={handleDiscard}>
+              放弃更改
+            </Button>
+            <Button size="sm" pending={save.isPending} onClick={handleSave}>
+              保存更改
+            </Button>
+          </div>
         ) : null}
       </header>
 
@@ -731,120 +1074,205 @@ export function SettingsPage() {
         </div>
       ) : null}
 
-      <SettingsSection
-        {...sectionProps("credentials")}
-        aside={
-          <Button
-            variant="secondary"
-            size="sm"
-            pending={testGithub.isPending}
-            onClick={handleTestGithub}
-          >
-            <ShieldCheck aria-hidden="true" className="size-3.5" />
-            测试 GitHub token
-          </Button>
-        }
-      />
-      <SettingsSection
-        {...sectionProps("model")}
-        aside={
-          <Button
-            variant="secondary"
-            size="sm"
-            pending={testLlm.isPending}
-            onClick={handleTestLlm}
-          >
-            <FlaskConical aria-hidden="true" className="size-3.5" />
-            测试模型配置
-          </Button>
-        }
-      />
-      <SettingsSection {...sectionProps("runner")} />
-
-      <SettingsSection
-        {...sectionProps("service")}
-        aside={
-          <>
-            <SyncButton />
-            <div className="flex flex-col items-end gap-1">
-              <Button
-                variant="danger"
-                size="sm"
-                // The post-recovery navigation would hit the beforeunload
-                // guard; force a save/discard decision before restarting.
-                disabled={dirtyCount > 0}
-                onClick={() => setRestartOpen(true)}
-              >
-                <Power aria-hidden="true" className="size-3.5" />
-                重启服务
-              </Button>
-              {dirtyCount > 0 ? (
-                <p className="text-caption text-warning">请先保存或放弃未保存的更改</p>
-              ) : null}
-            </div>
-          </>
-        }
-      >
-        {system.isPending && !system.data ? (
-          <Skeleton className="h-24 w-full" />
-        ) : (
-          <ServiceDetails system={system.data} />
-        )}
-      </SettingsSection>
-
-      <SettingsSection {...sectionProps("security")} />
-      <SettingsSection {...sectionProps("ops")} />
-      <SettingsSection {...sectionProps("advanced")}>
-        <AdvancedDetails data={data} />
-      </SettingsSection>
-
-      <Card>
-        <CardHeader>
-          <div className="min-w-0">
-            <CardTitle as="h2">关于</CardTitle>
-            <CardDescription>版本、许可证与源码位置。</CardDescription>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-2 text-body-sm text-text-secondary">
-          <p>
-            版本{" "}
-            <code className="font-mono text-text">{system.data?.version ?? "—"}</code>
-          </p>
-          <p>
-            许可证 <span className="text-text">MIT</span>
-          </p>
-          <p>
-            源码：
-            <a
-              href={REPO_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="text-accent underline-offset-2 hover:underline"
-            >
-              {REPO_URL}
-            </a>
-          </p>
-        </CardContent>
-      </Card>
-
-      {dirtyCount > 0 ? (
-        <div
-          data-testid="settings-save-bar"
-          className="sticky bottom-14 z-20 -mx-4 border-t border-border bg-surface/95 px-4 py-3 backdrop-blur sm:-mx-6 lg:static lg:mx-0 lg:rounded-card lg:border"
+      <div className="lg:grid lg:grid-cols-[220px_minmax(0,1fr)] lg:items-start lg:gap-6">
+        <nav
+          aria-label="设置分区"
+          className="hidden lg:sticky lg:top-20 lg:block lg:self-start"
         >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-body-sm text-text">{dirtyCount} 项未保存</p>
-            <div className="flex gap-2">
-              <Button variant="ghost" size="sm" onClick={handleDiscard}>
-                放弃更改
+          <div className="rounded-card border border-border bg-surface p-2">
+            <ul className="space-y-0.5">
+              {NAV_ITEMS.map((item) => {
+                const dirty = isSchemaGroup(item.id) && dirtyGroups.has(item.id);
+                const restart = isSchemaGroup(item.id) && restartGroups.has(item.id);
+                return (
+                  <li key={item.id}>
+                    <a
+                      href={`#${sectionElementId(item.id)}`}
+                      className="flex min-h-11 items-center gap-2 rounded-card px-2.5 text-body-sm text-text-secondary transition-colors duration-150 ease-out hover:bg-raised hover:text-text"
+                    >
+                      <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                      {dirty ? (
+                        <span
+                          aria-hidden="true"
+                          data-testid={`settings-nav-dirty-${item.id}`}
+                          className="size-2 shrink-0 rounded-full bg-warning"
+                        />
+                      ) : null}
+                      {dirty ? <span className="sr-only">有未保存更改</span> : null}
+                      {restart ? (
+                        <Badge
+                          variant="warning"
+                          data-testid={`settings-nav-restart-${item.id}`}
+                        >
+                          重启
+                        </Badge>
+                      ) : null}
+                    </a>
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="mt-2 flex gap-2 border-t border-border pt-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="flex-1"
+                onClick={() => setAllSections(true)}
+              >
+                展开全部
               </Button>
-              <Button size="sm" pending={save.isPending} onClick={handleSave}>
-                保存更改
+              <Button
+                variant="ghost"
+                size="sm"
+                className="flex-1"
+                onClick={() => setAllSections(false)}
+              >
+                收起全部
               </Button>
             </div>
           </div>
+        </nav>
+
+        <div className="mt-4 space-y-4 lg:mt-0">
+          <SettingsSection
+            {...sectionProps("credentials")}
+            aside={
+              <Button
+                variant="secondary"
+                size="sm"
+                pending={testGithub.isPending}
+                onClick={handleTestGithub}
+              >
+                <ShieldCheck aria-hidden="true" className="size-3.5" />
+                测试 GitHub token
+              </Button>
+            }
+          />
+          <SettingsSection
+            {...sectionProps("model")}
+            columns="two"
+            aside={
+              <Button
+                variant="secondary"
+                size="sm"
+                pending={testLlm.isPending}
+                onClick={handleTestLlm}
+              >
+                <FlaskConical aria-hidden="true" className="size-3.5" />
+                测试模型配置
+              </Button>
+            }
+          />
+          <SettingsSection {...sectionProps("runner")} columns="two" />
+
+          <SettingsSection
+            id="repo"
+            title="仓库"
+            description="来自运行器心跳上报的仓库、检出路径与验证配置；只读，不随本页保存。"
+            open={openSections.repo}
+            onToggle={() => toggleSection("repo")}
+            {...panelProps}
+            aside={
+              <Link
+                to="/runners"
+                className="inline-flex min-h-11 items-center gap-1.5 rounded-card border border-border-strong bg-raised px-3 text-caption font-medium text-text transition-colors duration-150 ease-out hover:border-accent hover:text-accent pointer-fine:min-h-9"
+              >
+                查看运行器
+              </Link>
+            }
+          >
+            <RepositoryBody query={runners} />
+          </SettingsSection>
+
+          <SettingsSection
+            {...sectionProps("service")}
+            aside={
+              <>
+                <SyncButton />
+                <div className="flex flex-col items-end gap-1">
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    // The post-recovery navigation would hit the beforeunload
+                    // guard; force a save/discard decision before restarting.
+                    disabled={dirtyCount > 0}
+                    onClick={() => setRestartOpen(true)}
+                  >
+                    <Power aria-hidden="true" className="size-3.5" />
+                    重启服务
+                  </Button>
+                  {dirtyCount > 0 ? (
+                    <p className="text-caption text-warning">
+                      请先保存或放弃未保存的更改
+                    </p>
+                  ) : null}
+                </div>
+              </>
+            }
+          >
+            {system.isPending && !system.data ? (
+              <Skeleton className="h-24 w-full" />
+            ) : (
+              <ServiceDetails system={system.data} />
+            )}
+          </SettingsSection>
+
+          <SettingsSection {...sectionProps("security")} columns="two" />
+          <SettingsSection {...sectionProps("ops")} columns="two" />
+          <SettingsSection {...sectionProps("advanced")}>
+            <AdvancedDetails data={data} />
+          </SettingsSection>
+
+          <SettingsSection
+            id="about"
+            title="关于"
+            description="版本、许可证与源码位置。"
+            open={openSections.about}
+            onToggle={() => toggleSection("about")}
+            {...panelProps}
+          >
+            <div className="space-y-2 text-body-sm text-text-secondary">
+              <p>
+                版本{" "}
+                <code className="font-mono text-text">{system.data?.version ?? "—"}</code>
+              </p>
+              <p>
+                许可证 <span className="text-text">MIT</span>
+              </p>
+              <p>
+                源码：
+                <a
+                  href={REPO_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-accent underline-offset-2 hover:underline"
+                >
+                  {REPO_URL}
+                </a>
+              </p>
+            </div>
+          </SettingsSection>
+
+          {dirtyCount > 0 ? (
+            <div
+              data-testid="settings-save-bar"
+              className="sticky bottom-14 z-20 -mx-4 border-t border-border bg-surface/95 px-4 py-3 backdrop-blur sm:-mx-6 lg:static lg:mx-0 lg:rounded-card lg:border"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-body-sm text-text">{dirtyCount} 项未保存</p>
+                <div className="flex gap-2">
+                  <Button variant="ghost" size="sm" onClick={handleDiscard}>
+                    放弃更改
+                  </Button>
+                  <Button size="sm" pending={save.isPending} onClick={handleSave}>
+                    保存更改
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
-      ) : null}
+      </div>
 
       <ConfirmDialog
         open={pendingHref !== null}

@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   mockMe,
   mockOverviewResources,
+  mockRunners,
   mockSettings,
   mockSystem,
   server,
@@ -48,7 +49,14 @@ async function openRestart() {
 }
 
 function signedIn(...handlers: Parameters<typeof server.use>) {
-  server.use(mockMe(), ...mockOverviewResources(), mockSystem(), mockSettings(), ...handlers);
+  server.use(
+    mockMe(),
+    ...mockOverviewResources(),
+    mockSystem(),
+    mockSettings(),
+    mockRunners(),
+    ...handlers,
+  );
 }
 
 beforeEach(() => {

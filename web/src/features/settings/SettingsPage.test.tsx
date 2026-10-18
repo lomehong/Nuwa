@@ -3,10 +3,12 @@ import { http, HttpResponse } from "msw";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  makeRunner,
   makeSettings,
   mockIssueDetail,
   mockMe,
   mockOverviewResources,
+  mockRunners,
   mockSettings,
   mockSystem,
   mockTranscript,
@@ -16,6 +18,9 @@ import { renderApp } from "../../test/render";
 
 beforeEach(() => {
   document.cookie = "nuwa_csrf=csrf-token; path=/";
+  // The repository section reuses the runner roster; every test gets a
+  // baseline fleet unless it registers its own /runners handler.
+  server.use(mockRunners());
 });
 
 type SettingsOverrides = Parameters<typeof mockSettings>[0];
@@ -28,6 +33,22 @@ function signedIn(settings: SettingsOverrides = {}, system: SystemOverrides = {}
     mockSystem(system),
     mockSettings(settings),
   );
+}
+
+function saveBar() {
+  return screen.getByTestId("settings-save-bar");
+}
+
+function saveButton() {
+  return within(saveBar()).getByRole("button", { name: "保存更改" });
+}
+
+function discardButton() {
+  return within(saveBar()).getByRole("button", { name: "放弃更改" });
+}
+
+function toggleSection(name: string) {
+  fireEvent.click(screen.getByRole("button", { name }));
 }
 
 function shellNavLink(name: string) {
@@ -71,12 +92,13 @@ describe("SettingsPage", () => {
     renderApp("/settings");
     const interval = await screen.findByLabelText("Poll interval");
     fireEvent.change(interval, { target: { value: "60" } });
-    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    fireEvent.click(saveButton());
 
     await waitFor(() => expect(body).toEqual({ values: { NUWA_INTERVAL: 60 } }));
     expect(await screen.findByText("重启后生效")).toBeInTheDocument();
     expect(screen.getByText("NUWA_INTERVAL")).toBeInTheDocument();
     expect(screen.getByText("设置已保存")).toBeInTheDocument();
+    expect(screen.getByTestId("settings-nav-restart-runner")).toBeInTheDocument();
   });
 
   it("never renders a stored secret value", async () => {
@@ -120,7 +142,7 @@ describe("SettingsPage", () => {
     fireEvent.change(await screen.findByLabelText("Poll interval"), {
       target: { value: "60" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    fireEvent.click(saveButton());
 
     expect(await screen.findByText("must be 1..86400")).toBeInTheDocument();
     expect(screen.getByText("保存失败")).toBeInTheDocument();
@@ -142,7 +164,7 @@ describe("SettingsPage", () => {
     fireEvent.change(await screen.findByLabelText("Poll interval"), {
       target: { value: "0" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    fireEvent.click(saveButton());
 
     expect(await screen.findByText("必须在 1–86400 之间")).toBeInTheDocument();
     expect(put).toBe(false);
@@ -154,14 +176,19 @@ describe("SettingsPage", () => {
     const interval = await screen.findByLabelText("Poll interval");
 
     fireEvent.change(interval, { target: { value: "60" } });
-    expect(screen.getByText("1 项未保存")).toBeInTheDocument();
-    expect(screen.getByText("未保存 1 项")).toBeInTheDocument();
-    const saveBar = screen.getByTestId("settings-save-bar");
-    expect(saveBar).toHaveClass("bottom-14", "z-20", "lg:static");
-    expect(saveBar).not.toHaveClass("bottom-0");
+    const bar = saveBar();
+    expect(within(bar).getByText("1 项未保存")).toBeInTheDocument();
+    const headerActions = screen.getByTestId("settings-header-actions");
+    expect(within(headerActions).getByText("1 项未保存")).toBeInTheDocument();
+    expect(within(headerActions).getByRole("button", { name: "保存更改" })).toBeInTheDocument();
+    expect(screen.getByTestId("settings-nav-dirty-runner")).toBeInTheDocument();
+    expect(bar).toHaveClass("bottom-14", "z-20", "lg:static");
+    expect(bar).not.toHaveClass("bottom-0");
 
-    fireEvent.click(screen.getByRole("button", { name: "放弃更改" }));
+    fireEvent.click(discardButton());
     expect(screen.queryByText("1 项未保存")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("settings-header-actions")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("settings-nav-dirty-runner")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Poll interval")).toHaveValue(30);
   });
 
@@ -173,6 +200,8 @@ describe("SettingsPage", () => {
     for (const title of ["模型", "Runner", "服务控制", "安全", "运维", "高级", "关于"]) {
       expect(screen.getByRole("heading", { name: title })).toBeInTheDocument();
     }
+    // Hidden panels stay mounted; expand them before asserting their content.
+    fireEvent.click(screen.getByRole("button", { name: "展开全部" }));
     expect(screen.getAllByText("0.2.0").length).toBeGreaterThan(0);
     expect(screen.getByText("MIT")).toBeInTheDocument();
     const repo = screen.getByRole("link", { name: /github\.com\/lomehong\/nuwa/ });
@@ -284,7 +313,7 @@ describe("SettingsPage", () => {
     clickInjectedLink("/settings/");
 
     expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument();
-    expect(screen.getByText("1 项未保存")).toBeInTheDocument();
+    expect(within(saveBar()).getByText("1 项未保存")).toBeInTheDocument();
   });
 
   it("ignores a current-route link whose query parameters are reordered", async () => {
@@ -297,7 +326,7 @@ describe("SettingsPage", () => {
     clickInjectedLink("/settings?b=2&a=1");
 
     expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument();
-    expect(screen.getByText("1 项未保存")).toBeInTheDocument();
+    expect(within(saveBar()).getByText("1 项未保存")).toBeInTheDocument();
   });
 
   it("warns that a console token change ends the session on restart", async () => {
@@ -322,7 +351,7 @@ describe("SettingsPage", () => {
     fireEvent.change(screen.getByPlaceholderText("留空保持不变"), {
       target: { value: "new-console-token" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    fireEvent.click(saveButton());
 
     expect(
       await screen.findByText("更改控制台令牌后，重启会使当前会话失效，需要重新登录。"),
@@ -347,14 +376,14 @@ describe("SettingsPage", () => {
     renderApp("/settings");
     const interval = await screen.findByLabelText("Poll interval");
     fireEvent.change(interval, { target: { value: "60" } });
-    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    fireEvent.click(saveButton());
     // Retype while the PUT is still in flight: this draft was not submitted.
     fireEvent.change(interval, { target: { value: "90" } });
     release();
 
     expect(await screen.findByText("设置已保存")).toBeInTheDocument();
     expect(screen.getByLabelText("Poll interval")).toHaveValue(90);
-    expect(screen.getByText("1 项未保存")).toBeInTheDocument();
+    expect(within(saveBar()).getByText("1 项未保存")).toBeInTheDocument();
   });
 
   it("probes GitHub with no values and the LLM with only non-empty drafts", async () => {
@@ -469,7 +498,7 @@ describe("SettingsPage", () => {
       screen.getByText("请先保存或放弃未保存的更改"),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "放弃更改" }));
+    fireEvent.click(discardButton());
     expect(restart).toBeEnabled();
     expect(
       screen.queryByText("请先保存或放弃未保存的更改"),
@@ -600,5 +629,141 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "有正在进行的修复" })).not.toBeInTheDocument();
+  });
+
+  it("groups runners into a read-only repository view", async () => {
+    server.use(
+      mockRunners([
+        makeRunner({
+          id: "runner-a",
+          repo: "example.com/app",
+          repo_path: "/srv/app",
+          prs_today: 1,
+          daily_pr_limit: 5,
+          current_fingerprint: "fp-alpha",
+          last_error: "checkout dirty",
+        }),
+        makeRunner({
+          id: "runner-b",
+          repo: "example.com/app",
+          repo_path: "/srv/app",
+          heartbeat_at_ms: Date.now() - 600_000,
+          offline: true,
+          prs_today: 0,
+          daily_pr_limit: null,
+        }),
+        makeRunner({ id: "runner-c", repo: "example.com/other", repo_path: "/srv/other" }),
+      ]),
+    );
+    signedIn();
+    renderApp("/settings");
+
+    expect(await screen.findByText("example.com/app")).toBeInTheDocument();
+    const group = screen.getByTestId("repo-group-example.com/app");
+    expect(within(group).getByText("1/2 在线")).toBeInTheDocument();
+    expect(within(group).getByText("/srv/app")).toBeInTheDocument();
+    expect(within(group).getByText("go test ./...")).toBeInTheDocument();
+    expect(within(group).getByText("3 个")).toBeInTheDocument();
+    expect(within(group).getByText("1/5")).toBeInTheDocument();
+    expect(within(group).getByText("checkout dirty")).toBeInTheDocument();
+    expect(
+      within(group).getByRole("link", { name: "查看当前单：fp-alpha" }),
+    ).toHaveAttribute("href", "/issues/fp-alpha");
+    expect(screen.getByTestId("repo-group-example.com/other")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "查看运行器" })).toHaveAttribute(
+      "href",
+      "/runners",
+    );
+  });
+
+  it("shows an empty repository note when no runner reported a repo", async () => {
+    server.use(mockRunners([]));
+    signedIn();
+    renderApp("/settings");
+
+    expect(await screen.findByText("还没有仓库注册")).toBeInTheDocument();
+    expect(screen.getByText(/仓库来自运行器心跳上报/)).toBeInTheDocument();
+  });
+
+  it("offers a retry when the runner roster fails to load", async () => {
+    server.use(
+      http.get("/api/v1/runners", () =>
+        HttpResponse.json(
+          { error: { code: "internal", message: "runner store unavailable" } },
+          { status: 500 },
+        ),
+      ),
+    );
+    signedIn();
+    renderApp("/settings");
+
+    expect(await screen.findByText("无法加载仓库")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+  });
+
+  it("anchors the section nav and collapses sections by default", async () => {
+    signedIn();
+    renderApp("/settings");
+    await screen.findByRole("heading", { name: "凭据" });
+
+    const nav = screen.getByRole("navigation", { name: "设置分区" });
+    const ids: Array<[string, string]> = [
+      ["凭据", "settings-credentials"],
+      ["模型", "settings-model"],
+      ["Runner", "settings-runner"],
+      ["仓库", "settings-repo"],
+      ["服务控制", "settings-service"],
+      ["安全", "settings-security"],
+      ["运维", "settings-ops"],
+      ["高级", "settings-advanced"],
+      ["关于", "settings-about"],
+    ];
+    for (const [label, id] of ids) {
+      expect(within(nav).getByRole("link", { name: label })).toHaveAttribute(
+        "href",
+        `#${id}`,
+      );
+      expect(document.getElementById(id)).toBeInTheDocument();
+    }
+
+    expect(screen.getByLabelText("Cookie secure")).not.toBeVisible();
+    expect(screen.getByRole("button", { name: "安全" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    toggleSection("安全");
+    expect(screen.getByRole("button", { name: "安全" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByLabelText("Cookie secure")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "收起全部" }));
+    expect(screen.getByLabelText("Cookie secure")).not.toBeVisible();
+    expect(screen.getByLabelText("Poll interval")).not.toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "展开全部" }));
+    expect(screen.getByLabelText("Cookie secure")).toBeVisible();
+    expect(screen.getByLabelText("Poll interval")).toBeVisible();
+  });
+
+  it("flags the dirty group in the nav and header until it is discarded", async () => {
+    signedIn();
+    renderApp("/settings");
+    fireEvent.change(await screen.findByLabelText("Poll interval"), {
+      target: { value: "60" },
+    });
+
+    expect(screen.getByTestId("settings-nav-dirty-runner")).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("settings-header-actions")).getByText("1 项未保存"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("settings-nav-dirty-model")).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(screen.getByTestId("settings-header-actions")).getByRole("button", {
+        name: "放弃更改",
+      }),
+    );
+    expect(screen.queryByTestId("settings-nav-dirty-runner")).not.toBeInTheDocument();
   });
 });
