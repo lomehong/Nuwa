@@ -17,7 +17,7 @@
 └── nuwa.env              # systemd EnvironmentFile（三把 token）
 ```
 
-- systemd 单元：`nuwa-serve`（`serve --listen 0.0.0.0:7321`）+ `nuwa-work`（`work --loop --interval 60 --pr --runner-id <host:repo> --service-unit nuwa-work`），均 `Restart=on-failure`
+- systemd 单元：`nuwa-serve`（`serve --listen 0.0.0.0:7321`）+ `nuwa-work`（`work --loop --interval 60 --pr --runner-id <host:repo> --service-unit nuwa-work --sessions /opt/nuwa/sessions`），均 `Restart=on-failure`。**`--sessions` 必须传绝对路径**：相对路径写入 `runs.session_dir` 后，转录接口（只接受绝对路径）读不到失败/中断 run 的会话。相对路径在启动时也会被解析为绝对路径，但显式传入可避免依赖进程 cwd。
 - 已知噪音：ubuntu 构建的产物在旧 glibc 上有 weak-version 警告（不致命）——待办：musl 静态构建
 - 腾讯云控制台安全组：放行 **TCP 7321**（来源限采集器网段）
 - 传输注意：CN→GitHub 大文件（>12MB）下载会被掐断——release 产物下载用**分块 Range 循环**，或本机经 SSH 直传（SSH 隧道稳定）
@@ -81,7 +81,7 @@ nuwa work --db shanhaijing.db \
 
 **Web 控制台**：`http://<server>:7321/ui`（Basic 鉴权，用户名任意，**密码 = 有效 UI 令牌：`NUWA_UI_TOKEN`，未设置时回退 `NUWA_INGEST_TOKEN`**）——问题单总览（状态徽章/PR 链接，60s 自刷）、escalated 一键 reopen、sync 对账按钮、serve/work 活性。服务端渲染，无 JS 框架；鉴权复用 UI 令牌（未配置 UI 令牌时即上报令牌，泄露后果同级、可轮换）。
 
-**API 登录（v3 控制台）**：`POST /api/v1/auth/login`，必须带 `Content-Type: application/json`，body `{"token":"<NUWA_UI_TOKEN>"}`；成功 204 并设置 `nuwa_session`（HttpOnly）与 `nuwa_csrf`。后续非 GET 请求必须带 `X-NUWA-CSRF` 头，且其值须与 `nuwa_csrf` cookie 值一致（双提交校验，仅"带头"不够）。会话与 CSRF cookie 的 `Max-Age` 由 `NUWA_SESSION_TTL_SECS` 控制（默认 86400，允许 300–2592000）；`NUWA_COOKIE_SECURE=always` 强制加 `Secure`（TLS 代理下也可由 `X-Forwarded-Proto: https` 自动触发）。旧 `/ui` Basic 鉴权保留至 M6。
+**API 登录（v3 控制台）**：`POST /api/v1/auth/login`，必须带 `Content-Type: application/json`，body `{"token":"<NUWA_UI_TOKEN>"}`；成功 204 并设置 `nuwa_session`（HttpOnly）与 `nuwa_csrf`。后续非 GET 请求必须带 `X-NUWA-CSRF` 头，且其值须与 `nuwa_csrf` cookie 值一致（双提交校验，仅"带头"不够）。会话与 CSRF cookie 的 `Max-Age` 由 `NUWA_SESSION_TTL_SECS` 控制（默认 86400，允许 300–2592000）；`NUWA_COOKIE_SECURE=always` 强制加 `Secure`（TLS 代理下也可由 `X-Forwarded-Proto: https` 自动触发），`=never` 显式关闭且优先级最高（即使同时配置 `always` 或代理上报 https 也不加 `Secure`）。旧 `/ui` Basic 鉴权保留至 M6。
 
 | 命令 | 用途 |
 |---|---|
@@ -140,20 +140,20 @@ nuwa work --db shanhaijing.db \
 - 缺 token → 502 `upstream_error`；已有 sync 在跑 → 409 `conflict`；30s 超时 → 502。`reconcile_all` 的本地存储失败是 500 `internal`（不是 GitHub 上游故障）。
 - 通过设置页写入 `NUWA_GITHUB_TOKEN` 后，**serve 进程要重启才读得到**（env 在进程启动时注入）；未重启前 sync 仍按旧值/缺 token 处理。
 
-`POST /api/v1/runners/{id}/restart`：重启该 runner 存储的 `service_unit`（`nuwa work --service-unit` 上报）。成功 202（`systemd-run --on-active=2 systemctl restart <unit>` 已编排，2 秒后执行）。runner 不存在 404；`service_unit` 缺失/空白或不在白名单（字母数字与 `@ . _ : -`）→ 422 `validation_failed`（`fields.service_unit`）；`systemd-run` 不可用 → 501 `not_supported` 并给出 `systemctl restart <unit>` 手动命令。同一 unit 承载多个 runner 时会一起重启，部署建议一 runner 一 unit。
+`POST /api/v1/runners/{id}/restart`：重启该 runner 存储的 `service_unit`（`nuwa work --service-unit` 上报）。成功 202（`systemd-run --on-active=2 systemctl restart <unit>` 已编排，2 秒后执行）。runner 不存在 404；`service_unit` 缺失/空白或不在白名单（字母数字与 `@ . _ : -`，且不得以 `-` 开头）→ 422 `validation_failed`（`fields.service_unit`）；`systemd-run` 不可用或 3 秒内未返回 → 501 `not_supported` 并给出 `systemctl restart <unit>` 手动命令。`/settings/restart` 与 `/runners/{id}/restart` 共享进程内重启互斥：已有重启在编排时 → 409 `conflict`（不写审计、不再起子进程）。同一 unit 承载多个 runner 时会一起重启，部署建议一 runner 一 unit。
 
 ### 6.3 设置
 
 - **事实源**：`NUWA_ENV_FILE`（默认 `/opt/nuwa/nuwa.env`，systemd `EnvironmentFile`）。设置页不写 shell 变量、不热更新进程；保存后 `restart_pending=true`，需重启 serve/work 才生效。
 - `GET /api/v1/settings`：返回 22 键 schema（分组/类型/默认/scope/是否密钥/是否只读）、掩码值、`env_path/env_exists/env_permissions`、`needs_migration`、`restart_pending`、`effective_diff`（runner 心跳的实际配置 vs 文件值，仅非密钥）、`unknown_keys`（只给键名）、`last_changes`。密钥只返回 `set/last4/updated_at_ms`，**永不回显值**；四位以内不返回 `last4`。
 - `PUT /api/v1/settings`：`{"values":{"NUWA_INTERVAL":"60","NUWA_GITHUB_TOKEN":""}}`。空密钥 = 保持不变；未知键与只读键（`NUWA_ENV_FILE`）422；任一字段非法则整单 422 且文件逐字节不变。成功保留注释/顺序/未知键，更新既有行或追加新键；写前备份 `<env>.bak`，Unix 同目录临时文件 + chmod 600 + rename。每个变更键写 `config_changed`（detail=key，actor=owner），历史小写已知键先迁移并写 `config_migrated`。
-- `POST /api/v1/settings/test`：`{"target":"github|llm","values":{…}}`；`values` 是未保存的候选值（不落盘、不写日志），未知键 422，字段类型错误 422。github 调 `GET https://api.github.com/rate_limit`（不耗配额）；llm 用 `max_tokens=1` 的真实请求（可能产生极小费用）。空 model/base/provider 视为未设置（回退环境变量/默认值）；anthropic 的 base 固定 `https://api.anthropic.com`（忽略 `NUWA_BASE_URL`），模型取自 vendored catalog，未知名回退 catalog 首项；zai 默认 base `https://open.bigmodel.cn/api/coding/paas/v4`、默认模型 `glm-5.3-flash`；faux 完全离线。显式空密钥不回落环境变量，直接 422。网络失败/非 2xx/10s 超时 → 502，且不回显 provider 响应体。
+- `POST /api/v1/settings/test`：`{"target":"github|llm","values":{…}}`；`values` 是未保存的候选值（不落盘、不写日志），未知键 422；**每个已知键的取值都做类型校验**——只接受字符串、数字或布尔（env 标量），对象/数组/null 一律 422（不会静默忽略后去测别的值）。github 调 `GET https://api.github.com/rate_limit`（不耗配额）；llm 用 `max_tokens=1` 的真实请求（可能产生极小费用）。空 model/base/provider 视为未设置（回退环境变量/默认值）；anthropic 的 base 固定 `https://api.anthropic.com`（忽略 `NUWA_BASE_URL`），模型取自 vendored catalog，未知名回退 catalog 首项；zai 默认 base `https://open.bigmodel.cn/api/coding/paas/v4`、默认模型 `glm-5.3-flash`；faux 完全离线。显式空密钥不回落环境变量，直接 422。网络失败/非 2xx/10s 超时 → 502，且不回显 provider 响应体。
 - `POST /api/v1/settings/restart`：`{"force":false}`。有未结束 run（`runs.finished_at IS NULL`）→ 409 `conflict`，body 含 `active_runs`；`force=true` 才继续。重启目标 = `NUWA_SERVE_UNIT`（默认 `nuwa-serve`）+ `NUWA_RUNNER_UNITS`（默认 `nuwa-work`，逗号分隔），逐个白名单校验；先写 `restart_requested` 审计（`__system__`），再 `systemd-run --on-active=2`，成功 202。无 unit 配置或 `systemd-run` 不可用 → 501 并给出手动命令。改 `NUWA_UI_TOKEN` 后重启会使当前会话失效，需重新登录。
 
 ### 6.4 系统与转录
 
 - `GET /api/v1/system`：`version/build_commit/started_at_ms/uptime_secs/db_path/db_size_bytes/local_mode/services[{unit,active}]`。systemd 不可用或 `systemctl is-active` 无输出时 `active="n/a"`，不算错误；本地模式会在页面显示无鉴权警告。
-- `GET /api/v1/issues/{fp}/transcript?run_id=&page=1&page_size=20`：省略 `run_id` 时取该指纹**最近一次有 `session_dir` 的 run**；指定不属于该指纹的 run → 404 `run not found`；未知单 → 404 `issue not found`。只解析 `kind=entry,type=message`，映射 user / assistant（thinking、text、tool_call）/ tool_result；其它记录（header/record/model_change/custom）忽略。单个块（text/thinking/tool_result/序列化后的 tool_call 参数）按 UTF-8 字节上限 16KB 截断并标 `truncated=true`，超限 tool_call 参数替换为 `<truncated: N bytes>` 预览。文件只读末尾 2MB（更早内容丢弃并标 `meta.truncated=true`），按消息分页：`page_size` 默认 20、**最大 100**，越界或非数字 422；无 run/无会话返回 `data:[]`、`meta.empty=true`。转录路径由 DB 的 run 行派生，从不接受客户端路径。
+- `GET /api/v1/issues/{fp}/transcript?run_id=&page=1&page_size=20`：省略 `run_id` 时取该指纹**最近一次有 `session_dir` 的 run**；指定不属于该指纹的 run → 404 `run not found`；未知单 → 404 `issue not found`。只解析 `kind=entry,type=message`，映射 user / assistant（thinking、text、tool_call）/ tool_result；其它记录（header/record/model_change/custom）忽略。单个块（text/thinking/tool_result/序列化后的 tool_call 参数）按 UTF-8 字节上限 16KB 截断并标 `truncated=true`；**超限 tool_call 的 `arguments` 会从 JSON 对象变成字符串预览 `<truncated: N bytes>`**（前端需同时处理 object 与 string 两种类型），避免单个调用占满页面。文件只读末尾 2MB（更早内容丢弃并标 `meta.truncated=true`），按消息分页：`page_size` 默认 **20**、最大 **100**（100 是上限不是默认值），越界或非数字 422；无 run/无会话返回 `data:[]`、`meta.empty=true`。转录路径由 DB 的 run 行派生（必须是绝对路径且不含 `..`），从不接受客户端路径；`work --sessions` 建议传绝对路径，否则失败/中断的 run 可能没有可读转录。
 
 ## 问题单状态机（运维视角）
 

@@ -16,7 +16,7 @@ use serde_json::Value;
 use shanhaijing::{EventRow, RunRow, RunnerRow, Store};
 
 use crate::api::common::{
-    configured_units, parse_json_body, schedule_restart, valid_systemd_unit,
+    configured_units, parse_json_body, restart_lock, schedule_restart, valid_systemd_unit,
 };
 use crate::api::{ApiError, ErrorBody, ErrorDetail};
 use crate::serve::AppState;
@@ -243,7 +243,7 @@ pub async fn test(payload: Result<Json<TestSettingsRequest>, JsonRejection>) -> 
     if !matches!(target, "github" | "llm") {
         return field_error("target", "must be github or llm").into_response();
     }
-    if let Err(error) = reject_unknown_values(&request.values) {
+    if let Err(error) = validate_values(&request.values) {
         return error.into_response();
     }
     let result = match target {
@@ -256,19 +256,38 @@ pub async fn test(payload: Result<Json<TestSettingsRequest>, JsonRejection>) -> 
     }
 }
 
-/// Unknown `values` keys are a 422 for the same reason as PUT: silently
-/// ignoring a mistyped key would make the probe test a different value than
-/// the operator typed (docs/09 §9.2).
-fn reject_unknown_values(values: &BTreeMap<String, Value>) -> Result<(), ApiError> {
-    let unknown: BTreeMap<String, String> = values
-        .keys()
-        .filter(|key| settings::setting_spec(key).is_none())
-        .map(|key| (key.clone(), "unknown key".to_string()))
-        .collect();
-    if unknown.is_empty() {
+/// Every `values` key is validated before any probe: unknown keys and
+/// non-scalar values are a 422 for the same reason as PUT — silently
+/// ignoring a mistyped key or an object payload would make the probe test a
+/// different value than the operator typed (docs/09 §9.2).
+fn validate_values(values: &BTreeMap<String, Value>) -> Result<(), ApiError> {
+    let mut fields = BTreeMap::new();
+    for (key, value) in values {
+        if settings::setting_spec(key).is_none() {
+            fields.insert(key.clone(), "unknown key".to_string());
+        } else if value_text(value).is_none() {
+            fields.insert(
+                key.clone(),
+                "must be a string, number or boolean".to_string(),
+            );
+        }
+    }
+    if fields.is_empty() {
         Ok(())
     } else {
-        Err(ApiError::validation(unknown))
+        Err(ApiError::validation(fields))
+    }
+}
+
+/// Env-file scalars as text. The console may send typed JSON (a number for an
+/// int field, a boolean for a flag), so those are converted; objects, arrays
+/// and null have no env representation.
+fn value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
     }
 }
 
@@ -284,9 +303,10 @@ fn field_error(field: &str, message: impl Into<String>) -> ApiError {
 /// fall through on empty instead (see [`resolve_llm_setting`]).
 fn provided_value(values: &BTreeMap<String, Value>, key: &str) -> Result<Option<String>, ApiError> {
     match values.get(key) {
-        Some(Value::String(text)) => Ok(Some(text.trim().to_string())),
-        Some(Value::Number(number)) => Ok(Some(number.to_string())),
-        Some(_) => Err(field_error(key, "must be a string")),
+        Some(value) => match value_text(value) {
+            Some(text) => Ok(Some(text.trim().to_string())),
+            None => Err(field_error(key, "must be a string, number or boolean")),
+        },
         None => Ok(None),
     }
 }
@@ -503,6 +523,13 @@ pub async fn restart(
     let request = match parse_json_body(payload) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
+    };
+    // One restart schedule at a time, across both restart endpoints. The
+    // guard lives to the end of this handler, i.e. until `systemd-run` has
+    // returned; a concurrent request is a 409 before any audit row or
+    // subprocess (docs/09 §9.2).
+    let Ok(_restart) = restart_lock().try_lock() else {
+        return ApiError::conflict("a restart is already being scheduled").into_response();
     };
     let store = Arc::clone(&state.store);
     let active = match tokio::task::spawn_blocking(move || store.active_runs()).await {
@@ -1039,6 +1066,7 @@ mod tests {
         audit_then_schedule, last_four, llm_key, resolve_anthropic_probe, resolve_llm_setting,
         restart_unavailable_message,
     };
+    use crate::api::common::restart_test_guard;
     use crate::serve::{build_app, AppState};
 
     /// docs/09 §13.1, in table order.
@@ -1103,6 +1131,7 @@ mod tests {
             env_path: env_path.clone(),
             db_path,
             cookie_secure: false,
+            cookie_secure_never: false,
             serve_unit: serve_unit.to_string(),
             runner_units: runner_units
                 .iter()
@@ -2009,7 +2038,8 @@ mod tests {
             "{value}"
         );
 
-        // Known keys and empty model/base are accepted (empty means unset).
+        // Known keys and empty model/base are accepted (empty means unset);
+        // a boolean candidate is an env scalar too.
         let response = post_json(
             &app,
             "/api/v1/settings/test",
@@ -2017,7 +2047,8 @@ mod tests {
             r#"{"target":"llm","values":{
                 "NUWA_PROVIDER":"faux",
                 "NUWA_MODEL":"",
-                "NUWA_BASE_URL":""
+                "NUWA_BASE_URL":"",
+                "NUWA_COOKIE_SECURE":true
             }}"#,
         )
         .await;
@@ -2027,7 +2058,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_test_rejects_non_scalar_values_for_known_keys() {
+        let (_dir, app, _store, _env_path) = test_app(None);
+        let csrf = csrf_token(&app).await;
+
+        // Every supplied key is type-checked, not only unknown names: the
+        // probe must never silently test a different value than typed.
+        let response = post_json(
+            &app,
+            "/api/v1/settings/test",
+            Some(&csrf),
+            r#"{"target":"llm","values":{
+                "NUWA_PROVIDER":"faux",
+                "NUWA_INTERVAL":{"nested":true},
+                "NUWA_MODEL":["m"],
+                "NUWA_BASE_URL":null
+            }}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "validation_failed");
+        for key in ["NUWA_INTERVAL", "NUWA_MODEL", "NUWA_BASE_URL"] {
+            assert!(value["error"]["fields"][key].is_string(), "{key}: {value}");
+        }
+        assert!(
+            value["error"]["fields"]["NUWA_PROVIDER"].is_null(),
+            "a valid scalar must not be flagged: {value}"
+        );
+    }
+
+    #[tokio::test]
     async fn restart_is_guarded_by_active_runs() {
+        let _serial = restart_test_guard().await;
         let now = crate::now_ms();
         let (_dir, app, store, _env_path) = test_app(None);
         let signal = Signal {
@@ -2078,6 +2141,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_with_invalid_units_is_422() {
+        let _serial = restart_test_guard().await;
         for (serve_unit, runner_units) in [
             ("nuwa serve", vec!["nuwa-work"]),
             ("nuwa-serve", vec!["nuwa-work", "../etc/passwd"]),
@@ -2114,6 +2178,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_without_configured_units_is_501() {
+        let _serial = restart_test_guard().await;
         let (_dir, app, store, _env_path) = test_app_custom(None, crate::now_ms(), "", &[]);
         let csrf = csrf_token(&app).await;
 

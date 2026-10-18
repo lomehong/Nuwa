@@ -208,6 +208,7 @@ mod tests {
             env_path: dir.path().join("nuwa.env"),
             db_path,
             cookie_secure: false,
+            cookie_secure_never: false,
             serve_unit: "nuwa-serve".to_string(),
             runner_units: vec!["nuwa-work".to_string()],
         };

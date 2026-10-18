@@ -12,8 +12,8 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::api::common::{
-    issue_stuck_after_ms, parse_json_body, runner_intervals, schedule_restart, stuck_floor_ms,
-    valid_systemd_unit,
+    issue_stuck_after_ms, parse_json_body, restart_lock, runner_intervals, schedule_restart,
+    stuck_floor_ms, valid_systemd_unit,
 };
 use crate::api::ApiError;
 use crate::ci;
@@ -137,19 +137,31 @@ pub async fn sync(State(state): State<AppState>) -> Response {
 }
 
 /// `NUWA_GITHUB_TOKEN` wins over `GITHUB_TOKEN` (the legacy console's order);
-/// a blank value counts as unset.
+/// surrounding whitespace is trimmed, and a blank value counts as unset so a
+/// `TOKEN=   ` line is a 502 instead of an opaque GitHub 401.
 fn github_token() -> Option<String> {
-    let read = |key: &str| std::env::var(key).ok().filter(|token| !token.is_empty());
+    let read = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+    };
     read("NUWA_GITHUB_TOKEN").or_else(|| read("GITHUB_TOKEN"))
 }
 
 /// `POST /api/v1/runners/{id}/restart` — schedule a restart of the runner's
-/// systemd unit (docs/09 §9.2).
+/// systemd unit (docs/09 §9.2). Shares the process-wide restart lock with
+/// `POST /settings/restart`.
 pub async fn restart_runner(
     State(state): State<AppState>,
     Path(runner_id): Path<String>,
 ) -> Response {
+    let Ok(_restart) = restart_lock().try_lock() else {
+        return ApiError::conflict("a restart is already being scheduled").into_response();
+    };
     let store = Arc::clone(&state.store);
+    // The guard stays in scope across the await: the lock is held until
+    // scheduling (inside `restart_runner_now`) returns.
     match tokio::task::spawn_blocking(move || restart_runner_now(&store, &runner_id)).await {
         Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
         Ok(Err(error)) => error.into_response(),
@@ -271,6 +283,7 @@ mod tests {
     use shanhaijing::{IssueRow, RunUpdate, RunnerHeartbeat, RunnerUpsert, State, Store};
     use tower::ServiceExt;
 
+    use crate::api::common::{restart_lock, restart_test_guard};
     use crate::serve::{build_app, AppState};
 
     const APP: &str = "example.com/actions";
@@ -292,6 +305,7 @@ mod tests {
             env_path: dir.path().join("nuwa.env"),
             db_path,
             cookie_secure: false,
+            cookie_secure_never: false,
             serve_unit: "nuwa-serve".to_string(),
             runner_units: vec!["nuwa-work".to_string()],
         };
@@ -969,19 +983,31 @@ mod tests {
 
         let _env = env_guard().await;
         let _restore = EnvRestore::save(&["NUWA_GITHUB_TOKEN", "GITHUB_TOKEN"]);
-        std::env::remove_var("NUWA_GITHUB_TOKEN");
-        std::env::remove_var("GITHUB_TOKEN");
+        for (nuwa, legacy) in [(None, None), (Some(" \t"), Some("  "))] {
+            match nuwa {
+                Some(token) => std::env::set_var("NUWA_GITHUB_TOKEN", token),
+                None => std::env::remove_var("NUWA_GITHUB_TOKEN"),
+            }
+            match legacy {
+                Some(token) => std::env::set_var("GITHUB_TOKEN", token),
+                None => std::env::remove_var("GITHUB_TOKEN"),
+            }
 
-        let response = post_json(&app, "/api/v1/sync", Some(&csrf), "").await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let value = json_body(response).await;
-        assert_eq!(value["error"]["code"], "upstream_error");
-        assert!(
-            value["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("NUWA_GITHUB_TOKEN")),
-            "message must name the missing variable: {value}"
-        );
+            let response = post_json(&app, "/api/v1/sync", Some(&csrf), "").await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "{nuwa:?} {legacy:?}"
+            );
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "upstream_error");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("NUWA_GITHUB_TOKEN")),
+                "message must name the missing variable: {value}"
+            );
+        }
     }
 
     // Holding the process-wide lock proves the 409 path without any GitHub
@@ -1018,6 +1044,9 @@ mod tests {
             "nuwa$(id)",
             "nuwa-work;rm",
             "nuwa-work\n",
+            // `systemctl` would parse a leading `-` as an option.
+            "-nuwa-work",
+            "--now",
         ] {
             assert!(!crate::api::common::valid_systemd_unit(unit), "{unit:?}");
         }
@@ -1025,6 +1054,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_unknown_runner_is_404() {
+        let _serial = restart_test_guard().await;
         let (_dir, state) = test_state();
         let app = build_app(state);
         let csrf = csrf_token(&app).await;
@@ -1044,6 +1074,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_without_a_service_unit_is_422() {
+        let _serial = restart_test_guard().await;
         for unit in [None, Some("")] {
             let (_dir, state) = test_state();
             upsert_runner_with_unit(&state.store, "runner-plain", unit);
@@ -1069,9 +1100,10 @@ mod tests {
 
     #[tokio::test]
     async fn restart_with_an_invalid_service_unit_is_422() {
+        let _serial = restart_test_guard().await;
         // None of these can become a valid unit after trimming, so the
         // systemd-run path is never reached.
-        for unit in ["nuwa work", "nuwa-work; rm -rf /", "../etc/passwd"] {
+        for unit in ["nuwa work", "nuwa-work; rm -rf /", "../etc/passwd", "-nuwa-work"] {
             let (_dir, state) = test_state();
             upsert_runner_with_unit(&state.store, "runner-odd", Some(unit));
             let app = build_app(state);
@@ -1092,6 +1124,37 @@ mod tests {
                 "invalid unit must name the field: {value}"
             );
         }
+    }
+
+    /// One process-wide mutex protects both restart endpoints: holding it
+    /// turns either POST into a 409 before any audit row or subprocess.
+    #[tokio::test]
+    async fn restart_lock_is_shared_by_both_endpoints() {
+        let _serial = restart_test_guard().await;
+        let (_dir, state) = test_state();
+        upsert_runner_with_unit(&state.store, "runner-locked", Some("nuwa-work"));
+        let store = Arc::clone(&state.store);
+        let app = build_app(state);
+        let csrf = csrf_token(&app).await;
+
+        let held = restart_lock().try_lock().expect("restart lock free");
+        for uri in [
+            "/api/v1/runners/runner-locked/restart",
+            "/api/v1/settings/restart",
+        ] {
+            let response = post_json(&app, uri, Some(&csrf), "{}").await;
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "conflict", "{uri}");
+        }
+        assert!(
+            store
+                .events_for("__system__", 10)
+                .expect("events")
+                .is_empty(),
+            "a locked-out restart must not audit or schedule"
+        );
+        drop(held);
     }
 
     // ---- M2c Task 6: combined actions/settings/system/transcript walk ----
@@ -1292,26 +1355,31 @@ mod tests {
         assert_eq!(value["ok"], true);
 
         // ---- restart guard: open runs need force ----
-        let response = post_json(
-            &app,
-            "/api/v1/settings/restart",
-            Some(&csrf),
-            r#"{"force":false}"#,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let value = json_body(response).await;
-        assert_eq!(value["error"]["code"], "conflict");
-        let active = value["active_runs"].as_array().expect("active runs");
-        assert!(!active.is_empty(), "the seed leaves runs open");
-        assert!(active.iter().all(|run| run["id"].is_string()), "{value}");
-        assert!(
-            store
-                .events_for("__system__", 10)
-                .expect("events")
-                .is_empty(),
-            "a guarded restart must not schedule or audit"
-        );
+        {
+            // The process-wide restart lock is shared across tests, so the
+            // guard must not race the test that deliberately holds it.
+            let _serial = restart_test_guard().await;
+            let response = post_json(
+                &app,
+                "/api/v1/settings/restart",
+                Some(&csrf),
+                r#"{"force":false}"#,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "conflict");
+            let active = value["active_runs"].as_array().expect("active runs");
+            assert!(!active.is_empty(), "the seed leaves runs open");
+            assert!(active.iter().all(|run| run["id"].is_string()), "{value}");
+            assert!(
+                store
+                    .events_for("__system__", 10)
+                    .expect("events")
+                    .is_empty(),
+                "a guarded restart must not schedule or audit"
+            );
+        }
 
         // ---- system facts ----
         let response = get(&app, "/api/v1/system").await;

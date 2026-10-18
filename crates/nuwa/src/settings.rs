@@ -487,15 +487,23 @@ pub fn render_env(map: &BTreeMap<String, String>) -> String {
 
 /// Copy `path` to the sibling `.bak` slot before a rewrite. A missing file is
 /// a no-op; any other failure aborts the caller, so the original is never
-/// lost by a write that could not be backed up.
+/// lost by a write that could not be backed up. On Unix the copy is chmodded
+/// to 0600 (best effort) so the backup is as private as the env file itself.
 pub(crate) fn backup_env_file(path: &std::path::Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
     let backup = path.with_extension("env.bak");
     std::fs::copy(path, &backup)
-        .map(|_| ())
-        .map_err(|e| format!("backup {} -> {}: {e}", path.display(), backup.display()))
+        .map_err(|e| format!("backup {} -> {}: {e}", path.display(), backup.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // A failed chmod must not fail the save: the copy already exists and
+        // the write is what the operator asked for.
+        let _ = std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// Rewrite `text` in place without reordering it (docs/09 §13.2):
@@ -959,6 +967,16 @@ mod tests {
             std::fs::read_to_string(path.with_extension("env.bak")).expect("read backup"),
             "NUWA_INTERVAL=30\n"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path.with_extension("env.bak"))
+                .expect("backup metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the backup must not be world-readable");
+        }
 
         // A missing file has nothing to back up.
         let absent = dir.path().join("absent.env");

@@ -43,7 +43,11 @@ pub struct AppState {
     pub env_path: PathBuf,
     /// `--db` path; shown by the system endpoint.
     pub db_path: PathBuf,
+    /// `NUWA_COOKIE_SECURE=always`: force the `Secure` attribute.
     pub cookie_secure: bool,
+    /// `NUWA_COOKIE_SECURE=never`: never set `Secure`, even when a proxy
+    /// reports `X-Forwarded-Proto: https` (the explicit opt-out wins).
+    pub cookie_secure_never: bool,
     /// `NUWA_SERVE_UNIT` (default `nuwa-serve`); restart target and the
     /// system endpoint's first service.
     pub serve_unit: String,
@@ -187,7 +191,11 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         .map(|t| Arc::new(Some(t)) as Arc<Option<String>>)
         .unwrap_or_else(|| Arc::clone(&ingest_token));
     let ttl_ms = session_ttl_ms(std::env::var("NUWA_SESSION_TTL_SECS").ok().as_deref());
-    let cookie_secure = std::env::var("NUWA_COOKIE_SECURE").ok().as_deref() == Some("always");
+    let cookie_mode = std::env::var("NUWA_COOKIE_SECURE").ok();
+    let cookie_secure = cookie_mode.as_deref() == Some("always");
+    // `never` is an explicit opt-out that also beats a proxy's
+    // `X-Forwarded-Proto: https`.
+    let cookie_secure_never = cookie_mode.as_deref() == Some("never");
     let serve_unit = serve_unit_from_env(std::env::var("NUWA_SERVE_UNIT").ok().as_deref());
     let runner_units = runner_units_from_env(std::env::var("NUWA_RUNNER_UNITS").ok().as_deref());
     let state = AppState {
@@ -203,6 +211,7 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         env_path,
         db_path,
         cookie_secure,
+        cookie_secure_never,
         serve_unit,
         runner_units,
     };
@@ -352,6 +361,7 @@ mod tests {
             env_path: dir.path().join("nuwa.env"),
             db_path,
             cookie_secure: false,
+            cookie_secure_never: false,
             serve_unit: "nuwa-serve".to_string(),
             runner_units: vec!["nuwa-work".to_string()],
         };

@@ -423,7 +423,7 @@ floor = NUWA_STUCK_AFTER_SECS（默认 300s，范围 60–86400）
 | 动作 | 允许的起始状态 | 结果 | 附加 |
 |---|---|---|---|
 | `reopen` | `escalated`、`rejected` | → `new` | 清冷却、清 owner、事件 `state_changed` detail=`reopened by owner` |
-| `requeue` | `triggered`、`fixing` | → `new` | 仅当 `stuck`；`force=1` 可跳过卡单检查；清冷却/owner；事件 `requeued` |
+| `requeue` | `triggered`、`fixing` | → `new` | 仅当 `stuck`；body 的 `force` 为 JSON 布尔（`true` 才生效，`"1"` 字符串不是合法布尔）可跳过卡单检查；清冷却/owner；事件 `requeued` detail=`stuck requeued by owner` |
 | 非法状态 | 其他 | `409 invalid_state` | 不改变数据 |
 
 - 两个动作都走 Store 内的显式方法，不把 `triggered/fixing → new` 加进通用 `can_transition`，避免 runner 误用。
@@ -592,8 +592,8 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 |---|---|---|---|---|
 | POST | `/issues/{fp}/reopen` | `{reason?}` | 204 | 404/409 |
 | POST | `/issues/{fp}/requeue` | `{force?: bool, reason?}` | 204 | 404/409/422 |
-| POST | `/sync` | — | 200 汇总 | 409（并发）/500（本地存储）/502（缺 token/超时/上游） |
-| POST | `/runners/{id}/restart` | — | 202 | 404/422（unit 缺失或非法）/501 |
+| POST | `/sync` | — | 200 汇总 | 409（并发）/500（本地存储）/502（缺 token 或 30s 超时；单个 PR 的上游失败是 200 + `errors[]`） |
+| POST | `/runners/{id}/restart` | — | 202 | 404/409（已有重启在编排）/422（unit 缺失或非法）/501 |
 
 `/sync` 响应：
 
@@ -690,7 +690,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
   "env_permissions": "600",
   "needs_migration": false,
   "restart_pending": true,
-  "effective_diff": { "NUWA_INTERVAL": { "file": "60", "runtime": "30" } },
+  "effective_diff": { "NUWA_INTERVAL": { "file": "60", "runtime": "30", "source": "file" } },
   "unknown_keys": ["LEGACY_KEY"],
   "last_changes": [{ "key": "NUWA_INTERVAL", "ts_ms": 0, "actor": "owner" }]
 }
@@ -698,7 +698,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 - 非密钥返回明文 `value`；密钥只返回 `set/last4/updated_at_ms`。
 - `source`: `env` | `default`（未在文件中的已知键）。
-- `effective_diff`: 由 runner 心跳上报的实际运行值 vs 文件值；无 runner 时为空；**只比较非密钥**。
+- `effective_diff`: 由 runner 心跳上报的实际运行值 vs 文件值；无 runner 时为空；**只比较非密钥**。每项带 `source`: `file`（比较值取自 env 文件）| `default`（文件缺该键，显示 schema 默认值）。
 - `unknown_keys` 只返回键名，不返回值。
 - env 文件不存在时返回 `env_exists=false`，`values` 使用默认值，页面允许保存以创建文件（不再 500）。
 - `env_permissions` 在非 Unix 返回 `n/a`。
@@ -722,7 +722,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 { "target": "github", "values": { "NUWA_GITHUB_TOKEN": "…" } }   // values 可选
 ```
 
-- `values` 可携带尚未保存的字段值用于测试；缺省用当前 env。测试值不落盘、不写日志；未知键或字段类型错误 422。
+- `values` 可携带尚未保存的字段值用于测试；缺省用当前 env。测试值不落盘、不写日志；未知键 422；每个已知键的取值只接受字符串/数字/布尔（env 标量），对象/数组/null 422。
 - github：`GET https://api.github.com/rate_limit`（只验证令牌有效与可达，不耗配额）。显式空 token 直接 422，不回落环境变量。
 - llm：调用 provider 的轻量端点；若需真实生成，body 明确 `max_tokens=1`，UI 二次确认并提示可能产生极小费用。
   - 空 `NUWA_MODEL` / `NUWA_BASE_URL` / `NUWA_PROVIDER` 表示"未设置"：回退环境变量，再回退 provider 默认值（provider 默认 `anthropic`）。
@@ -737,11 +737,12 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 { "force": false }
 ```
 
+- 进程内重启互斥（与 `POST /runners/{id}/restart` 共用）：已有重启在编排 → 409 `conflict`，不写审计也不起子进程。
 - 有活动 run（`runs.finished_at IS NULL`）且 `force=false` → 409 `conflict`，body 含 `active_runs`。
 - 成功返回 `202`（已编排，尚未重启完成）。
 - 通过 `systemd-run --on-active=2 systemctl restart <units>` 编排；units = `NUWA_SERVE_UNIT`（默认 `nuwa-serve`）+ `NUWA_RUNNER_UNITS`（默认 `nuwa-work`，逗号分隔）。
-- unit 名先做白名单校验（`[A-Za-z0-9@._:-]`），用参数数组执行，绝不拼 shell；非法值 422。
-- 非 systemd 环境返回 501；记录 `restart_requested` 审计。
+- unit 名先做白名单校验（`[A-Za-z0-9@._:-]`，且不得以 `-` 开头，否则 `systemctl` 会当作选项），用参数数组执行，绝不拼 shell；非法值 422。
+- 未配置任何 unit → 501 `not_supported`（不写审计、不起子进程）；非 systemd 环境或 helper 3 秒内未返回（超时即 kill）→ 501，但先写 `restart_requested` 审计（尝试发生过）。
 
 #### 系统
 
@@ -997,7 +998,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
   - 已知键统一转大写；
   - 若同时存在 `nuwa_x` 与 `NUWA_X`，大写优先，删除小写；
   - 记录 `config_migrated`（detail 为 key 列表）；
-  - serve 与 work 启动时都执行一次（幂等）。
+  - 只有 serve 启动时执行一次（幂等）；work 不做文件迁移（env 由 systemd 注入，work 只读）。
 - 写回：
   - 保留文件顺序与注释；更新已存在键；新键追加到对应分组末尾。
   - Unix：同目录临时文件写入 → chmod 600 → rename；失败则报错，不留下半文件。
@@ -1013,9 +1014,11 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 - serve 重启自身 + `NUWA_RUNNER_UNITS` 中的 work units。
 - 使用 `systemd-run --on-active=2 systemctl restart <unit...>`，确保 HTTP 响应先返回。
+- 进程内互斥（`/settings/restart` 与 `/runners/{id}/restart` 共用）：已有重启在编排 → 409，审计与子进程都不发生。
 - 活动 run 检查：`runs.finished_at IS NULL`；有则默认 409，前端展示列表并要求 force。
-- 命令执行使用参数数组；unit 名白名单 `[A-Za-z0-9@._:-]`，缺失/非法返回 422；非 systemd 返回 501 并提示手动命令。
+- 命令执行使用参数数组；unit 名白名单 `[A-Za-z0-9@._:-]` 且不得以 `-` 开头，缺失/非法返回 422；非 systemd、helper 3s 超时（kill）返回 501 并提示手动命令。
 - 重启前写 `restart_requested` 审计；重启后进程启动时间/会话密钥自然更新。
+- `systemctl is-active` 同样有 3s 预算，超时/不可用显示 `n/a`，不阻塞 `/system`。
 
 ## 14 · 实施计划
 

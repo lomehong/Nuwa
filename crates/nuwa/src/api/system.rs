@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
-use crate::api::common::configured_units;
+use crate::api::common::{configured_units, run_bounded};
 use crate::api::ApiError;
 use crate::serve::AppState;
 
@@ -86,15 +86,10 @@ fn build_system(
 }
 
 /// `systemctl is-active <unit>` on hosts with systemd; anything else (spawn
-/// failure, empty output) reports `n/a` and is not an error (docs/09 §9.2).
+/// failure, a helper that exceeds the 3s budget, empty output) reports `n/a`
+/// and is not an error (docs/09 §9.2).
 fn service_state(unit: &str) -> String {
-    let output = std::process::Command::new("systemctl")
-        .args(["is-active", unit])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output();
-    match output {
+    match run_bounded("systemctl", &["is-active", unit], true) {
         Ok(output) => {
             let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if state.is_empty() {
@@ -139,6 +134,7 @@ mod tests {
             env_path: dir.path().join("nuwa.env"),
             db_path: db_path.clone(),
             cookie_secure: false,
+            cookie_secure_never: false,
             serve_unit: serve_unit.to_string(),
             runner_units: runner_units.iter().map(|unit| (*unit).to_string()).collect(),
         };

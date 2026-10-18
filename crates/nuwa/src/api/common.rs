@@ -1,6 +1,9 @@
 //! Helpers shared by the read endpoints.
 
 use std::collections::BTreeMap;
+use std::io::Read;
+use std::process::{ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
@@ -308,9 +311,12 @@ fn ci_timeout_within_day(store: &Store, fingerprint: &str, now: i64) -> ShanResu
 }
 
 /// systemd unit whitelist (docs/09 §13): letters, digits and `@ . _ : -`.
+/// A leading `-` is rejected: `systemctl` treats it as an option terminator
+/// convention, so `-nuwa-work` could be parsed as a flag rather than a unit.
 /// Values are always passed as one `Command` argument, never shell text.
 pub(crate) fn valid_systemd_unit(unit: &str) -> bool {
     !unit.is_empty()
+        && !unit.starts_with('-')
         && unit
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | ':' | '-'))
@@ -329,21 +335,105 @@ pub(crate) fn configured_units(serve_unit: &str, runner_units: &[String]) -> Vec
     units
 }
 
+/// Budget for one systemd helper process. A hung `systemd-run`/`systemctl`
+/// must not pin a console worker past the documented response window.
+pub(crate) const SYSTEMD_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often a bounded wait re-checks the child.
+const SYSTEMD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Process-wide restart mutex: one schedule in flight at a time, shared by
+/// `POST /settings/restart` and `POST /runners/{id}/restart` (docs/09 §9.2).
+/// `try_lock` keeps a concurrent request a 409 instead of a queue.
+pub(crate) fn restart_lock() -> &'static tokio::sync::Mutex<()> {
+    static RESTART_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    RESTART_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Serializes restart tests: one test holds [`restart_lock`] to prove the
+/// 409, so every other restart test waits its turn instead of racing it.
+#[cfg(test)]
+pub(crate) async fn restart_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static RESTART_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    RESTART_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+/// Result of a bounded subprocess run. `stdout` is empty unless the caller
+/// asked to capture it.
+#[derive(Debug)]
+pub(crate) struct BoundedOutput {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+}
+
+/// Run one helper process without a shell, waiting at most [`SYSTEMD_TIMEOUT`].
+/// A child that outlives the budget is killed and reported as
+/// `TimedOut`, which callers map to a 501 (`systemd-run`) or `n/a`
+/// (`systemctl is-active`).
+pub(crate) fn run_bounded(
+    program: &str,
+    args: &[&str],
+    capture_stdout: bool,
+) -> std::io::Result<BoundedOutput> {
+    run_bounded_with(program, args, capture_stdout, SYSTEMD_TIMEOUT)
+}
+
+fn run_bounded_with(
+    program: &str,
+    args: &[&str],
+    capture_stdout: bool,
+    timeout: Duration,
+) -> std::io::Result<BoundedOutput> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // Best effort: kill a hung helper so it cannot leak, and reap it
+            // so no zombie is left behind.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{program} did not exit within {}ms", timeout.as_millis()),
+            ));
+        }
+        std::thread::sleep(SYSTEMD_POLL_INTERVAL);
+    };
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        // The child has exited, so the pipe reaches EOF instead of blocking.
+        pipe.read_to_end(&mut stdout)?;
+    }
+    Ok(BoundedOutput { status, stdout })
+}
+
 /// `systemd-run --on-active=2 systemctl restart <units...>`: the systemd
 /// manager performs the restart after the HTTP response is written, so
 /// restarting `nuwa-serve` cannot cut off its own reply. Units stay separate
-/// arguments; nothing is ever concatenated into shell text.
+/// arguments; nothing is ever concatenated into shell text. A spawn failure
+/// or a helper that hangs past the budget is a `false` (→ 501), never a hung
+/// console request.
 pub(crate) fn schedule_restart(units: &[String]) -> bool {
-    std::process::Command::new("systemd-run")
-        .arg("--on-active=2")
-        .arg("systemctl")
-        .arg("restart")
-        .args(units)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
+    let mut args: Vec<&str> = vec!["--on-active=2", "systemctl", "restart"];
+    args.extend(units.iter().map(String::as_str));
+    run_bounded("systemd-run", &args, false)
+        .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
@@ -434,6 +524,49 @@ mod tests {
         assert_eq!(
             reason_for_detail("PR closed without merge", "rejected"),
             REASON_PR_CLOSED
+        );
+    }
+
+    #[test]
+    fn systemd_unit_whitelist_rejects_option_like_names() {
+        for unit in ["nuwa-work", "nuwa-work@1.service", "a.b_c:d", "nuwa-work-2"] {
+            assert!(valid_systemd_unit(unit), "{unit}");
+        }
+        for unit in ["-nuwa-work", "--now", "", "nuwa work", "../etc/passwd"] {
+            assert!(!valid_systemd_unit(unit), "{unit:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_subprocess_captures_stdout_and_reports_spawn_failure() {
+        // `git` is a hard test prerequisite in this workspace.
+        let output = run_bounded("git", &["--version"], true).expect("git --version");
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("git version"),
+            "{:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let error = run_bounded("nuwa-test-no-such-program", &[], false)
+            .expect_err("a missing program must be an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn bounded_subprocess_kills_a_hung_child() {
+        #[cfg(unix)]
+        let (program, args) = ("sleep", &["10"][..]);
+        #[cfg(windows)]
+        let (program, args) = ("ping", &["-n", "20", "127.0.0.1"][..]);
+        let started = Instant::now();
+        let error = run_bounded_with(program, args, false, Duration::from_millis(150))
+            .expect_err("a slow child must be killed");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must be bounded, took {:?}",
+            started.elapsed()
         );
     }
 

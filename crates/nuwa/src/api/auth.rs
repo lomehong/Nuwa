@@ -33,6 +33,11 @@ pub struct MeResponse {
 }
 
 fn secure_cookie(state: &AppState, headers: &HeaderMap) -> bool {
+    // `NUWA_COOKIE_SECURE=never` is an explicit opt-out and wins over both
+    // `always` and a TLS-terminating proxy's X-Forwarded-Proto header.
+    if state.cookie_secure_never {
+        return false;
+    }
     state.cookie_secure
         || headers
             .get("x-forwarded-proto")
@@ -178,7 +183,78 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap, jar: CookieJa
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    use crate::serve::{build_app, AppState};
+
     use super::*;
+
+    fn test_app(cookie_secure: bool, cookie_secure_never: bool) -> (tempfile::TempDir, Router) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("s.db");
+        let store = Arc::new(shanhaijing::Store::open(&db_path).expect("open"));
+        let state = AppState {
+            store,
+            ui_token: Arc::new(None),
+            ingest_token: Arc::new(None),
+            session: Arc::new(crate::session::SessionManager::new("", 86_400_000)),
+            limiter: Arc::new(crate::session::LoginLimiter::new()),
+            started_at_ms: crate::now_ms(),
+            env_path: dir.path().join("nuwa.env"),
+            db_path,
+            cookie_secure,
+            cookie_secure_never,
+            serve_unit: "nuwa-serve".to_string(),
+            runner_units: vec!["nuwa-work".to_string()],
+        };
+        (dir, build_app(state))
+    }
+
+    /// Local mode `me` always issues the readable CSRF cookie, so the
+    /// `Secure` attribute is observable without a login round-trip.
+    async fn csrf_set_cookie(app: &Router, forwarded_proto: Option<&str>) -> String {
+        let mut request = Request::builder().uri("/api/v1/auth/me");
+        if let Some(proto) = forwarded_proto {
+            request = request.header("x-forwarded-proto", proto);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("ascii cookie"))
+            .find(|raw| raw.starts_with("nuwa_csrf="))
+            .expect("csrf Set-Cookie")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn cookie_secure_never_overrides_forwarded_proto() {
+        // `never` wins even with `always` also set and a TLS proxy header.
+        let (_dir, app) = test_app(true, true);
+        let cookie = csrf_set_cookie(&app, Some("https")).await;
+        assert!(!cookie.contains("Secure"), "never must drop Secure: {cookie}");
+
+        // Without `never`, X-Forwarded-Proto: https still opts in...
+        let (_dir, app) = test_app(false, false);
+        let cookie = csrf_set_cookie(&app, Some("https")).await;
+        assert!(cookie.contains("Secure"), "https proxy must set Secure: {cookie}");
+
+        // ...and `always` does so without any proxy header.
+        let (_dir, app) = test_app(true, false);
+        let cookie = csrf_set_cookie(&app, None).await;
+        assert!(cookie.contains("Secure"), "always must set Secure: {cookie}");
+    }
 
     #[test]
     fn session_cookie_is_httponly_and_csrf_is_readable() {

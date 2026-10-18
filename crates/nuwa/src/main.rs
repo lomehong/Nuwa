@@ -252,6 +252,16 @@ pub(crate) fn report_one(
     Ok(line)
 }
 
+/// Resolve the sessions root once at runner startup. `runs.session_dir` is
+/// persisted before (and kept through) a repair failure/interruption, and the
+/// transcript endpoint only accepts absolute, `..`-free paths — a relative
+/// `--sessions` default would leave those runs with an unreadable transcript
+/// and shadow older readable runs.
+fn absolute_sessions_dir(path: PathBuf) -> anyhow::Result<PathBuf> {
+    std::path::absolute(&path)
+        .with_context(|| format!("resolve sessions dir {}", path.display()))
+}
+
 /// 应龙 runner v0 — claim the highest-priority ready issue from 山海经 and
 /// drive it to a verified branch/PR. Failure anywhere after the claim
 /// escalates the issue (docs/07 A-1 回炉升级). `--loop` keeps polling
@@ -329,6 +339,9 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     }
     let provider = provider_given.unwrap_or_else(env_provider_default);
     let instructions_path = instructions_path.context("--instructions <path> is required")?;
+    // One absolute root drives both the pre-repair `runs.session_dir` write
+    // (`work_once`) and the harness session dir (`RepairJob`).
+    let sessions_dir = absolute_sessions_dir(sessions_dir)?;
 
     let store = Arc::new(
         shanhaijing::Store::open(&db_path)
@@ -1366,6 +1379,24 @@ mod tests {
     use crate::issue::FailingCheck;
 
     #[test]
+    fn relative_sessions_root_becomes_absolute() {
+        // The default `spike/sessions` is relative; the transcript endpoint
+        // rejects relative run paths, so run_work resolves the root once.
+        let absolute =
+            absolute_sessions_dir(PathBuf::from("spike/sessions")).expect("absolutize");
+        assert!(absolute.is_absolute(), "{absolute:?}");
+        assert!(
+            absolute.ends_with(Path::new("spike").join("sessions")),
+            "{absolute:?}"
+        );
+
+        // An already absolute root is kept as-is.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("sessions");
+        assert_eq!(absolute_sessions_dir(root.clone()).expect("absolute"), root);
+    }
+
+    #[test]
     fn runner_id_is_sanitized_and_stable() {
         let id = sanitize_runner_id("host/repo name:日本");
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')));
@@ -1555,6 +1586,11 @@ mod tests {
         assert_eq!(run.outcome.as_deref(), Some("success"));
         assert!(run.turns >= 1, "faux run must record at least one turn");
         assert!(run.session_dir.is_some());
+        assert!(
+            Path::new(run.session_dir.as_deref().expect("session dir")).is_absolute(),
+            "the transcript endpoint requires an absolute session dir: {:?}",
+            run.session_dir
+        );
         assert!(run.harness_run_id.is_some());
         assert!(
             !run.verification_detail.as_deref().unwrap_or("").is_empty(),
@@ -1665,6 +1701,11 @@ mod tests {
         let run_a = store.latest_run(&fp_a).expect("latest a").expect("run a");
         assert_eq!(run_a.outcome.as_deref(), Some("success"));
         assert_eq!(run_a.runner_id, "test:runner");
+        let session_dir = run_a.session_dir.as_deref().expect("run a session dir");
+        assert!(
+            Path::new(session_dir).is_absolute(),
+            "run_work must persist an absolute session dir: {session_dir}"
+        );
 
         // Simulate a crashed in-flight run for B, owned by the same runner.
         store.set_state(&fp_b, State::Triggered, now + 2, None).expect("t");
