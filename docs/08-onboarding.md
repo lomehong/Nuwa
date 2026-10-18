@@ -83,7 +83,7 @@ nuwa work --db shanhaijing.db \
 
 - **问题单动作**：rejected/escalated 可 `重新打开`（立即回到 `new` 并清冷却，无确认）；卡单（`triggered`/`fixing` 且超过卡单窗口）可 `重排`（破坏性确认，清归属重新入队）。动作出现在详情头部、列表与总览待处理队列；成功 toast、失败逐条显示服务端错误。
 - **对账与重启**：`GitHub 对账` 汇总 checked/merged/rejected/still_open，并逐条展示 `errors[]`；runner `重启 unit` 先确认影响（显示当前修复指纹，提示同一 unit 承载的多个 runner 会一起重启）。409 表示已有重启在排程，422 指出 `service_unit` 缺失/非法，501 直接给出手动 `systemctl restart <unit>` 命令。
-- **设置**：按 22 键 schema 分组编辑；密钥只显示「已设置 · 末 4 位」，留空保存表示保持不变；只提交改动键，保存写 `NUWA_ENV_FILE`（自动 `.bak` 备份）并提示 `重启后生效`。`测试 GitHub token` / `测试模型配置` 使用未保存的候选值探测（不落盘）；`重启服务` 在存在活动 run 时返回 409 `active_runs`，必须勾选「我了解这会中断正在进行的修复」后才允许 `强制重启`，202 后页面轮询 `/health` 与 `/auth/me` 等待恢复，systemd 不可用则显示手动命令。修改 `NUWA_UI_TOKEN` 后重启会使当前会话失效，需要重新登录。
+- **设置**：按 22 键 schema 分组编辑；密钥只显示「已设置 · 末 4 位」，留空保存表示保持不变；只提交改动键，保存写 `NUWA_ENV_FILE`（自动 `.bak` 备份）并提示 `重启后生效`。`测试 GitHub token` / `测试模型配置` 使用未保存的候选值探测（不落盘）；`重启服务` 在存在活动 run 时返回 409 `active_runs`，必须勾选「我了解这会中断正在进行的修复」后才允许 `强制重启`，202 后页面轮询 `/health` 与 `/auth/me` 等待恢复，systemd 不可用则显示手动命令。修改 `NUWA_UI_TOKEN` 后重启会使当前会话失效，页面会提示重新登录；有未保存的草稿时重启按钮禁用，需先保存或放弃。重启恢复后控制台回到 SPA 根路径 `/`。
 - 旧 `/ui` 的 Basic 页面与 SPA 的 `/settings` **路径冲突**：SPA 内请用侧栏/抽屉导航进入；直接刷新 `/settings` 会命中旧 Basic 页（M6 移除旧页后消失）。
 
 **API 登录（v3 控制台）**：`POST /api/v1/auth/login`，必须带 `Content-Type: application/json`，body `{"token":"<NUWA_UI_TOKEN>"}`；成功 204 并设置 `nuwa_session`（HttpOnly）与 `nuwa_csrf`。后续非 GET 请求必须带 `X-NUWA-CSRF` 头，且其值须与 `nuwa_csrf` cookie 值一致（双提交校验，仅"带头"不够）。会话与 CSRF cookie 的 `Max-Age` 由 `NUWA_SESSION_TTL_SECS` 控制（默认 86400，允许 300–2592000）；`NUWA_COOKIE_SECURE=always` 强制加 `Secure`（TLS 代理下也可由 `X-Forwarded-Proto: https` 自动触发），`=never` 显式关闭且优先级最高（即使同时配置 `always` 或代理上报 https 也不加 `Secure`）。旧 `/ui` Basic 鉴权保留至 M6。
