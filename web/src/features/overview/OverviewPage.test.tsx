@@ -182,8 +182,12 @@ describe("OverviewPage", () => {
       within(attention).getByRole("link", { name: "打开 PR" }),
     ).toHaveAttribute("href", "https://github.com/example/app/pull/7");
     // Escalated → reopen; the stuck fixing card → requeue.
-    expect(within(attention).getByRole("button", { name: "重新打开" })).toBeInTheDocument();
-    expect(within(attention).getByRole("button", { name: "重排" })).toBeInTheDocument();
+    expect(
+      within(attention).getByRole("button", { name: "重新打开：fp-escalat…" }),
+    ).toBeInTheDocument();
+    expect(
+      within(attention).getByRole("button", { name: "重排：fp-stuck-0…" }),
+    ).toBeInTheDocument();
 
     const runs = within(attention).getAllByRole("link", { name: /查看详情/ });
     expect(runs[0]).toHaveAttribute("href", "/issues/fp-escalated-001");

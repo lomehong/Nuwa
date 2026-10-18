@@ -1,10 +1,12 @@
+import { clsx } from "clsx";
 import { RefreshCw, RotateCcw } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Button, ConfirmDialog, useToast, type IssueState } from "../../components/ui";
 import { ApiError } from "../../lib/api";
-import { describeError } from "../overview/PanelChrome";
+import { describeError } from "../../lib/errors";
 import { issueActionFor, useReopenIssue, useRequeueIssue } from "./actions";
+import { shortFingerprint } from "./format";
 
 interface IssueActionButtonProps {
   fingerprint: string;
@@ -29,9 +31,11 @@ function actionErrorDescription(error: unknown): string {
 }
 
 /**
- * State-aware owner action (docs/09 §10.8): reopen a rejected/escalated issue
+ * State-aware owner action (docs/09 §8.5): reopen a rejected/escalated issue
  * without a confirmation, or requeue a stuck issue behind a destructive
- * confirmation. Renders nothing when the state allows neither.
+ * confirmation. Placed in the detail header (§10.5), the issue list (§10.4)
+ * and the overview attention queue (§10.3.1). Renders nothing when the state
+ * allows neither.
  */
 export function IssueActionButton({
   fingerprint,
@@ -46,9 +50,21 @@ export function IssueActionButton({
   const requeue = useRequeueIssue(fingerprint);
   const [confirmOpen, setConfirmOpen] = useState(false);
 
+  // A poll can drop `stuck` (the action disappears) and re-add it later; the
+  // stale open flag must not resurrect the confirmation for the new state.
+  useEffect(() => {
+    if (action !== "requeue") {
+      setConfirmOpen(false);
+    }
+  }, [action]);
+
   if (!action) {
     return null;
   }
+
+  const shortFp = shortFingerprint(fingerprint);
+  const actionLabel = action === "reopen" ? "重新打开" : "重排";
+  const actionName = `${actionLabel}：${shortFp}`;
 
   const reportFailure = (title: string, error: unknown) => {
     toast({
@@ -58,13 +74,18 @@ export function IssueActionButton({
     });
   };
 
+  // A successful write disables the button (like `pending`) until the
+  // invalidated views report the new state, so a double click cannot POST the
+  // same transition twice.
   if (action === "reopen") {
     return (
       <Button
         variant="secondary"
         size={size}
-        className={className}
+        className={clsx("whitespace-nowrap", className)}
         pending={reopen.isPending}
+        disabled={reopen.isSuccess}
+        aria-label={actionName}
         onClick={() => {
           reopen.mutate(undefined, {
             onSuccess: () => {
@@ -89,8 +110,10 @@ export function IssueActionButton({
       <Button
         variant="secondary"
         size={size}
-        className={className}
+        className={clsx("whitespace-nowrap", className)}
         pending={requeue.isPending}
+        disabled={requeue.isSuccess}
+        aria-label={actionName}
         onClick={() => setConfirmOpen(true)}
       >
         <RefreshCw aria-hidden="true" className="size-4" />

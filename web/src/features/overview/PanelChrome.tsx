@@ -2,22 +2,10 @@ import { AlertCircle, RefreshCw } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { Button, Card, CardContent } from "../../components/ui";
-import { ApiError } from "../../lib/api";
+import { describeError, describeErrorCode } from "../../lib/errors";
 
-/** Human-safe error text; never render a stack trace in the console. */
-export function describeError(error: unknown): string {
-  if (error instanceof ApiError) {
-    return error.message || "请求失败";
-  }
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-  return "请求失败，请稍后重试";
-}
-
-export function describeErrorCode(error: unknown): string | null {
-  return error instanceof ApiError ? error.code : null;
-}
+// Re-exported for the panels that already import these from the panel chrome.
+export { describeError, describeErrorCode };
 
 interface OverviewSectionProps {
   id: string;

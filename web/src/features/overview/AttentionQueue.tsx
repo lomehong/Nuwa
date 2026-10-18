@@ -127,7 +127,7 @@ export function AttentionQueue({ items }: AttentionQueueProps) {
                       </div>
                     </dl>
 
-                    <div className="flex items-center justify-between gap-2 border-t border-border pt-2 text-caption">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-2 text-caption">
                       {item.pr_url ? (
                         <a
                           href={item.pr_url}
@@ -141,7 +141,7 @@ export function AttentionQueue({ items }: AttentionQueueProps) {
                       ) : (
                         <span aria-hidden="true" />
                       )}
-                      <div className="flex shrink-0 items-center gap-1">
+                      <div className="flex flex-wrap items-center gap-1">
                         <IssueActionButton
                           fingerprint={item.fingerprint}
                           state={item.state}
@@ -150,7 +150,7 @@ export function AttentionQueue({ items }: AttentionQueueProps) {
                         <Link
                           to={detailPath}
                           aria-label={`查看详情：${item.title || item.fingerprint}`}
-                          className="inline-flex items-center gap-1 rounded-sm px-1.5 font-medium text-text-secondary transition-colors hover:text-accent"
+                          className="inline-flex items-center gap-1 rounded-sm px-1.5 font-medium whitespace-nowrap text-text-secondary transition-colors hover:text-accent"
                         >
                           查看详情
                           <ArrowRight aria-hidden="true" className="size-3.5" />

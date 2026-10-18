@@ -1,6 +1,6 @@
 /**
  * Owner actions on an issue: reopen a rejected/escalated issue or requeue a
- * stuck timed-out run (docs/09 §10.8, `crates/nuwa/src/api/actions.rs`).
+ * stuck timed-out run (docs/09 §8.5, `crates/nuwa/src/api/actions.rs`).
  *
  * Both endpoints are POSTs through {@link apiFetch}, so the CSRF double-submit
  * header is attached automatically. A successful write invalidates every view

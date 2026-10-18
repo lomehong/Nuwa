@@ -128,6 +128,30 @@ describe("apiFetch", () => {
     });
   });
 
+  it("leaves body undefined when the error response is not JSON", async () => {
+    server.use(
+      http.post(
+        "/api/v1/issues/abc/reopen",
+        () =>
+          new HttpResponse("<html>Bad gateway</html>", {
+            status: 502,
+            headers: { "Content-Type": "text/html" },
+          }),
+      ),
+    );
+
+    const error = await apiFetch("/issues/abc/reopen", { method: "POST" }).catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(ApiError);
+    const apiError = error as ApiError;
+    expect(apiError.status).toBe(502);
+    expect(apiError.code).toBe("http_error");
+    expect(apiError.message).toBe("服务器错误");
+    expect(apiError.body).toBeUndefined();
+  });
+
   it("exposes Retry-After seconds on rate-limit errors", async () => {
     server.use(
       http.post("/api/v1/auth/login", () =>

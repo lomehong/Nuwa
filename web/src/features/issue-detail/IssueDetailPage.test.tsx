@@ -452,8 +452,8 @@ describe("IssueDetailPage", () => {
       name: "Average panics on empty slice",
     });
     const header = title.closest("header") as HTMLElement;
-    expect(within(header).queryByRole("button", { name: "重新打开" })).not.toBeInTheDocument();
-    expect(within(header).queryByRole("button", { name: "重排" })).not.toBeInTheDocument();
+    expect(within(header).queryByRole("button", { name: /^重新打开：/ })).not.toBeInTheDocument();
+    expect(within(header).queryByRole("button", { name: /^重排：/ })).not.toBeInTheDocument();
   });
 
   it("reopens an escalated issue from the header", async () => {
@@ -475,9 +475,9 @@ describe("IssueDetailPage", () => {
       name: "Average panics on empty slice",
     });
     const header = title.closest("header") as HTMLElement;
-    expect(within(header).queryByRole("button", { name: "重排" })).not.toBeInTheDocument();
+    expect(within(header).queryByRole("button", { name: /^重排：/ })).not.toBeInTheDocument();
 
-    fireEvent.click(within(header).getByRole("button", { name: "重新打开" }));
+    fireEvent.click(within(header).getByRole("button", { name: "重新打开：fp-detail-…" }));
 
     await waitFor(() => expect(posted).toBe("fp-detail-001:csrf-token"));
     expect(await screen.findByText("已重新入队")).toBeInTheDocument();

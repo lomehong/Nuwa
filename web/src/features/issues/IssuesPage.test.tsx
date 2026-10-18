@@ -554,13 +554,17 @@ describe("IssuesPage", () => {
 
     const table = await screen.findByRole("region", { name: "问题单列表" });
     // The escalated row can reopen; the healthy fixing row has no action.
-    expect(within(table).getAllByRole("button", { name: "重新打开" })).toHaveLength(1);
-    expect(within(table).queryByRole("button", { name: "重排" })).not.toBeInTheDocument();
+    expect(
+      within(table).getAllByRole("button", { name: "重新打开：fp-escalat…" }),
+    ).toHaveLength(1);
+    expect(within(table).queryByRole("button", { name: /^重排：/ })).not.toBeInTheDocument();
 
     const cards = screen.getByRole("list", { name: "问题单卡片列表" });
-    expect(within(cards).getAllByRole("button", { name: "重新打开" })).toHaveLength(1);
+    expect(
+      within(cards).getAllByRole("button", { name: "重新打开：fp-escalat…" }),
+    ).toHaveLength(1);
 
-    fireEvent.click(within(table).getByRole("button", { name: "重新打开" }));
+    fireEvent.click(within(table).getByRole("button", { name: "重新打开：fp-escalat…" }));
 
     await waitFor(() => expect(posted).toBe("fp-escalated-001:csrf-token"));
     expect(await screen.findByText("已重新入队")).toBeInTheDocument();

@@ -12,21 +12,32 @@ beforeEach(() => {
   document.cookie = "nuwa_csrf=csrf-token; path=/";
 });
 
-function renderAction(props: { state: IssueState; stuck?: boolean; fingerprint?: string }) {
+interface ActionProps {
+  state: IssueState;
+  stuck?: boolean;
+  fingerprint?: string;
+}
+
+function renderAction(props: ActionProps) {
   const queryClient = createTestQueryClient();
   const invalidate = vi.spyOn(queryClient, "invalidateQueries");
-  render(
+  const tree = (next: ActionProps) => (
     <QueryClientProvider client={queryClient}>
       <ToastProvider>
         <IssueActionButton
-          fingerprint={props.fingerprint ?? "fp-1"}
-          state={props.state}
-          stuck={props.stuck ?? false}
+          fingerprint={next.fingerprint ?? "fp-1"}
+          state={next.state}
+          stuck={next.stuck ?? false}
         />
       </ToastProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { queryClient, invalidate };
+  const view = render(tree(props));
+  return {
+    queryClient,
+    invalidate,
+    rerender: (next: ActionProps) => view.rerender(tree(next)),
+  };
 }
 
 describe("IssueActionButton", () => {
@@ -43,7 +54,7 @@ describe("IssueActionButton", () => {
 
     const { invalidate } = renderAction({ state: "rejected" });
 
-    fireEvent.click(screen.getByRole("button", { name: "重新打开" }));
+    fireEvent.click(screen.getByRole("button", { name: "重新打开：fp-1" }));
 
     await waitFor(() => expect(posted).toBe("fp-1:csrf-token"));
     expect(body).toEqual({});
@@ -56,7 +67,26 @@ describe("IssueActionButton", () => {
     );
   });
 
-  it("asks for confirmation before requeueing a stuck issue", async () => {
+  it("names reopen with the visible label and short fingerprint", () => {
+    const fingerprint = "fp-1234567890abcdef";
+
+    renderAction({ state: "rejected", fingerprint });
+    expect(
+      screen.getByRole("button", { name: "重新打开：fp-1234567…" }),
+    ).toBeInTheDocument();
+  });
+
+  it("names requeue with the visible label and short fingerprint", () => {
+    renderAction({
+      state: "fixing",
+      stuck: true,
+      fingerprint: "fp-1234567890abcdef",
+    });
+
+    expect(screen.getByRole("button", { name: "重排：fp-1234567…" })).toBeInTheDocument();
+  });
+
+  it("asks for confirmation before requeueing and toasts the result", async () => {
     let posted = false;
     let body: unknown;
     server.use(
@@ -69,7 +99,7 @@ describe("IssueActionButton", () => {
 
     renderAction({ state: "fixing", stuck: true });
 
-    fireEvent.click(screen.getByRole("button", { name: "重排" }));
+    fireEvent.click(screen.getByRole("button", { name: "重排：fp-1" }));
     expect(screen.getByRole("dialog", { name: "重排卡单问题？" })).toBeInTheDocument();
     expect(posted).toBe(false);
 
@@ -77,7 +107,62 @@ describe("IssueActionButton", () => {
 
     await waitFor(() => expect(posted).toBe(true));
     expect(body).toEqual({});
+    expect(await screen.findByText("已重排")).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("cancels the requeue dialog without posting", () => {
+    let posts = 0;
+    server.use(
+      http.post("/api/v1/issues/:fp/requeue", () => {
+        posts += 1;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+
+    renderAction({ state: "fixing", stuck: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "重排：fp-1" }));
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(posts).toBe(0);
+  });
+
+  it("keeps the requeue dialog closed when the issue leaves and re-enters stuck", () => {
+    const { rerender } = renderAction({ state: "fixing", stuck: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "重排：fp-1" }));
+    expect(screen.getByRole("dialog", { name: "重排卡单问题？" })).toBeInTheDocument();
+
+    // A poll clears `stuck`: the action disappears and the dialog must close.
+    rerender({ state: "fixing", stuck: false });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    // A later poll re-adds `stuck`; the stale open flag must not resurrect it.
+    rerender({ state: "fixing", stuck: true });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("does not POST twice after a successful write", async () => {
+    let posts = 0;
+    server.use(
+      http.post("/api/v1/issues/:fp/reopen", () => {
+        posts += 1;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+
+    renderAction({ state: "rejected" });
+    const button = screen.getByRole("button", { name: "重新打开：fp-1" });
+
+    fireEvent.click(button);
+    await waitFor(() => expect(posts).toBe(1));
+    await waitFor(() => expect(button).toBeDisabled());
+
+    fireEvent.click(button);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(posts).toBe(1);
   });
 
   it.each(["new", "pr_open", "merged"] as const)(
@@ -93,7 +178,7 @@ describe("IssueActionButton", () => {
     ["fixing", false],
   ] as const)("does not requeue a healthy %s issue", (state, stuck) => {
     renderAction({ state, stuck });
-    expect(screen.queryByRole("button", { name: "重排" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^重排：/ })).not.toBeInTheDocument();
   });
 
   it("surfaces a 409 with its field detail in a danger toast", async () => {
@@ -114,11 +199,31 @@ describe("IssueActionButton", () => {
 
     renderAction({ state: "escalated" });
 
-    fireEvent.click(screen.getByRole("button", { name: "重新打开" }));
+    fireEvent.click(screen.getByRole("button", { name: "重新打开：fp-1" }));
 
     expect(await screen.findByText("重新打开失败")).toBeInTheDocument();
     expect(
       screen.getByText("state is merged（state：expected escalated or rejected）"),
     ).toBeInTheDocument();
+  });
+
+  it("toasts the status fallback when the error body is not JSON", async () => {
+    server.use(
+      http.post(
+        "/api/v1/issues/:fp/reopen",
+        () =>
+          new HttpResponse("<html>not found</html>", {
+            status: 404,
+            headers: { "Content-Type": "text/html" },
+          }),
+      ),
+    );
+
+    renderAction({ state: "rejected" });
+
+    fireEvent.click(screen.getByRole("button", { name: "重新打开：fp-1" }));
+
+    expect(await screen.findByText("重新打开失败")).toBeInTheDocument();
+    expect(screen.getByText("资源不存在")).toBeInTheDocument();
   });
 });
