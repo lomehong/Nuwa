@@ -1,6 +1,6 @@
-//! `nuwa serve` — single-port HTTP surface: legacy console, `/api/v1`,
-//! ingest and the static fallback. Extracted from `main.rs` in M2a so the
-//! router can be assembled and route-tested without binding a socket.
+//! `nuwa serve` — single-port HTTP surface: SPA, `/api/v1`, ingest and the
+//! static fallback. Extracted from `main.rs` in M2a so the router can be
+//! assembled and route-tested without binding a socket.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -10,16 +10,15 @@ use anyhow::{bail, Context};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 
 use crate::{now_ms, parse_signals, report_one, Shared};
 
-/// Strict CSP for the JSON API and the SPA: no inline script or style.
+/// Strict CSP for every route (API, SPA and redirects): no inline script or
+/// style.
 const CSP_STRICT: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
-/// The legacy console keeps inline styles until it is replaced in M6.
-const CSP_LEGACY: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'";
 
 /// Session TTL bounds and default from docs/09 (`NUWA_SESSION_TTL_SECS`).
 const SESSION_TTL_DEFAULT_SECS: i64 = 86_400;
@@ -65,33 +64,18 @@ impl AppState {
     }
 }
 
-/// Full app assembly: legacy console + `/api/v1` + static fallback.
-/// The security-header layer wraps every route, so auth rejections and
-/// fallback responses carry the headers too.
+/// Full app assembly: `/api/v1`, ingest, SPA redirects and the static
+/// fallback. The security-header layer wraps every route, so auth rejections
+/// and fallback responses carry the headers too.
 pub fn build_app(state: AppState) -> Router {
-    let legacy_state: Shared = (Arc::clone(&state.store), Arc::clone(&state.ui_token));
+    let ingest_state: Shared = (Arc::clone(&state.store), Arc::clone(&state.ingest_token));
     let ingest_auth = axum::middleware::from_fn_with_state(
         (Arc::clone(&state.store), Arc::clone(&state.ingest_token)),
         check_auth,
     );
-    let ui_auth = axum::middleware::from_fn_with_state(
-        (Arc::clone(&state.store), Arc::clone(&state.ui_token)),
-        crate::ui::ui_auth,
-    );
-    // UI/settings only. `/health` and `/ingest` keep their own gates — a
-    // route_layer over all legacy routes would put Basic auth in front of
-    // `/health` (and swallow the ingest token check behind it).
-    let legacy_ui = Router::new()
-        .route("/ui", get(crate::ui::dashboard))
-        .route("/ui/reopen", post(crate::ui::reopen))
-        .route("/ui/sync", post(crate::ui::sync_now))
-        .route("/issue/{fp}", get(crate::ui::issue_detail))
-        .route("/settings", get(crate::settings::get_settings))
-        .route("/settings/save", post(crate::settings::save_settings))
-        .route("/settings/restart", post(crate::settings::restart_services))
-        .route_layer(ui_auth)
-        .route_layer(axum::middleware::from_fn(crate::ui::origin_guard));
-    let legacy = Router::new()
+    // `/ingest` and `/health` keep their own gates; the SPA owns everything
+    // else, except the two legacy-console namespaces redirected below.
+    let backend = Router::new()
         .route(
             "/ingest",
             // Non-POST methods are a plain 404, never the SPA shell (the
@@ -101,25 +85,43 @@ pub fn build_app(state: AppState) -> Router {
                 .fallback(|| async { StatusCode::NOT_FOUND }),
         )
         .route("/health", get(|| async { "nuwa serve ok" }))
-        .merge(legacy_ui)
-        .with_state(legacy_state);
+        .with_state(ingest_state);
+    // Bookmark compatibility from the retired console (M6): `/ui*` returns
+    // to the SPA root, `/issue/{fp}` to its new detail route. `/settings`
+    // needs no redirect — it is the same SPA path.
+    let redirects = Router::new()
+        .route(
+            "/ui",
+            get(|| async { Redirect::permanent("/") })
+                .post(|| async { StatusCode::NOT_FOUND }),
+        )
+        .route(
+            "/ui/{*rest}",
+            get(|| async { Redirect::permanent("/") })
+                .post(|| async { StatusCode::NOT_FOUND }),
+        )
+        .route(
+            "/issue/{fp}",
+            get(
+                |axum::extract::Path(fp): axum::extract::Path<String>| async move {
+                    Redirect::permanent(&format!("/issues/{fp}"))
+                },
+            )
+            .post(|| async { StatusCode::NOT_FOUND }),
+        );
 
     let api = crate::api::router(Arc::new(state.clone()));
     Router::new()
-        .merge(legacy)
+        .merge(backend)
+        .merge(redirects)
         .nest("/api/v1", api)
         .fallback(crate::web::serve)
         .layer(axum::middleware::from_fn(crate::serve::security_headers))
 }
 
-/// Response hardening for every route. The legacy console (`/ui`, `/issue/`,
-/// `/settings`) keeps `style-src 'unsafe-inline'` until M6 replaces it; the
-/// JSON API and the SPA get the strict policy.
+/// Response hardening for every route. All responses use the strict CSP.
 pub async fn security_headers(req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    let legacy = path.starts_with("/ui")
-        || path.starts_with("/issue/")
-        || path.starts_with("/settings");
     // API payloads (session state, M2b read data) must never be cached. Static
     // responses keep the cache policy their handler set.
     let api = path == "/api" || path.starts_with("/api/");
@@ -138,10 +140,9 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
         HeaderName::from_static("permissions-policy"),
         HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
-    let csp = if legacy { CSP_LEGACY } else { CSP_STRICT };
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(csp),
+        HeaderValue::from_static(CSP_STRICT),
     );
     if api {
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -408,7 +409,6 @@ mod tests {
     }
 
     const STRICT_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
-    const LEGACY_CSP: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'";
 
     fn header_str(response: &Response, name: header::HeaderName) -> String {
         response
@@ -489,64 +489,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_ui_requires_basic_auth() {
+    async fn legacy_console_redirects_to_the_spa() {
         let (_dir, app) = test_app();
-        let response = app
-            .oneshot(Request::builder().uri("/ui").body(Body::empty()).expect("request"))
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert!(response.headers().get(header::WWW_AUTHENTICATE).is_some());
+        for (uri, location) in [
+            ("/ui", "/"),
+            ("/ui/reopen", "/"),
+            ("/ui/sync", "/"),
+            ("/issue/abc123", "/issues/abc123"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT, "{uri}");
+            assert_eq!(
+                header_str(&response, header::LOCATION),
+                location,
+                "{uri}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn legacy_ui_accepts_basic_auth() {
-        use base64::Engine;
+    async fn legacy_write_routes_are_gone() {
         let (_dir, app) = test_app();
-        let credential =
-            base64::engine::general_purpose::STANDARD.encode("owner:secret");
+        for uri in ["/ui/reopen", "/ui/sync", "/settings/save", "/settings/restart"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_spa_uses_the_strict_csp() {
+        let (_dir, app) = test_app();
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/ui")
-                    .header(header::AUTHORIZATION, format!("Basic {credential}"))
+                    .uri("/settings")
                     .body(Body::empty())
                     .expect("request"),
             )
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(body_text(response).await.contains("山海经"));
-    }
-
-    // The M0 origin guard must remain wired around the legacy write routes:
-    // valid Basic auth alone must not let a cross-site POST through.
-    #[tokio::test]
-    async fn legacy_write_rejects_cross_origin_post_even_with_valid_basic_auth() {
-        use base64::Engine;
-        let (_dir, app) = test_app();
-        let credential = base64::engine::general_purpose::STANDARD.encode("owner:secret");
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/settings/save")
-                    .header(header::HOST, "localhost:7321")
-                    .header(header::ORIGIN, "https://evil.example")
-                    .header(header::AUTHORIZATION, format!("Basic {credential}"))
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_common_security_headers(&response);
-        assert_eq!(
-            header_str(&response, header::CONTENT_SECURITY_POLICY),
-            LEGACY_CSP
-        );
-        assert!(body_text(response).await.contains("cross-origin"));
+        let csp = header_str(&response, header::CONTENT_SECURITY_POLICY);
+        assert!(csp.contains("style-src 'self'"), "{csp}");
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
     }
 
     #[tokio::test]
@@ -611,33 +615,6 @@ mod tests {
             "no-store",
             "API responses must never be cached"
         );
-    }
-
-    // The legacy console keeps inline styles until M6, and headers must be
-    // applied even when auth rejects the request before a handler runs.
-    #[tokio::test]
-    async fn legacy_console_responses_carry_relaxed_security_headers() {
-        let (_dir, app) = test_app();
-        for path in ["/ui", "/settings", "/issue/abc123"] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(path)
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
-            assert_common_security_headers(&response);
-            let csp = header_str(&response, header::CONTENT_SECURITY_POLICY);
-            assert_eq!(csp, LEGACY_CSP, "{path}");
-            assert!(
-                csp.contains("style-src 'self' 'unsafe-inline'"),
-                "legacy CSP must allow inline styles: {csp}"
-            );
-        }
     }
 
     #[tokio::test]

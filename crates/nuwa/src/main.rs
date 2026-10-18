@@ -8,7 +8,6 @@ mod repair;
 mod serve;
 mod session;
 mod settings;
-mod ui;
 mod web;
 
 use std::path::{Path, PathBuf};
@@ -16,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context};
 
-/// serve 各路由共享的状态：（问题单库，UI 鉴权令牌）。
+/// Shared by the ingest route: the issue store and its report token.
 pub type Shared = (Arc<shanhaijing::Store>, Arc<Option<String>>);
 
 #[derive(Debug)]
