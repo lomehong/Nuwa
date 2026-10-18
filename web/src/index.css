@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+/*
+ * Minimal base only. Design tokens (`--bg`, `--surface`, severity stones, …)
+ * and the full light/dark palettes land in M3 Task 2 in `styles/tokens.css`.
+ */
+:root {
+  color-scheme: dark;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
