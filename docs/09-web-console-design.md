@@ -582,7 +582,8 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 - `run_id` 省略时取该指纹最近一次有 `session_dir` 的 run；指定时必须属于该指纹，否则 404。
 - 只解析 `kind=entry, type=message`；映射 user / assistant（thinking、text、toolCall）/ tool_result。
-- 单条内容截断 16KB；总读取上限 2MB（超出取末尾并标记 `truncated=true`）；按消息分页。
+- 单个块按 UTF-8 字节上限 16KB 截断（text / thinking / tool_result 与序列化后的 tool_call 参数），命中时该块带 `truncated: true`；超限的 tool_call 参数替换为 `<truncated: N bytes>` 短预览，避免单个调用占满页面。
+- 总读取上限 2MB（超出取末尾并标记 `truncated=true`）；按消息分页，`page_size` 默认 20、最大 100，非法值 422。
 - 无 run/无会话返回 `{ "data": [], "meta": { "empty": true } }`。
 
 #### 动作
@@ -591,18 +592,20 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 |---|---|---|---|---|
 | POST | `/issues/{fp}/reopen` | `{reason?}` | 204 | 404/409 |
 | POST | `/issues/{fp}/requeue` | `{force?: bool, reason?}` | 204 | 404/409/422 |
-| POST | `/sync` | — | 200 汇总 | 409（并发）/502 |
-| POST | `/runners/{id}/restart` | — | 202 | 404/501 |
+| POST | `/sync` | — | 200 汇总 | 409（并发）/500（本地存储）/502（缺 token/超时/上游） |
+| POST | `/runners/{id}/restart` | — | 202 | 404/422（unit 缺失或非法）/501 |
 
 `/sync` 响应：
 
 ```json
-{ "checked": 7, "merged": 1, "rejected": 0, "still_open": 6,
-  "errors": [{ "fingerprint": "…", "message": "actions runs 403" }] }
+{ "checked": 7, "merged": 1, "rejected": 0, "still_open": 5,
+  "errors": [{ "fingerprint": "…", "message": "pulls/12 502: Bad Gateway" }] }
 ```
 
 - 30s 超时；进程内互斥，已有 sync 时返回 409。
 - 只更新已存储的 PR 状态；不创建/合并 PR。
+- **单条 PR 查询失败不终止对账**：该问题单的结果行是 `error : <fp> — <message>`，进入 200 响应的 `errors[]`；`still_open` 只统计真实 open 的 PR，`skip` 仍表示 PR URL 无法解析。前端必须展示 `errors[]`。
+- `reconcile_all` 返回 `Err` 只代表本地存储/序列化失败 → 500 `internal`；缺 token 与 30s 超时仍为 502 `upstream_error`。
 
 #### 运行器
 
@@ -719,10 +722,14 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 { "target": "github", "values": { "NUWA_GITHUB_TOKEN": "…" } }   // values 可选
 ```
 
-- `values` 可携带尚未保存的字段值用于测试；缺省用当前 env。测试值不落盘、不写日志。
-- github：`GET https://api.github.com/rate_limit`（只验证令牌有效与可达）。
+- `values` 可携带尚未保存的字段值用于测试；缺省用当前 env。测试值不落盘、不写日志；未知键或字段类型错误 422。
+- github：`GET https://api.github.com/rate_limit`（只验证令牌有效与可达，不耗配额）。显式空 token 直接 422，不回落环境变量。
 - llm：调用 provider 的轻量端点；若需真实生成，body 明确 `max_tokens=1`，UI 二次确认并提示可能产生极小费用。
-- 返回 `{ ok, detail }`；失败 502 `upstream_error`。
+  - 空 `NUWA_MODEL` / `NUWA_BASE_URL` / `NUWA_PROVIDER` 表示"未设置"：回退环境变量，再回退 provider 默认值（provider 默认 `anthropic`）。
+  - zai：默认 base `https://open.bigmodel.cn/api/coding/paas/v4`、默认模型 `glm-5.3-flash`；`ZAI_API_KEY` 显式空值 422。
+  - anthropic：base 固定 `https://api.anthropic.com`（运行时忽略 `NUWA_BASE_URL`），模型必须取自 vendored catalog，未知或缺失回退 catalog 首项；`ANTHROPIC_API_KEY` 显式空值 422。
+  - faux：完全离线，无需 key 与网络。
+- 探测总超时 10s；返回 `{ ok, detail }`；网络失败/非 2xx/超时 502 `upstream_error`，不回显 provider 响应体（可能引用请求）。
 
 `POST /settings/restart`
 
@@ -733,7 +740,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - 有活动 run（`runs.finished_at IS NULL`）且 `force=false` → 409 `conflict`，body 含 `active_runs`。
 - 成功返回 `202`（已编排，尚未重启完成）。
 - 通过 `systemd-run --on-active=2 systemctl restart <units>` 编排；units = `NUWA_SERVE_UNIT`（默认 `nuwa-serve`）+ `NUWA_RUNNER_UNITS`（默认 `nuwa-work`，逗号分隔）。
-- unit 名先做白名单校验（`[A-Za-z0-9@._-]`），用参数数组执行，绝不拼 shell。
+- unit 名先做白名单校验（`[A-Za-z0-9@._:-]`），用参数数组执行，绝不拼 shell；非法值 422。
 - 非 systemd 环境返回 501；记录 `restart_requested` 审计。
 
 #### 系统
@@ -1007,7 +1014,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - serve 重启自身 + `NUWA_RUNNER_UNITS` 中的 work units。
 - 使用 `systemd-run --on-active=2 systemctl restart <unit...>`，确保 HTTP 响应先返回。
 - 活动 run 检查：`runs.finished_at IS NULL`；有则默认 409，前端展示列表并要求 force。
-- 命令执行使用参数数组；unit 名白名单校验；非 systemd 返回 501 并提示手动命令。
+- 命令执行使用参数数组；unit 名白名单 `[A-Za-z0-9@._:-]`，缺失/非法返回 422；非 systemd 返回 501 并提示手动命令。
 - 重启前写 `restart_requested` 审计；重启后进程启动时间/会话密钥自然更新。
 
 ## 14 · 实施计划

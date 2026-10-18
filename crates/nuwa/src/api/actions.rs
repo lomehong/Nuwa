@@ -117,10 +117,20 @@ pub async fn sync(State(state): State<AppState>) -> Response {
     let store = Arc::clone(&state.store);
     let now = crate::now_ms();
     match tokio::time::timeout(SYNC_TIMEOUT, ci::reconcile_all(&store, &token, now)).await {
+        // Per-issue GitHub failures arrive as `error` lines inside this
+        // summary (200 with `errors[]`), not as `Err` (docs/09 §9.2).
         Ok(Ok(lines)) => Json(ci::summarize_lines(&lines)).into_response(),
+        // `reconcile_all` only errors on local store failures now: GitHub
+        // unreachability is captured per issue. That is an internal failure,
+        // not an upstream one.
         Ok(Err(error)) => {
-            eprintln!("sync: reconcile failed: {error:#}");
-            ApiError::upstream("GitHub PR reconciliation failed").into_response()
+            eprintln!("sync: local reconcile failure: {error:#}");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "failed to reconcile PR state",
+            )
+            .into_response()
         }
         Err(_) => ApiError::upstream("sync timed out after 30s").into_response(),
     }
@@ -258,12 +268,13 @@ mod tests {
     use axum::http::{header, Request, StatusCode};
     use axum::response::Response;
     use axum::Router;
-    use shanhaijing::{IssueRow, RunnerHeartbeat, RunnerUpsert, State, Store};
+    use shanhaijing::{IssueRow, RunUpdate, RunnerHeartbeat, RunnerUpsert, State, Store};
     use tower::ServiceExt;
 
     use crate::serve::{build_app, AppState};
 
     const APP: &str = "example.com/actions";
+    const STRICT_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
     // ---- app / request helpers --------------------------------------------
 
@@ -352,11 +363,95 @@ mod tests {
             .expect("response")
     }
 
+    async fn put_json(
+        app: &Router,
+        uri: &str,
+        csrf: Option<&str>,
+        body: &str,
+    ) -> Response {
+        let mut request = Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header(header::HOST, "localhost:7321")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = csrf {
+            request = request
+                .header(header::COOKIE, format!("nuwa_csrf={token}"))
+                .header("x-nuwa-csrf", token);
+        }
+        app.clone()
+            .oneshot(request.body(Body::from(body.to_string())).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    async fn get(app: &Router, uri: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
     async fn json_body(response: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
         serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn header_str(response: &Response, name: header::HeaderName) -> String {
+        response
+            .headers()
+            .get(&name)
+            .unwrap_or_else(|| panic!("missing header {name}"))
+            .to_str()
+            .expect("ascii header")
+            .to_string()
+    }
+
+    fn assert_api_headers(response: &Response) {
+        assert_eq!(header_str(response, header::CACHE_CONTROL), "no-store");
+        assert_eq!(
+            header_str(response, header::CONTENT_SECURITY_POLICY),
+            STRICT_CSP
+        );
+        assert!(
+            header_str(response, header::CONTENT_TYPE).starts_with("application/json"),
+            "API responses must be JSON"
+        );
+    }
+
+    fn set_session_dir(store: &Store, run_id: &str, dir: &std::path::Path) {
+        store
+            .update_run(
+                run_id,
+                &RunUpdate {
+                    session_dir: Some(dir.display().to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("update run session dir");
+    }
+
+    fn write_session_jsonl(
+        root: &std::path::Path,
+        lines: &[serde_json::Value],
+    ) -> std::path::PathBuf {
+        let dir = root.join("--repo--");
+        std::fs::create_dir_all(&dir).expect("session dir");
+        let path = dir.join("2026-10-18T00-00-00-000Z_combined.jsonl");
+        let mut body = String::new();
+        for line in lines {
+            body.push_str(&line.to_string());
+            body.push('\n');
+        }
+        std::fs::write(&path, body).expect("write session jsonl");
+        path
     }
 
     fn issue_row(store: &Store, fingerprint: &str) -> IssueRow {
@@ -997,5 +1092,343 @@ mod tests {
                 "invalid unit must name the field: {value}"
             );
         }
+    }
+
+    // ---- M2c Task 6: combined actions/settings/system/transcript walk ----
+
+    /// One local-mode app over a temp DB/env/session tree: owner actions with
+    /// CSRF, sync without a token, settings read/write/test/restart guard,
+    /// system facts, and a parsed transcript with pagination and 404s.
+    #[tokio::test]
+    async fn m2c_combined_actions_settings_system_and_transcript() {
+        let (dir, app, store, seed) = seeded_app();
+        let csrf = csrf_token(&app).await;
+
+        // ---- CSRF is mandatory even in local mode ----
+        let response = post_json(
+            &app,
+            &format!("/api/v1/issues/{}/reopen", seed.rejected),
+            None,
+            "{}",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "forbidden");
+        assert_eq!(issue_row(&store, &seed.rejected).state, "rejected");
+
+        // ---- reopen / requeue with CSRF ----
+        let response = post_json(
+            &app,
+            &format!("/api/v1/issues/{}/reopen", seed.rejected),
+            Some(&csrf),
+            r#"{"reason":"combined reopen"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(issue_row(&store, &seed.rejected).state, "new");
+        let event = store
+            .latest_event(&seed.rejected)
+            .expect("event query")
+            .expect("event");
+        assert_eq!(event.kind, "state_changed");
+        assert_eq!(event.detail, "reopened by owner");
+        assert_eq!(event.actor.as_deref(), Some("owner"));
+
+        // Escalated issues reopen too, and the owner is cleared.
+        let response = post_json(
+            &app,
+            &format!("/api/v1/issues/{}/reopen", seed.escalated),
+            Some(&csrf),
+            "{}",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let escalated = issue_row(&store, &seed.escalated);
+        assert_eq!(escalated.state, "new");
+        assert!(escalated.owner_runner_id.is_none());
+
+        let response = post_json(
+            &app,
+            &format!("/api/v1/issues/{}/requeue", seed.stale),
+            Some(&csrf),
+            r#"{"reason":"combined requeue"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(issue_row(&store, &seed.stale).state, "new");
+        let event = store
+            .latest_event(&seed.stale)
+            .expect("event query")
+            .expect("event");
+        assert_eq!(event.kind, "requeued");
+        assert_eq!(event.detail, "stuck requeued by owner");
+
+        // A read carries no-store + the strict API CSP.
+        let response = get(&app, &format!("/api/v1/issues/{}", seed.rejected)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_api_headers(&response);
+        let detail = json_body(response).await;
+        assert_eq!(detail["issue"]["state"], "new");
+
+        // ---- sync without a GitHub token is an upstream 502, no network ----
+        {
+            let _env = env_guard().await;
+            let _restore = EnvRestore::save(&["NUWA_GITHUB_TOKEN", "GITHUB_TOKEN"]);
+            std::env::remove_var("NUWA_GITHUB_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            let response = post_json(&app, "/api/v1/sync", Some(&csrf), "").await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "upstream_error");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("NUWA_GITHUB_TOKEN")),
+                "{value}"
+            );
+        }
+
+        // ---- settings: masked read, validated write, audit ----
+        let env_path = dir.path().join("nuwa.env");
+        let original_env = "# combined fixture\n\
+                            NUWA_GITHUB_TOKEN=ghp_combinedsecret1234\n\
+                            NUWA_INTERVAL=30\n\
+                            LEGACY_KEY=keep-me\n";
+        std::fs::write(&env_path, original_env).expect("write env");
+
+        let response = get(&app, "/api/v1/settings").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_api_headers(&response);
+        let settings = json_body(response).await;
+        assert_eq!(settings["env_path"], env_path.display().to_string());
+        assert_eq!(settings["env_exists"], true);
+        let token = &settings["values"]["NUWA_GITHUB_TOKEN"];
+        assert_eq!(token["set"], true);
+        assert_eq!(token["last4"], "1234");
+        assert!(
+            token.get("value").is_none(),
+            "secrets must not echo: {token}"
+        );
+        assert_eq!(settings["values"]["NUWA_INTERVAL"]["value"], "30");
+        assert_eq!(settings["values"]["NUWA_INTERVAL"]["source"], "env");
+        assert_eq!(settings["unknown_keys"], serde_json::json!(["LEGACY_KEY"]));
+        assert!(
+            !settings.to_string().contains("ghp_combinedsecret1234"),
+            "secret value leaked into the response"
+        );
+
+        let response = put_json(
+            &app,
+            "/api/v1/settings",
+            Some(&csrf),
+            r#"{"values":{"NUWA_INTERVAL":"60"}}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["changed"], serde_json::json!(["NUWA_INTERVAL"]));
+        assert_eq!(value["restart_required"], true);
+        let text = std::fs::read_to_string(&env_path).expect("read env");
+        assert!(text.contains("NUWA_INTERVAL=60"), "{text}");
+        assert!(
+            text.contains("NUWA_GITHUB_TOKEN=ghp_combinedsecret1234"),
+            "an untouched secret must survive the write: {text}"
+        );
+        assert!(text.contains("# combined fixture"), "{text}");
+        let events = store.events_for("__config__", 10).expect("config events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "config_changed");
+        assert_eq!(events[0].detail, "NUWA_INTERVAL");
+        assert_eq!(events[0].actor.as_deref(), Some("owner"));
+
+        let response = get(&app, "/api/v1/settings").await;
+        let after = json_body(response).await;
+        assert_eq!(after["values"]["NUWA_INTERVAL"]["value"], "60");
+        assert_eq!(after["values"]["NUWA_INTERVAL"]["source"], "env");
+        assert_eq!(
+            after["last_changes"][0]["key"], "NUWA_INTERVAL",
+            "the write must be audited"
+        );
+
+        // ---- settings test: invalid target / empty key are 422, offline ----
+        let response = post_json(
+            &app,
+            "/api/v1/settings/test",
+            Some(&csrf),
+            r#"{"target":"bogus"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "validation_failed");
+        assert!(value["error"]["fields"]["target"].is_string(), "{value}");
+
+        for body in [
+            r#"{"target":"github","values":{"NUWA_GITHUB_TOKEN":""}}"#,
+            r#"{"target":"llm","values":{"NUWA_PROVIDER":"zai","ZAI_API_KEY":""}}"#,
+            r#"{"target":"llm","values":{"NUWA_PROVIDER":"anthropic","ANTHROPIC_API_KEY":""}}"#,
+        ] {
+            let response = post_json(&app, "/api/v1/settings/test", Some(&csrf), body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body}"
+            );
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "validation_failed", "{body}");
+        }
+
+        // faux is the offline provider: a successful probe needs no network.
+        let response = post_json(
+            &app,
+            "/api/v1/settings/test",
+            Some(&csrf),
+            r#"{"target":"llm","values":{"NUWA_PROVIDER":"faux"}}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["ok"], true);
+
+        // ---- restart guard: open runs need force ----
+        let response = post_json(
+            &app,
+            "/api/v1/settings/restart",
+            Some(&csrf),
+            r#"{"force":false}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "conflict");
+        let active = value["active_runs"].as_array().expect("active runs");
+        assert!(!active.is_empty(), "the seed leaves runs open");
+        assert!(active.iter().all(|run| run["id"].is_string()), "{value}");
+        assert!(
+            store
+                .events_for("__system__", 10)
+                .expect("events")
+                .is_empty(),
+            "a guarded restart must not schedule or audit"
+        );
+
+        // ---- system facts ----
+        let response = get(&app, "/api/v1/system").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_api_headers(&response);
+        let system = json_body(response).await;
+        assert_eq!(system["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(system["local_mode"], true);
+        assert!(system["uptime_secs"].is_u64());
+        assert!(
+            system["db_size_bytes"]
+                .as_u64()
+                .is_some_and(|size| size > 0),
+            "the temp DB has a size: {system}"
+        );
+        let units: Vec<&str> = system["services"]
+            .as_array()
+            .expect("services")
+            .iter()
+            .map(|service| service["unit"].as_str().expect("unit"))
+            .collect();
+        assert_eq!(units, vec!["nuwa-serve", "nuwa-work"]);
+
+        // ---- transcript: blocks, pagination, 404 ----
+        let transcript_fp = report(&store, &signal("combined transcript"), crate::now_ms());
+        start_run(
+            &store,
+            "run-combined-transcript",
+            &transcript_fp,
+            "runner-combined",
+            crate::now_ms(),
+        );
+        let session_root = dir.path().join("sessions").join("run-combined-transcript");
+        write_session_jsonl(
+            &session_root,
+            &[
+                serde_json::json!({
+                    "kind": "entry", "type": "message", "seq": 1, "timestamp": 1_000,
+                    "message": { "kind": "user", "role": "user", "content": "fix the bug" }
+                }),
+                serde_json::json!({
+                    "kind": "entry", "type": "message", "seq": 2, "timestamp": 2_000,
+                    "message": {
+                        "kind": "assistant", "role": "assistant",
+                        "content": [
+                            { "type": "thinking", "thinking": "read the code" },
+                            { "type": "text", "text": "I will read calc.go" },
+                            { "type": "toolCall", "name": "read",
+                              "arguments": { "path": "calc.go" } }
+                        ]
+                    }
+                }),
+                serde_json::json!({
+                    "kind": "entry", "type": "message", "seq": 3, "timestamp": 3_000,
+                    "message": {
+                        "kind": "tool_result", "role": "toolResult", "toolName": "read",
+                        "content": [{ "type": "text", "text": "package main" }],
+                        "isError": false
+                    }
+                }),
+            ],
+        );
+        set_session_dir(&store, "run-combined-transcript", &session_root);
+
+        let base = format!("/api/v1/issues/{transcript_fp}/transcript?page_size=1");
+        let response = get(&app, &format!("{base}&page=1")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_api_headers(&response);
+        let page = json_body(response).await;
+        assert_eq!(
+            page["meta"],
+            serde_json::json!({
+                "page": 1, "page_size": 1, "total": 3, "truncated": false, "empty": false
+            })
+        );
+        assert_eq!(page["data"][0]["seq"], 1);
+        assert_eq!(page["data"][0]["role"], "user");
+        assert_eq!(
+            page["data"][0]["blocks"],
+            serde_json::json!([{ "type": "text", "text": "fix the bug" }])
+        );
+
+        let response = get(&app, &format!("{base}&page=2")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = json_body(response).await;
+        assert_eq!(page["data"][0]["seq"], 2);
+        let blocks = page["data"][0]["blocks"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[2]["type"], "tool_call");
+        assert_eq!(blocks[2]["arguments"]["path"], "calc.go");
+
+        let response = get(&app, &format!("{base}&page=3")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = json_body(response).await;
+        assert_eq!(page["data"][0]["seq"], 3);
+        assert_eq!(page["data"][0]["role"], "tool");
+        assert_eq!(page["data"][0]["blocks"][0]["is_error"], false);
+
+        for (query, message) in [
+            ("run_id=does-not-exist", "run not found"),
+            // A run of another fingerprint is not addressable here.
+            ("run_id=run-slow", "run not found"),
+        ] {
+            let response = get(
+                &app,
+                &format!("/api/v1/issues/{transcript_fp}/transcript?{query}"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{query}");
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["message"], message, "{query}");
+        }
+        let response = get(&app, "/api/v1/issues/does-not-exist/transcript").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["message"], "issue not found");
     }
 }

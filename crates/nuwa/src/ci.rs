@@ -178,7 +178,7 @@ pub struct SyncSummary {
     pub merged: u64,
     pub rejected: u64,
     pub still_open: u64,
-    /// Lines the reconciler could not act on (`skip`), plus unknown prefixes.
+    /// Per-issue failures (`skip`/`error` lines), plus unknown prefixes.
     pub errors: Vec<SyncError>,
 }
 
@@ -189,8 +189,9 @@ pub struct SyncError {
 }
 
 /// Count `reconcile_all` result lines by their fixed prefixes: `merged`,
-/// `rejected`, `still open` and `skip` (the reconciler's only error line).
-/// Unknown prefixes become errors instead of vanishing from the counters.
+/// `rejected`, `still open`, plus the two error lines `skip` (unparsable PR
+/// url) and `error` (per-issue GitHub failure, docs/09 §9.2). Unknown prefixes
+/// become errors too instead of vanishing from the counters.
 pub fn summarize_lines(lines: &[String]) -> SyncSummary {
     let mut summary = SyncSummary {
         checked: lines.len() as u64,
@@ -209,7 +210,9 @@ pub fn summarize_lines(lines: &[String]) -> SyncSummary {
             "merged" => summary.merged += 1,
             "rejected" => summary.rejected += 1,
             "still open" => summary.still_open += 1,
-            "skip" => {
+            // Both carry `fingerprint — message`; both stay 200-level errors
+            // in the console summary, not failed reconciles.
+            "skip" | "error" => {
                 let (fingerprint, message) = rest
                     .split_once(" — ")
                     .map(|(fp, message)| (fp.trim().to_string(), message.trim().to_string()))
@@ -287,7 +290,12 @@ pub async fn reconcile_all(
                     row.fingerprint
                 ));
             }
-            _ => out.push(format!("still open : {} — PR #{number}", row.fingerprint)),
+            Ok(_) => out.push(format!("still open : {} — PR #{number}", row.fingerprint)),
+            // Per-issue GitHub failures stay 200-level for the console: the
+            // summary's `errors[]` surfaces them, and the other issues are
+            // still reconciled (docs/09 §9.2). Only local store failures
+            // abort the whole pass.
+            Err(error) => out.push(format!("error      : {} — {error}", row.fingerprint)),
         }
     }
     Ok(out)
@@ -323,6 +331,40 @@ mod tests {
                 fingerprint: "fp-e".to_string(),
                 message: "unparsable PR url not-a-url".to_string(),
             }]
+        );
+    }
+
+    // The full result vocabulary: counters for terminal/non-terminal states
+    // and both per-issue error lines surfaced in `errors[]`.
+    #[test]
+    fn summarize_lines_parses_merged_rejected_open_skip_and_error() {
+        let lines = vec![
+            "merged     : fp-a → https://github.com/o/r/pull/1".to_string(),
+            "rejected   : fp-b (PR #2 closed without merge)".to_string(),
+            "still open : fp-c — PR #3".to_string(),
+            "skip       : fp-d — unparsable PR url nope".to_string(),
+            "error      : fp-e — pulls/5 502: Bad Gateway".to_string(),
+        ];
+
+        let summary = summarize_lines(&lines);
+
+        assert_eq!(summary.checked, 5, "every result line is checked");
+        assert_eq!(summary.merged, 1);
+        assert_eq!(summary.rejected, 1);
+        assert_eq!(summary.still_open, 1);
+        assert_eq!(
+            summary.errors,
+            vec![
+                SyncError {
+                    fingerprint: "fp-d".to_string(),
+                    message: "unparsable PR url nope".to_string(),
+                },
+                SyncError {
+                    fingerprint: "fp-e".to_string(),
+                    message: "pulls/5 502: Bad Gateway".to_string(),
+                },
+            ],
+            "GitHub per-issue failures must not be folded into still_open"
         );
     }
 
