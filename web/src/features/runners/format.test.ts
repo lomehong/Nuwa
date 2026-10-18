@@ -17,12 +17,20 @@ describe("runner status", () => {
     expect(runnerStatusVariant(runner, NOW)).toBe("danger");
   });
 
-  it("maps live statuses to operator vocabulary", () => {
-    expect(runnerStatusLabel(makeRunner({ status: "starting" }), NOW)).toBe("启动中");
-    expect(runnerStatusLabel(makeRunner({ status: "idle" }), NOW)).toBe("待命");
-    expect(runnerStatusLabel(makeRunner({ status: "standing_down" }), NOW)).toBe("配额待命");
-    expect(runnerStatusLabel(makeRunner({ status: "error" }), NOW)).toBe("异常");
-    expect(runnerStatusLabel(makeRunner({ status: "working" }), NOW)).toBe("工作中");
+  it("maps live statuses to operator vocabulary and badge tones", () => {
+    const live = (status: string) => makeRunner({ status, heartbeat_at_ms: NOW });
+
+    expect(runnerStatusLabel(live("starting"), NOW)).toBe("启动中");
+    expect(runnerStatusLabel(live("idle"), NOW)).toBe("待命");
+    expect(runnerStatusLabel(live("standing_down"), NOW)).toBe("配额待命");
+    expect(runnerStatusLabel(live("error"), NOW)).toBe("异常");
+    expect(runnerStatusLabel(live("working"), NOW)).toBe("工作中");
+
+    expect(runnerStatusVariant(live("working"), NOW)).toBe("info");
+    expect(runnerStatusVariant(live("standing_down"), NOW)).toBe("warning");
+    expect(runnerStatusVariant(live("starting"), NOW)).toBe("success");
+    expect(runnerStatusVariant(live("idle"), NOW)).toBe("success");
+    expect(runnerStatusVariant(live("unknown"), NOW)).toBe("neutral");
   });
 
   it("treats an explicit offline flag or a future heartbeat as offline only when flagged", () => {

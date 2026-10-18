@@ -188,8 +188,8 @@ function SidebarFooter({ localMode }: { localMode: boolean }) {
 /**
  * Compact health strip fed by `/overview` (docs/09 §10.1). It shares the
  * overview query (and key) with the page: the 10s poll pauses while the tab is
- * hidden and refreshes immediately on focus. Values are links only where a
- * page exists today; runner/settings links arrive with M4/M5.
+ * hidden and refreshes immediately on focus. Runner and issue counts link to
+ * their pages; settings links arrive with M5.
  */
 export function HealthStrip() {
   const overview = useOverviewQuery();
@@ -226,8 +226,9 @@ export function HealthStrip() {
           <StatusDot tone="success" />
           serve 正常
         </span>
-        <span
-          className={PILL_CLASS}
+        <Link
+          to="/runners"
+          className={PILL_LINK_CLASS}
           title={`运行器在线 ${health.runners_online}/${health.runners_total}`}
         >
           <Cpu aria-hidden="true" className="size-3.5 text-text-muted" />
@@ -236,7 +237,7 @@ export function HealthStrip() {
           <span className="font-mono tabular-nums">
             {health.runners_online}/{health.runners_total}
           </span>
-        </span>
+        </Link>
         <Link
           to="/issues?state=new"
           className={PILL_LINK_CLASS}
@@ -260,11 +261,15 @@ export function HealthStrip() {
           <span className="font-mono tabular-nums">{health.prs_today}</span>
         </span>
         {health.standing_down > 0 ? (
-          <span className={PILL_CLASS} title="配额用完、进入待命的运行器数量">
+          <Link
+            to="/runners"
+            className={PILL_LINK_CLASS}
+            title="查看配额待命的运行器"
+          >
             <StatusDot tone="warning" />
             <span>配额待命</span>
             <span className="font-mono tabular-nums">{health.standing_down}</span>
-          </span>
+          </Link>
         ) : null}
         {overview.isError || overview.isRefetchError ? (
           <button
@@ -435,8 +440,8 @@ export function AppShell() {
                 variant="secondary"
                 size="sm"
                 disabled
-                aria-label="全局搜索（M4 提供）"
-                title="全局搜索将在 M4 提供"
+                aria-label="全局搜索（M6 提供）"
+                title="全局搜索将在 M6 提供"
                 className="w-60 justify-start font-normal text-text-muted"
               >
                 <Search aria-hidden="true" className="size-3.5 shrink-0" />

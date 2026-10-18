@@ -28,7 +28,7 @@ afterEach(() => {
 });
 
 describe("AppShell", () => {
-  it("renders the sidebar nav and marks future pages as Soon", async () => {
+  it("renders the sidebar nav with settings marked as Soon", async () => {
     signedIn();
     renderApp("/");
 
@@ -38,25 +38,32 @@ describe("AppShell", () => {
       "page",
     );
     expect(within(nav).getByRole("link", { name: "问题单" })).toBeInTheDocument();
-    for (const label of ["运行器", "活动"]) {
-      expect(within(nav).getByRole("link", { name: label })).toBeInTheDocument();
-    }
-    expect(within(nav).getByText("设置").closest("[aria-disabled='true']")).not.toBeNull();
-    expect(within(nav).getAllByText("Soon")).toHaveLength(1);
-  });
-
-  it("activates runners and events navigation and marks settings as soon", async () => {
-    signedIn();
-    renderApp("/");
-
-    const nav = await screen.findByRole("navigation", { name: "主导航" });
     expect(within(nav).getByRole("link", { name: "运行器" })).toHaveAttribute(
       "href",
       "/runners",
     );
-    expect(within(nav).getByRole("link", { name: "活动" })).toHaveAttribute("href", "/events");
+    expect(within(nav).getByRole("link", { name: "活动" })).toHaveAttribute(
+      "href",
+      "/events",
+    );
     expect(within(nav).getByText("设置").closest("[aria-disabled='true']")).not.toBeNull();
     expect(within(nav).getAllByText("Soon")).toHaveLength(1);
+  });
+
+  it("renders the runners route with the page title and placeholder", async () => {
+    signedIn();
+    renderApp("/runners");
+
+    expect(await screen.findByRole("heading", { level: 1, name: "运行器" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 2, name: "运行器" })).toBeInTheDocument();
+  });
+
+  it("renders the events route with the page title and placeholder", async () => {
+    signedIn();
+    renderApp("/events");
+
+    expect(await screen.findByRole("heading", { level: 1, name: "活动" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 2, name: "活动" })).toBeInTheDocument();
   });
 
   it("renders the health strip from /overview", async () => {
@@ -101,6 +108,14 @@ describe("AppShell", () => {
     ).toHaveAttribute("href", "/issues?state=triggered,fixing");
     expect(within(region).getByText("今日 PR").parentElement).toHaveTextContent("今日 PR2");
     expect(within(region).getByText("配额待命").parentElement).toHaveTextContent("配额待命1");
+    expect(within(region).getByRole("link", { name: /^运行器\s*在线\s*1\/2$/ })).toHaveAttribute(
+      "href",
+      "/runners",
+    );
+    expect(within(region).getByRole("link", { name: /^配额待命\s*1$/ })).toHaveAttribute(
+      "href",
+      "/runners",
+    );
   });
 
   it("logs out through the API and returns to the login page", async () => {
