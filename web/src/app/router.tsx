@@ -1,7 +1,7 @@
 import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 
 import { AuthLoading } from "../components/AuthLoading";
-import { IssueDetailPage } from "../features/issues/IssueDetailPage";
+import { IssueDetailPage } from "../features/issue-detail/IssueDetailPage";
 import { IssuesPage } from "../features/issues/IssuesPage";
 import { LoginPage } from "../features/login/LoginPage";
 import { OverviewPage } from "../features/overview/OverviewPage";

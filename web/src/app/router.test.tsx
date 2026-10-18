@@ -5,9 +5,11 @@ import { describe, expect, it } from "vitest";
 import {
   makeIssue,
   mockEvents,
+  mockIssueDetail,
   mockIssues,
   mockMe,
   mockOverviewResources,
+  mockTranscript,
   mockTrends,
   mockUnauthorizedMe,
   server,
@@ -75,15 +77,27 @@ describe("AppRoutes", () => {
     ).toBeInTheDocument();
   });
 
-  it("renders the issue detail placeholder with the fingerprint", async () => {
-    server.use(mockMe(), ...mockOverviewResources());
+  it("renders the issue detail with the fingerprint from the route", async () => {
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockIssueDetail({
+        issue: makeIssue({
+          fingerprint: "fp-123",
+          title: "Router detail issue",
+        }),
+      }),
+      mockTranscript(),
+    );
 
     renderApp("/issues/fp-123");
 
     expect(
       await screen.findByRole("heading", { level: 1, name: "问题单详情" }),
     ).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "Router detail issue" }),
+    ).toBeInTheDocument();
     expect(screen.getAllByText("fp-123").length).toBeGreaterThan(0);
-    expect(screen.getByText("问题单详情即将上线")).toBeInTheDocument();
   });
 });
