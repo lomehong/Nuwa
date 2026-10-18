@@ -1,0 +1,307 @@
+/*
+ * Nuwa design tokens — docs/09-web-console-design.md §11.
+ *
+ * Every colour is exposed twice:
+ *   - raw semantic tokens (`--bg`, `--surface`, `--stone-critical`, …) that
+ *     carry the dark/light values from the design document, and
+ *   - Tailwind v4 theme entries (`--color-bg`, …) so utilities such as
+ *     `bg-surface` / `text-text-secondary` resolve through the raw tokens and
+ *     therefore follow `[data-theme]` without inline styles.
+ *
+ * Severity and issue-state colours are selected by class (`sev-critical`,
+ * `state-new`, …) so dynamic data never needs a `style` attribute, which the
+ * strict production CSP forbids.
+ */
+
+@theme {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-text: var(--text);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-on-danger: var(--on-danger);
+  --color-info: var(--info);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-scrim: var(--scrim);
+  --color-stone-critical: var(--stone-critical);
+  --color-stone-high: var(--stone-high);
+  --color-stone-medium: var(--stone-medium);
+  --color-stone-low: var(--stone-low);
+  --color-stone-unknown: var(--stone-unknown);
+
+  --font-sans: var(--font-family-sans);
+  --font-mono: var(--font-family-mono);
+
+  /* Type scale: 12 / 13 / 14 / 16 / 20 / 24 / 32 (docs/09 §11.3). */
+  --text-caption: 12px;
+  --text-caption--line-height: 1.4;
+  --text-body-sm: 13px;
+  --text-body-sm--line-height: 1.5;
+  --text-body: 14px;
+  --text-body--line-height: 1.55;
+  --text-heading-sm: 16px;
+  --text-heading-sm--line-height: 1.4;
+  --text-heading: 20px;
+  --text-heading--line-height: 1.3;
+  --text-title: 24px;
+  --text-title--line-height: 1.25;
+  --text-display: 32px;
+  --text-display--line-height: 1.2;
+
+  /* 4px spacing baseline is Tailwind's default `--spacing`. */
+  --radius-card: 8px;
+  --radius-modal: 12px;
+  --container-page: 1440px;
+  --shadow-overlay: var(--overlay-shadow);
+}
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --font-family-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-family-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    Consolas, "Liberation Mono", "Courier New", monospace;
+
+  /* docs/09 §11.1 — dark palette */
+  --bg: #0a0d14;
+  --surface: #111624;
+  --raised: #161d2e;
+  --border: #232b3d;
+  --border-strong: #303a50;
+  --text: #e9eef7;
+  --text-secondary: #a5b1c6;
+  --text-muted: #6c7a92;
+  --accent: #7c9cff;
+  --info: #62b6ff;
+  --success: #3ddc97;
+  --warning: #f2b84b;
+  --danger: #ff6b6b;
+  --on-accent: #0a0d14;
+  --on-danger: #1a0a0a;
+  --scrim: rgb(2 6 16 / 0.66);
+
+  /* docs/09 §11.2 — 五色石 (severity) */
+  --stone-critical: #f06565;
+  --stone-high: #e8873a;
+  --stone-medium: #e9c46a;
+  --stone-low: #52d3a8;
+  --stone-unknown: #a98bff;
+
+  /* docs/09 §11.2 — issue states */
+  --state-new: #52d3a8;
+  --state-triggered: #e9c46a;
+  --state-fixing: #62b6ff;
+  --state-pr_open: #a98bff;
+  --state-merged: #3ddc97;
+  --state-rejected: #ff6b6b;
+  --state-escalated: #ff8a5c;
+
+  --overlay-shadow: 0 24px 64px rgb(0 0 0 / 0.55), 0 4px 16px rgb(0 0 0 / 0.35);
+  --motion-fast: 120ms;
+  --motion-base: 180ms;
+  --motion-ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* docs/09 §11.1 — light palette */
+  --bg: #f6f7fb;
+  --surface: #ffffff;
+  --raised: #f0f2f8;
+  --border: #e2e6ef;
+  --border-strong: #cbd3e1;
+  --text: #131a26;
+  --text-secondary: #4e5b70;
+  --text-muted: #7a879b;
+  --accent: #3d5bd9;
+  --info: #1f6fd0;
+  --success: #0e8a5f;
+  --warning: #9a6700;
+  --danger: #c62828;
+  --on-accent: #ffffff;
+  --on-danger: #ffffff;
+  --scrim: rgb(15 23 42 / 0.4);
+
+  /* The stones keep the §11.2 hues; state text uses darker variants so the
+     label still clears WCAG AA on the light surface. */
+  --state-new: #0b7a54;
+  --state-triggered: #8a5a00;
+  --state-fixing: #1f6fd0;
+  --state-pr_open: #6d4ad1;
+  --state-merged: #0e7a55;
+  --state-rejected: #c62828;
+  --state-escalated: #c2410c;
+
+  --overlay-shadow: 0 24px 64px rgb(15 23 42 / 0.18), 0 4px 16px rgb(15 23 42 / 0.08);
+}
+
+@layer components {
+  /* Severity: shape/icon + text + colour (never colour alone). */
+  .severity-stone {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: nowrap;
+  }
+
+  .severity-stone__mark {
+    flex: none;
+    color: var(--sev-color, var(--stone-unknown));
+  }
+
+  .severity-stone__label {
+    font-weight: 500;
+  }
+
+  .sev-critical {
+    --sev-color: var(--stone-critical);
+  }
+
+  .sev-high {
+    --sev-color: var(--stone-high);
+  }
+
+  .sev-medium {
+    --sev-color: var(--stone-medium);
+  }
+
+  .sev-low {
+    --sev-color: var(--stone-low);
+  }
+
+  .sev-unknown {
+    --sev-color: var(--stone-unknown);
+  }
+
+  /* Issue state badge: dot + label + tinted outline. */
+  .state-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 8px;
+    border: 1px solid color-mix(in srgb, var(--state-color) 40%, transparent);
+    border-radius: 9999px;
+    background-color: color-mix(in srgb, var(--state-color) 12%, transparent);
+    color: var(--state-color);
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.4;
+    white-space: nowrap;
+  }
+
+  .state-badge__dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background-color: var(--state-color);
+  }
+
+  .state-new {
+    --state-color: var(--state-new);
+  }
+
+  .state-triggered {
+    --state-color: var(--state-triggered);
+  }
+
+  .state-fixing {
+    --state-color: var(--state-fixing);
+  }
+
+  .state-pr_open {
+    --state-color: var(--state-pr_open);
+  }
+
+  .state-merged {
+    --state-color: var(--state-merged);
+  }
+
+  .state-rejected {
+    --state-color: var(--state-rejected);
+  }
+
+  .state-escalated {
+    --state-color: var(--state-escalated);
+  }
+
+  .ui-button {
+    touch-action: manipulation;
+  }
+
+  /* docs/09 §11.6 — touch targets stay at least 44px on touch pointers. */
+  @media (pointer: coarse) {
+    .ui-button {
+      min-height: 44px;
+    }
+  }
+
+  /* Motion is limited to layer changes (docs/09 §11.5). */
+  .nuwa-toast {
+    animation: nuwa-toast-in var(--motion-fast) var(--motion-ease);
+  }
+
+  .nuwa-dialog {
+    animation: nuwa-dialog-in var(--motion-base) var(--motion-ease);
+  }
+
+  .nuwa-backdrop {
+    animation: nuwa-fade-in var(--motion-fast) var(--motion-ease);
+  }
+}
+
+@keyframes nuwa-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes nuwa-dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes nuwa-fade-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nuwa-toast,
+  .nuwa-dialog,
+  .nuwa-backdrop {
+    animation: none;
+  }
+}

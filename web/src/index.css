@@ -1,19 +1,65 @@
 @import "tailwindcss";
+@import "./styles/tokens.css";
 
-/*
- * Minimal base only. Design tokens (`--bg`, `--surface`, severity stones, …)
- * and the full light/dark palettes land in M3 Task 2 in `styles/tokens.css`.
- */
-:root {
-  color-scheme: dark;
-}
+@layer base {
+  html {
+    min-height: 100%;
+    background-color: var(--bg);
+  }
 
-[data-theme="light"] {
-  color-scheme: light;
-}
+  body {
+    min-height: 100vh;
+    margin: 0;
+    background-color: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
 
-html,
-body,
-#root {
-  min-height: 100%;
+  #root {
+    min-height: 100vh;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-weight: 600;
+  }
+
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-mono);
+  }
+
+  /* docs/09 §11.6 — visible 2px accent focus ring for keyboard users. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--accent);
+    color: var(--on-accent);
+  }
+
+  /* docs/09 §11.5 — honour reduced-motion for every transition/animation,
+     including utilities such as `animate-pulse` on skeletons. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
 }
