@@ -272,13 +272,6 @@
     touch-action: manipulation;
   }
 
-  /* docs/09 §11.6 — touch targets stay at least 44px on touch pointers. */
-  @media (pointer: coarse) {
-    .ui-button {
-      min-height: 44px;
-    }
-  }
-
   /* Motion is limited to layer changes (docs/09 §11.5). */
   .nuwa-toast {
     animation: nuwa-toast-in var(--motion-fast) var(--motion-ease);

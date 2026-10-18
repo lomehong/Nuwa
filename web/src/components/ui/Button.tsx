@@ -12,8 +12,10 @@ const VARIANT_CLASSES: Record<ButtonVariant, string> = {
   danger: "border-danger bg-danger text-on-danger hover:bg-danger/90",
 };
 
+// docs/09 §11.6: keep a 44px touch floor, and only shrink to 36px on fine
+// (mouse-like) pointers, where precision is high and space is tight.
 const SIZE_CLASSES: Record<ButtonSize, string> = {
-  sm: "min-h-9 gap-1.5 px-3 text-caption",
+  sm: "min-h-11 pointer-fine:min-h-9 gap-1.5 px-3 text-caption",
   md: "min-h-11 gap-2 px-4 text-body",
 };
 

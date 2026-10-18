@@ -307,6 +307,28 @@ export function AppShell() {
     setDrawerOpen(false);
   }, [location.pathname]);
 
+  // The drawer portal is `lg:hidden`, but the modal lock (inert + body scroll
+  // lock) is not: if the viewport grows past 1024px while the drawer is open,
+  // it would become invisible with the lock still applied and no visible way
+  // to close it. Close as soon as the desktop breakpoint starts matching.
+  useEffect(() => {
+    if (!drawerOpen || typeof window.matchMedia !== "function") {
+      return;
+    }
+    const query = window.matchMedia("(min-width: 1024px)");
+    if (query.matches) {
+      closeDrawer();
+      return;
+    }
+    const handleChange = (event: MediaQueryListEvent) => {
+      if (event.matches) {
+        closeDrawer();
+      }
+    };
+    query.addEventListener("change", handleChange);
+    return () => query.removeEventListener("change", handleChange);
+  }, [drawerOpen, closeDrawer]);
+
   async function handleLogout() {
     if (loggingOut) {
       return;

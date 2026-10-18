@@ -1,6 +1,6 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { THEME_STORAGE_KEY } from "../lib/theme";
 import {
@@ -229,5 +229,68 @@ describe("AppShell", () => {
       expect(screen.queryByText(/无法连接服务器。/)).not.toBeInTheDocument(),
     );
     expect(await screen.findByText("serve 正常")).toBeInTheDocument();
+  });
+
+  it("closes the drawer when the viewport crosses the desktop breakpoint", async () => {
+    signedIn();
+
+    type ChangeListener = (event: MediaQueryListEvent) => void;
+    const changeListeners = new Set<ChangeListener>();
+    const desktopQuery = {
+      matches: false,
+      media: "(min-width: 1024px)",
+      onchange: null,
+      addEventListener: vi.fn((type: string, listener: ChangeListener) => {
+        if (type === "change") {
+          changeListeners.add(listener);
+        }
+      }),
+      removeEventListener: vi.fn((type: string, listener: ChangeListener) => {
+        if (type === "change") {
+          changeListeners.delete(listener);
+        }
+      }),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(() => true),
+    };
+    // jsdom has no matchMedia and theme initialisation also asks for
+    // `(prefers-color-scheme: light)`, so answer every query with the same list.
+    vi.stubGlobal("matchMedia", vi.fn(() => desktopQuery));
+
+    try {
+      const { container } = renderApp("/");
+      await screen.findByRole("heading", { level: 1, name: "总览" });
+      await screen.findByText("暂无活动记录");
+      await screen.findByText("暂无趋势数据");
+
+      const toggle = screen.getByRole("button", { name: "打开导航菜单" });
+      fireEvent.click(toggle);
+
+      expect(screen.getByRole("dialog", { name: "导航菜单" })).toBeInTheDocument();
+      expect(document.body).toHaveClass("nuwa-scroll-lock");
+      expect(container).toHaveAttribute("inert");
+      expect(changeListeners.size).toBe(1);
+
+      desktopQuery.matches = true;
+      act(() => {
+        for (const listener of changeListeners) {
+          listener({ matches: true } as MediaQueryListEvent);
+        }
+      });
+
+      await waitFor(() =>
+        expect(screen.queryByRole("dialog", { name: "导航菜单" })).not.toBeInTheDocument(),
+      );
+      expect(document.body).not.toHaveClass("nuwa-scroll-lock");
+      expect(container).not.toHaveAttribute("inert");
+      expect(toggle).toHaveAttribute("aria-expanded", "false");
+      expect(desktopQuery.removeEventListener).toHaveBeenCalledWith(
+        "change",
+        expect.any(Function),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

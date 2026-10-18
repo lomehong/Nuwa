@@ -23,4 +23,21 @@ describe("Button", () => {
     expect(button).toBeDisabled();
     expect(button).toHaveAttribute("aria-busy", "true");
   });
+
+  it("keeps a 44px touch floor and only compacts small buttons on fine pointers", () => {
+    render(
+      <>
+        <Button size="sm">小号</Button>
+        <Button size="md">中号</Button>
+      </>,
+    );
+
+    const small = screen.getByRole("button", { name: "小号" });
+    expect(small).toHaveClass("min-h-11");
+    expect(small).toHaveClass("pointer-fine:min-h-9");
+
+    const medium = screen.getByRole("button", { name: "中号" });
+    expect(medium).toHaveClass("min-h-11");
+    expect(medium).not.toHaveClass("pointer-fine:min-h-9");
+  });
 });
