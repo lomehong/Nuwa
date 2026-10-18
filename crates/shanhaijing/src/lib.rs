@@ -1542,6 +1542,37 @@ impl Store {
         }
     }
 
+    /// One run by id, scoped to its issue. Unlike `runs_for(.., N)` this is
+    /// not limited to a recent-run window, so an old run stays addressable.
+    pub fn run_for(&self, fingerprint: &str, id: &str) -> ShanResult<Option<RunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs WHERE id=?1 AND fingerprint=?2"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params![id, fingerprint])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::run_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Newest run of an issue that wrote a session directory — the
+    /// transcript's default run. A run still in flight has no `session_dir`
+    /// yet, so the newest run with one is the last readable transcript.
+    pub fn latest_run_with_session(&self, fingerprint: &str) -> ShanResult<Option<RunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs
+             WHERE fingerprint=?1 AND session_dir IS NOT NULL AND TRIM(session_dir) <> ''
+             ORDER BY started_at DESC, id DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query([fingerprint])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::run_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn runs_for(&self, fingerprint: &str, limit: u32) -> ShanResult<Vec<RunRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
@@ -2088,6 +2119,65 @@ mod tests {
             .find(|issue| issue.fingerprint == fp)
             .expect("issue row");
         assert_eq!(issue.ci_verdict.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn run_for_is_scoped_to_the_issue_and_ignores_the_recent_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let fp = match store
+            .report_signal(&issue_signal("old run", "Average"), 1)
+            .expect("report")
+        {
+            ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("expected NewIssue, got {other:?}"),
+        };
+        let other = match store
+            .report_signal(&issue_signal("other run", "Median"), 1)
+            .expect("report")
+        {
+            ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("expected NewIssue, got {other:?}"),
+        };
+        assert_ne!(fp, other);
+
+        seed_run(&store, "run-old", &fp, "example.com/spike-target", 100, None, (0, 0));
+        seed_run(&store, "run-new", &fp, "example.com/spike-target", 200, None, (0, 0));
+        seed_run(&store, "run-other", &other, "example.com/spike-target", 300, None, (0, 0));
+
+        // An old run id is found directly, without scanning recent runs.
+        let old = store
+            .run_for(&fp, "run-old")
+            .expect("run_for")
+            .expect("old run");
+        assert_eq!(old.id, "run-old");
+        assert_eq!(old.fingerprint, fp);
+        // A run of another fingerprint is never visible through this issue.
+        assert!(store.run_for(&other, "run-old").expect("cross fp").is_none());
+        assert!(store.run_for(&fp, "missing").expect("missing").is_none());
+
+        // Default transcript run: the newest run that wrote a session dir,
+        // even while a newer run is still in flight without one.
+        store
+            .update_run(
+                "run-old",
+                &RunUpdate {
+                    session_dir: Some("sessions/old".into()),
+                    ..RunUpdate::default()
+                },
+            )
+            .expect("session dir");
+        let latest = store.latest_run(&fp).expect("latest").expect("run");
+        assert_eq!(latest.id, "run-new");
+        let session = store
+            .latest_run_with_session(&fp)
+            .expect("latest with session")
+            .expect("run");
+        assert_eq!(session.id, "run-old");
+        assert!(store
+            .latest_run_with_session(&other)
+            .expect("other")
+            .is_none());
     }
 
     #[test]

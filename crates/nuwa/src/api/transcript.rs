@@ -19,17 +19,16 @@ use serde_json::Value;
 use crate::api::common::parse_page_number;
 use crate::api::ApiError;
 use crate::serve::AppState;
-use shanhaijing::{RunRow, ShanResult, Store};
+use shanhaijing::{ShanResult, Store};
 
 /// Transcript pagination (docs/09 §9.2): 20 messages per page, 100 at most.
 const DEFAULT_PAGE_SIZE: u64 = 20;
 const MAX_PAGE_SIZE: u64 = 100;
 /// Only the tail of a session file is served; a larger file sets `truncated`.
 const TAIL_BYTES: u64 = 2 * 1024 * 1024;
-/// Per-text-block cap, in characters (char-safe, ellipsis appended).
-const MAX_BLOCK_CHARS: usize = 16 * 1024;
-/// "Latest run with a session dir" scan depth over the issue's run history.
-const RUN_SCAN_LIMIT: u32 = 1_000;
+/// Per-block byte budget (16KB of UTF-8 content before the ellipsis). Applied
+/// to text, thinking, tool_result text and serialized tool_call arguments.
+const MAX_BLOCK_BYTES: usize = 16 * 1024;
 /// Session lookup bounds: the layout is `<run dir>/<cwd slug>/<ts>_<id>.jsonl`.
 const MAX_SESSION_DEPTH: usize = 4;
 const MAX_SESSION_ENTRIES: usize = 1_000;
@@ -92,25 +91,38 @@ pub struct TranscriptMessage {
 }
 
 /// Displayable content block. Wire tags: `thinking`, `text`, `tool_call`,
-/// `tool_result` (docs/09 §9.2).
+/// `tool_result` (docs/09 §9.2). `truncated` appears only on a block whose
+/// content (or serialized arguments) hit the 16KB budget.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TranscriptBlock {
     Thinking {
         text: String,
+        #[serde(skip_serializing_if = "is_false")]
+        truncated: bool,
     },
     Text {
         text: String,
+        #[serde(skip_serializing_if = "is_false")]
+        truncated: bool,
     },
     ToolCall {
         name: String,
         arguments: Value,
+        #[serde(skip_serializing_if = "is_false")]
+        truncated: bool,
     },
     ToolResult {
         name: String,
         text: String,
         is_error: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        truncated: bool,
     },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Serialize)]
@@ -164,14 +176,14 @@ fn build_transcript(store: &Store, fingerprint: &str, params: &Params) -> ShanRe
     if store.get(fingerprint)?.is_none() {
         return Ok(Outcome::IssueNotFound);
     }
-    let runs = store.runs_for(fingerprint, RUN_SCAN_LIMIT)?;
     let run = match &params.run_id {
-        Some(run_id) => match runs.into_iter().find(|run| &run.id == run_id) {
+        // Direct id lookup: not limited to the newest runs, scoped by
+        // fingerprint. A run of another fingerprint is "not found" here.
+        Some(run_id) => match store.run_for(fingerprint, run_id)? {
             Some(run) => run,
-            // A run of another fingerprint is "not found" for this issue.
             None => return Ok(Outcome::RunNotFound),
         },
-        None => match latest_run_with_session(runs) {
+        None => match store.latest_run_with_session(fingerprint)? {
             Some(run) => run,
             None => return Ok(Outcome::Ready(empty_response(params))),
         },
@@ -184,10 +196,17 @@ fn build_transcript(store: &Store, fingerprint: &str, params: &Params) -> ShanRe
     else {
         return Ok(Outcome::Ready(empty_response(params)));
     };
-    let Some((tail, truncated)) = read_tail(&file) else {
-        // The file can vanish or stay locked while the runner appends; the
-        // transcript is auxiliary, so an unreadable session is an empty page.
-        return Ok(Outcome::Ready(empty_response(params)));
+    let (tail, truncated) = match read_tail(&file) {
+        Ok(tail) => tail,
+        Err(error) => {
+            // The file can vanish or stay locked while the runner appends;
+            // the transcript is auxiliary, so log and serve an empty page.
+            eprintln!(
+                "transcript: unreadable session file {}: {error}",
+                file.display()
+            );
+            return Ok(Outcome::Ready(empty_response(params)));
+        }
     };
     let messages = parse_messages(&tail);
     let total = messages.len();
@@ -215,14 +234,6 @@ fn build_transcript(store: &Store, fingerprint: &str, params: &Params) -> ShanRe
             empty: total == 0,
         },
     }))
-}
-
-fn latest_run_with_session(runs: Vec<RunRow>) -> Option<RunRow> {
-    runs.into_iter().find(|run| {
-        run.session_dir
-            .as_deref()
-            .is_some_and(|dir| !dir.trim().is_empty())
-    })
 }
 
 fn empty_response(params: &Params) -> TranscriptResponse {
@@ -277,8 +288,15 @@ fn collect_jsonl(dir: &FsPath, depth: usize, budget: &mut usize, out: &mut Vec<S
     if depth > MAX_SESSION_DEPTH || *budget == 0 {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "transcript: cannot list session dir {}: {error}",
+                dir.display()
+            );
+            return;
+        }
     };
     for entry in entries.flatten() {
         if *budget == 0 {
@@ -309,19 +327,18 @@ fn collect_jsonl(dir: &FsPath, depth: usize, budget: &mut usize, out: &mut Vec<S
 
 /// Read at most the last 2MB of a session file. When the window starts
 /// mid-line the partial first line is dropped; `truncated` reports that
-/// earlier content exists.
-fn read_tail(path: &FsPath) -> Option<(String, bool)> {
-    let mut file = File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+/// earlier content exists. IO errors surface so the caller can log them.
+fn read_tail(path: &FsPath) -> std::io::Result<(String, bool)> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
     let truncated = len > TAIL_BYTES;
     let start = len.saturating_sub(TAIL_BYTES);
     // One byte before the window tells us whether the first line is complete.
     let read_from = start.saturating_sub(1);
-    file.seek(SeekFrom::Start(read_from)).ok()?;
+    file.seek(SeekFrom::Start(read_from))?;
     let mut bytes = Vec::new();
     file.take(len.saturating_sub(read_from))
-        .read_to_end(&mut bytes)
-        .ok()?;
+        .read_to_end(&mut bytes)?;
     let text_bytes: &[u8] = if start == 0 {
         &bytes
     } else if bytes.first() == Some(&b'\n') {
@@ -333,7 +350,7 @@ fn read_tail(path: &FsPath) -> Option<(String, bool)> {
         }
     };
     // A window split inside a multi-byte character must not lose the tail.
-    Some((String::from_utf8_lossy(text_bytes).into_owned(), truncated))
+    Ok((String::from_utf8_lossy(text_bytes).into_owned(), truncated))
 }
 
 fn parse_messages(tail: &str) -> Vec<TranscriptMessage> {
@@ -375,9 +392,7 @@ fn map_message(message: &Value, seq: u64, ts: i64) -> Option<TranscriptMessage> 
 
 fn user_blocks(content: Option<&Value>) -> Vec<TranscriptBlock> {
     match content {
-        Some(Value::String(text)) => vec![TranscriptBlock::Text {
-            text: truncate_block(text),
-        }],
+        Some(Value::String(text)) => vec![text_block(text)],
         Some(Value::Array(items)) => items
             .iter()
             .filter_map(|item| {
@@ -385,13 +400,16 @@ fn user_blocks(content: Option<&Value>) -> Vec<TranscriptBlock> {
                     return None;
                 }
                 let text = item.get("text").and_then(Value::as_str)?;
-                Some(TranscriptBlock::Text {
-                    text: truncate_block(text),
-                })
+                Some(text_block(text))
             })
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn text_block(text: &str) -> TranscriptBlock {
+    let (text, truncated) = truncate_block(text);
+    TranscriptBlock::Text { text, truncated }
 }
 
 fn assistant_blocks(content: Option<&Value>) -> Vec<TranscriptBlock> {
@@ -405,21 +423,21 @@ fn assistant_block(item: &Value) -> Option<TranscriptBlock> {
     match item.get("type").and_then(Value::as_str)? {
         "thinking" => {
             let text = item.get("thinking").and_then(Value::as_str)?;
-            Some(TranscriptBlock::Thinking {
-                text: truncate_block(text),
-            })
+            let (text, truncated) = truncate_block(text);
+            Some(TranscriptBlock::Thinking { text, truncated })
         }
         "text" => {
             let text = item.get("text").and_then(Value::as_str)?;
-            Some(TranscriptBlock::Text {
-                text: truncate_block(text),
-            })
+            Some(text_block(text))
         }
         "toolCall" => {
             let name = item.get("name").and_then(Value::as_str)?;
+            let (arguments, truncated) =
+                bounded_arguments(item.get("arguments").cloned().unwrap_or(Value::Null));
             Some(TranscriptBlock::ToolCall {
                 name: name.to_string(),
-                arguments: item.get("arguments").cloned().unwrap_or(Value::Null),
+                arguments,
+                truncated,
             })
         }
         // Images and future block kinds have no console rendering yet.
@@ -451,21 +469,39 @@ fn tool_result_blocks(message: &Value) -> Vec<TranscriptBlock> {
             .join("\n"),
         _ => String::new(),
     };
+    let (text, truncated) = truncate_block(&text);
     vec![TranscriptBlock::ToolResult {
         name,
-        text: truncate_block(&text),
+        text,
         is_error,
+        truncated,
     }]
 }
 
-/// Cap one text block at 16K characters, char-safe, appending `…`.
-fn truncate_block(text: &str) -> String {
-    if text.chars().count() <= MAX_BLOCK_CHARS {
-        return text.to_string();
+/// Cap one block at 16KB of UTF-8, cutting on a char boundary and appending
+/// `…`. Returns whether the content was capped.
+fn truncate_block(text: &str) -> (String, bool) {
+    if text.len() <= MAX_BLOCK_BYTES {
+        return (text.to_string(), false);
     }
-    let mut truncated: String = text.chars().take(MAX_BLOCK_CHARS).collect();
+    let mut end = MAX_BLOCK_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = String::with_capacity(end + '…'.len_utf8());
+    truncated.push_str(&text[..end]);
     truncated.push('…');
-    truncated
+    (truncated, true)
+}
+
+/// Tool-call arguments are served as JSON. A pathological argument blob is
+/// replaced by a short preview so one call cannot dominate the page.
+fn bounded_arguments(arguments: Value) -> (Value, bool) {
+    let bytes = serde_json::to_string(&arguments).map_or(0, |json| json.len());
+    if bytes <= MAX_BLOCK_BYTES {
+        return (arguments, false);
+    }
+    (Value::String(format!("<truncated: {bytes} bytes>")), true)
 }
 
 fn internal_error() -> Response {
@@ -491,6 +527,8 @@ mod tests {
 
     use crate::serve::{build_app, AppState};
     use shanhaijing::Store;
+
+    use super::{newest_jsonl, truncate_block, validated_session_dir, MAX_BLOCK_BYTES};
 
     const APP: &str = "example.com/transcript";
     const STRICT_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
@@ -548,6 +586,16 @@ mod tests {
         );
         set_session_dir(&store, "run-heavy", &heavy_dir);
 
+        // Oversized text/thinking/tool_result/tool-call arguments.
+        start_run(&store, &fp, "run-bounded", 1_500_000);
+        let bounded_dir = session_root.join("run-bounded");
+        write_jsonl(
+            &bounded_dir,
+            "2026-10-15T15-30-00-000Z_bounded.jsonl",
+            &bounded_lines(),
+        );
+        set_session_dir(&store, "run-bounded", &bounded_dir);
+
         start_run(&store, &other, "run-other", 4_000_000);
         let other_dir = session_root.join("run-other");
         write_jsonl(
@@ -562,6 +610,12 @@ mod tests {
         set_session_dir(&store, "run-other", &other_dir);
 
         start_run(&store, &empty, "run-empty", 5_000_000);
+        // A session dir that exists but holds no `.jsonl` is still an empty
+        // transcript, not an error.
+        let empty_dir = session_root.join("run-empty");
+        std::fs::create_dir_all(&empty_dir).expect("empty session dir");
+        std::fs::write(empty_dir.join("notes.txt"), "not a session").expect("notes");
+        set_session_dir(&store, "run-empty", &empty_dir);
 
         let state = AppState {
             store,
@@ -675,6 +729,38 @@ mod tests {
                 "message": {
                     "kind": "user", "role": "user",
                     "content": [{ "type": "text", "text": "tail-visible" }]
+                }
+            })
+            .to_string(),
+        ]
+    }
+
+    /// Messages whose blocks all exceed the 16KB byte budget: ASCII text,
+    /// CJK thinking, a huge tool-call argument blob, and a tool result.
+    fn bounded_lines() -> Vec<String> {
+        vec![
+            json!({
+                "kind": "entry", "type": "message", "seq": 1, "timestamp": 1_000,
+                "message": {
+                    "kind": "assistant", "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "a".repeat(20_000) },
+                        { "type": "thinking", "thinking": "汉".repeat(20_000) },
+                        {
+                            "type": "toolCall", "name": "write",
+                            "arguments": { "path": "calc.go", "content": "x".repeat(20_000) }
+                        },
+                        { "type": "toolCall", "name": "read", "arguments": { "path": "calc.go" } }
+                    ]
+                }
+            })
+            .to_string(),
+            json!({
+                "kind": "entry", "type": "message", "seq": 2, "timestamp": 2_000,
+                "message": {
+                    "kind": "tool_result", "role": "toolResult", "toolName": "write",
+                    "content": [{ "type": "text", "text": "y".repeat(20_000) }],
+                    "isError": false
                 }
             })
             .to_string(),
@@ -935,11 +1021,19 @@ mod tests {
         assert_eq!(seqs(&value), vec![2, 3]);
         assert!(!value.to_string().contains("ancient message"));
 
-        // 16K characters are kept, char-safe, plus the ellipsis marker.
-        let text = value["data"][0]["blocks"][0]["text"]
-            .as_str()
-            .expect("truncated text");
-        assert_eq!(text.chars().count(), 16 * 1024 + 1);
+        // 16KB of UTF-8 kept on a char boundary, plus the ellipsis marker.
+        let block = &value["data"][0]["blocks"][0];
+        let text = block["text"].as_str().expect("truncated text");
+        assert!(
+            text.len() <= MAX_BLOCK_BYTES + '…'.len_utf8(),
+            "capped block is {} bytes",
+            text.len()
+        );
+        assert!(
+            text.len() > MAX_BLOCK_BYTES - 4,
+            "the 16KB budget is filled"
+        );
+        assert_eq!(block["truncated"].as_bool(), Some(true));
         assert!(text.ends_with('…'), "truncation marker missing");
         assert!(text.starts_with('汉'), "multi-byte text must stay valid");
         assert!(text.chars().all(|c| c == '汉' || c == '…'));
@@ -948,6 +1042,133 @@ mod tests {
             value["data"][1]["blocks"],
             json!([{ "type": "text", "text": "tail-visible" }])
         );
+    }
+
+    #[tokio::test]
+    async fn transcript_caps_oversized_blocks_and_flags_them() {
+        let fixture = fixture();
+        let response = get(
+            &fixture.app,
+            &format!(
+                "/api/v1/issues/{}/transcript?run_id=run-bounded",
+                fixture.fp
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_api_headers(&response);
+        let value = json_body(response).await;
+
+        assert_eq!(value["meta"]["total"].as_u64(), Some(2));
+        let blocks = value["data"][0]["blocks"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 4);
+
+        // A >16KB ASCII text block: exactly the byte budget + `…`.
+        assert_eq!(blocks[0]["type"], "text");
+        let ascii = blocks[0]["text"].as_str().expect("ascii text");
+        assert_eq!(ascii.len(), MAX_BLOCK_BYTES + '…'.len_utf8());
+        assert!(ascii.chars().all(|c| c == 'a' || c == '…'));
+        assert_eq!(blocks[0]["truncated"].as_bool(), Some(true));
+
+        // A >16KB CJK thinking block: cut on a char boundary.
+        assert_eq!(blocks[1]["type"], "thinking");
+        let cjk = blocks[1]["text"].as_str().expect("cjk text");
+        assert!(
+            cjk.len() <= MAX_BLOCK_BYTES + '…'.len_utf8(),
+            "capped block is {} bytes",
+            cjk.len()
+        );
+        assert!(cjk.starts_with('汉') && cjk.ends_with('…'));
+        assert!(cjk.chars().all(|c| c == '汉' || c == '…'));
+        assert_eq!(blocks[1]["truncated"].as_bool(), Some(true));
+
+        // Multi-KB tool-call arguments become a short preview string.
+        let big_call = &blocks[2];
+        assert_eq!(big_call["type"], "tool_call");
+        assert_eq!(big_call["name"], "write");
+        assert_eq!(big_call["truncated"].as_bool(), Some(true));
+        let preview = big_call["arguments"].as_str().expect("arguments preview");
+        assert!(preview.starts_with("<truncated: "), "{preview}");
+        assert!(preview.ends_with(" bytes>"), "{preview}");
+        assert!(preview.len() < 64, "{preview}");
+
+        // Small arguments keep the plain object shape and no flag.
+        let small_call = &blocks[3];
+        assert_eq!(small_call["arguments"], json!({ "path": "calc.go" }));
+        assert!(
+            small_call.get("truncated").is_none(),
+            "an uncapped block carries no flag: {small_call}"
+        );
+
+        // tool_result text is capped too.
+        let tool = &value["data"][1]["blocks"][0];
+        assert_eq!(tool["type"], "tool_result");
+        assert_eq!(tool["truncated"].as_bool(), Some(true));
+        let tool_text = tool["text"].as_str().expect("tool text");
+        assert!(tool_text.len() <= MAX_BLOCK_BYTES + '…'.len_utf8());
+        assert!(tool_text.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_block_uses_a_utf8_byte_budget() {
+        let ascii = "a".repeat(MAX_BLOCK_BYTES + 1);
+        let (capped, truncated) = truncate_block(&ascii);
+        assert!(truncated);
+        assert_eq!(capped.len(), MAX_BLOCK_BYTES + '…'.len_utf8());
+        assert_eq!(
+            capped.chars().filter(|c| *c == 'a').count(),
+            MAX_BLOCK_BYTES
+        );
+        assert!(capped.ends_with('…'));
+
+        let cjk = "汉".repeat(20_000);
+        let (capped, truncated) = truncate_block(&cjk);
+        assert!(truncated);
+        // A 3-byte character can never straddle the budget.
+        assert!(
+            capped.len() <= MAX_BLOCK_BYTES + '…'.len_utf8(),
+            "capped block is {} bytes",
+            capped.len()
+        );
+        assert!(capped.len() > MAX_BLOCK_BYTES - 4, "{} bytes", capped.len());
+        assert!(capped.ends_with('…'));
+        assert!(capped.trim_end_matches('…').chars().all(|c| c == '汉'));
+
+        // Content at or under the budget is untouched.
+        let exact = "a".repeat(MAX_BLOCK_BYTES);
+        let (untouched, truncated) = truncate_block(&exact);
+        assert!(!truncated);
+        assert_eq!(untouched, exact);
+    }
+
+    #[test]
+    fn validated_session_dir_rejects_relative_and_parent_paths() {
+        // Relative DB values never reach the filesystem.
+        assert!(validated_session_dir("sessions/run").is_none());
+        assert!(validated_session_dir("../sessions").is_none());
+        assert!(validated_session_dir("").is_none());
+
+        // An absolute path with a parent component is rejected too.
+        let sneaky = std::env::temp_dir().join("a").join("..").join("b");
+        assert!(
+            validated_session_dir(&sneaky.display().to_string()).is_none(),
+            "{}",
+            sneaky.display()
+        );
+
+        // A plain absolute directory is accepted.
+        let ok = std::env::temp_dir();
+        let validated = validated_session_dir(&ok.display().to_string()).expect("absolute dir");
+        assert_eq!(validated, ok);
+    }
+
+    #[test]
+    fn newest_jsonl_none_without_a_jsonl_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("repo")).expect("nested");
+        std::fs::write(dir.path().join("repo").join("notes.txt"), "x").expect("write");
+        assert!(newest_jsonl(dir.path()).is_none());
+        assert!(newest_jsonl(&dir.path().join("missing")).is_none());
     }
 
     #[tokio::test]
