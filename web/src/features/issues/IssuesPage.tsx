@@ -2,6 +2,7 @@ import { useCallback, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { useToast } from "../../components/ui";
+import { SyncButton } from "../actions/SyncButton";
 import { buildIssueSearchParams, hasActiveFilters, parseIssueFilters } from "./filters";
 import { shortFingerprint } from "./format";
 import { IssueCards } from "./IssueCards";
@@ -127,14 +128,17 @@ export function IssuesPage() {
 
   return (
     <div className="space-y-4">
-      <header>
-        <h2 className="text-title font-semibold text-text">问题单</h2>
-        <p className="mt-1 text-body-sm text-text-secondary">
-          按状态、严重度、仓库与语言筛选，查看每个指纹的修复进度。
-        </p>
-        <p className="mt-1 text-caption text-text-muted">
-          每 15 秒自动刷新，标签页隐藏时暂停；窗口重新聚焦时立即更新。
-        </p>
+      <header className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <h2 className="text-title font-semibold text-text">问题单</h2>
+          <p className="mt-1 text-body-sm text-text-secondary">
+            按状态、严重度、仓库与语言筛选，查看每个指纹的修复进度。
+          </p>
+          <p className="mt-1 text-caption text-text-muted">
+            每 15 秒自动刷新，标签页隐藏时暂停；窗口重新聚焦时立即更新。
+          </p>
+        </div>
+        <SyncButton className="self-start sm:shrink-0" />
       </header>
 
       <IssueFilters
