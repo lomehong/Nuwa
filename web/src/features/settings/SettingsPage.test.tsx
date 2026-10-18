@@ -3,11 +3,13 @@ import { http, HttpResponse } from "msw";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  makeRepo,
   makeRunner,
   makeSettings,
   mockIssueDetail,
   mockMe,
   mockOverviewResources,
+  mockRepos,
   mockRunners,
   mockSettings,
   mockSystem,
@@ -18,9 +20,10 @@ import { renderApp } from "../../test/render";
 
 beforeEach(() => {
   document.cookie = "nuwa_csrf=csrf-token; path=/";
-  // The repository section reuses the runner roster; every test gets a
-  // baseline fleet unless it registers its own /runners handler.
-  server.use(mockRunners());
+  // The repository section reuses the runner roster and the registry; every
+  // test gets a baseline fleet and an empty registry unless it registers its
+  // own handlers.
+  server.use(mockRunners(), mockRepos([]));
 });
 
 type SettingsOverrides = Parameters<typeof mockSettings>[0];
@@ -681,6 +684,282 @@ describe("SettingsPage", () => {
       "href",
       "/runners",
     );
+  });
+
+  it("merges the registry with runner groups", async () => {
+    server.use(
+      mockRepos([
+        makeRepo({
+          repo: "example.com/app",
+          name: "Acme App",
+          url: "https://github.com/acme/app",
+          description: "primary",
+        }),
+        makeRepo({
+          repo: "example.com/quiet",
+          name: "Quiet Service",
+          url: "ssh://git@example.com/quiet.git",
+        }),
+      ]),
+      mockRunners([
+        makeRunner({ id: "runner-a", repo: "example.com/app", repo_path: "/srv/app" }),
+        makeRunner({ id: "runner-c", repo: "example.com/other", repo_path: "/srv/other" }),
+      ]),
+    );
+    signedIn();
+    renderApp("/settings");
+
+    const registered = await screen.findByTestId("repo-group-example.com/app");
+    expect(within(registered).getByText("Acme App")).toBeInTheDocument();
+    expect(within(registered).getByText("example.com/app")).toBeInTheDocument();
+    expect(within(registered).getByText("https://github.com/acme/app")).toBeInTheDocument();
+    expect(within(registered).getByText("primary")).toBeInTheDocument();
+    // Repository content stays read-only: the card has no editable field.
+    expect(within(registered).queryByRole("textbox")).not.toBeInTheDocument();
+    expect(within(registered).getByText("go test ./...")).toBeInTheDocument();
+    expect(within(registered).getByText("3 个")).toBeInTheDocument();
+    expect(within(registered).getByText("/srv/app")).toBeInTheDocument();
+    expect(
+      within(registered).getByRole("button", { name: "编辑 Acme App" }),
+    ).toBeInTheDocument();
+
+    const quiet = screen.getByTestId("repo-group-example.com/quiet");
+    expect(within(quiet).getByText("Quiet Service")).toBeInTheDocument();
+    expect(within(quiet).getByText("暂无 runner 上报")).toBeInTheDocument();
+    expect(
+      within(quiet).queryByRole("button", { name: "登记" }),
+    ).not.toBeInTheDocument();
+
+    const unregistered = screen.getByTestId("repo-group-example.com/other");
+    expect(within(unregistered).getByText("未登记")).toBeInTheDocument();
+    const register = within(unregistered).getByRole("button", { name: "登记" });
+    expect(within(unregistered).getByText("/srv/other")).toBeInTheDocument();
+
+    fireEvent.click(register);
+    const dialog = await screen.findByRole("dialog", { name: "添加仓库" });
+    expect(within(dialog).getByLabelText("仓库标识")).toHaveValue("example.com/other");
+    expect(within(dialog).getByLabelText("名称")).toHaveValue("example.com/other");
+  });
+
+  it("creates a repository and refreshes the registry list", async () => {
+    const created = makeRepo({
+      repo: "example.com/new",
+      name: "New App",
+      url: "https://example.com/new",
+      description: "brand new",
+    });
+    let posted: unknown;
+    let csrf: string | null = null;
+    let listCalls = 0;
+    server.use(
+      http.get("/api/v1/repos", () => {
+        listCalls += 1;
+        return HttpResponse.json({ data: listCalls > 1 ? [created] : [] });
+      }),
+      http.post("/api/v1/repos", async ({ request }) => {
+        csrf = request.headers.get("x-nuwa-csrf");
+        posted = await request.json();
+        return HttpResponse.json({ data: created }, { status: 201 });
+      }),
+    );
+    signedIn();
+    renderApp("/settings");
+
+    fireEvent.click(await screen.findByRole("button", { name: "添加仓库" }));
+    const dialog = await screen.findByRole("dialog", { name: "添加仓库" });
+    fireEvent.change(within(dialog).getByLabelText("名称"), {
+      target: { value: "New App" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("仓库标识"), {
+      target: { value: "example.com/new" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("仓库地址"), {
+      target: { value: "https://example.com/new" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("描述（可选）"), {
+      target: { value: "brand new" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "添加" }));
+
+    await waitFor(() =>
+      expect(posted).toEqual({
+        repo: "example.com/new",
+        name: "New App",
+        url: "https://example.com/new",
+        description: "brand new",
+      }),
+    );
+    expect(csrf).toBe("csrf-token");
+    expect(await screen.findByText("仓库已添加")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "添加仓库" })).not.toBeInTheDocument(),
+    );
+    // The mutation invalidates ["repos"], so the list refetches and shows it.
+    expect(await screen.findByTestId("repo-group-example.com/new")).toBeInTheDocument();
+    expect(listCalls).toBeGreaterThan(1);
+  });
+
+  it("validates the repository form before sending", async () => {
+    let posted = false;
+    server.use(
+      http.post("/api/v1/repos", () => {
+        posted = true;
+        return HttpResponse.json({ data: makeRepo() }, { status: 201 });
+      }),
+    );
+    signedIn();
+    renderApp("/settings");
+
+    fireEvent.click(await screen.findByRole("button", { name: "添加仓库" }));
+    const dialog = await screen.findByRole("dialog", { name: "添加仓库" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "添加" }));
+
+    expect(await within(dialog).findByText("请填写名称")).toBeInTheDocument();
+    expect(within(dialog).getByText("请填写仓库标识")).toBeInTheDocument();
+    expect(within(dialog).getByText("请填写仓库地址")).toBeInTheDocument();
+    expect(posted).toBe(false);
+
+    fireEvent.change(within(dialog).getByLabelText("名称"), {
+      target: { value: "New App" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("仓库标识"), {
+      target: { value: "example.com/new" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("仓库地址"), {
+      target: { value: "ftp://example.com/new" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "添加" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "请填写 HTTPS 或 SSH 地址",
+    );
+    expect(posted).toBe(false);
+
+    // SSH (scp-style) addresses are accepted and submit.
+    fireEvent.change(within(dialog).getByLabelText("仓库地址"), {
+      target: { value: "git@example.com:new.git" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "添加" }));
+    await waitFor(() => expect(posted).toBe(true));
+  });
+
+  it("edits a registered repository on an encoded path", async () => {
+    const repo = makeRepo({
+      repo: "example.com/app",
+      name: "Acme App",
+      url: "https://example.com/app",
+    });
+    let putUrl = "";
+    let body: unknown;
+    server.use(
+      mockRepos([repo]),
+      http.put("/api/v1/repos/:repo", async ({ request }) => {
+        putUrl = new URL(request.url).pathname;
+        body = await request.json();
+        return HttpResponse.json({ data: { ...repo, name: "Acme Console" } });
+      }),
+    );
+    signedIn();
+    renderApp("/settings");
+
+    fireEvent.click(await screen.findByRole("button", { name: "编辑 Acme App" }));
+    const dialog = await screen.findByRole("dialog", { name: "编辑仓库" });
+    // Identity is path-owned: shown as text, never as an editable field.
+    expect(within(dialog).queryByLabelText("仓库标识")).not.toBeInTheDocument();
+    expect(within(dialog).getByText("example.com/app")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("名称")).toHaveValue("Acme App");
+
+    fireEvent.change(within(dialog).getByLabelText("名称"), {
+      target: { value: "Acme Console" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(body).toEqual({
+        name: "Acme Console",
+        url: "https://example.com/app",
+        description: "",
+      }),
+    );
+    expect(putUrl).toBe("/api/v1/repos/example.com%2Fapp");
+    expect(await screen.findByText("仓库已更新")).toBeInTheDocument();
+  });
+
+  it("removes a registration only after confirmation", async () => {
+    const repo = makeRepo({ repo: "example.com/app", name: "Acme App" });
+    const deletes: string[] = [];
+    server.use(
+      mockRepos([repo]),
+      http.delete("/api/v1/repos/:repo", ({ request }) => {
+        deletes.push(new URL(request.url).pathname);
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    signedIn();
+    renderApp("/settings");
+
+    fireEvent.click(await screen.findByRole("button", { name: "删除登记：Acme App" }));
+    const dialog = await screen.findByRole("dialog", { name: "移除仓库登记？" });
+    expect(within(dialog).getByText(/不会停止 runner/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/nuwa\.repo\.json/)).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "移除仓库登记？" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(deletes).toEqual([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "删除登记：Acme App" }));
+    fireEvent.click(await screen.findByRole("button", { name: "移除登记" }));
+    await waitFor(() => expect(deletes).toEqual(["/api/v1/repos/example.com%2Fapp"]));
+    expect(await screen.findByText("已移除仓库登记")).toBeInTheDocument();
+  });
+
+  it("maps repository 422 fields inline", async () => {
+    server.use(
+      http.post("/api/v1/repos", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "validation_failed",
+              message: "invalid repository",
+              fields: {
+                repo: "identity is already taken",
+                url: "must use https or ssh",
+              },
+            },
+          },
+          { status: 422 },
+        ),
+      ),
+    );
+    signedIn();
+    renderApp("/settings");
+
+    fireEvent.click(await screen.findByRole("button", { name: "添加仓库" }));
+    const dialog = await screen.findByRole("dialog", { name: "添加仓库" });
+    fireEvent.change(within(dialog).getByLabelText("名称"), {
+      target: { value: "Acme App" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("仓库标识"), {
+      target: { value: "example.com/app" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("仓库地址"), {
+      target: { value: "https://example.com/app" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "添加" }));
+
+    expect(
+      await within(dialog).findByText("identity is already taken"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("must use https or ssh")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("仓库标识")).toHaveAttribute(
+      "aria-invalid",
+      "true",
+    );
+    expect(screen.getByText("添加失败")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "添加" })).toBeEnabled();
   });
 
   it("shows an empty repository note when no runner reported a repo", async () => {

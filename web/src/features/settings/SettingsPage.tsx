@@ -1,5 +1,14 @@
 import { clsx } from "clsx";
-import { ChevronRight, FlaskConical, GitBranch, Power, ShieldCheck } from "lucide-react";
+import {
+  ChevronRight,
+  FlaskConical,
+  GitBranch,
+  Pencil,
+  Plus,
+  Power,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 
@@ -25,9 +34,12 @@ import { PanelError } from "../overview/PanelChrome";
 import { runnerIsOffline } from "../runners/format";
 import { useRunnersQuery } from "../runners/queries";
 import type { RunnerDto } from "../runners/types";
+import { RepoFormDialog, type RepoFormPrefill } from "./RepoFormDialog";
 import { RestartDialog } from "./RestartDialog";
 import { SettingField } from "./SettingField";
 import {
+  useDeleteRepoMutation,
+  useReposQuery,
   useSaveSettingsMutation,
   useSettingsQuery,
   useSystemQuery,
@@ -36,6 +48,7 @@ import {
 import {
   isPlainValue,
   type DiffDto,
+  type RepoDto,
   type SettingDto,
   type SettingGroup,
   type SettingsResponse,
@@ -146,11 +159,14 @@ interface RepoGroup {
   runners: RunnerDto[];
 }
 
+/** A heartbeat without a repo cannot be registered; it stays read-only. */
+const UNREPORTED_REPO = "（未上报仓库）";
+
 /** Runners report a repo each heartbeat; the repository view groups by it. */
 function groupRunnersByRepo(runners: RunnerDto[]): RepoGroup[] {
   const groups = new Map<string, RunnerDto[]>();
   for (const runner of runners) {
-    const repo = runner.repo || "（未上报仓库）";
+    const repo = runner.repo || UNREPORTED_REPO;
     const bucket = groups.get(repo);
     if (bucket) {
       bucket.push(runner);
@@ -159,6 +175,36 @@ function groupRunnersByRepo(runners: RunnerDto[]): RepoGroup[] {
     }
   }
   return [...groups].map(([repo, members]) => ({ repo, runners: members }));
+}
+
+interface RepoEntry extends RepoGroup {
+  /** `null` means a runner reported an identity nobody registered. */
+  registration: RepoDto | null;
+}
+
+/**
+ * Registry rows and runner groups keyed by the same identity. Registry order
+ * (name, from the API) wins for registered entries; runner-only groups keep
+ * heartbeat order behind them.
+ */
+function mergeRepoEntries(registrations: RepoDto[], runners: RunnerDto[]): RepoEntry[] {
+  const entries = new Map<string, RepoEntry>();
+  for (const row of registrations) {
+    entries.set(row.repo, { repo: row.repo, registration: row, runners: [] });
+  }
+  for (const group of groupRunnersByRepo(runners)) {
+    const existing = entries.get(group.repo);
+    if (existing) {
+      existing.runners = group.runners;
+    } else {
+      entries.set(group.repo, {
+        repo: group.repo,
+        registration: null,
+        runners: group.runners,
+      });
+    }
+  }
+  return [...entries.values()];
 }
 
 const REPO_URL = "https://github.com/lomehong/nuwa";
@@ -493,8 +539,16 @@ function AdvancedDetails({ data }: { data: SettingsResponse }) {
   );
 }
 
-function RepoGroupCard({ group, nowMs }: { group: RepoGroup; nowMs: number }) {
-  const { runners } = group;
+interface RepoGroupCardProps {
+  entry: RepoEntry;
+  nowMs: number;
+  onEdit: (repo: RepoDto) => void;
+  onDelete: (repo: RepoDto) => void;
+  onRegister: (prefill: RepoFormPrefill) => void;
+}
+
+function RepoGroupCard({ entry, nowMs, onEdit, onDelete, onRegister }: RepoGroupCardProps) {
+  const { repo, registration, runners } = entry;
   const online = runners.filter((runner) => !runnerIsOffline(runner, nowMs)).length;
   const checkoutPaths = distinctStrings(runners.map((runner) => runner.repo_path));
   const failingChecks = distinctStrings(
@@ -522,80 +576,170 @@ function RepoGroupCard({ group, nowMs }: { group: RepoGroup; nowMs: number }) {
   const working = runners.filter((runner) => runner.current_fingerprint);
   const lastErrors = distinctStrings(runners.map((runner) => runner.last_error));
   const variant = online === runners.length ? "success" : online === 0 ? "danger" : "warning";
+  const registerable = registration === null && repo !== UNREPORTED_REPO;
 
   return (
     <div
-      data-testid={`repo-group-${group.repo}`}
+      data-testid={`repo-group-${repo}`}
       className="rounded-card border border-border"
     >
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
-        <p className="min-w-0 break-all font-mono text-body-sm font-semibold text-text">
-          {group.repo}
-        </p>
-        <Badge variant={variant}>
-          {online}/{runners.length} 在线
-        </Badge>
-      </div>
-      <dl className="grid gap-x-4 gap-y-3 px-3 py-3 sm:grid-cols-2 xl:grid-cols-4">
-        <InfoItem label="检出路径" mono>
-          {checkoutPaths.length > 0 ? checkoutPaths.join(" · ") : "—"}
-        </InfoItem>
-        <InfoItem label="Failing check" mono>
-          {failingChecks.length > 0 ? failingChecks.join(" · ") : "—"}
-        </InfoItem>
-        <InfoItem label="禁改路径">
-          {forbiddenCounts.length > 0 ? `${forbiddenCounts.join(" / ")} 个` : "—"}
-        </InfoItem>
-        <InfoItem label="今日 PR 配额" mono>
-          {quota}
-        </InfoItem>
-        <InfoItem label="当前指纹">
-          {working.length > 0 ? (
-            <span className="flex flex-wrap gap-x-3 gap-y-1">
-              {working.map((runner) => (
-                <Link
-                  key={runner.id}
-                  to={issueDetailPath(runner.current_fingerprint ?? "")}
-                  title={runner.current_fingerprint ?? undefined}
-                  aria-label={`查看当前单：${runner.current_fingerprint}`}
-                  className="inline-flex min-h-11 items-center rounded-sm font-mono text-text-secondary transition-colors hover:text-accent pointer-fine:min-h-9"
-                >
-                  {shortFingerprint(runner.current_fingerprint ?? "")}
-                </Link>
-              ))}
-            </span>
-          ) : (
-            "队列为空"
-          )}
-        </InfoItem>
-      </dl>
-      {lastErrors.length > 0 ? (
-        <div className="mx-3 mb-3 rounded-card border border-danger/40 bg-danger/10 px-3 py-2">
-          <p className="text-caption text-text-muted">最近错误</p>
-          <ul className="mt-0.5 space-y-1">
-            {lastErrors.map((error) => (
-              <li key={error} className="break-words font-mono text-caption text-text">
-                {error}
-              </li>
-            ))}
-          </ul>
+      <div className="flex flex-wrap items-start justify-between gap-2 border-b border-border px-3 py-2">
+        <div className="min-w-0 flex-1 space-y-0.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <p
+              className={clsx(
+                "min-w-0 text-body-sm font-semibold text-text",
+                registration ? "break-words" : "break-all font-mono",
+              )}
+            >
+              {registration ? registration.name : repo}
+            </p>
+            {registration ? null : <Badge variant="warning">未登记</Badge>}
+            {runners.length > 0 ? (
+              <Badge variant={variant}>
+                {online}/{runners.length} 在线
+              </Badge>
+            ) : null}
+          </div>
+          {registration ? (
+            <p className="break-all font-mono text-caption text-text-secondary">
+              {repo}
+            </p>
+          ) : null}
+          {registration ? (
+            <>
+              <p className="break-all text-caption text-text-muted">{registration.url}</p>
+              {registration.description ? (
+                <p className="break-words text-caption text-text-secondary">
+                  {registration.description}
+                </p>
+              ) : null}
+            </>
+          ) : null}
         </div>
-      ) : null}
+        <div className="flex flex-wrap items-center gap-1">
+          {registration ? (
+            <>
+              <Button
+                variant="secondary"
+                size="sm"
+                aria-label={`编辑 ${registration.name}`}
+                onClick={() => onEdit(registration)}
+              >
+                <Pencil aria-hidden="true" className="size-3.5" />
+                编辑
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={`删除登记：${registration.name}`}
+                onClick={() => onDelete(registration)}
+              >
+                <Trash2 aria-hidden="true" className="size-3.5" />
+                删除
+              </Button>
+            </>
+          ) : registerable ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => onRegister({ repo, name: repo })}
+            >
+              登记
+            </Button>
+          ) : null}
+        </div>
+      </div>
+      {runners.length === 0 ? (
+        <div className="px-3 py-3">
+          <p className="text-body-sm text-text-secondary">暂无 runner 上报</p>
+          <p className="mt-0.5 text-caption text-text-muted">
+            启动该仓库的 nuwa work 后，这里会显示检出路径、验证配置与配额。
+          </p>
+        </div>
+      ) : (
+        <>
+          <dl className="grid gap-x-4 gap-y-3 px-3 py-3 sm:grid-cols-2 xl:grid-cols-4">
+            <InfoItem label="检出路径" mono>
+              {checkoutPaths.length > 0 ? checkoutPaths.join(" · ") : "—"}
+            </InfoItem>
+            <InfoItem label="Failing check" mono>
+              {failingChecks.length > 0 ? failingChecks.join(" · ") : "—"}
+            </InfoItem>
+            <InfoItem label="禁改路径">
+              {forbiddenCounts.length > 0 ? `${forbiddenCounts.join(" / ")} 个` : "—"}
+            </InfoItem>
+            <InfoItem label="今日 PR 配额" mono>
+              {quota}
+            </InfoItem>
+            <InfoItem label="当前指纹">
+              {working.length > 0 ? (
+                <span className="flex flex-wrap gap-x-3 gap-y-1">
+                  {working.map((runner) => (
+                    <Link
+                      key={runner.id}
+                      to={issueDetailPath(runner.current_fingerprint ?? "")}
+                      title={runner.current_fingerprint ?? undefined}
+                      aria-label={`查看当前单：${runner.current_fingerprint}`}
+                      className="inline-flex min-h-11 items-center rounded-sm font-mono text-text-secondary transition-colors hover:text-accent pointer-fine:min-h-9"
+                    >
+                      {shortFingerprint(runner.current_fingerprint ?? "")}
+                    </Link>
+                  ))}
+                </span>
+              ) : (
+                "队列为空"
+              )}
+            </InfoItem>
+          </dl>
+          {lastErrors.length > 0 ? (
+            <div className="mx-3 mb-3 rounded-card border border-danger/40 bg-danger/10 px-3 py-2">
+              <p className="text-caption text-text-muted">最近错误</p>
+              <ul className="mt-0.5 space-y-1">
+                {lastErrors.map((error) => (
+                  <li key={error} className="break-words font-mono text-caption text-text">
+                    {error}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </>
+      )}
     </div>
   );
 }
 
-/**
- * Read-only repository summary derived from the runner roster (docs/09 §10.8):
- * the API only reports repos through heartbeats, so this section groups the
- * same `useRunnersQuery` data instead of adding a new endpoint.
- */
-function RepositoryBody({ query }: { query: ReturnType<typeof useRunnersQuery> }) {
-  const data = query.data;
-  const runners = data?.data ?? [];
-  const nowMs = Date.now();
+interface RepositoryBodyProps {
+  reposQuery: ReturnType<typeof useReposQuery>;
+  runnersQuery: ReturnType<typeof useRunnersQuery>;
+  onEdit: (repo: RepoDto) => void;
+  onDelete: (repo: RepoDto) => void;
+  onRegister: (prefill: RepoFormPrefill) => void;
+}
 
-  if (query.isPending && !data) {
+/**
+ * Registry entries merged with the runner roster (docs/09 §8.7, §10.8). The
+ * registry supplies the editable display identity; runners contribute the
+ * read-only repository content. Runner-only identities stay visible with a
+ * "未登记" badge and a prefilled registration shortcut.
+ */
+function RepositoryBody({
+  reposQuery,
+  runnersQuery,
+  onEdit,
+  onDelete,
+  onRegister,
+}: RepositoryBodyProps) {
+  const registrations = reposQuery.data?.data ?? [];
+  const runners = runnersQuery.data?.data ?? [];
+  const entries = mergeRepoEntries(registrations, runners);
+  const nowMs = Date.now();
+  const loading =
+    (reposQuery.isPending && !reposQuery.data) ||
+    (runnersQuery.isPending && !runnersQuery.data);
+
+  if (loading) {
     return (
       <div role="status" aria-busy="true" className="space-y-3">
         <span className="sr-only">正在加载仓库</span>
@@ -604,42 +748,72 @@ function RepositoryBody({ query }: { query: ReturnType<typeof useRunnersQuery> }
       </div>
     );
   }
-  if (query.isError && !data) {
+  if (entries.length === 0 && runnersQuery.isError && !runnersQuery.data) {
     return (
       <PanelError
         title="无法加载仓库"
-        error={query.error}
-        onRetry={() => void query.refetch()}
+        error={runnersQuery.error}
+        onRetry={() => void runnersQuery.refetch()}
       />
     );
   }
   return (
     <div className="space-y-3">
-      {query.isError ? (
+      {reposQuery.isError ? (
         <div className="flex flex-wrap items-start justify-between gap-2 rounded-card border border-warning/40 bg-warning/10 px-4 py-2 text-body-sm text-text">
           <p role="status" className="min-w-0 flex-1">
-            仓库信息更新失败，显示的是上次数据。
-            <span className="ml-1 text-text-secondary">{describeError(query.error)}</span>
+            仓库登记信息更新失败，登记状态可能不完整。
+            <span className="ml-1 text-text-secondary">
+              {describeError(reposQuery.error)}
+            </span>
           </p>
-          <Button variant="secondary" size="sm" onClick={() => void query.refetch()}>
+          <Button variant="secondary" size="sm" onClick={() => void reposQuery.refetch()}>
             重试
           </Button>
         </div>
       ) : null}
-      {runners.length === 0 ? (
+      {runnersQuery.isError ? (
+        <div className="flex flex-wrap items-start justify-between gap-2 rounded-card border border-warning/40 bg-warning/10 px-4 py-2 text-body-sm text-text">
+          <p role="status" className="min-w-0 flex-1">
+            运行器信息更新失败，仓库状态可能不完整。
+            <span className="ml-1 text-text-secondary">
+              {describeError(runnersQuery.error)}
+            </span>
+          </p>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => void runnersQuery.refetch()}
+          >
+            重试
+          </Button>
+        </div>
+      ) : null}
+      {entries.length === 0 ? (
         <EmptyState
           icon={GitBranch}
           title="还没有仓库注册"
-          description="仓库来自运行器心跳上报：在目标主机启动 nuwa work，首拍心跳后这里会按仓库汇总检出路径、验证配置与配额。"
+          description="仓库来自运行器心跳上报：在目标主机启动 nuwa work，首拍心跳后这里会按仓库汇总检出路径、验证配置与配额。也可以先手动登记仓库。"
         />
       ) : (
-        groupRunnersByRepo(runners).map((group) => (
-          <RepoGroupCard key={group.repo} group={group} nowMs={nowMs} />
+        entries.map((entry) => (
+          <RepoGroupCard
+            key={entry.repo}
+            entry={entry}
+            nowMs={nowMs}
+            onEdit={onEdit}
+            onDelete={onDelete}
+            onRegister={onRegister}
+          />
         ))
       )}
     </div>
   );
 }
+
+type RepoDialogState =
+  | { mode: "create"; prefill?: RepoFormPrefill }
+  | { mode: "edit"; target: RepoDto };
 
 /**
  * Schema-driven settings editor (docs/09 §10.8, §13). Every group renders from
@@ -650,9 +824,11 @@ export function SettingsPage() {
   const settings = useSettingsQuery();
   const system = useSystemQuery();
   const runners = useRunnersQuery();
+  const repos = useReposQuery();
   const save = useSaveSettingsMutation();
   const testGithub = useTestSettingsMutation();
   const testLlm = useTestSettingsMutation();
+  const removeRepo = useDeleteRepoMutation();
   const { toast } = useToast();
   const location = useLocation();
   const navigate = useNavigate();
@@ -660,6 +836,8 @@ export function SettingsPage() {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [pendingHref, setPendingHref] = useState<string | null>(null);
   const [restartOpen, setRestartOpen] = useState(false);
+  const [repoDialog, setRepoDialog] = useState<RepoDialogState | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<RepoDto | null>(null);
   const [openSections, setOpenSections] = useState<Record<SectionId, boolean>>({
     ...INITIAL_OPEN,
   });
@@ -781,6 +959,32 @@ export function SettingsPage() {
   function handleDiscard() {
     setDrafts({});
     setFieldErrors({});
+  }
+
+  /** Unregistering only drops the console row; runners and the repo are untouched. */
+  function handleRemoveRepo() {
+    const target = deleteTarget;
+    if (!target) {
+      return;
+    }
+    removeRepo.mutate(target.repo, {
+      onSuccess: () => {
+        setDeleteTarget(null);
+        toast({
+          title: "已移除仓库登记",
+          description: `${target.name}（${target.repo}）`,
+          variant: "success",
+        });
+      },
+      onError: (error) => {
+        setDeleteTarget(null);
+        toast({
+          title: "移除失败",
+          description: describeError(error),
+          variant: "danger",
+        });
+      },
+    });
   }
 
   function toggleSection(id: SectionId) {
@@ -1201,20 +1405,36 @@ export function SettingsPage() {
           <SettingsSection
             id="repo"
             title="仓库"
-            description="来自运行器心跳上报的仓库、检出路径与验证配置；只读，不随本页保存。"
+            description="控制台登记的仓库与运行器心跳上报的仓库；登记信息可编辑，仓库内容只读。"
             open={openSections.repo}
             onToggle={() => toggleSection("repo")}
             {...panelProps}
             aside={
-              <Link
-                to="/runners"
-                className="inline-flex min-h-11 items-center gap-1.5 rounded-card border border-border-strong bg-raised px-3 text-caption font-medium text-text transition-colors duration-150 ease-out hover:border-accent hover:text-accent pointer-fine:min-h-9"
-              >
-                查看运行器
-              </Link>
+              <>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setRepoDialog({ mode: "create" })}
+                >
+                  <Plus aria-hidden="true" className="size-3.5" />
+                  添加仓库
+                </Button>
+                <Link
+                  to="/runners"
+                  className="inline-flex min-h-11 items-center gap-1.5 rounded-card border border-border-strong bg-raised px-3 text-caption font-medium text-text transition-colors duration-150 ease-out hover:border-accent hover:text-accent pointer-fine:min-h-9"
+                >
+                  查看运行器
+                </Link>
+              </>
             }
           >
-            <RepositoryBody query={runners} />
+            <RepositoryBody
+              reposQuery={repos}
+              runnersQuery={runners}
+              onEdit={(target) => setRepoDialog({ mode: "edit", target })}
+              onDelete={setDeleteTarget}
+              onRegister={(prefill) => setRepoDialog({ mode: "create", prefill })}
+            />
           </SettingsSection>
 
           <SettingsSection
@@ -1328,6 +1548,35 @@ export function SettingsPage() {
         open={restartOpen}
         onClose={() => setRestartOpen(false)}
         units={system.data?.services.map((service) => service.unit) ?? []}
+      />
+
+      <RepoFormDialog
+        open={repoDialog !== null}
+        mode={repoDialog?.mode ?? "create"}
+        target={repoDialog?.mode === "edit" ? repoDialog.target : null}
+        prefill={repoDialog?.mode === "create" ? (repoDialog.prefill ?? null) : null}
+        onClose={() => setRepoDialog(null)}
+      />
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title="移除仓库登记？"
+        description={
+          deleteTarget
+            ? `将从控制台移除 ${deleteTarget.name}（${deleteTarget.repo}）的登记。这不会停止 runner，也不会修改目标仓库的 nuwa.repo.json；仓库内容（failing_check、forbidden_paths、notes）保持不变。`
+            : undefined
+        }
+        confirmLabel="移除登记"
+        cancelLabel="取消"
+        danger
+        pending={removeRepo.isPending}
+        cancelDisabled={removeRepo.isPending}
+        onConfirm={handleRemoveRepo}
+        onCancel={() => {
+          if (!removeRepo.isPending) {
+            setDeleteTarget(null);
+          }
+        }}
       />
     </div>
   );

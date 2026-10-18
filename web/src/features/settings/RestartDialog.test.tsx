@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   mockMe,
   mockOverviewResources,
+  mockRepos,
   mockRunners,
   mockSettings,
   mockSystem,
@@ -55,6 +56,7 @@ function signedIn(...handlers: Parameters<typeof server.use>) {
     mockSystem(),
     mockSettings(),
     mockRunners(),
+    mockRepos(),
     ...handlers,
   );
 }

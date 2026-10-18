@@ -10,6 +10,8 @@ import type { IssueDetailResponse, RunDto } from "../features/issue-detail/types
 import type { IssueListItem, IssueListResponse } from "../features/issues/types";
 import type { RunnerDto, RunnerListResponse } from "../features/runners/types";
 import type {
+  RepoDto,
+  RepoListResponse,
   SettingDto,
   SettingsResponse,
   SystemResponse,
@@ -427,4 +429,23 @@ export function makeSystem(overrides: Partial<SystemResponse> = {}): SystemRespo
 export function mockSystem(overrides: Partial<SystemResponse> = {}) {
   const body = makeSystem(overrides);
   return http.get("/api/v1/system", () => HttpResponse.json(body));
+}
+
+/** One console registry row; identities contain `/` by design. */
+export function makeRepo(overrides: Partial<RepoDto> = {}): RepoDto {
+  return {
+    repo: "example.com/app",
+    name: "Example App",
+    url: "https://example.com/app",
+    description: "",
+    created_at_ms: 1_700_000_000_000,
+    updated_at_ms: 1_700_000_000_000,
+    ...overrides,
+  };
+}
+
+/** Static registry handler; defaults to an empty registry. */
+export function mockRepos(repos: RepoDto[] = []) {
+  const body: RepoListResponse = { data: repos };
+  return http.get("/api/v1/repos", () => HttpResponse.json(body));
 }
