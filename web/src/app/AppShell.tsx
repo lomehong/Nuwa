@@ -179,7 +179,7 @@ function SidebarFooter({ localMode }: { localMode: boolean }) {
  * Compact health strip fed by `/overview` (docs/09 §10.1). It shares the
  * overview query (and key) with the page: the 10s poll pauses while the tab is
  * hidden and refreshes immediately on focus. Runner and issue counts link to
- * their pages; settings links arrive with M5.
+ * their pages.
  */
 export function HealthStrip() {
   const overview = useOverviewQuery();

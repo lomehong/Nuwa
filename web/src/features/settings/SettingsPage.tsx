@@ -1,5 +1,6 @@
 import { clsx } from "clsx";
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 
 import {
   Badge,
@@ -9,6 +10,7 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
+  ConfirmDialog,
   Skeleton,
   useToast,
 } from "../../components/ui";
@@ -335,8 +337,11 @@ export function SettingsPage() {
   const system = useSystemQuery();
   const save = useSaveSettingsMutation();
   const { toast } = useToast();
+  const location = useLocation();
+  const navigate = useNavigate();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [pendingHref, setPendingHref] = useState<string | null>(null);
   const [lastSave, setLastSave] = useState<{
     changed: string[];
     restartRequired: boolean;
@@ -344,6 +349,75 @@ export function SettingsPage() {
 
   const data = settings.data;
   const dirtyCount = Object.keys(drafts).length;
+  // Guards read dirty state through a ref, so listener setup never depends on
+  // per-keystroke draft text.
+  const dirtyRef = useRef(false);
+
+  useEffect(() => {
+    dirtyRef.current = dirtyCount > 0;
+  }, [dirtyCount]);
+
+  // Native unload guard: the browser owns the confirmation copy.
+  useEffect(() => {
+    function handleBeforeUnload(event: BeforeUnloadEvent) {
+      if (!dirtyRef.current) {
+        return;
+      }
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, []);
+
+  // In-app navigation guard: links are caught in the capture phase so the
+  // router never sees the click while drafts are unsaved. Same-origin plain
+  // left clicks only; new tabs, downloads, external and hash links pass.
+  useEffect(() => {
+    function handleLinkClick(event: MouseEvent) {
+      if (!dirtyRef.current || event.defaultPrevented || event.button !== 0) {
+        return;
+      }
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+        return;
+      }
+      const target = event.target;
+      const anchor =
+        target instanceof Element ? target.closest<HTMLAnchorElement>("a[href]") : null;
+      if (!anchor) {
+        return;
+      }
+      if (anchor.target && anchor.target !== "_self") {
+        return;
+      }
+      if (anchor.hasAttribute("download")) {
+        return;
+      }
+      const href = anchor.getAttribute("href");
+      if (!href || href.startsWith("#")) {
+        return;
+      }
+      let url: URL;
+      try {
+        url = new URL(anchor.href, window.location.href);
+      } catch {
+        return;
+      }
+      if (url.origin !== window.location.origin) {
+        return;
+      }
+      const next = `${url.pathname}${url.search}${url.hash}`;
+      const current = `${location.pathname}${location.search}${location.hash}`;
+      if (next === current) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      setPendingHref(next);
+    }
+    document.addEventListener("click", handleLinkClick, true);
+    return () => document.removeEventListener("click", handleLinkClick, true);
+  }, [location.pathname, location.search, location.hash]);
 
   function handleDraftChange(spec: SettingDto, raw: string) {
     setDrafts((current) => {
@@ -376,6 +450,7 @@ export function SettingsPage() {
     }
     const specs = new Map(data.schema.map((spec) => [spec.key, spec]));
     const values: SettingsValues = {};
+    const submittedDrafts: Record<string, string> = {};
     const errors: Record<string, string> = {};
     for (const [key, raw] of Object.entries(drafts)) {
       const spec = specs.get(key);
@@ -387,6 +462,7 @@ export function SettingsPage() {
         errors[key] = message;
         continue;
       }
+      submittedDrafts[key] = raw;
       values[key] = spec.type === "int" && raw !== "" ? Number(raw) : raw;
     }
     if (Object.keys(errors).length > 0) {
@@ -404,7 +480,17 @@ export function SettingsPage() {
     }
     save.mutate(values, {
       onSuccess: (result) => {
-        setDrafts({});
+        // Only drop the drafts that this PUT submitted and that still hold the
+        // submitted text; an edit typed while the request was in flight stays.
+        setDrafts((current) => {
+          const next = { ...current };
+          for (const [key, raw] of Object.entries(submittedDrafts)) {
+            if (next[key] === raw) {
+              delete next[key];
+            }
+          }
+          return next;
+        });
         setFieldErrors({});
         setLastSave({
           changed: result.changed,
@@ -512,6 +598,11 @@ export function SettingsPage() {
           ) : (
             <span>有配置更改尚未重启生效；重启 serve 与 runner units 后才会加载。</span>
           )}
+          {lastSave?.changed.includes("NUWA_UI_TOKEN") ? (
+            <span className="w-full text-warning">
+              更改控制台令牌后，重启会使当前会话失效，需要重新登录。
+            </span>
+          ) : null}
         </div>
       ) : null}
 
@@ -572,7 +663,10 @@ export function SettingsPage() {
       </Card>
 
       {dirtyCount > 0 ? (
-        <div className="sticky bottom-0 z-20 -mx-4 border-t border-border bg-surface/95 px-4 py-3 backdrop-blur sm:-mx-6 lg:static lg:mx-0 lg:rounded-card lg:border">
+        <div
+          data-testid="settings-save-bar"
+          className="sticky bottom-14 z-20 -mx-4 border-t border-border bg-surface/95 px-4 py-3 backdrop-blur sm:-mx-6 lg:static lg:mx-0 lg:rounded-card lg:border"
+        >
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-body-sm text-text">{dirtyCount} 项未保存</p>
             <div className="flex gap-2">
@@ -586,6 +680,23 @@ export function SettingsPage() {
           </div>
         </div>
       ) : null}
+
+      <ConfirmDialog
+        open={pendingHref !== null}
+        title="放弃未保存的更改？"
+        description={`离开后将丢失 ${dirtyCount} 项未保存的修改。`}
+        confirmLabel="放弃并离开"
+        cancelLabel="留在本页"
+        danger
+        onConfirm={() => {
+          const href = pendingHref;
+          setPendingHref(null);
+          if (href) {
+            navigate(href);
+          }
+        }}
+        onCancel={() => setPendingHref(null)}
+      />
     </div>
   );
 }

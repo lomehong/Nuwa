@@ -28,6 +28,7 @@ describe("validateSettingValue", () => {
   it("rejects non-integers and out-of-range numbers", () => {
     expect(validateSettingValue(interval, "abc")).toBe("请输入整数");
     expect(validateSettingValue(interval, "1.5")).toBe("请输入整数");
+    expect(validateSettingValue(interval, "")).toBe("请输入整数");
     expect(validateSettingValue(interval, "0")).toBe("必须在 1–86400 之间");
     expect(validateSettingValue(interval, "86401")).toBe("必须在 1–86400 之间");
     expect(validateSettingValue(interval, "30")).toBeNull();
@@ -45,9 +46,10 @@ describe("validateSettingValue", () => {
     expect(validateSettingValue(spec({ type: "url" }), "")).toBeNull();
   });
 
-  it("leaves empty values and free text to the server", () => {
-    expect(validateSettingValue(interval, "")).toBeNull();
+  it("leaves empty non-int values and free text to the server", () => {
+    expect(validateSettingValue(spec({ type: "string" }), "")).toBeNull();
     expect(validateSettingValue(spec({ type: "string" }), "任意 值")).toBeNull();
+    expect(validateSettingValue(spec({ type: "csv" }), "")).toBeNull();
     expect(validateSettingValue(spec({ type: "csv" }), "a,b")).toBeNull();
   });
 

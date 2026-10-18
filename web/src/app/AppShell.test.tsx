@@ -8,6 +8,8 @@ import {
   mockIssues,
   mockMe,
   mockOverviewResources,
+  mockSettings,
+  mockSystem,
   server,
 } from "../test/msw";
 import { renderApp } from "../test/render";
@@ -51,6 +53,17 @@ describe("AppShell", () => {
       "/settings",
     );
     expect(within(nav).queryByText("Soon")).not.toBeInTheDocument();
+  });
+
+  it("marks the settings nav link current on /settings", async () => {
+    server.use(mockMe(), ...mockOverviewResources(), mockSystem(), mockSettings());
+    renderApp("/settings");
+
+    const nav = await screen.findByRole("navigation", { name: "主导航" });
+    expect(within(nav).getByRole("link", { name: "设置" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
   });
 
   it("renders the runners route with the page title and placeholder", async () => {

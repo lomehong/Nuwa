@@ -14,6 +14,11 @@ const URL_PATTERN = /^https?:\/\/\S+$/i;
 const INTEGER_PATTERN = /^-?\d+$/;
 
 export function validateSettingValue(spec: SettingDto, raw: string): string | null {
+  if (spec.type === "int" && raw === "") {
+    // Ints are not clearable: an empty field would silently fall back to the
+    // server default, so require an explicit number.
+    return "请输入整数";
+  }
   if (raw === "") {
     // An empty non-secret follows the server's default/clear rules; an empty
     // secret means "keep the current value".

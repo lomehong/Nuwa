@@ -1,8 +1,9 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  makeSettings,
   mockMe,
   mockOverviewResources,
   mockSettings,
@@ -26,6 +27,13 @@ function signedIn(settings: SettingsOverrides = {}, system: SystemOverrides = {}
     mockSettings(settings),
   );
 }
+
+function shellNavLink(name: string) {
+  const nav = screen.getByRole("navigation", { name: "主导航" });
+  return within(nav).getByRole("link", { name });
+}
+
+const LEAVE_DIALOG = "放弃未保存的更改？";
 
 describe("SettingsPage", () => {
   it("only sends changed keys and shows the restart notice", async () => {
@@ -59,11 +67,14 @@ describe("SettingsPage", () => {
     expect(screen.queryByDisplayValue("supersecret1234")).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue(/1234/)).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "更新" }));
+    fireEvent.click(screen.getByRole("button", { name: "更新 GitHub token" }));
     const secretInput = screen.getByPlaceholderText("留空保持不变");
     expect(secretInput).toHaveAttribute("type", "password");
     expect(secretInput).toHaveAttribute("autocomplete", "new-password");
     expect(secretInput).toHaveValue("");
+    const cancel = screen.getByRole("button", { name: "取消更新 GitHub token" });
+    expect(cancel).toHaveTextContent("取消");
+    expect(cancel).toHaveAttribute("aria-expanded", "true");
   });
 
   it("shows server field errors next to the field", async () => {
@@ -125,6 +136,9 @@ describe("SettingsPage", () => {
     fireEvent.change(interval, { target: { value: "60" } });
     expect(screen.getByText("1 项未保存")).toBeInTheDocument();
     expect(screen.getByText("未保存 1 项")).toBeInTheDocument();
+    const saveBar = screen.getByTestId("settings-save-bar");
+    expect(saveBar).toHaveClass("bottom-14", "z-20", "lg:static");
+    expect(saveBar).not.toHaveClass("bottom-0");
 
     fireEvent.click(screen.getByRole("button", { name: "放弃更改" }));
     expect(screen.queryByText("1 项未保存")).not.toBeInTheDocument();
@@ -178,5 +192,96 @@ describe("SettingsPage", () => {
     expect(
       await screen.findByText(/任何能访问该端口的客户端都可修改设置/),
     ).toBeInTheDocument();
+  });
+
+  it("guards in-app navigation while drafts are unsaved", async () => {
+    signedIn();
+    renderApp("/settings");
+    const interval = await screen.findByLabelText("Poll interval");
+    fireEvent.change(interval, { target: { value: "60" } });
+
+    fireEvent.click(shellNavLink("总览"));
+    const dialog = await screen.findByRole("dialog", { name: LEAVE_DIALOG });
+    expect(within(dialog).getByRole("button", { name: "留在本页" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "放弃并离开" })).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "留在本页" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument(),
+    );
+    expect(screen.getByRole("heading", { level: 2, name: "设置" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Poll interval")).toHaveValue(60);
+
+    fireEvent.click(shellNavLink("总览"));
+    fireEvent.click(await screen.findByRole("button", { name: "放弃并离开" }));
+    expect(await screen.findByRole("heading", { level: 1, name: "总览" })).toBeInTheDocument();
+  });
+
+  it("navigates without a dialog when nothing is dirty", async () => {
+    signedIn();
+    renderApp("/settings");
+    await screen.findByLabelText("Poll interval");
+
+    fireEvent.click(shellNavLink("总览"));
+
+    expect(await screen.findByRole("heading", { level: 1, name: "总览" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument();
+  });
+
+  it("warns that a console token change ends the session on restart", async () => {
+    const base = makeSettings();
+    const secretSpec = base.schema.find((spec) => spec.secret)!;
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockSystem(),
+      mockSettings({
+        schema: [
+          ...base.schema,
+          { ...secretSpec, key: "NUWA_UI_TOKEN", label: "Console token" },
+        ],
+      }),
+      http.put("/api/v1/settings", () =>
+        HttpResponse.json({ changed: ["NUWA_UI_TOKEN"], restart_required: true }),
+      ),
+    );
+    renderApp("/settings");
+    fireEvent.click(await screen.findByRole("button", { name: "更新 Console token" }));
+    fireEvent.change(screen.getByPlaceholderText("留空保持不变"), {
+      target: { value: "new-console-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+
+    expect(
+      await screen.findByText("更改控制台令牌后，重启会使当前会话失效，需要重新登录。"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps drafts edited while the save request is pending", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockSystem(),
+      mockSettings(),
+      http.put("/api/v1/settings", async () => {
+        await gate;
+        return HttpResponse.json({ changed: ["NUWA_INTERVAL"], restart_required: false });
+      }),
+    );
+    renderApp("/settings");
+    const interval = await screen.findByLabelText("Poll interval");
+    fireEvent.change(interval, { target: { value: "60" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存更改" }));
+    // Retype while the PUT is still in flight: this draft was not submitted.
+    fireEvent.change(interval, { target: { value: "90" } });
+    release();
+
+    expect(await screen.findByText("设置已保存")).toBeInTheDocument();
+    expect(screen.getByLabelText("Poll interval")).toHaveValue(90);
+    expect(screen.getByText("1 项未保存")).toBeInTheDocument();
   });
 });

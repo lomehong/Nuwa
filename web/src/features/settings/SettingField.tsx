@@ -90,6 +90,7 @@ export function SettingField({ spec, value, diff, draft, error, onChange }: Sett
             variant="secondary"
             size="sm"
             aria-expanded={revealed}
+            aria-label={revealed ? `取消更新 ${spec.label}` : `更新 ${spec.label}`}
             onClick={() => {
               if (revealed) {
                 // Hiding the input discards a typed candidate: an unseen draft
