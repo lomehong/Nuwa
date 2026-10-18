@@ -1,6 +1,6 @@
 # Web Console M6 — Hardening and Cutover Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Finish the console polish (a11y, search, backoff, retention), remove the legacy server-rendered console, and deliver a locally verified 0.2.0 release candidate without pushing or deploying.
 
@@ -60,7 +60,7 @@
 - `PanelError` no longer wraps its retry button in `role="alert"`.
 - Light stones reach ≥3:1 against `surface` and `bg`.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```tsx
 it("updates the document title per route", async () => {
@@ -90,11 +90,11 @@ it("light stones reach 3:1 against both page and surface backgrounds", () => {
 });
 ```
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cd web && npx vitest run src/app/AppShell.test.tsx src/components/ui/EmptyState.test.tsx src/styles/tokens.test.ts` → FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 - `AppShell`: `useEffect(() => { document.title = title === "Nuwa 控制台" ? "女娲 · 补天" : `${title} · 女娲`; }, [title]);` `pageMeta` already returns titles.
 - `LoginPage`: `useEffect(() => { document.title = "登录 · 女娲"; }, []);`
@@ -112,11 +112,11 @@ it("light stones reach 3:1 against both page and surface backgrounds", () => {
 
 - Bottom navigation: after M4 all four slots are live; remove any residual disabled styling for 运行器/活动.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 `cd web && npx vitest run src/app/AppShell.test.tsx src/components/ui src/styles src/features/overview` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/app web/src/features/login/LoginPage.tsx web/src/components/ui/EmptyState.tsx web/src/features/overview/PanelChrome.tsx web/src/styles/tokens.css web/src/styles/tokens.test.ts
@@ -139,7 +139,7 @@ git commit -m "fix(web): deferred a11y and light-theme polish"
 - In IssuesPage, `/` focuses the search input when no editable element is focused; Escape blurs it.
 - Palette queries `GET /issues?q=<q>&page_size=5&sort=last_seen&order=desc` (150 ms debounce) and links each result to `/issues/<fp>`.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```tsx
 it("opens with Ctrl+K and navigates to a selected issue", async () => {
@@ -171,11 +171,11 @@ it("focuses search on / and blurs on Escape", async () => {
 });
 ```
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cd web && npx vitest run src/app/CommandPalette.test.tsx src/features/issues/IssuesPage.test.tsx -t "focuses search"` → FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `CommandPalette`:
 - Portal + `role="dialog"`, `aria-label="搜索问题单"`, focus trap via `useModalBehavior`.
@@ -204,11 +204,11 @@ IssuesPage/IssueFilters:
 - `useEffect` listens for `/` when `document.activeElement` is not `INPUT`, `TEXTAREA`, `SELECT`, or contenteditable; call `event.preventDefault(); searchInputRef.current?.focus();`.
 - Escape blurs the search input only (does not clear the value).
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 `cd web && npx vitest run src/app/CommandPalette.test.tsx src/features/issues` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/app/CommandPalette.tsx web/src/app/CommandPalette.test.tsx web/src/app/AppShell.tsx web/src/features/issues
@@ -232,7 +232,7 @@ git commit -m "feat(web): command palette and slash search shortcut"
 - `backoffDelay(baseMs, failures, maxMs = 60_000): number` → base, 2×, 4×… capped.
 - `backoffInterval(baseMs)` returns `(query: { state: { fetchFailureCount: number } }) => number | false`.
 
-- [ ] **Step 1: Write failing test**
+- [x] **Step 1: Write failing test**
 
 ```ts
 import { backoffDelay } from "./polling";
@@ -246,11 +246,11 @@ it("backs off exponentially and caps at 60s", () => {
 });
 ```
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cd web && npx vitest run src/lib/polling.test.ts` → FAIL.
 
-- [ ] **Step 3: Implement and wire**
+- [x] **Step 3: Implement and wire**
 
 ```ts
 export function backoffDelay(baseMs: number, failures: number, maxMs = 60_000): number {
@@ -266,11 +266,11 @@ export function backoffInterval(baseMs: number) {
 
 In each query hook replace `refetchInterval: CONST` with `refetchInterval: backoffInterval(CONST)`. Keep `refetchIntervalInBackground: false` and focus refetch. The existing cadence tests still assert one request per cycle after success (failure count 0).
 
-- [ ] **Step 4: Run all frontend query tests**
+- [x] **Step 4: Run all frontend query tests**
 
 `cd web && npx vitest run src/lib src/features/overview src/features/issues src/features/issue-detail src/features/runners src/features/events` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/lib/polling.ts web/src/lib/polling.test.ts web/src/features
@@ -289,7 +289,7 @@ git commit -m "feat(web): exponential backoff for polling"
 - `event_retention_days()` reads `NUWA_EVENT_RETENTION_DAYS` (default 90, clamp 1–3650).
 - On `serve` startup, call `store.prune(now, days, 365)` best-effort and log the deleted count.
 
-- [ ] **Step 1: Write failing test**
+- [x] **Step 1: Write failing test**
 
 ```rust
 #[test]
@@ -310,11 +310,11 @@ fn serve_prunes_events_past_retention_but_keeps_audit() {
 
 (Use the actual `Store::record_event` signature and `EventQuery` default; if the test helper differs, reuse the M1a prune test pattern.)
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cargo test -p nuwa serve::tests::serve_prunes_events_past_retention_but_keeps_audit` → FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 fn event_retention_days() -> u32 {
@@ -340,7 +340,7 @@ match prune_on_start(&store, now_ms(), event_retention_days()) {
 }
 ```
 
-- [ ] **Step 4: Run serve tests and clippy**
+- [x] **Step 4: Run serve tests and clippy**
 
 ```bash
 cargo test -p nuwa serve::tests
@@ -348,7 +348,7 @@ cargo clippy --no-deps -p nuwa --all-targets -- -D warnings
 ```
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/nuwa/src/serve.rs
@@ -374,7 +374,7 @@ git commit -m "feat(serve): prune expired telemetry on startup"
 - Legacy write routes (`/ui/reopen`, `/ui/sync`, `/settings/save`, `/settings/restart`) → 404.
 - `/ingest`, `/health`, `/api/v1`, static assets unchanged.
 
-- [ ] **Step 1: Write failing routing tests**
+- [x] **Step 1: Write failing routing tests**
 
 ```rust
 #[tokio::test]
@@ -408,11 +408,11 @@ async fn settings_spa_uses_the_strict_csp() {
 }
 ```
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cargo test -p nuwa serve::tests::legacy_console_redirects_to_the_spa` → FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 - `main.rs`: remove `mod ui;`.
 - `serve.rs`:
@@ -435,7 +435,7 @@ async fn settings_spa_uses_the_strict_csp() {
 - `ui.rs`: delete the file.
 - `web.rs`: keep the `/ingest`, `/health`, `/api` guards; `/ui` and `/issue` are handled by the router redirects.
 
-- [ ] **Step 4: Run Rust tests and clippy**
+- [x] **Step 4: Run Rust tests and clippy**
 
 ```bash
 cargo clippy --no-deps -p nuwa -p shanhaijing --all-targets -- -D warnings
@@ -443,7 +443,7 @@ cargo test -p nuwa -p shanhaijing
 ```
 Expected: PASS; no references to `crate::ui` remain (`grep -rn "crate::ui" crates/nuwa/src` returns nothing).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A crates/nuwa/src crates/nuwa/Cargo.toml
@@ -464,11 +464,11 @@ git commit -m "feat(serve)!: remove the legacy server-rendered console"
 - Modify: `README.md`
 - Modify: `AGENTS.md` (if commands/layout changed)
 
-- [ ] **Step 1: Bump version**
+- [x] **Step 1: Bump version**
 
 Set `crates/nuwa/Cargo.toml` to `version = "0.2.0"` and run `cargo check -p nuwa` to refresh `Cargo.lock`.
 
-- [ ] **Step 2: Update docs**
+- [x] **Step 2: Update docs**
 
 - docs/04 ADR-009: add an “Implementation status (2026-10-18)” section: M3–M6 completed; legacy console removed; version 0.2.0; release gate pending.
 - docs/07: final M6 bullet with axe/benchmark/UAT evidence and the rollback procedure.
@@ -477,14 +477,14 @@ Set `crates/nuwa/Cargo.toml` to `version = "0.2.0"` and run `cargo check -p nuwa
 - README: quick start points at `/`, not `/ui`; mention the single binary embeds the SPA.
 - AGENTS: layout/commands already include web; update any `/ui` references.
 
-- [ ] **Step 3: Verify no stale instructions**
+- [x] **Step 3: Verify no stale instructions**
 
 ```bash
 grep -rn "/ui\|Basic 鉴权\|旧控制台" README.md docs/08-onboarding.md AGENTS.md docs/07-open-items.md
 ```
 Only historical/ADR references may remain; operational docs must describe the SPA.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/nuwa/Cargo.toml Cargo.lock docs README.md AGENTS.md
@@ -501,14 +501,14 @@ git commit -m "docs: cut over to the 0.2.0 web console"
 - Create: `web/e2e/bench.py` (optional)
 - Modify: `.gitignore` for `web/e2e/artifacts/`
 
-- [ ] **Step 1: Install axe locally**
+- [x] **Step 1: Install axe locally**
 
 ```bash
 cd web && npm install --save-dev axe-core
 ```
 No runtime dependency; the script injects `node_modules/axe-core/axe.min.js` into the page with `page.addScriptTag({ path })`.
 
-- [ ] **Step 2: Run axe on the core pages**
+- [x] **Step 2: Run axe on the core pages**
 
 Extend `smoke.mjs` with:
 ```js
@@ -522,7 +522,7 @@ if (serious.length) throw new Error(JSON.stringify(serious, null, 2));
 ```
 Run for `/login`, `/`, `/issues`, `/issues/<fp>`, `/runners`, `/events`, `/settings`, both themes at 390 and 1440.
 
-- [ ] **Step 3: Benchmark with 5,000 issues**
+- [x] **Step 3: Benchmark with 5,000 issues**
 
 Generate a temp DB (seed script extended to `--issues 5000`), start serve, and measure:
 ```bash
@@ -530,20 +530,20 @@ for i in $(seq 1 50); do curl -s -o /dev/null -w "%{time_total}\n" -b cookies.tx
 ```
 Record p95 for `/issues` and `/overview`; acceptance: issues p95 < 300 ms, overview < 200 ms on this host. Browser-render the list at 1440 and 390 and confirm no layout overflow.
 
-- [ ] **Step 4: Production DB copy rehearsal (local, read-only source)**
+- [x] **Step 4: Production DB copy rehearsal (local, read-only source)**
 
 - Copy a production DB **only if the operator has provided one**; otherwise use the seeded 5,000-issue DB and record that substitution.
 - Run `nuwa serve` against the copy with a dummy UI token and a temp env file.
 - Practice: login → four “open moments” (new/escalated/stuck/pr_open) → reopen a rejected issue → settings save of a non-secret key → restart dialog cancelled.
 - Confirm no real credentials appear in screenshots/logs.
 
-- [ ] **Step 5: Rollback drill (local)**
+- [x] **Step 5: Rollback drill (local)**
 
 - Keep the previous `v0.1.7` binary (or the pre-M6 commit's binary) available.
 - Document: stop 0.2.0 → restore the previous binary → confirm schema v1 compatibility (no destructive migration) → `/ui` works again on the old binary.
 - The rollback is a procedure only; do not deploy.
 
-- [ ] **Step 6: Commit artifacts**
+- [x] **Step 6: Commit artifacts**
 
 ```bash
 git add web/package.json web/package-lock.json web/e2e .gitignore docs/07-open-items.md
