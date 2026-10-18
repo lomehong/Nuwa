@@ -87,4 +87,57 @@ describe("ConfirmDialog", () => {
     expect(container).not.toHaveAttribute("inert");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
+
+  it("reference-counts the page lock across two concurrent modals", () => {
+    const { container, rerender } = render(
+      <>
+        <ConfirmDialog open title="外层确认" onConfirm={() => {}} onCancel={() => {}} />
+        <ConfirmDialog open title="内层确认" onConfirm={() => {}} onCancel={() => {}} />
+      </>,
+    );
+
+    expect(document.body).toHaveClass("nuwa-scroll-lock");
+    expect(container).toHaveAttribute("inert");
+    // Neither panel may end up inside an inert backdrop.
+    expect(screen.getByRole("dialog", { name: "外层确认" }).closest("[inert]")).toBeNull();
+    expect(screen.getByRole("dialog", { name: "内层确认" }).closest("[inert]")).toBeNull();
+
+    rerender(
+      <>
+        <ConfirmDialog open title="外层确认" onConfirm={() => {}} onCancel={() => {}} />
+        <ConfirmDialog
+          open={false}
+          title="内层确认"
+          onConfirm={() => {}}
+          onCancel={() => {}}
+        />
+      </>,
+    );
+
+    // Closing the inner modal leaves the page locked and the outer modal
+    // interactive; only the last unlock restores everything.
+    expect(document.body).toHaveClass("nuwa-scroll-lock");
+    expect(container).toHaveAttribute("inert");
+    expect(screen.getByRole("dialog", { name: "外层确认" }).closest("[inert]")).toBeNull();
+
+    rerender(
+      <>
+        <ConfirmDialog
+          open={false}
+          title="外层确认"
+          onConfirm={() => {}}
+          onCancel={() => {}}
+        />
+        <ConfirmDialog
+          open={false}
+          title="内层确认"
+          onConfirm={() => {}}
+          onCancel={() => {}}
+        />
+      </>,
+    );
+
+    expect(document.body).not.toHaveClass("nuwa-scroll-lock");
+    expect(container).not.toHaveAttribute("inert");
+  });
 });

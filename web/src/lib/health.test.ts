@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { probeServeOnce, waitForServeRecovery } from "./health";
+import {
+  RECOVERY_INITIAL_DELAY_MS,
+  probeServeOnce,
+  reloadConsole,
+  waitForServeRecovery,
+} from "./health";
 
 type FetchMock = ReturnType<typeof vi.fn>;
 
@@ -30,6 +35,8 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("probeServeOnce", () => {
@@ -59,19 +66,51 @@ describe("probeServeOnce", () => {
     mockFetch(response(true), response(false));
     await expect(probeServeOnce()).resolves.toBe(false);
   });
+
+  it("bounds each probe with a timeout signal that also follows the caller", async () => {
+    const external = new AbortController();
+    const signals: AbortSignal[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation((async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      if (init?.signal) {
+        signals.push(init.signal);
+      }
+      return response(true);
+    }) as typeof fetch);
+
+    await expect(probeServeOnce(external.signal)).resolves.toBe(true);
+    expect(signals).toHaveLength(2);
+    for (const signal of signals) {
+      // Combined with AbortSignal.timeout, so never the caller's signal itself.
+      expect(signal).not.toBe(external.signal);
+      expect(signal.aborted).toBe(false);
+    }
+
+    external.abort();
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+  });
 });
 
 describe("waitForServeRecovery", () => {
-  it("returns immediately when serve and the session are already back", async () => {
+  it("waits out the systemd restart delay before the first probe", async () => {
     const fetchMock = mockFetch(response(true), response(true));
 
-    await expect(waitForServeRecovery(5_000)).resolves.toBeUndefined();
+    const recovery = waitForServeRecovery();
+    await vi.advanceTimersByTimeAsync(RECOVERY_INITIAL_DELAY_MS - 1);
+    // The old process still serves /health during systemd-run's 2s delay, so
+    // probing earlier would reload against a process about to die.
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(recovery).resolves.toBeUndefined();
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("retries until health and /auth/me both answer", async () => {
-    // First poll: process still down. Second: health is up but the session
-    // endpoint has not come back yet. Third: fully recovered.
+  it("retries every second until health and /auth/me both answer", async () => {
+    // First poll at 3s: health down. Second at 4s: health up, session not yet.
+    // Third at 5s: fully recovered.
     mockFetch(
       response(false),
       response(true),
@@ -80,8 +119,8 @@ describe("waitForServeRecovery", () => {
       response(true),
     );
 
-    const recovery = waitForServeRecovery(10_000);
-    await vi.advanceTimersByTimeAsync(0);
+    const recovery = waitForServeRecovery(undefined, 10_000);
+    await vi.advanceTimersByTimeAsync(RECOVERY_INITIAL_DELAY_MS);
     await vi.advanceTimersByTimeAsync(1_000);
     await vi.advanceTimersByTimeAsync(1_000);
 
@@ -91,14 +130,44 @@ describe("waitForServeRecovery", () => {
   it("throws once the timeout elapses", async () => {
     mockFetch(response(false), response(false), response(false), response(false));
 
-    const recovery = waitForServeRecovery(2_000);
+    const recovery = waitForServeRecovery(undefined, 5_000);
     // A rejection must be observed before advancing or vitest reports it as
     // unhandled when the loop throws.
     const settled = recovery.catch((error: unknown) => error);
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(5_000);
 
     const error = await settled;
     expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toBe("服务在 2 秒内未恢复");
+    expect((error as Error).message).toBe("服务在 5 秒内未恢复");
+  });
+
+  it("stops polling and rejects when the caller aborts", async () => {
+    const controller = new AbortController();
+    const fetchMock = mockFetch(response(true), response(true));
+
+    const recovery = waitForServeRecovery(controller.signal);
+    const settled = recovery.catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    controller.abort();
+    const error = await settled;
+    expect(error).toMatchObject({ name: "AbortError" });
+
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("reloadConsole", () => {
+  it("reloads the console window", () => {
+    const reload = vi.fn();
+    // jsdom's Location.reload is non-configurable, so replace the whole
+    // window binding instead of trying to spy on the method.
+    vi.stubGlobal("window", { ...window, location: { reload } });
+
+    reloadConsole();
+
+    expect(reload).toHaveBeenCalledTimes(1);
   });
 });

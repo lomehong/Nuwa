@@ -4,10 +4,12 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import {
   makeSettings,
+  mockIssueDetail,
   mockMe,
   mockOverviewResources,
   mockSettings,
   mockSystem,
+  mockTranscript,
   server,
 } from "../../test/msw";
 import { renderApp } from "../../test/render";
@@ -354,6 +356,7 @@ describe("SettingsPage", () => {
 
   it("probes GitHub with no values and the LLM with only non-empty drafts", async () => {
     const bodies: Array<Record<string, unknown>> = [];
+    const csrf: Array<string | null> = [];
     const base = makeSettings();
     const providerSpec = base.schema.find((spec) => spec.key === "NUWA_PROVIDER")!;
     server.use(
@@ -387,6 +390,7 @@ describe("SettingsPage", () => {
         },
       }),
       http.post("/api/v1/settings/test", async ({ request }) => {
+        csrf.push(request.headers.get("x-nuwa-csrf"));
         const body = (await request.json()) as Record<string, unknown>;
         bodies.push(body);
         return HttpResponse.json({
@@ -414,6 +418,7 @@ describe("SettingsPage", () => {
       }),
     );
     expect(await screen.findByText("zai model responded")).toBeInTheDocument();
+    expect(csrf).toEqual(["csrf-token", "csrf-token"]);
   });
 
   it("surfaces a probe 422 as a danger toast with the field message", async () => {
@@ -454,5 +459,87 @@ describe("SettingsPage", () => {
     const dialog = await screen.findByRole("dialog", { name: "重启服务？" });
     expect(within(dialog).getByText(/nuwa-serve、nuwa-work/)).toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "确认重启" })).toBeInTheDocument();
+  });
+
+  it("clears a probe field error once a later probe succeeds", async () => {
+    let calls = 0;
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockSystem(),
+      mockSettings(),
+      http.post("/api/v1/settings/test", () => {
+        calls += 1;
+        if (calls === 1) {
+          return HttpResponse.json(
+            {
+              error: {
+                code: "validation_failed",
+                message: "invalid settings",
+                fields: { NUWA_INTERVAL: "must be 1..86400" },
+              },
+            },
+            { status: 422 },
+          );
+        }
+        return HttpResponse.json({ ok: true, detail: "model responded" });
+      }),
+    );
+    renderApp("/settings");
+
+    const probe = await screen.findByRole("button", { name: "测试模型配置" });
+    fireEvent.click(probe);
+    expect(await screen.findByText("must be 1..86400")).toBeInTheDocument();
+    expect(screen.getByLabelText("Poll interval")).toHaveAttribute("aria-invalid", "true");
+
+    fireEvent.click(probe);
+    expect(await screen.findByText("model responded")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText("must be 1..86400")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByLabelText("Poll interval")).not.toHaveAttribute("aria-invalid");
+  });
+
+  it("lets an active-run link in the restart dialog navigate despite dirty drafts", async () => {
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockSystem(),
+      mockSettings(),
+      mockIssueDetail(),
+      mockTranscript(),
+      http.post("/api/v1/settings/restart", () =>
+        HttpResponse.json(
+          {
+            error: { code: "conflict", message: "active runs" },
+            active_runs: [
+              {
+                id: "run-1",
+                fingerprint: "fp-1",
+                runner_id: "r1",
+                repo: "a/b",
+                phase: "repair",
+                started_at_ms: Date.now(),
+              },
+            ],
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    renderApp("/settings");
+    fireEvent.change(await screen.findByLabelText("Poll interval"), {
+      target: { value: "60" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "重启服务" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认重启" }));
+
+    fireEvent.click(await screen.findByRole("link", { name: "fp-1" }));
+
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "Default issue" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "有正在进行的修复" })).not.toBeInTheDocument();
   });
 });

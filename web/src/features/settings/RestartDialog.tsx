@@ -7,13 +7,17 @@ import { Link } from "react-router-dom";
 import { Button, ConfirmDialog } from "../../components/ui";
 import { ApiError } from "../../lib/api";
 import { describeError } from "../../lib/errors";
-import { waitForServeRecovery, reloadConsole } from "../../lib/health";
+import {
+  RECOVERY_TIMEOUT_MS,
+  reloadConsole,
+  waitForServeRecovery,
+} from "../../lib/health";
 import { useModalBehavior } from "../../lib/modal";
 import { formatAge } from "../overview/format";
 import { useRestartServicesMutation } from "./queries";
 import type { ActiveRunSummary } from "./types";
 
-type Phase = "confirm" | "active" | "restarting" | "failed";
+type Phase = "confirm" | "active" | "restarting" | "failed" | "manual";
 
 export interface RestartDialogProps {
   open: boolean;
@@ -21,6 +25,8 @@ export interface RestartDialogProps {
   /** systemd units the server will restart, from `/system.services`. */
   units: string[];
 }
+
+const RECOVERY_SECONDS = Math.round(RECOVERY_TIMEOUT_MS / 1_000);
 
 function isActiveRun(value: unknown): value is ActiveRunSummary {
   if (typeof value !== "object" || value === null) {
@@ -46,11 +52,33 @@ function activeRunsFrom(body: unknown): ActiveRunSummary[] {
 }
 
 /**
+ * A rejected restart: `manual` means the server cannot schedule one at all
+ * (501, systemd-run unavailable), so retrying the same request is pointless
+ * and only the manual command helps. A 422 names the offending env keys; they
+ * are appended to the message so the operator sees them without a toast.
+ */
+function describeRestartFailure(error: unknown): { message: string; manual: boolean } {
+  if (error instanceof ApiError) {
+    if (error.status === 501) {
+      return { message: error.message || "服务器不支持自动重启", manual: true };
+    }
+    const fields = error.fields;
+    if (fields && Object.keys(fields).length > 0) {
+      const details = Object.entries(fields)
+        .map(([key, text]) => `${key}：${text}`)
+        .join("；");
+      return { message: `${describeError(error)}（${details}）`, manual: false };
+    }
+  }
+  return { message: describeError(error), manual: false };
+}
+
+/**
  * Guarded restart flow (docs/09 §10.8, §13.3): confirm, surface the active
  * runs a 409 lists, require an explicit acknowledgement before forcing, then
  * poll `/health` and `/auth/me` and reload once the new process is serving.
  * A 501 means systemd-run is unavailable; its message carries the manual
- * command and is shown verbatim.
+ * command and is shown verbatim, without a retry that can never succeed.
  */
 export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
   const restart = useRestartServicesMutation();
@@ -61,7 +89,9 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
   const [message, setMessage] = useState<string | null>(null);
 
   const attemptRef = useRef(0);
+  const recoveryRef = useRef<AbortController | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const statusRef = useRef<HTMLParagraphElement>(null);
   const titleId = useId();
   const descriptionId = useId();
   const unitsLabel = units.length > 0 ? units.join("、") : "未配置 systemd unit";
@@ -78,12 +108,27 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
     }
   }, [open]);
 
+  // Leaving the page mid-restart must stop the poll loop; a late success can
+  // also no longer reload a page that is already gone.
+  useEffect(
+    () => () => {
+      attemptRef.current += 1;
+      recoveryRef.current?.abort();
+    },
+    [],
+  );
+
   const settle = useCallback(() => {
     attemptRef.current += 1;
+    recoveryRef.current?.abort();
+    recoveryRef.current = null;
   }, []);
 
+  // Cancel, Escape and backdrop dismissal are no-ops while the restart POST is
+  // in flight or once it has been handed to systemd: the request is already
+  // on its way and closing would only hide its outcome.
   const handleClose = useCallback(() => {
-    if (phase === "restarting") {
+    if (restart.isPending || phase === "restarting") {
       return;
     }
     settle();
@@ -94,23 +139,31 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
     setAcknowledged(false);
     setMessage(null);
     onClose();
-  }, [onClose, phase, settle]);
+  }, [onClose, phase, restart.isPending, settle]);
 
   const runRecovery = useCallback(
     async (attempt: number) => {
+      const controller = new AbortController();
+      recoveryRef.current?.abort();
+      recoveryRef.current = controller;
       try {
-        await waitForServeRecovery();
-        if (attempt === attemptRef.current) {
+        await waitForServeRecovery(controller.signal);
+        if (attempt === attemptRef.current && !controller.signal.aborted) {
           reloadConsole();
         }
       } catch {
-        if (attempt !== attemptRef.current) {
+        // An unmount or a superseded attempt cancels the wait on purpose.
+        if (controller.signal.aborted || attempt !== attemptRef.current) {
           return;
         }
         setMessage(
-          `服务在 60 秒内未恢复，请检查 systemd 状态：systemctl status ${units.join(" ")}`,
+          `服务在 ${RECOVERY_SECONDS} 秒内未恢复，请检查 systemd 状态：systemctl status ${units.join(" ")}`,
         );
         setPhase("failed");
+      } finally {
+        if (recoveryRef.current === controller) {
+          recoveryRef.current = null;
+        }
       }
     },
     [units],
@@ -144,8 +197,11 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
                 return;
               }
             }
-            setMessage(describeError(error));
-            setPhase("failed");
+            // A 409 with an empty list is a held mutex, not a guard prompt:
+            // it stays retryable like any other transient failure.
+            const failure = describeRestartFailure(error);
+            setMessage(failure.message);
+            setPhase(failure.manual ? "manual" : "failed");
           },
         },
       );
@@ -161,6 +217,14 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
     onEscape: phase === "restarting" ? undefined : handleClose,
   });
 
+  // The restarting panel has no focusable control (cancel is locked); move
+  // focus to the status text so a screen reader announces it.
+  useEffect(() => {
+    if (open && phase === "restarting") {
+      statusRef.current?.focus();
+    }
+  }, [open, phase]);
+
   if (!open) {
     return null;
   }
@@ -175,6 +239,7 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
         cancelLabel="取消"
         danger
         pending={restart.isPending}
+        cancelDisabled={restart.isPending}
         onConfirm={() => submit(false)}
         onCancel={handleClose}
       />
@@ -183,7 +248,12 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
 
   const status =
     phase === "restarting" ? (
-      <p role="status" className="mt-4 flex items-center gap-2 text-body-sm text-text">
+      <p
+        ref={statusRef}
+        role="status"
+        tabIndex={-1}
+        className="mt-4 flex items-center gap-2 text-body-sm text-text focus:outline-none"
+      >
         <Loader2 aria-hidden="true" className="size-4 animate-spin text-accent" />
         正在重启，等待服务恢复…
       </p>
@@ -194,7 +264,7 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
       role="presentation"
       className="nuwa-backdrop fixed inset-0 z-50 flex items-end justify-center bg-scrim p-4 sm:items-center"
       onMouseDown={(event) => {
-        if (phase !== "restarting" && event.target === event.currentTarget) {
+        if (event.target === event.currentTarget) {
           handleClose();
         }
       }}
@@ -207,18 +277,28 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
         aria-describedby={status ? undefined : descriptionId}
         tabIndex={-1}
         onKeyDown={handleKeyDown}
-        className="nuwa-dialog w-full max-w-lg rounded-modal border border-border-strong bg-surface p-5 text-text shadow-overlay"
+        // Links here (active-run fingerprints) navigate away and unmount this
+        // page, so the settings dirty guard must not intercept them.
+        data-allow-navigation=""
+        className="nuwa-dialog max-h-[calc(100vh-2rem)] w-full max-w-lg overflow-y-auto rounded-modal border border-border-strong bg-surface p-5 text-text shadow-overlay"
       >
         <div className="flex items-start justify-between gap-4">
           <h2 id={titleId} className="text-heading-sm font-semibold">
-            {phase === "active" ? "有正在进行的修复" : phase === "failed" ? "重启未完成" : "重启服务"}
+            {phase === "active"
+              ? "有正在进行的修复"
+              : phase === "failed"
+                ? "重启未完成"
+                : phase === "manual"
+                  ? "无法自动重启"
+                  : "重启服务"}
           </h2>
           {phase !== "restarting" ? (
             <button
               type="button"
               aria-label="关闭对话框"
               onClick={handleClose}
-              className="-mr-2 -mt-2 flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-raised hover:text-text"
+              disabled={restart.isPending}
+              className="-mr-2 -mt-2 flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-raised hover:text-text disabled:pointer-events-none disabled:opacity-50"
             >
               <X aria-hidden="true" className="size-4" />
             </button>
@@ -252,17 +332,21 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
                 </li>
               ))}
             </ul>
-            <label className="mt-4 flex items-start gap-2 text-body-sm text-text">
+            <label className="mt-4 flex min-h-11 cursor-pointer items-center gap-2 text-body-sm text-text">
               <input
                 type="checkbox"
                 checked={acknowledged}
                 onChange={(event) => setAcknowledged(event.target.checked)}
-                className="mt-0.5 size-4 accent-danger"
+                className="size-4 accent-danger"
               />
               <span>我了解这会中断正在进行的修复</span>
             </label>
             <div className="mt-5 flex flex-wrap justify-end gap-2">
-              <Button variant="secondary" onClick={handleClose}>
+              <Button
+                variant="secondary"
+                disabled={restart.isPending}
+                onClick={handleClose}
+              >
                 取消
               </Button>
               <Button
@@ -279,7 +363,7 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
 
         {status}
 
-        {phase === "failed" ? (
+        {phase === "failed" || phase === "manual" ? (
           <>
             <p
               id={descriptionId}
@@ -295,9 +379,15 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
               <Button variant="secondary" onClick={handleClose}>
                 关闭
               </Button>
-              <Button variant="danger" pending={restart.isPending} onClick={() => submit(forced)}>
-                重试
-              </Button>
+              {phase === "failed" ? (
+                <Button
+                  variant="danger"
+                  pending={restart.isPending}
+                  onClick={() => submit(forced)}
+                >
+                  重试
+                </Button>
+              ) : null}
             </div>
           </>
         ) : null}

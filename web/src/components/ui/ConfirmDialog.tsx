@@ -14,6 +14,8 @@ export interface ConfirmDialogProps {
   cancelLabel?: string;
   danger?: boolean;
   pending?: boolean;
+  /** Locks the cancel button while the confirm action is in flight. */
+  cancelDisabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -32,6 +34,7 @@ export function ConfirmDialog({
   cancelLabel = "取消",
   danger = false,
   pending = false,
+  cancelDisabled = false,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -89,7 +92,7 @@ export function ConfirmDialog({
           </p>
         ) : null}
         <div className="mt-5 flex flex-wrap justify-end gap-2">
-          <Button ref={cancelRef} variant="secondary" onClick={onCancel}>
+          <Button ref={cancelRef} variant="secondary" disabled={cancelDisabled} onClick={onCancel}>
             {cancelLabel}
           </Button>
           <Button

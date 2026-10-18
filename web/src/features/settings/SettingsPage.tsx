@@ -381,6 +381,9 @@ export function SettingsPage() {
   // Guards read dirty state through a ref, so listener setup never depends on
   // per-keystroke draft text.
   const dirtyRef = useRef(false);
+  // Keys the last failed probe reported, so a later success can clear exactly
+  // those inline errors without touching unrelated save validation.
+  const probeErrorKeysRef = useRef<string[]>([]);
 
   useEffect(() => {
     dirtyRef.current = dirtyCount > 0;
@@ -413,8 +416,18 @@ export function SettingsPage() {
         return;
       }
       const target = event.target;
-      const anchor =
-        target instanceof Element ? target.closest<HTMLAnchorElement>("a[href]") : null;
+      if (!(target instanceof Element)) {
+        return;
+      }
+      // Links inside a dialog this page owns (the restart dialog's active-run
+      // fingerprints) navigate normally: the page unmounts and takes the
+      // dialog with it. Guarding them would stack a second dialog on top of a
+      // modal one. The shell's navigation drawer is also `role="dialog"` but
+      // must still open the guard, so the exemption is explicit.
+      if (target.closest('[role="dialog"][data-allow-navigation]')) {
+        return;
+      }
+      const anchor = target.closest<HTMLAnchorElement>("a[href]");
       if (!anchor) {
         return;
       }
@@ -552,8 +565,25 @@ export function SettingsPage() {
     });
   }
 
+  /** A probe that now succeeds retires the inline errors its last failure set. */
+  function clearProbeErrors() {
+    const keys = probeErrorKeysRef.current;
+    if (keys.length === 0) {
+      return;
+    }
+    probeErrorKeysRef.current = [];
+    setFieldErrors((current) => {
+      const next = { ...current };
+      for (const key of keys) {
+        delete next[key];
+      }
+      return next;
+    });
+  }
+
   function reportProbeError(error: unknown, title: string) {
     const fields = error instanceof ApiError ? error.fields : undefined;
+    probeErrorKeysRef.current = fields ? Object.keys(fields) : [];
     if (fields) {
       // A 422 names the offending env keys: mirror them next to the fields and
       // keep the toast readable by joining every message.
@@ -572,6 +602,7 @@ export function SettingsPage() {
       { target: "github" },
       {
         onSuccess: (result) => {
+          clearProbeErrors();
           toast({
             title: "GitHub token 可用",
             description: result.detail,
@@ -595,6 +626,7 @@ export function SettingsPage() {
       { target: "llm", values },
       {
         onSuccess: (result) => {
+          clearProbeErrors();
           toast({
             title: "模型配置可用",
             description: result.detail,
