@@ -2,8 +2,8 @@ import { fireEvent, screen, within } from "@testing-library/react";
 import { http, HttpResponse, delay } from "msw";
 import { describe, expect, it, vi } from "vitest";
 
+import type { EventsResponse } from "../events/types";
 import type {
-  EventsResponse,
   OverviewResponse,
   TrendBucket,
   TrendsResponse,

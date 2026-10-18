@@ -115,30 +115,6 @@ export function trendsQueryKey(range: TrendsRange = DEFAULT_TRENDS_RANGE, repo?:
   return ["trends", range, repo ?? null] as const;
 }
 
-/** One row of `GET /events`; raw rows carry `count=1` and equal timestamps. */
-export interface EventItem {
-  fingerprint: string;
-  kind: string;
-  detail: string;
-  ts_ms: number;
-  repo: string;
-  actor: string | null;
-  count: number;
-  first_ts_ms: number;
-  last_ts_ms: number;
-}
-
-export interface PageMeta {
-  page: number;
-  page_size: number;
-  total: number;
-}
-
-export interface EventsResponse {
-  data: EventItem[];
-  meta: PageMeta;
-}
-
 export function recentEventsQueryKey(pageSize: number) {
   return ["events", "recent", pageSize] as const;
 }

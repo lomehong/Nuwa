@@ -16,12 +16,12 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { apiFetch } from "../../lib/api";
+import type { EventsResponse } from "../events/types";
 import {
   DEFAULT_TRENDS_RANGE,
   overviewQueryKey,
   recentEventsQueryKey,
   trendsQueryKey,
-  type EventsResponse,
   type OverviewResponse,
   type TrendsRange,
   type TrendsResponse,

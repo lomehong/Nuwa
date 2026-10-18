@@ -19,7 +19,7 @@ import {
   shortFingerprint,
 } from "./format";
 import { OverviewSection, PanelError } from "./PanelChrome";
-import type { EventsResponse } from "./types";
+import type { EventsResponse } from "../events/types";
 
 const KIND_VARIANTS: Record<string, BadgeVariant> = {
   ci_green: "success",

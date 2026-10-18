@@ -1,8 +1,8 @@
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 
+import type { EventsResponse } from "../features/events/types";
 import type {
-  EventsResponse,
   OverviewResponse,
   TrendsResponse,
 } from "../features/overview/types";
