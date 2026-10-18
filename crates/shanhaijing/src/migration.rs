@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::ShanResult;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub fn apply(conn: &mut Connection) -> ShanResult<()> {
     conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
@@ -14,10 +14,17 @@ pub fn apply(conn: &mut Connection) -> ShanResult<()> {
     // v0 基线表（issues/events/heartbeat）。CREATE IF NOT EXISTS 对旧库无副作用。
     conn.execute_batch(super::SCHEMA)?;
 
-    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version < SCHEMA_VERSION {
+    let mut version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 1 {
         let tx = conn.transaction()?;
         migrate_v1(&tx)?;
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+        version = 1;
+    }
+    if version < SCHEMA_VERSION {
+        let tx = conn.transaction()?;
+        migrate_v2(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
     }
@@ -107,6 +114,22 @@ fn migrate_v1(conn: &Connection) -> ShanResult<()> {
     Ok(())
 }
 
+/// v2：控制台仓库注册表。这里只存展示身份；仓库内容（failing_check /
+/// forbidden_paths / notes）仍以目标仓 `nuwa.repo.json` 为唯一来源，只读。
+fn migrate_v2(conn: &Connection) -> ShanResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS repos (
+            repo        TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            url         TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -183,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_is_v1() {
+    fn fresh_database_is_v2() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fresh.db");
         let _store = Store::open(&path).expect("open");
@@ -191,8 +214,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 1);
-        for table in ["issues", "events", "runners", "runs", "signal_daily"] {
+        assert_eq!(version, 2);
+        for table in ["issues", "events", "runners", "runs", "signal_daily", "repos"] {
             assert!(table_exists(&conn, table), "missing {table}");
         }
         for (table, column) in [
@@ -200,6 +223,8 @@ mod tests {
             ("issues", "owner_runner_id"),
             ("events", "repo"),
             ("events", "actor"),
+            ("repos", "created_at"),
+            ("repos", "updated_at"),
         ] {
             assert!(column_exists(&conn, table, column), "missing {table}.{column}");
         }
@@ -215,6 +240,11 @@ mod tests {
         }
         let _store = Store::open(&path).expect("migrate");
         let conn = Connection::open(&path).expect("reopen");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 2, "v0 must run v1 and v2");
+        assert!(table_exists(&conn, "repos"));
         let (state_changed_at, owner): (i64, Option<String>) = conn
             .query_row(
                 "SELECT state_changed_at, owner_runner_id FROM issues WHERE fingerprint='fp1'",
@@ -233,6 +263,32 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v1_database_to_v2() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v1.db");
+        {
+            let conn = Connection::open(&path).expect("open");
+            v0_schema(&conn);
+            migrate_v1(&conn).expect("v1 migration");
+            conn.pragma_update(None, "user_version", 1).expect("version");
+        }
+        let _store = Store::open(&path).expect("migrate v2");
+        let conn = Connection::open(&path).expect("reopen");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 2);
+        assert!(table_exists(&conn, "repos"));
+        // v1 data survives the upgrade.
+        let title: String = conn
+            .query_row("SELECT title FROM issues WHERE fingerprint='fp1'", [], |row| {
+                row.get(0)
+            })
+            .expect("issue title");
+        assert_eq!(title, "t");
+    }
+
+    #[test]
     fn migration_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("idem.db");
@@ -242,7 +298,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[test]

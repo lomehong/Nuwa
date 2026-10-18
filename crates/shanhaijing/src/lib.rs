@@ -123,6 +123,8 @@ pub enum ShanError {
     UnknownRunner(String),
     #[error("unknown run {0}")]
     UnknownRun(String),
+    #[error("repo {0} already exists")]
+    RepoExists(String),
     #[error("issue {0} is not stuck")]
     NotStuck(String),
 }
@@ -262,6 +264,19 @@ pub struct RunnerRow {
     pub service_unit: Option<String>,
     pub config_json: String,
     pub last_error: Option<String>,
+}
+
+/// One registered repository — the console registry's display identity.
+/// Repository content (`failing_check`, `forbidden_paths`, `notes`) stays in
+/// the target repo's `nuwa.repo.json` and is deliberately not stored here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepoRow {
+    pub repo: String,
+    pub name: String,
+    pub url: String,
+    pub description: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1423,6 +1438,94 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Registered repositories, ordered by display name (case-insensitive)
+    /// then identity — the console registry list.
+    pub fn list_repos(&self) -> ShanResult<Vec<RepoRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT repo, name, url, description, created_at, updated_at
+             FROM repos ORDER BY name COLLATE NOCASE, repo",
+        )?;
+        let rows = stmt.query_map([], Self::repo_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn get_repo(&self, repo: &str) -> ShanResult<Option<RepoRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT repo, name, url, description, created_at, updated_at
+             FROM repos WHERE repo = ?1",
+        )?;
+        let mut rows = stmt.query([repo])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::repo_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Register one repository. A duplicate identity is
+    /// [`ShanError::RepoExists`], not a silent overwrite: PUT is the explicit
+    /// edit path.
+    pub fn insert_repo(
+        &self,
+        repo: &str,
+        name: &str,
+        url: &str,
+        description: &str,
+        now_ms: i64,
+    ) -> ShanResult<()> {
+        let conn = self.lock();
+        match conn.execute(
+            "INSERT INTO repos(repo, name, url, description, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            rusqlite::params![repo, name, url, description, now_ms],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Err(ShanError::RepoExists(repo.to_string()))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Edit display fields; the identity itself is immutable. `false` means
+    /// no such repository.
+    pub fn update_repo(
+        &self,
+        repo: &str,
+        name: &str,
+        url: &str,
+        description: &str,
+        now_ms: i64,
+    ) -> ShanResult<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE repos SET name = ?2, url = ?3, description = ?4, updated_at = ?5
+             WHERE repo = ?1",
+            rusqlite::params![repo, name, url, description, now_ms],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn delete_repo(&self, repo: &str) -> ShanResult<bool> {
+        let conn = self.lock();
+        let changed = conn.execute("DELETE FROM repos WHERE repo = ?1", [repo])?;
+        Ok(changed > 0)
+    }
+
+    fn repo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoRow> {
+        Ok(RepoRow {
+            repo: row.get(0)?,
+            name: row.get(1)?,
+            url: row.get(2)?,
+            description: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
     }
 
     pub fn start_run(&self, r: &RunStart) -> ShanResult<()> {
@@ -3696,5 +3799,123 @@ mod runner_tests {
                 }
             )
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod repo_tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        (dir, store)
+    }
+
+    #[test]
+    fn repos_list_in_case_insensitive_name_order() {
+        let (_dir, store) = store();
+        store
+            .insert_repo("example.com/zed", "zed", "https://example.com/zed", "", 1)
+            .expect("zed");
+        store
+            .insert_repo("example.com/beta", "Beta", "git@example.com:beta.git", "", 2)
+            .expect("beta");
+        store
+            .insert_repo("example.com/alpha2", "Alpha", "https://example.com/alpha2", "", 3)
+            .expect("alpha2");
+        store
+            .insert_repo("example.com/alpha", "alpha", "https://example.com/alpha", "", 4)
+            .expect("alpha");
+
+        let repos = store.list_repos().expect("list");
+        let ids: Vec<&str> = repos.iter().map(|row| row.repo.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "example.com/alpha",
+                "example.com/alpha2",
+                "example.com/beta",
+                "example.com/zed"
+            ],
+            "name NOCASE first, then identity"
+        );
+    }
+
+    #[test]
+    fn repo_crud_and_duplicate_identity() {
+        let (_dir, store) = store();
+        assert_eq!(store.get_repo("example.com/app").expect("get"), None);
+        store
+            .insert_repo(
+                "example.com/app",
+                "App",
+                "https://example.com/app",
+                "primary",
+                100,
+            )
+            .expect("insert");
+
+        let row = store
+            .get_repo("example.com/app")
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row,
+            RepoRow {
+                repo: "example.com/app".into(),
+                name: "App".into(),
+                url: "https://example.com/app".into(),
+                description: "primary".into(),
+                created_at: 100,
+                updated_at: 100,
+            }
+        );
+
+        match store.insert_repo("example.com/app", "Again", "https://x", "", 200) {
+            Err(ShanError::RepoExists(repo)) => assert_eq!(repo, "example.com/app"),
+            other => panic!("expected RepoExists, got {other:?}"),
+        }
+
+        assert!(store
+            .update_repo(
+                "example.com/app",
+                "App v2",
+                "git@example.com:app.git",
+                "",
+                200,
+            )
+            .expect("update"));
+        let row = store
+            .get_repo("example.com/app")
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.name, "App v2");
+        assert_eq!(row.url, "git@example.com:app.git");
+        assert_eq!(row.description, "");
+        assert_eq!(row.created_at, 100, "created_at is immutable");
+        assert_eq!(row.updated_at, 200);
+        assert!(!store
+            .update_repo("example.com/missing", "N", "U", "", 300)
+            .expect("update missing"));
+
+        assert!(store.delete_repo("example.com/app").expect("delete"));
+        assert_eq!(store.get_repo("example.com/app").expect("get"), None);
+        assert!(!store.delete_repo("example.com/app").expect("delete again"));
+        assert!(store.list_repos().expect("list").is_empty());
+    }
+
+    #[test]
+    fn repos_survive_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.db");
+        {
+            let store = Store::open(&path).expect("open");
+            store
+                .insert_repo("example.com/app", "App", "https://x", "", 1)
+                .expect("insert");
+        }
+        let store = Store::open(&path).expect("reopen");
+        assert_eq!(store.list_repos().expect("list").len(), 1);
     }
 }

@@ -4,6 +4,7 @@ pub mod common;
 pub mod events;
 pub mod issues;
 pub mod overview;
+pub mod repos;
 pub mod runners;
 pub mod settings;
 pub mod system;
@@ -114,7 +115,7 @@ pub fn api_not_found() -> ApiError {
 
 /// `/api/v1` router: public login plus session/CSRF-protected routes.
 pub fn router(state: Arc<AppState>) -> axum::Router {
-    use axum::routing::{get, post};
+    use axum::routing::{get, post, put};
 
     let public = axum::Router::new().route("/auth/login", post(auth::login));
     let protected = axum::Router::new()
@@ -128,6 +129,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/issues/{fp}/requeue", post(actions::requeue))
         .route("/runners", get(runners::list))
         .route("/runners/{id}/restart", post(actions::restart_runner))
+        .route("/repos", get(repos::list).post(repos::create))
+        .route("/repos/{repo}", put(repos::update).delete(repos::delete))
         .route("/sync", post(actions::sync))
         .route("/settings", get(settings::get).put(settings::put))
         .route("/settings/test", post(settings::test))

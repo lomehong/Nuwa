@@ -438,7 +438,7 @@ floor = NUWA_STUCK_AFTER_SECS（默认 300s，范围 60–86400）
 
 ### 8.7 多仓库展示
 
-- 不引入仓库注册表；仓库列表由 `runners` 与 `issues` 派生。
+- 2026-10-18 起后端引入 `repos` 注册表（schema v2；仅展示身份：repo/name/url/description），通过 `/api/v1/repos` 增删改查；仓库内容（`failing_check`/`forbidden_paths`/`notes`）仍来自目标仓 `nuwa.repo.json` 与 runner 心跳，只读。前端仓库管理页在后续阶段接入；在此之前仓库列表仍可由 `runners` 与 `issues` 派生。
 - 每仓库展示：runner 在线状态、当前单、配额、最近错误、checkout 路径、`failing_check`（由 runner 心跳写入 `config_json` 上报）。
 - 同一仓库多 runner 的情况允许显示，但本期部署约定一仓一进程；UI 不假设唯一。
 - 总览、问题单、趋势均支持 repo 过滤。
