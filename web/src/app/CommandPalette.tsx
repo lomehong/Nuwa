@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type MouseEvent,
   type ReactNode,
   type RefObject,
 } from "react";
@@ -99,6 +100,19 @@ export function CommandPalette({ open, onClose, returnFocusRef }: CommandPalette
   const issues = search.data?.data ?? [];
   const firstResult = issues[0];
 
+  // Announce the settled result count (or emptiness) through a persistent
+  // live region: a status node that mounts with its text is often not read.
+  const settled =
+    trimmed.length > 0 &&
+    !waitingForDebounce &&
+    !search.isPending &&
+    !search.isError;
+  const announcement = !settled
+    ? ""
+    : issues.length === 0
+      ? "没有匹配的问题单"
+      : `找到 ${issues.length} 条问题单`;
+
   function handleInputKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     // Enter jumps to the newest match, but never while an IME composition or
     // a pending debounce would make the visible row disagree with the term.
@@ -112,6 +126,24 @@ export function CommandPalette({ open, onClose, returnFocusRef }: CommandPalette
       event.preventDefault();
       onClose();
       navigate(issueDetailPath(firstResult.fingerprint));
+    }
+  }
+
+  /**
+   * Only an unmodified primary click navigates inside the SPA. A modified
+   * click (Ctrl/Cmd/Shift/Alt, middle button) means "open in a new tab", so
+   * the palette stays mounted; otherwise closing it would tear down the page
+   * the new tab was opened from.
+   */
+  function handleResultClick(event: MouseEvent<HTMLAnchorElement>) {
+    const unmodifiedPrimary =
+      event.button === 0 &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.shiftKey &&
+      !event.altKey;
+    if (unmodifiedPrimary) {
+      onClose();
     }
   }
 
@@ -165,7 +197,7 @@ export function CommandPalette({ open, onClose, returnFocusRef }: CommandPalette
           <li key={issue.fingerprint}>
             <Link
               to={issueDetailPath(issue.fingerprint)}
-              onClick={onClose}
+              onClick={handleResultClick}
               className="flex min-h-11 flex-col justify-center gap-1 rounded-card px-2.5 py-2 transition-colors duration-150 ease-out hover:bg-raised focus-visible:bg-raised"
             >
               <span className="truncate text-body font-medium text-text">
@@ -229,6 +261,9 @@ export function CommandPalette({ open, onClose, returnFocusRef }: CommandPalette
             <X aria-hidden="true" className="size-4" />
           </button>
         </div>
+        <p role="status" className="sr-only">
+          {announcement}
+        </p>
         {body}
       </div>
     </div>,

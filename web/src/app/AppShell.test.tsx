@@ -19,6 +19,30 @@ function signedIn(overrides: Parameters<typeof makeOverview>[0] = {}) {
   server.use(mockMe(), ...mockOverviewResources(overrides));
 }
 
+/**
+ * The desktop field and the mobile icon share the accessible name
+ * "搜索问题单"; only the desktop field carries the visible label text.
+ */
+function desktopSearchTrigger(): HTMLElement {
+  const trigger = screen
+    .getAllByRole("button", { name: "搜索问题单" })
+    .find((button) => button.textContent?.includes("搜索问题单…"));
+  if (!trigger) {
+    throw new Error("desktop search trigger not found");
+  }
+  return trigger;
+}
+
+function mobileSearchTrigger(): HTMLElement {
+  const trigger = screen
+    .getAllByRole("button", { name: "搜索问题单" })
+    .find((button) => !button.textContent?.includes("搜索问题单…"));
+  if (!trigger) {
+    throw new Error("mobile search trigger not found");
+  }
+  return trigger;
+}
+
 beforeEach(() => {
   window.localStorage.clear();
   document.documentElement.removeAttribute("data-theme");
@@ -376,7 +400,7 @@ describe("AppShell", () => {
     await screen.findByRole("heading", { level: 1, name: "总览" });
     await waitFor(() => expect(document.title).toBe("总览 · 女娲"));
 
-    const trigger = screen.getByRole("button", { name: "搜索问题单" });
+    const trigger = desktopSearchTrigger();
     expect(trigger).toBeEnabled();
     expect(trigger).toHaveTextContent("搜索问题单…");
     expect(trigger).toHaveTextContent("⌘K");
@@ -395,6 +419,83 @@ describe("AppShell", () => {
     );
     await waitFor(() => expect(trigger).toHaveFocus());
     expect(trigger).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("opens the palette from the mobile search icon and restores focus to it", async () => {
+    signedIn();
+    renderApp("/");
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+    await waitFor(() => expect(document.title).toBe("总览 · 女娲"));
+
+    const trigger = mobileSearchTrigger();
+    expect(trigger).toHaveClass("md:hidden");
+    expect(trigger).toHaveClass("size-11");
+    expect(trigger).toHaveAttribute("aria-haspopup", "dialog");
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole("dialog", { name: "搜索问题单" });
+    const input = within(dialog).getByRole("searchbox");
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "搜索问题单" }),
+      ).not.toBeInTheDocument(),
+    );
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("closes the drawer when the palette opens and keeps the page locked", async () => {
+    signedIn();
+    renderApp("/");
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+    await waitFor(() => expect(document.title).toBe("总览 · 女娲"));
+
+    fireEvent.click(screen.getByRole("button", { name: "打开导航菜单" }));
+    expect(screen.getByRole("dialog", { name: "导航菜单" })).toBeInTheDocument();
+    expect(document.body).toHaveClass("nuwa-scroll-lock");
+
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+
+    const dialog = await screen.findByRole("dialog", { name: "搜索问题单" });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "导航菜单" }),
+      ).not.toBeInTheDocument(),
+    );
+    // The palette takes the page lock over from the drawer instead of both
+    // portals holding (and later releasing) it independently.
+    expect(document.body).toHaveClass("nuwa-scroll-lock");
+    await waitFor(() => expect(within(dialog).getByRole("searchbox")).toHaveFocus());
+  });
+
+  it("opens the palette with Ctrl+K from a focused input and returns focus to it", async () => {
+    signedIn();
+    server.use(mockIssues());
+    renderApp("/issues");
+    await screen.findByRole("heading", { level: 1, name: "问题单" });
+    await waitFor(() => expect(document.title).toBe("问题单 · 女娲"));
+
+    const search = screen.getByRole("searchbox", { name: "搜索" });
+    search.focus();
+    expect(search).toHaveFocus();
+
+    fireEvent.keyDown(search, { key: "k", ctrlKey: true });
+
+    const dialog = await screen.findByRole("dialog", { name: "搜索问题单" });
+    await waitFor(() => expect(within(dialog).getByRole("searchbox")).toHaveFocus());
+
+    fireEvent.keyDown(within(dialog).getByRole("searchbox"), { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "搜索问题单" }),
+      ).not.toBeInTheDocument(),
+    );
+    await waitFor(() => expect(search).toHaveFocus());
   });
 
   it("shows an offline banner when the transport fails and clears it on retry", async () => {

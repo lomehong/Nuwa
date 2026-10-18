@@ -43,6 +43,20 @@ function fixingIssue(): IssueListItem {
   });
 }
 
+/** A stuck run owns the requeue action, which opens a confirmation modal. */
+function stuckIssue(): IssueListItem {
+  return makeIssue({
+    fingerprint: "fp-stuck-003",
+    title: "Worker hangs on idle",
+    language: "rust",
+    repo: "example.com/worker",
+    severity: "medium",
+    state: "fixing",
+    stuck: true,
+    last_seen_ms: NOW - 60_000,
+  });
+}
+
 function pageResponse(url: URL): IssueListResponse {
   const page = Number(url.searchParams.get("page") ?? "1");
   const pageSize = Number(url.searchParams.get("page_size") ?? "50");
@@ -611,6 +625,27 @@ describe("IssuesPage", () => {
 
     expect(repo).toHaveFocus();
     expect(screen.getByRole("searchbox", { name: "搜索" })).not.toHaveFocus();
+  });
+
+  it("leaves the / shortcut alone while a modal dialog is open", async () => {
+    useIssuesHandler(() =>
+      makeIssues({
+        data: [stuckIssue()],
+        meta: { page: 1, page_size: 50, total: 1 },
+      }),
+    );
+    renderIssues();
+    await screen.findByRole("region", { name: "问题单列表" });
+
+    // The requeue confirmation is a real portal modal (focus trapped).
+    fireEvent.click(screen.getAllByRole("button", { name: /^重排：/ })[0]);
+    const dialog = await screen.findByRole("dialog", { name: "重排卡单问题？" });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(document, { key: "/" });
+
+    expect(screen.getByRole("searchbox", { name: "搜索" })).not.toHaveFocus();
+    expect(dialog.contains(document.activeElement)).toBe(true);
   });
 
   it("round-trips filters, sort and pagination from the initial URL", async () => {

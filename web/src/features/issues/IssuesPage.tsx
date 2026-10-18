@@ -19,6 +19,29 @@ import { useIssuesQuery } from "./queries";
 import type { IssueListItem, IssueListFilters, IssueSort } from "./types";
 
 /**
+ * True when a rendered modal dialog covers the page (the drawer, the command
+ * palette, a confirmation). Dialogs that are explicitly not displayed do not
+ * count. Page shortcuts must stand down: focusing an input behind a trap, or
+ * swallowing the key, would strand the user inside the dialog.
+ */
+function hasVisibleModal(): boolean {
+  const dialogs = document.querySelectorAll<HTMLElement>(
+    '[role="dialog"][aria-modal="true"]',
+  );
+  for (const dialog of dialogs) {
+    if (!dialog.isConnected) {
+      continue;
+    }
+    const style = window.getComputedStyle(dialog);
+    if (style.display === "none" || style.visibility === "hidden") {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
  * Issue list (docs/09 §10.4).
  *
  * The URL is the source of truth: every filter, sort and page change rewrites
@@ -49,6 +72,10 @@ export function IssuesPage() {
         return;
       }
       if (event.key !== "/" || event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+      // A modal (palette, drawer, confirmation) owns the keyboard while open.
+      if (hasVisibleModal()) {
         return;
       }
       if (

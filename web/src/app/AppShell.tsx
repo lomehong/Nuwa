@@ -303,7 +303,7 @@ export function AppShell() {
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const drawerRef = useRef<HTMLDivElement>(null);
   const drawerCloseRef = useRef<HTMLButtonElement>(null);
-  const searchButtonRef = useRef<HTMLButtonElement>(null);
+  const paletteReturnFocusRef = useRef<HTMLElement | null>(null);
 
   const closeDrawer = useCallback(() => setDrawerOpen(false), []);
   const closePalette = useCallback(() => setPaletteOpen(false), []);
@@ -315,6 +315,32 @@ export function AppShell() {
     onEscape: closeDrawer,
   });
 
+  /**
+   * Opens the palette from `trigger`, or from the focused element for the
+   * keyboard shortcut. The drawer closes first: two modals sharing the page
+   * lock would leave the palette mounted over a closing drawer. The invoking
+   * control (or the focused element, or `<main>` when nothing meaningful is
+   * focused) is remembered so closing puts focus back where the user was.
+   */
+  const openPalette = useCallback((trigger?: HTMLElement | null) => {
+    setDrawerOpen(false);
+    const active = document.activeElement;
+    const candidate =
+      trigger ??
+      (active instanceof HTMLElement &&
+      active !== document.body &&
+      active !== document.documentElement &&
+      active.isConnected &&
+      // The drawer is closing: an element inside it is about to unmount.
+      !drawerRef.current?.contains(active)
+        ? active
+        : null);
+    paletteReturnFocusRef.current = candidate?.isConnected
+      ? candidate
+      : document.getElementById("main-content");
+    setPaletteOpen(true);
+  }, []);
+
   // ⌘K / Ctrl+K opens the palette from anywhere (docs/09 §12), including
   // while an input is focused: it is a global command surface, not a page
   // shortcut. A second press toggles it closed.
@@ -322,12 +348,16 @@ export function AppShell() {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        setPaletteOpen((open) => !open);
+        if (paletteOpen) {
+          setPaletteOpen(false);
+        } else {
+          openPalette();
+        }
       }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [paletteOpen, openPalette]);
 
   // The document title follows the active route so tabs, history entries and
   // screen-reader page announcements stay distinguishable. The login page sets
@@ -460,13 +490,12 @@ export function AppShell() {
 
             <div className="hidden md:block">
               <Button
-                ref={searchButtonRef}
                 variant="secondary"
                 size="sm"
                 aria-label="搜索问题单"
                 aria-haspopup="dialog"
                 aria-expanded={paletteOpen}
-                onClick={() => setPaletteOpen(true)}
+                onClick={(event) => openPalette(event.currentTarget)}
                 className="w-60 justify-start font-normal"
               >
                 <Search aria-hidden="true" className="size-3.5 shrink-0" />
@@ -476,6 +505,19 @@ export function AppShell() {
                 </kbd>
               </Button>
             </div>
+
+            {/* Touch equivalent of the desktop search field. It is the visible
+                return target for the palette on small screens. */}
+            <button
+              type="button"
+              aria-label="搜索问题单"
+              aria-haspopup="dialog"
+              aria-expanded={paletteOpen}
+              onClick={(event) => openPalette(event.currentTarget)}
+              className="flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-raised hover:text-text md:hidden"
+            >
+              <Search aria-hidden="true" className="size-5" />
+            </button>
 
             <ThemeToggle />
 
@@ -590,7 +632,7 @@ export function AppShell() {
       <CommandPalette
         open={paletteOpen}
         onClose={closePalette}
-        returnFocusRef={searchButtonRef}
+        returnFocusRef={paletteReturnFocusRef}
       />
     </div>
   );

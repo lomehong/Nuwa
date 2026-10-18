@@ -54,6 +54,17 @@ async function openWithShortcut() {
   return screen.findByRole("dialog", { name: "搜索问题单" }, { timeout: 3_000 });
 }
 
+/** The desktop field shares its accessible name with the mobile icon. */
+function desktopSearchTrigger(): HTMLElement {
+  const trigger = screen
+    .getAllByRole("button", { name: "搜索问题单" })
+    .find((button) => button.textContent?.includes("搜索问题单…"));
+  if (!trigger) {
+    throw new Error("desktop search trigger not found");
+  }
+  return trigger;
+}
+
 describe("CommandPalette", () => {
   it("opens with Ctrl+K, searches after the debounce and navigates to the chosen issue", async () => {
     const requests: URL[] = [];
@@ -88,6 +99,7 @@ describe("CommandPalette", () => {
     expect(within(link).getByText("严重")).toBeInTheDocument();
     expect(within(link).getByText("已升级")).toBeInTheDocument();
     expect(link).toHaveAttribute("href", "/issues/fp-palette-001");
+    expect(within(dialog).getByRole("status")).toHaveTextContent("找到 1 条问题单");
 
     fireEvent.click(link);
 
@@ -110,7 +122,7 @@ describe("CommandPalette", () => {
     renderApp("/");
     await screen.findByRole("heading", { level: 1, name: "总览" });
 
-    const trigger = screen.getByRole("button", { name: "搜索问题单" });
+    const trigger = desktopSearchTrigger();
     fireEvent.click(trigger);
     const dialog = await screen.findByRole("dialog", { name: "搜索问题单" });
     const input = within(dialog).getByRole("searchbox");
@@ -208,9 +220,40 @@ describe("CommandPalette", () => {
       target: { value: "zzz-no-match" },
     });
 
-    expect(
-      await within(dialog).findByText("没有匹配的问题单", {}, { timeout: 3_000 }),
-    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(within(dialog).getByRole("status")).toHaveTextContent(
+        "没有匹配的问题单",
+      ),
+    );
+    expect(within(dialog).getByRole("status")).toHaveClass("sr-only");
+  });
+
+  it("keeps the palette open for a modified result click", async () => {
+    signedIn();
+    server.use(paletteIssues());
+    renderApp("/");
+
+    const dialog = await openWithShortcut();
+    const input = within(dialog).getByRole("searchbox", { name: "搜索问题单" });
+    fireEvent.change(input, { target: { value: "panic" } });
+    const link = await within(dialog).findByRole(
+      "link",
+      { name: /Average panics/ },
+      { timeout: 3_000 },
+    );
+
+    // Ctrl+click means "open in a new tab". jsdom would try to navigate the
+    // current document, so stop the default action after React saw the event.
+    const stopNavigation = (event: Event) => event.preventDefault();
+    document.addEventListener("click", stopNavigation);
+    try {
+      fireEvent.click(link, { button: 0, ctrlKey: true });
+    } finally {
+      document.removeEventListener("click", stopNavigation);
+    }
+
+    expect(screen.getByRole("dialog", { name: "搜索问题单" })).toBeInTheDocument();
+    expect(input).toHaveValue("panic");
   });
 
   it("surfaces request errors outside the retry control", async () => {
