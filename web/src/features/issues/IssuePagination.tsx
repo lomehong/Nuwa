@@ -29,7 +29,9 @@ export function IssuePagination({ meta, page, fetching, onPageChange }: IssuePag
       <p className="text-body-sm text-text-secondary">
         共 <span className="font-mono tabular-nums text-text">{formatCount(meta.total)}</span> 条
         <span aria-hidden="true"> · </span>
-        第 <span className="font-mono tabular-nums text-text">{meta.page}</span> /{" "}
+        {/* The URL page is authoritative: `meta.page` trails behind while
+            `keepPreviousData` paints the previous page during a transition. */}
+        第 <span className="font-mono tabular-nums text-text">{page}</span> /{" "}
         <span className="font-mono tabular-nums text-text">{pageCount}</span> 页
       </p>
       <div className="flex items-center gap-2">

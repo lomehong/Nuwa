@@ -96,4 +96,23 @@ describe("issue list filters", () => {
     expect(hasActiveFilters({ ...DEFAULT_ISSUE_FILTERS, attention: true })).toBe(true);
     expect(hasActiveFilters({ ...DEFAULT_ISSUE_FILTERS, q: " panic " })).toBe(true);
   });
+
+  it("caps the search term at the backend's 128-character limit", () => {
+    const long = "x".repeat(129);
+    expect(parseIssueFilters(new URLSearchParams(`q=${long}`)).q).toBe("x".repeat(128));
+
+    const params = buildIssueSearchParams({ ...DEFAULT_ISSUE_FILTERS, q: long });
+    expect(params.get("q")).toBe("x".repeat(128));
+
+    // Shorter values keep their trimmed form.
+    expect(
+      buildIssueSearchParams({ ...DEFAULT_ISSUE_FILTERS, q: "  panic  " }).get("q"),
+    ).toBe("panic");
+
+    // The cap counts characters (code points), not UTF-16 units.
+    const fox = "🦊".repeat(129);
+    const capped = buildIssueSearchParams({ ...DEFAULT_ISSUE_FILTERS, q: fox }).get("q");
+    expect(capped).not.toBeNull();
+    expect(Array.from(capped ?? "")).toHaveLength(128);
+  });
 });

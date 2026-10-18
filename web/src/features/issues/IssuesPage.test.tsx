@@ -1,5 +1,5 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { delay, http, HttpResponse } from "msw";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
@@ -72,7 +72,7 @@ function LocationProbe() {
 
 function renderIssues(initialEntry = "/issues") {
   const queryClient = createTestQueryClient();
-  return render(
+  const result = render(
     <QueryClientProvider client={queryClient}>
       <ToastProvider>
         <MemoryRouter initialEntries={[initialEntry]}>
@@ -92,6 +92,7 @@ function renderIssues(initialEntry = "/issues") {
       </ToastProvider>
     </QueryClientProvider>,
   );
+  return { ...result, queryClient };
 }
 
 describe("IssuesPage", () => {
@@ -372,6 +373,130 @@ describe("IssuesPage", () => {
     expect(alert).toHaveTextContent("validation_failed");
   });
 
+  it("caps a 129-character search commit and surfaces the 422 field", async () => {
+    const longQ = "x".repeat(129);
+    const requests: URL[] = [];
+    server.use(
+      http.get("/api/v1/issues", ({ request }) => {
+        const url = new URL(request.url);
+        requests.push(url);
+        if (url.searchParams.get("q")) {
+          // Forced 422 so the error path is exercised even though the client
+          // truncates the term before sending it.
+          return HttpResponse.json(
+            {
+              error: {
+                code: "validation_failed",
+                message: "validation failed",
+                fields: { q: "must be at most 128 characters" },
+              },
+            },
+            { status: 422 },
+          );
+        }
+        return HttpResponse.json(pageResponse(url));
+      }),
+    );
+    renderIssues();
+
+    await screen.findByRole("region", { name: "问题单列表" });
+    const search = screen.getByLabelText("搜索");
+    expect(search).toHaveAttribute("maxlength", "128");
+
+    fireEvent.change(search, { target: { value: longQ } });
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("筛选条件无效");
+    expect(alert).toHaveTextContent("q：must be at most 128 characters");
+    expect(alert).toHaveTextContent("validation_failed");
+
+    // The 129-character commit is capped before it reaches the wire.
+    expect(requests).toHaveLength(2);
+    expect(requests[1].searchParams.get("q")).toBe("x".repeat(128));
+  });
+
+  it("surfaces a 422 above cached rows when a background refetch fails", async () => {
+    let calls = 0;
+    server.use(
+      http.get("/api/v1/issues", ({ request }) => {
+        calls += 1;
+        if (calls > 1) {
+          return HttpResponse.json(
+            {
+              error: {
+                code: "validation_failed",
+                message: "validation failed",
+                fields: { q: "must be at most 128 characters" },
+              },
+            },
+            { status: 422 },
+          );
+        }
+        return HttpResponse.json(pageResponse(new URL(request.url)));
+      }),
+    );
+    const { queryClient } = renderIssues("/issues?q=panic");
+
+    const table = await screen.findByRole("region", { name: "问题单列表" });
+    await act(async () => {
+      await queryClient.refetchQueries().catch(() => undefined);
+    });
+
+    const banner = await screen.findByText("问题单更新失败，正在显示上次数据。");
+    // The toast provider also mounts an empty live region, so anchor on the
+    // stale banner text and walk up to its status container.
+    const status = banner.closest<HTMLElement>('[role="status"]');
+    if (!status) {
+      throw new Error("stale-data banner is not inside a status region");
+    }
+    expect(status).toHaveTextContent("筛选条件无效");
+    expect(status).toHaveTextContent("q：must be at most 128 characters");
+    expect(status).toHaveTextContent("validation_failed");
+    // The retry button lives outside the live region.
+    expect(within(status).queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+
+    // The cached rows stay visible below the banner.
+    expect(
+      within(table).getByRole("link", { name: "Average panics on empty slice" }),
+    ).toBeInTheDocument();
+  });
+
+  it("clears a pending debounced draft when filters are cleared", async () => {
+    const requests = useIssuesHandler(pageResponse);
+    renderIssues("/issues?state=escalated");
+
+    await screen.findByRole("region", { name: "问题单列表" });
+    const search = screen.getByLabelText("搜索");
+    // The draft is still inside its debounce window when clear is pressed.
+    fireEvent.change(search, { target: { value: "panic" } });
+    fireEvent.click(screen.getByRole("button", { name: "清除筛选" }));
+
+    await waitFor(() => expect(requests).toHaveLength(2));
+    expect(requests[1].searchParams.get("q")).toBeNull();
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/issues$/);
+    expect(search).toHaveValue("");
+
+    // Wait past the debounce window: the abandoned draft must not commit.
+    await new Promise((resolve) => window.setTimeout(resolve, 450));
+    expect(requests).toHaveLength(2);
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/issues$/);
+  });
+
+  it("shows the URL page in the footer even when meta trails behind", async () => {
+    useIssuesHandler(() =>
+      makeIssues({
+        data: [escalatedIssue()],
+        // Simulates `keepPreviousData` painting page 1 while page 2 loads.
+        meta: { page: 1, page_size: 50, total: 120 },
+      }),
+    );
+    renderIssues("/issues?page=2");
+
+    const pagination = await screen.findByRole("navigation", { name: "问题单分页" });
+    expect(pagination).toHaveTextContent("第 2 / 3 页");
+  });
+
   it("links rows to the detail page and copies the fingerprint with a toast", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {
@@ -397,6 +522,15 @@ describe("IssuesPage", () => {
     );
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("fp-escalated-001"));
     expect(await screen.findByText("已复制指纹")).toBeInTheDocument();
+
+    // The short-fingerprint affordance copies the full value and says so.
+    fireEvent.click(
+      within(table).getByRole("button", {
+        name: "复制指纹（完整）：fp-escalated-001",
+      }),
+    );
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(2));
+    expect(writeText).toHaveBeenLastCalledWith("fp-escalated-001");
 
     fireEvent.click(titleLink);
     expect(

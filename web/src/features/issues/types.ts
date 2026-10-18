@@ -71,6 +71,13 @@ export const DEFAULT_PAGE_SIZE = 50;
 export const MAX_PAGE_SIZE = 200;
 export const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const;
 
+/**
+ * Server cap for the free-text search term (`MAX_Q_CHARS` in
+ * crates/nuwa/src/api/issues.rs). Longer values are rejected with a 422, so
+ * the input and the URL serialization clamp to the same limit.
+ */
+export const MAX_SEARCH_QUERY_CHARS = 128;
+
 /** Severity values accepted by the list endpoint (no `unknown` filter). */
 export const SEVERITY_FILTER_VALUES = ["critical", "high", "medium", "low"] as const;
 

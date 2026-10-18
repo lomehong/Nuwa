@@ -25,6 +25,7 @@ import {
   ISSUE_SORT_LABELS,
   ISSUE_SORT_VALUES,
   MAX_PAGE_SIZE,
+  MAX_SEARCH_QUERY_CHARS,
   PAGE_SIZE_OPTIONS,
   SEVERITY_FILTER_VALUES,
   type IssueListFilters,
@@ -56,11 +57,17 @@ function toggleState(states: IssueState[], state: IssueState): IssueState[] {
  * `delay`. `committed` records the last value this field wrote so an echoing
  * URL change (our own commit) never overwrites newer keystrokes, while a real
  * external change (back/forward, "clear filters", a shared link) is adopted.
+ *
+ * `resetNonce` is bumped by "clear filters" to drop a draft whose timer has
+ * not fired yet. Relying on the URL value alone is not enough: if nothing had
+ * been committed, the URL already equals the empty value and the pending
+ * draft would resurrect itself after the clear.
  */
 function useDebouncedText(
   value: string,
   onCommit: (next: string) => void,
   delay: number = FILTER_DEBOUNCE_MS,
+  resetNonce: number = 0,
 ) {
   const [draft, setDraft] = useState(value);
   const committed = useRef(value);
@@ -68,6 +75,11 @@ function useDebouncedText(
   const commit = useRef(onCommit);
   current.current = value;
   commit.current = onCommit;
+
+  useEffect(() => {
+    committed.current = value;
+    setDraft(value);
+  }, [resetNonce]);
 
   useEffect(() => {
     if (value !== committed.current) {
@@ -97,6 +109,8 @@ interface DebouncedTextInputProps {
   placeholder?: string;
   type?: "search" | "text";
   list?: string;
+  maxLength?: number;
+  resetNonce?: number;
   onCommit: (next: string) => void;
 }
 
@@ -106,9 +120,11 @@ function DebouncedTextInput({
   placeholder,
   type = "text",
   list,
+  maxLength,
+  resetNonce,
   onCommit,
 }: DebouncedTextInputProps) {
-  const [draft, setDraft] = useDebouncedText(value, onCommit);
+  const [draft, setDraft] = useDebouncedText(value, onCommit, FILTER_DEBOUNCE_MS, resetNonce);
   return (
     <Input
       label={label}
@@ -116,6 +132,7 @@ function DebouncedTextInput({
       value={draft}
       placeholder={placeholder}
       list={list}
+      maxLength={maxLength}
       onChange={(event) => setDraft(event.target.value)}
     />
   );
@@ -142,6 +159,11 @@ interface IssueFiltersProps {
   /** Applies a filter/sort patch and resets the page to 1. */
   onApply: (patch: Partial<IssueListFilters>) => void;
   onClear: () => void;
+  /**
+   * Bumped by the page on every clear (toolbar or empty state) so pending
+   * debounce drafts are dropped instead of committing after the reset.
+   */
+  resetNonce: number;
 }
 
 /**
@@ -150,7 +172,13 @@ interface IssueFiltersProps {
  * Every control writes through the URL; nothing is stored locally except the
  * debounce drafts.
  */
-export function IssueFilters({ filters, repos, onApply, onClear }: IssueFiltersProps) {
+export function IssueFilters({
+  filters,
+  repos,
+  onApply,
+  onClear,
+  resetNonce,
+}: IssueFiltersProps) {
   const repoListId = useId();
   const canClear = hasActiveFilters(filters) || filters.page > 1;
   const pageSizeOptions = (
@@ -181,6 +209,8 @@ export function IssueFilters({ filters, repos, onApply, onClear }: IssueFiltersP
             type="search"
             value={filters.q}
             placeholder="标题或指纹，例如 panic"
+            maxLength={MAX_SEARCH_QUERY_CHARS}
+            resetNonce={resetNonce}
             onCommit={(q) => onApply({ q })}
           />
         </div>
@@ -190,6 +220,7 @@ export function IssueFilters({ filters, repos, onApply, onClear }: IssueFiltersP
             value={filters.repo}
             placeholder="example.com/app"
             list={repoListId}
+            resetNonce={resetNonce}
             onCommit={(repo) => onApply({ repo })}
           />
           <datalist id={repoListId}>
@@ -202,6 +233,7 @@ export function IssueFilters({ filters, repos, onApply, onClear }: IssueFiltersP
           label="语言"
           value={filters.language}
           placeholder="go / rust / python"
+          resetNonce={resetNonce}
           onCommit={(language) => onApply({ language })}
         />
         <Select

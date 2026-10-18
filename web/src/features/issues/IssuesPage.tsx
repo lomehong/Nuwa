@@ -1,12 +1,16 @@
-import { RefreshCw } from "lucide-react";
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
-import { Button, useToast } from "../../components/ui";
+import { useToast } from "../../components/ui";
 import { buildIssueSearchParams, hasActiveFilters, parseIssueFilters } from "./filters";
 import { IssueCards } from "./IssueCards";
 import { IssueFilters } from "./IssueFilters";
-import { IssueListEmpty, IssueListError, IssueListSkeleton } from "./IssueListStates";
+import {
+  IssueListEmpty,
+  IssueListError,
+  IssueListSkeleton,
+  IssueListStaleNotice,
+} from "./IssueListStates";
 import { IssuePagination } from "./IssuePagination";
 import { IssueTable } from "./IssueTable";
 import { useIssuesQuery } from "./queries";
@@ -26,6 +30,7 @@ export function IssuesPage() {
   const filters = useMemo(() => parseIssueFilters(searchParams), [searchParams]);
   const query = useIssuesQuery(filters);
   const { toast } = useToast();
+  const [filterResetNonce, setFilterResetNonce] = useState(0);
 
   /** Applies filter/sort patches and resets to page 1. */
   const applyFilters = useCallback(
@@ -36,6 +41,9 @@ export function IssuesPage() {
   );
 
   const clearFilters = useCallback(() => {
+    // Drop pending debounce drafts first: a term typed moments before the
+    // click would otherwise commit after the URL had already been cleared.
+    setFilterResetNonce((nonce) => nonce + 1);
     setSearchParams(
       buildIssueSearchParams({
         ...filters,
@@ -131,28 +139,20 @@ export function IssuesPage() {
         repos={repos}
         onApply={applyFilters}
         onClear={clearFilters}
+        resetNonce={filterResetNonce}
       />
 
       {query.isError && data ? (
-        <div
-          role="status"
-          className="flex flex-wrap items-center justify-between gap-2 rounded-card border border-warning/40 bg-warning/10 px-4 py-2 text-body-sm text-text"
-        >
-          <span>问题单更新失败，正在显示上次数据。</span>
-          <Button variant="ghost" size="sm" onClick={() => void query.refetch()}>
-            <RefreshCw aria-hidden="true" className="size-3.5" />
-            重试
-          </Button>
-        </div>
+        <IssueListStaleNotice error={query.error} onRetry={() => void query.refetch()} />
       ) : null}
 
       {isInitialLoading ? <IssueListSkeleton /> : null}
 
-      {!data && !isInitialLoading ? (
+      {query.isError && !data ? (
         <IssueListError error={query.error} onRetry={() => void query.refetch()} />
       ) : null}
 
-      {data && emptyKind ? (
+      {data && emptyKind && !query.isError ? (
         <IssueListEmpty
           kind={emptyKind}
           total={data.meta.total}

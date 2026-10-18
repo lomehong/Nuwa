@@ -19,6 +19,7 @@ import {
   ISSUE_ORDER_VALUES,
   ISSUE_SORT_VALUES,
   MAX_PAGE_SIZE,
+  MAX_SEARCH_QUERY_CHARS,
   SEVERITY_FILTER_VALUES,
   type IssueListFilters,
   type IssueSort,
@@ -27,6 +28,15 @@ import {
 
 const STATE_VALUES: readonly string[] = ISSUE_STATE_VALUES;
 const SEVERITY_VALUES: readonly string[] = SEVERITY_FILTER_VALUES;
+
+/**
+ * Trim and cap the free-text search at the server limit. The backend counts
+ * Unicode scalar values, so slice by code point rather than UTF-16 unit; this
+ * keeps a pasted/shared over-long `q` from ever producing a 422.
+ */
+export function normalizeSearchQuery(value: string): string {
+  return Array.from(value.trim()).slice(0, MAX_SEARCH_QUERY_CHARS).join("");
+}
 
 export function isIssueState(value: string): value is IssueState {
   return STATE_VALUES.includes(value);
@@ -78,7 +88,7 @@ export function parseIssueFilters(params: URLSearchParams): IssueListFilters {
     severity: isFilterSeverity(severityRaw) ? severityRaw : "",
     repo: (params.get("repo") ?? "").trim(),
     language: (params.get("language") ?? "").trim(),
-    q: (params.get("q") ?? "").trim(),
+    q: normalizeSearchQuery(params.get("q") ?? ""),
     stuck: parseFlag(params.get("stuck")),
     attention: parseFlag(params.get("attention")),
     sort: isIssueSort(sortRaw) ? sortRaw : DEFAULT_ISSUE_FILTERS.sort,
@@ -102,7 +112,7 @@ export function buildIssueSearchParams(filters: IssueListFilters): URLSearchPara
 
   const repo = filters.repo.trim();
   const language = filters.language.trim();
-  const q = filters.q.trim();
+  const q = normalizeSearchQuery(filters.q);
   if (repo) {
     params.set("repo", repo);
   }

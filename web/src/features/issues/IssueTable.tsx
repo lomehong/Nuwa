@@ -138,8 +138,8 @@ export function IssueTable({ issues, sort, order, onSort, onCopyFingerprint }: I
                     <button
                       type="button"
                       onClick={() => onCopyFingerprint(issue)}
-                      aria-label={`复制短指纹：${issue.fingerprint}`}
-                      title="复制指纹"
+                      aria-label={`复制指纹（完整）：${issue.fingerprint}`}
+                      title="复制指纹（完整）"
                       className="mt-0.5 flex max-w-full items-center gap-1 rounded-sm text-left font-mono text-caption text-text-muted transition-colors hover:text-text"
                     >
                       <span className="truncate">{shortFingerprint(issue.fingerprint)}</span>
