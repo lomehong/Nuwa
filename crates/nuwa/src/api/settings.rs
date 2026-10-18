@@ -661,7 +661,7 @@ fn read_settings(
         .iter()
         .filter(|event| event.kind == "config_changed")
         .collect();
-    changes.sort_by(|a, b| b.ts.cmp(&a.ts));
+    changes.sort_by_key(|a| std::cmp::Reverse(a.ts));
 
     let mut values = BTreeMap::new();
     // Values plus the diff source label (`file` / `default`) for
