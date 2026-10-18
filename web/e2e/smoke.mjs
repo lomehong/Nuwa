@@ -79,20 +79,12 @@ async function login(page) {
 }
 
 /**
- * `/settings` still has a legacy server-rendered Basic-auth page until M6, so
- * a full navigation would answer 401. Enter through the SPA navigation link
- * (sidebar on desktop, drawer at <1024px) exactly like an operator would.
+ * `/settings` is a plain SPA route since the legacy console was removed, so a
+ * direct navigation (the operator's bookmark/refresh path) must render the
+ * settings page like any other route.
  */
 async function openSettings(page) {
-  const direct = page.getByRole("link", { name: "设置" }).filter({ visible: true });
-  if ((await direct.count()) > 0) {
-    await direct.first().click();
-  } else {
-    await page.getByRole("button", { name: "打开导航菜单" }).click();
-    const drawer = page.getByRole("dialog", { name: "导航菜单" });
-    await drawer.waitFor({ timeout: 10_000 });
-    await drawer.getByRole("link", { name: "设置" }).click();
-  }
+  await page.goto(`${BASE}/settings`, { waitUntil: "domcontentloaded" });
   await page.getByRole("heading", { level: 2, name: "设置" }).waitFor({ timeout: 15_000 });
 }
 

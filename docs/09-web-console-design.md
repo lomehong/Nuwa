@@ -1,6 +1,6 @@
 # 09 · Web 控制台设计（v3）
 
-状态：已定稿（2026-10-17）。替代 v2（2026-10-16）。实施状态：M0–M5 已完成（2026-10-18）；M6 进行中。
+状态：已定稿（2026-10-17）。替代 v2（2026-10-16）。实施状态：M0–M6 已完成（2026-10-18）；axe/5k 基准与生产副本/回滚演练属验证任务（Task 7），之后进入发布门。
 
 决策摘要：
 
@@ -158,7 +158,7 @@ web/
 
 ### 5.5 兼容与回滚
 
-- 旧 `/ui`、`/issue/:fp`、`/settings` 在 v0.2.0 中移除。
+- 旧 `/ui`、`/issue/:fp`、`/settings` 已在 v0.2.0 移除：`/ui*` 308 到 `/`，`/issue/{fp}` 308 到 `/issues/{fp}`，`/settings` 直接由 SPA 提供。
 - 旧 `heartbeat` 表保留；`work` 在 v0.2.x 内继续 best-effort 写全局心跳，便于回滚到旧二进制。v0.3 删除双写与旧表。
 - 数据库迁移只增列/增表，不删不改语义；回滚到旧二进制时旧代码仍可读写核心表。
 - 部署前保留 `nuwa.prev` 与停服 DB 备份。
@@ -773,6 +773,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - 健康条：serve、runner 在线/总数、队列待领、运行中、今日 PR 配额。异常项可点击跳转。
 - <1024px：导航收为抽屉 + 底部四项主导航；健康条横向滚动。
 - 全局状态：离线横幅（API 不可达）、401 自动跳登录、错误边界、toast、骨架屏。
+- 路由：`/` 即 SPA 控制台；旧书签 `/ui*` 308 到 `/`、`/issue/{fp}` 308 到 `/issues/{fp}`；`/settings` 直接由 SPA 提供。
 
 ### 10.2 登录页
 
@@ -1125,6 +1126,8 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - docs/09（本文）、docs/04 ADR-009、docs/08、docs/07、README、AGENTS 同步。
 
 ## 16 · CI、发布、部署与回滚
+
+**切流状态（2026-10-18，0.2.0）**：旧服务端渲染控制台已移除（`ui.rs` 删除、Basic 鉴权移除、全站严格 CSP）。`/` 是唯一控制台；`/ui*` 308 到 `/`，`/issue/{fp}` 308 到 `/issues/{fp}`，`/settings` 是 SPA 设置页；`/ingest` 与 `/health` 不变。crate 版本已升至 0.2.0；发布（tag/push/部署）仍需所有者明确批准。
 
 ### 16.1 CI
 

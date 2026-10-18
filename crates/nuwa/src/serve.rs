@@ -28,7 +28,8 @@ const SESSION_TTL_MAX_SECS: i64 = 2_592_000;
 /// Background retention sweep cadence for a long-running `serve`.
 const RETENTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// State shared by the legacy console routes and the `/api/v1` surface.
+/// State shared by the `/api/v1` surface, the ingest gate and the SPA static
+/// fallback (the legacy server-rendered console is gone as of 0.2.0).
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<shanhaijing::Store>,

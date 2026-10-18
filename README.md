@@ -45,7 +45,7 @@ nuwa work  --db spike/demo.db \
 
 ## Web 控制台（前端开发）
 
-前端源码在 `web/`（Vite + React + TypeScript + Tailwind 4）。`npm run build` 产出 `web/dist`，`nuwa serve` 将其嵌入并在站点根路径 `/` 提供；旧的服务端渲染控制台 `/ui` 保留至 M6。开发时先启动 `nuwa serve`（默认 7321），再：
+前端源码在 `web/`（Vite + React + TypeScript + Tailwind 4）。`npm run build` 产出 `web/dist`，`nuwa serve` 将其嵌入并在站点根路径 `/` 提供：`/` 即控制台（SPA），`/settings` 是 SPA 设置页；旧书签 `/ui*` 永久重定向到 `/`，`/issue/{fp}` 重定向到 `/issues/{fp}`（旧服务端渲染控制台已于 0.2.0 移除）。开发时先启动 `nuwa serve`（默认 7321），再：
 
 ```bash
 cd web
