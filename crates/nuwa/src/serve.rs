@@ -38,6 +38,14 @@ pub struct AppState {
     #[allow(dead_code)]
     pub started_at_ms: i64,
     pub cookie_secure: bool,
+    /// `NUWA_SERVE_UNIT` (default `nuwa-serve`); read by the M2c settings
+    /// restart endpoint.
+    #[allow(dead_code)]
+    pub serve_unit: String,
+    /// `NUWA_RUNNER_UNITS` comma list (default `["nuwa-work"]`); read by the
+    /// M2c settings restart endpoint.
+    #[allow(dead_code)]
+    pub runner_units: Vec<String>,
 }
 
 impl AppState {
@@ -175,6 +183,8 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         .unwrap_or_else(|| Arc::clone(&ingest_token));
     let ttl_ms = session_ttl_ms(std::env::var("NUWA_SESSION_TTL_SECS").ok().as_deref());
     let cookie_secure = std::env::var("NUWA_COOKIE_SECURE").ok().as_deref() == Some("always");
+    let serve_unit = serve_unit_from_env(std::env::var("NUWA_SERVE_UNIT").ok().as_deref());
+    let runner_units = runner_units_from_env(std::env::var("NUWA_RUNNER_UNITS").ok().as_deref());
     let state = AppState {
         store: Arc::clone(&store),
         ui_token: Arc::clone(&ui_token),
@@ -186,6 +196,8 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         limiter: Arc::new(crate::session::LoginLimiter::new()),
         started_at_ms: now_ms(),
         cookie_secure,
+        serve_unit,
+        runner_units,
     };
     let local_mode = state.local_mode();
     let app = build_app(state);
@@ -219,6 +231,35 @@ fn session_ttl_ms(raw: Option<&str>) -> i64 {
         .unwrap_or(SESSION_TTL_DEFAULT_SECS)
         .clamp(SESSION_TTL_MIN_SECS, SESSION_TTL_MAX_SECS)
         .saturating_mul(1000)
+}
+
+/// `NUWA_SERVE_UNIT` — the serve unit name used by restart actions; blank
+/// falls back to the documented default.
+fn serve_unit_from_env(raw: Option<&str>) -> String {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("nuwa-serve")
+        .to_string()
+}
+
+/// `NUWA_RUNNER_UNITS` — comma separated runner units; blanks are dropped and
+/// an empty list falls back to `nuwa-work`.
+fn runner_units_from_env(raw: Option<&str>) -> Vec<String> {
+    let units: Vec<String> = raw
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|unit| !unit.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if units.is_empty() {
+        vec!["nuwa-work".to_string()]
+    } else {
+        units
+    }
 }
 
 /// Whether the configured listen address stays on this host. Used only for
@@ -301,6 +342,8 @@ mod tests {
             limiter: Arc::new(crate::session::LoginLimiter::new()),
             started_at_ms: crate::now_ms(),
             cookie_secure: false,
+            serve_unit: "nuwa-serve".to_string(),
+            runner_units: vec!["nuwa-work".to_string()],
         };
         (dir, state)
     }
@@ -1171,6 +1214,33 @@ mod tests {
             session_ttl_ms(Some("999999999999")),
             2_592_000_000,
             "clamped to 30 days"
+        );
+    }
+
+    #[test]
+    fn serve_unit_env_defaults_and_trims() {
+        assert_eq!(serve_unit_from_env(None), "nuwa-serve");
+        assert_eq!(serve_unit_from_env(Some("")), "nuwa-serve");
+        assert_eq!(serve_unit_from_env(Some("   ")), "nuwa-serve");
+        assert_eq!(serve_unit_from_env(Some(" nuwa-web ")), "nuwa-web");
+    }
+
+    #[test]
+    fn runner_units_env_splits_trims_and_defaults() {
+        assert_eq!(runner_units_from_env(None), vec!["nuwa-work".to_string()]);
+        assert_eq!(runner_units_from_env(Some("")), vec!["nuwa-work".to_string()]);
+        assert_eq!(
+            runner_units_from_env(Some(" , ,")),
+            vec!["nuwa-work".to_string()],
+            "a list of blanks falls back to the default"
+        );
+        assert_eq!(
+            runner_units_from_env(Some("nuwa-work@a, nuwa-work@b ,,nuwa-runner")),
+            vec![
+                "nuwa-work@a".to_string(),
+                "nuwa-work@b".to_string(),
+                "nuwa-runner".to_string(),
+            ]
         );
     }
 

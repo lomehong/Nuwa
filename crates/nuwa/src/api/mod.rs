@@ -68,6 +68,14 @@ impl ApiError {
     pub fn invalid_state(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "invalid_state", message)
     }
+    /// Concurrent sync / conflicting actions (docs/09 §9.1).
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "conflict", message)
+    }
+    /// Non-systemd environments cannot schedule a restart (docs/09 §9.1).
+    pub fn not_supported(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_IMPLEMENTED, "not_supported", message)
+    }
     // Consumed by the issue endpoints in M2b/M2c.
     pub fn validation(fields: BTreeMap<String, String>) -> Self {
         Self {
@@ -85,7 +93,6 @@ impl ApiError {
         )
     }
     // Consumed by the GitHub/LLM-backed endpoints in M2c.
-    #[allow(dead_code)]
     pub fn upstream(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, "upstream_error", message)
     }
@@ -116,6 +123,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/issues/{fp}/reopen", post(actions::reopen))
         .route("/issues/{fp}/requeue", post(actions::requeue))
         .route("/runners", get(runners::list))
+        .route("/runners/{id}/restart", post(actions::restart_runner))
+        .route("/sync", post(actions::sync))
         .route("/events", get(events::list))
         .route("/metrics/trends", get(trends::trends))
         .route_layer(axum::middleware::from_fn_with_state(

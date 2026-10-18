@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::api::common::{issue_stuck_after_ms, runner_intervals, stuck_floor_ms};
 use crate::api::ApiError;
+use crate::ci;
 use crate::serve::AppState;
 use shanhaijing::{IssueRow, ShanError, Store};
 
@@ -89,6 +90,120 @@ pub async fn requeue(
             internal_error().into_response()
         }
     }
+}
+
+/// GitHub reconciliation budget for the console action (docs/09 §9.2).
+const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Process-wide guard: one GitHub reconcile at a time. `try_lock` turns a
+/// concurrent POST into a 409 instead of queuing expensive GitHub calls.
+fn sync_lock() -> &'static tokio::sync::Mutex<()> {
+    static SYNC_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    SYNC_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// `POST /api/v1/sync` — reconcile every `pr_open` issue against GitHub
+/// (docs/09 §9.2). Owner-triggered; the work runner keeps its own loop.
+pub async fn sync(State(state): State<AppState>) -> Response {
+    let Some(token) = github_token() else {
+        return ApiError::upstream("NUWA_GITHUB_TOKEN (or GITHUB_TOKEN) is not set")
+            .into_response();
+    };
+    let Ok(_guard) = sync_lock().try_lock() else {
+        return ApiError::conflict("sync is already running").into_response();
+    };
+    let store = Arc::clone(&state.store);
+    let now = crate::now_ms();
+    match tokio::time::timeout(SYNC_TIMEOUT, ci::reconcile_all(&store, &token, now)).await {
+        Ok(Ok(lines)) => Json(ci::summarize_lines(&lines)).into_response(),
+        Ok(Err(error)) => {
+            eprintln!("sync: reconcile failed: {error:#}");
+            ApiError::upstream("GitHub PR reconciliation failed").into_response()
+        }
+        Err(_) => ApiError::upstream("sync timed out after 30s").into_response(),
+    }
+}
+
+/// `NUWA_GITHUB_TOKEN` wins over `GITHUB_TOKEN` (the legacy console's order);
+/// a blank value counts as unset.
+fn github_token() -> Option<String> {
+    let read = |key: &str| std::env::var(key).ok().filter(|token| !token.is_empty());
+    read("NUWA_GITHUB_TOKEN").or_else(|| read("GITHUB_TOKEN"))
+}
+
+/// `POST /api/v1/runners/{id}/restart` — schedule a restart of the runner's
+/// systemd unit (docs/09 §9.2).
+pub async fn restart_runner(
+    State(state): State<AppState>,
+    Path(runner_id): Path<String>,
+) -> Response {
+    let store = Arc::clone(&state.store);
+    match tokio::task::spawn_blocking(move || restart_runner_now(&store, &runner_id)).await {
+        Ok(Ok(())) => StatusCode::ACCEPTED.into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(error) => {
+            eprintln!("runner restart: blocking task failed: {error}");
+            internal_error().into_response()
+        }
+    }
+}
+
+fn restart_runner_now(store: &Store, runner_id: &str) -> Result<(), ApiError> {
+    let runner = store
+        .list_runners()
+        .map_err(|error| {
+            eprintln!("runner restart: runner lookup failed: {error}");
+            internal_error()
+        })?
+        .into_iter()
+        .find(|runner| runner.id == runner_id)
+        .ok_or_else(|| ApiError::not_found("runner not found"))?;
+    // The stored unit is used verbatim: trimming must not turn an invalid
+    // value into a unit systemd would accept.
+    let unit = runner
+        .service_unit
+        .as_deref()
+        .filter(|unit| !unit.is_empty())
+        .ok_or_else(|| unit_error("runner has no service_unit; restart needs a systemd unit"))?;
+    if !valid_unit(unit) {
+        return Err(unit_error(
+            "service_unit may only contain letters, digits and @ . _ : -",
+        ));
+    }
+    if !schedule_restart(unit) {
+        return Err(ApiError::not_supported(
+            "systemd-run is unavailable; restart the unit manually",
+        ));
+    }
+    Ok(())
+}
+
+fn unit_error(message: &str) -> ApiError {
+    let mut fields = BTreeMap::new();
+    fields.insert("service_unit".to_string(), message.to_string());
+    ApiError::validation(fields)
+}
+
+/// systemd unit whitelist (docs/09 §13): letters, digits and `@ . _ : -`.
+/// The value is always passed as one `Command` argument, never shell text.
+fn valid_unit(unit: &str) -> bool {
+    !unit.is_empty()
+        && unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | ':' | '-'))
+}
+
+/// `systemd-run --on-active=2 systemctl restart <unit>`: the systemd manager
+/// performs the restart after the HTTP response is written, so restarting
+/// `nuwa-serve` cannot cut off its own reply.
+fn schedule_restart(unit: &str) -> bool {
+    std::process::Command::new("systemd-run")
+        .args(["--on-active=2", "systemctl", "restart", unit])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn requeue_issue(
@@ -210,6 +325,8 @@ mod tests {
             limiter: Arc::new(crate::session::LoginLimiter::new()),
             started_at_ms: crate::now_ms(),
             cookie_secure: false,
+            serve_unit: "nuwa-serve".to_string(),
+            runner_units: vec!["nuwa-work".to_string()],
         };
         (dir, state)
     }
@@ -391,6 +508,64 @@ mod tests {
                 model: None,
             })
             .expect("start run");
+    }
+
+    fn upsert_runner_with_unit(store: &Store, id: &str, unit: Option<&str>) {
+        let now = crate::now_ms();
+        store
+            .upsert_runner(&RunnerUpsert {
+                id: id.to_string(),
+                repo: APP.to_string(),
+                host: "test-host".to_string(),
+                pid: Some(1),
+                started_at: now - 1_000,
+                heartbeat_at: now,
+                status: "idle".to_string(),
+                provider: None,
+                model: None,
+                daily_pr_limit: Some(5),
+                repo_path: None,
+                service_unit: unit.map(str::to_string),
+                config_json: "{}".to_string(),
+            })
+            .expect("upsert runner");
+    }
+
+    /// Cargo runs tests in parallel and process env is global: the tests that
+    /// fake `NUWA_GITHUB_TOKEN`/`GITHUB_TOKEN` serialize on this async lock,
+    /// which may be held across the request await.
+    async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    /// Restores saved env vars on drop, so a failed assertion cannot leak a
+    /// fake token into another test.
+    struct EnvRestore(Vec<(&'static str, Option<String>)>);
+
+    impl EnvRestore {
+        fn save(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var(key).ok()))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 
     /// Seeds the reopenable states, a stale owner-less fixing issue, a stale
@@ -715,5 +890,156 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let value = json_body(response).await;
         assert_eq!(value["error"]["code"], "validation_failed");
+    }
+
+    // ---- sync --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sync_and_restart_require_csrf() {
+        let (_dir, state) = test_state();
+        let app = build_app(state);
+
+        let response = post_json(&app, "/api/v1/sync", None, "").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "forbidden");
+
+        let response = post_json(&app, "/api/v1/runners/does-not-exist/restart", None, "").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn sync_without_a_github_token_is_502() {
+        let (_dir, state) = test_state();
+        let app = build_app(state);
+        let csrf = csrf_token(&app).await;
+
+        let _env = env_guard().await;
+        let _restore = EnvRestore::save(&["NUWA_GITHUB_TOKEN", "GITHUB_TOKEN"]);
+        std::env::remove_var("NUWA_GITHUB_TOKEN");
+        std::env::remove_var("GITHUB_TOKEN");
+
+        let response = post_json(&app, "/api/v1/sync", Some(&csrf), "").await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "upstream_error");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("NUWA_GITHUB_TOKEN")),
+            "message must name the missing variable: {value}"
+        );
+    }
+
+    // Holding the process-wide lock proves the 409 path without any GitHub
+    // call: the handler must fail on `try_lock` before reconciling.
+    #[tokio::test]
+    async fn sync_rejects_a_concurrent_run_with_409() {
+        let (_dir, state) = test_state();
+        let app = build_app(state);
+        let csrf = csrf_token(&app).await;
+
+        let _env = env_guard().await;
+        let _restore = EnvRestore::save(&["NUWA_GITHUB_TOKEN"]);
+        std::env::set_var("NUWA_GITHUB_TOKEN", "test-token-never-used");
+        let held = super::sync_lock().try_lock().expect("sync lock free");
+        let response = post_json(&app, "/api/v1/sync", Some(&csrf), "").await;
+        drop(held);
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "conflict");
+    }
+
+    // ---- runner restart ----------------------------------------------------
+
+    #[test]
+    fn service_unit_whitelist_accepts_systemd_names_only() {
+        for unit in ["nuwa-work", "nuwa-work@1.service", "nuwa-serve", "a.b_c:d"] {
+            assert!(super::valid_unit(unit), "{unit}");
+        }
+        for unit in [
+            "",
+            "nuwa work",
+            "nuwa/work",
+            "nuwa$(id)",
+            "nuwa-work;rm",
+            "nuwa-work\n",
+        ] {
+            assert!(!super::valid_unit(unit), "{unit:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_unknown_runner_is_404() {
+        let (_dir, state) = test_state();
+        let app = build_app(state);
+        let csrf = csrf_token(&app).await;
+
+        let response = post_json(
+            &app,
+            "/api/v1/runners/does-not-exist/restart",
+            Some(&csrf),
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "not_found");
+        assert_eq!(value["error"]["message"], "runner not found");
+    }
+
+    #[tokio::test]
+    async fn restart_without_a_service_unit_is_422() {
+        for unit in [None, Some("")] {
+            let (_dir, state) = test_state();
+            upsert_runner_with_unit(&state.store, "runner-plain", unit);
+            let app = build_app(state);
+            let csrf = csrf_token(&app).await;
+
+            let response = post_json(
+                &app,
+                "/api/v1/runners/runner-plain/restart",
+                Some(&csrf),
+                "",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{unit:?}");
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "validation_failed");
+            assert!(
+                value["error"]["fields"]["service_unit"].is_string(),
+                "missing unit must name the field: {value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_with_an_invalid_service_unit_is_422() {
+        // None of these can become a valid unit after trimming, so the
+        // systemd-run path is never reached.
+        for unit in ["nuwa work", "nuwa-work; rm -rf /", "../etc/passwd"] {
+            let (_dir, state) = test_state();
+            upsert_runner_with_unit(&state.store, "runner-odd", Some(unit));
+            let app = build_app(state);
+            let csrf = csrf_token(&app).await;
+
+            let response = post_json(
+                &app,
+                "/api/v1/runners/runner-odd/restart",
+                Some(&csrf),
+                "",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{unit:?}");
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "validation_failed");
+            assert!(
+                value["error"]["fields"]["service_unit"].is_string(),
+                "invalid unit must name the field: {value}"
+            );
+        }
     }
 }

@@ -290,6 +290,8 @@ mod tests {
             limiter: Arc::new(crate::session::LoginLimiter::new()),
             started_at_ms: crate::now_ms(),
             cookie_secure: false,
+            serve_unit: "nuwa-serve".to_string(),
+            runner_units: vec!["nuwa-work".to_string()],
         };
         (dir, state)
     }

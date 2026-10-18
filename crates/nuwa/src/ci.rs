@@ -5,6 +5,7 @@
 //! human (ADR-003) — nuwa only acts on red: close the PR, flip the issue.
 
 use anyhow::{bail, Context};
+use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -168,6 +169,62 @@ pub(crate) fn journal_terminal(
     store.record_event(fingerprint, now, Some(repo), actor, kind, detail)
 }
 
+/// Structured form of a `reconcile_all` result, for the Web console
+/// `POST /api/v1/sync` (docs/09 §9.2). The CLI keeps printing the raw lines.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct SyncSummary {
+    /// pr_open issues the reconciler examined (one result line each).
+    pub checked: u64,
+    pub merged: u64,
+    pub rejected: u64,
+    pub still_open: u64,
+    /// Lines the reconciler could not act on (`skip`), plus unknown prefixes.
+    pub errors: Vec<SyncError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SyncError {
+    pub fingerprint: String,
+    pub message: String,
+}
+
+/// Count `reconcile_all` result lines by their fixed prefixes: `merged`,
+/// `rejected`, `still open` and `skip` (the reconciler's only error line).
+/// Unknown prefixes become errors instead of vanishing from the counters.
+pub fn summarize_lines(lines: &[String]) -> SyncSummary {
+    let mut summary = SyncSummary {
+        checked: lines.len() as u64,
+        ..SyncSummary::default()
+    };
+    for line in lines {
+        let Some((prefix, rest)) = line.split_once(':') else {
+            summary.errors.push(SyncError {
+                fingerprint: String::new(),
+                message: line.clone(),
+            });
+            continue;
+        };
+        let rest = rest.trim();
+        match prefix.trim() {
+            "merged" => summary.merged += 1,
+            "rejected" => summary.rejected += 1,
+            "still open" => summary.still_open += 1,
+            "skip" => {
+                let (fingerprint, message) = rest
+                    .split_once(" — ")
+                    .map(|(fp, message)| (fp.trim().to_string(), message.trim().to_string()))
+                    .unwrap_or_else(|| (String::new(), rest.to_string()));
+                summary.errors.push(SyncError { fingerprint, message });
+            }
+            _ => summary.errors.push(SyncError {
+                fingerprint: String::new(),
+                message: line.clone(),
+            }),
+        }
+    }
+    summary
+}
+
 /// 对账全部 pr_open 问题单（CLI `sync` 与 Web 控制台共用）。
 /// merged → `merged`；closed 且未合并 → `rejected`；仍 open → 不动。
 pub async fn reconcile_all(
@@ -240,7 +297,77 @@ pub async fn reconcile_all(
 mod tests {
     use super::aggregate;
     use super::journal_terminal;
+    use super::summarize_lines;
+    use super::SyncError;
     use super::Verdict;
+
+    #[test]
+    fn summarize_lines_counts_each_prefix_and_parses_skips() {
+        let lines = vec![
+            "merged     : fp-a → https://github.com/o/r/pull/1".to_string(),
+            "rejected   : fp-b (PR #2 closed without merge)".to_string(),
+            "still open : fp-c — PR #3".to_string(),
+            "still open : fp-d — PR #4".to_string(),
+            "skip       : fp-e — unparsable PR url not-a-url".to_string(),
+        ];
+
+        let summary = summarize_lines(&lines);
+
+        assert_eq!(summary.checked, 5);
+        assert_eq!(summary.merged, 1);
+        assert_eq!(summary.rejected, 1);
+        assert_eq!(summary.still_open, 2);
+        assert_eq!(
+            summary.errors,
+            vec![SyncError {
+                fingerprint: "fp-e".to_string(),
+                message: "unparsable PR url not-a-url".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn summarize_lines_of_an_empty_reconcile_is_all_zero() {
+        let summary = summarize_lines(&[]);
+        assert_eq!(summary.checked, 0);
+        assert_eq!(summary.merged, 0);
+        assert_eq!(summary.rejected, 0);
+        assert_eq!(summary.still_open, 0);
+        assert!(summary.errors.is_empty());
+    }
+
+    // A future line kind must surface as an error instead of vanishing from
+    // the console counters.
+    #[test]
+    fn summarize_lines_surfaces_unrecognized_lines_as_errors() {
+        let lines = vec!["mystery    : fp-x — something new".to_string()];
+        let summary = summarize_lines(&lines);
+        assert_eq!(summary.checked, 1);
+        assert_eq!(summary.merged + summary.rejected + summary.still_open, 0);
+        assert_eq!(summary.errors.len(), 1);
+        assert_eq!(summary.errors[0].message, lines[0]);
+    }
+
+    #[test]
+    fn sync_summary_serializes_the_console_contract() {
+        let lines = vec![
+            "merged     : fp-a → https://github.com/o/r/pull/1".to_string(),
+            "rejected   : fp-b (PR #2 closed without merge)".to_string(),
+            "still open : fp-c — PR #3".to_string(),
+            "skip       : fp-d — unparsable PR url nope".to_string(),
+        ];
+        let value = serde_json::to_value(summarize_lines(&lines)).expect("json");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "checked": 4,
+                "merged": 1,
+                "rejected": 1,
+                "still_open": 1,
+                "errors": [{ "fingerprint": "fp-d", "message": "unparsable PR url nope" }],
+            })
+        );
+    }
 
     fn run(completed: bool, conclusion: Option<&str>) -> (bool, Option<&str>) {
         (completed, conclusion)
