@@ -92,8 +92,8 @@ pub fn build_app(state: AppState) -> Router {
     // Bookmark compatibility from the retired console (M6): `/ui*` returns
     // to the SPA root and `/issue/{fp}` to its new detail route; the bare
     // trailing-slash forms point at the canonical pages. `/settings` needs no
-    // redirect — it is the same SPA path. Non-GET methods stay 404 instead of
-    // becoming a 405 or falling through to the SPA shell.
+    // redirect — it is the same SPA path. Legacy POSTs stay 404 instead of
+    // falling through to the SPA shell.
     let redirects = Router::new()
         .route("/ui", get(legacy_console_redirect).post(not_found))
         .route("/ui/", get(legacy_console_redirect).post(not_found))
@@ -310,7 +310,6 @@ fn runner_units_from_env(raw: Option<&str>) -> Vec<String> {
 }
 
 /// `NUWA_EVENT_RETENTION_DAYS` — normal events roll off after this many days.
-/// Out-of-range or malformed values fall back to the documented 90-day default.
 fn event_retention_days() -> u32 {
     retention_days_from_env(std::env::var("NUWA_EVENT_RETENTION_DAYS").ok().as_deref())
 }

@@ -348,7 +348,7 @@ CREATE INDEX idx_runs_started      ON runs(started_at DESC);
 CREATE INDEX idx_signal_day        ON signal_daily(day, repo);
 ```
 
-- 每日清理：`events` 超过 `NUWA_EVENT_RETENTION_DAYS`（默认 90）、`runs` 超过 365 天；审计事件（`config_changed`/`config_migrated`/`restart_requested`）保留 365 天。
+- 每日清理：`events` 超过 `NUWA_EVENT_RETENTION_DAYS`（默认 90）、`runs` 超过 365 天；审计事件（`config_changed`/`config_migrated`/`restart_requested`）保留 `max(NUWA_EVENT_RETENTION_DAYS, 365)` 天，不低于一年。
 - `runners` 中离线超过 30 天的行清理；在线/最近活跃的保留。
 - 清理失败不影响主流程；记录一次 `runner_error`/标准错误输出即可（不写事件，避免自激）。
 
