@@ -1,6 +1,6 @@
 # Web Console M6 — Hardening and Cutover Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Finish the console polish (a11y, search, backoff, retention), remove the legacy server-rendered console, and deliver a locally verified 0.2.0 release candidate without pushing or deploying.
 
