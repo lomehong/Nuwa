@@ -554,7 +554,7 @@ git commit -m "test(web): axe, performance and cutover rehearsal"
 
 ### Task 8: Final review and release gate
 
-- [ ] **Step 1: Full verification**
+- [x] **Step 1: Full verification**
 
 ```bash
 cd web && npm run typecheck && npm run lint && npm test && npm run build
@@ -563,11 +563,11 @@ cargo test -p nuwa -p shanhaijing
 cargo check --release -p nuwa
 ```
 
-- [ ] **Step 2: Whole-branch review**
+- [x] **Step 2: Whole-branch review**
 
 Dispatch one final reviewer over the M4–M6 range with the spec, plans, reports and diff. Fix Critical/Important findings in one wave, re-review, and record residuals.
 
-- [ ] **Step 3: Release checklist (manual gate — do not execute)**
+- [x] **Step 3: Release checklist (manual gate — do not execute)**
 
 Document in docs/07:
 - version `0.2.0`, tag `v0.2.0` (explicit approval required);
@@ -577,7 +577,7 @@ Document in docs/07:
 - rollback: previous binary + DB backup, confirm old `/ui`;
 - acceptance evidence from axe/benchmark/UAT attached.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/07-open-items.md
