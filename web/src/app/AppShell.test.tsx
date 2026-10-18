@@ -336,6 +336,67 @@ describe("AppShell", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "false");
   });
 
+  it("toggles the command palette from Ctrl+K and Meta+K", async () => {
+    signedIn();
+    renderApp("/");
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+    // The shortcut listener registers before the title effect, so the title
+    // proves the shell effects (listener included) have flushed.
+    await waitFor(() => expect(document.title).toBe("总览 · 女娲"));
+
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    expect(
+      await screen.findByRole(
+        "dialog",
+        { name: "搜索问题单" },
+        { timeout: 3_000 },
+      ),
+    ).toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "K", metaKey: true });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "搜索问题单" }),
+      ).not.toBeInTheDocument(),
+    );
+
+    fireEvent.keyDown(document, { key: "K", metaKey: true });
+    expect(
+      await screen.findByRole(
+        "dialog",
+        { name: "搜索问题单" },
+        { timeout: 3_000 },
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("opens the command palette from the topbar search button", async () => {
+    signedIn();
+    renderApp("/");
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+    await waitFor(() => expect(document.title).toBe("总览 · 女娲"));
+
+    const trigger = screen.getByRole("button", { name: "搜索问题单" });
+    expect(trigger).toBeEnabled();
+    expect(trigger).toHaveTextContent("搜索问题单…");
+    expect(trigger).toHaveTextContent("⌘K");
+
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole("dialog", { name: "搜索问题单" });
+    const input = within(dialog).getByRole("searchbox");
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "搜索问题单" }),
+      ).not.toBeInTheDocument(),
+    );
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+  });
+
   it("shows an offline banner when the transport fails and clears it on retry", async () => {
     // A real transport outage fails every request; if the sibling trends/events
     // queries were left succeeding they could clear the banner before the

@@ -24,6 +24,7 @@ import { useOverviewQuery } from "../features/overview/queries";
 import { ApiError } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { useModalBehavior } from "../lib/modal";
+import { CommandPalette } from "./CommandPalette";
 
 interface NavItem {
   label: string;
@@ -298,11 +299,14 @@ export function AppShell() {
   const { title, breadcrumb } = pageMeta(location.pathname);
   const [loggingOut, setLoggingOut] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const drawerRef = useRef<HTMLDivElement>(null);
   const drawerCloseRef = useRef<HTMLButtonElement>(null);
+  const searchButtonRef = useRef<HTMLButtonElement>(null);
 
   const closeDrawer = useCallback(() => setDrawerOpen(false), []);
+  const closePalette = useCallback(() => setPaletteOpen(false), []);
   const handleDrawerKeyDown = useModalBehavior({
     active: drawerOpen,
     containerRef: drawerRef,
@@ -311,6 +315,20 @@ export function AppShell() {
     onEscape: closeDrawer,
   });
 
+  // ⌘K / Ctrl+K opens the palette from anywhere (docs/09 §12), including
+  // while an input is focused: it is a global command surface, not a page
+  // shortcut. A second press toggles it closed.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteOpen((open) => !open);
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   // The document title follows the active route so tabs, history entries and
   // screen-reader page announcements stay distinguishable. The login page sets
   // its own title.
@@ -318,10 +336,18 @@ export function AppShell() {
     document.title = title === "Nuwa 控制台" ? "女娲 · 补天" : `${title} · 女娲`;
   }, [title]);
 
-  // A route change always dismisses the drawer (nav links call close too; this
-  // covers browser back/forward and redirects).
+  // A route change always dismisses the drawer and the palette (nav links and
+  // palette results close themselves; this covers browser back/forward and
+  // redirects). The mount pass is skipped: it would otherwise close a drawer
+  // or palette that a user opened immediately after the first paint.
+  const currentPath = useRef(location.pathname);
   useEffect(() => {
+    if (currentPath.current === location.pathname) {
+      return;
+    }
+    currentPath.current = location.pathname;
     setDrawerOpen(false);
+    setPaletteOpen(false);
   }, [location.pathname]);
 
   // The drawer portal is `lg:hidden`, but the modal lock (inert + body scroll
@@ -434,12 +460,14 @@ export function AppShell() {
 
             <div className="hidden md:block">
               <Button
+                ref={searchButtonRef}
                 variant="secondary"
                 size="sm"
-                disabled
-                aria-label="全局搜索（M6 提供）"
-                title="全局搜索将在 M6 提供"
-                className="w-60 justify-start font-normal text-text-muted"
+                aria-label="搜索问题单"
+                aria-haspopup="dialog"
+                aria-expanded={paletteOpen}
+                onClick={() => setPaletteOpen(true)}
+                className="w-60 justify-start font-normal"
               >
                 <Search aria-hidden="true" className="size-3.5 shrink-0" />
                 <span className="truncate">搜索问题单…</span>
@@ -558,6 +586,12 @@ export function AppShell() {
           })}
         </ul>
       </nav>
+
+      <CommandPalette
+        open={paletteOpen}
+        onClose={closePalette}
+        returnFocusRef={searchButtonRef}
+      />
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { useToast } from "../../components/ui";
@@ -34,6 +34,38 @@ export function IssuesPage() {
   const query = useIssuesQuery(filters);
   const { toast } = useToast();
   const [filterResetNonce, setFilterResetNonce] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // docs/09 §12: `/` focuses the page search from anywhere that is not already
+  // an editable control; Escape only blurs it (the typed value is kept).
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const active = document.activeElement;
+      if (event.key === "Escape") {
+        if (active === searchInputRef.current) {
+          event.preventDefault();
+          searchInputRef.current?.blur();
+        }
+        return;
+      }
+      if (event.key !== "/" || event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+      if (
+        active instanceof HTMLElement &&
+        (active.isContentEditable ||
+          active.tagName === "INPUT" ||
+          active.tagName === "TEXTAREA" ||
+          active.tagName === "SELECT")
+      ) {
+        return;
+      }
+      event.preventDefault();
+      searchInputRef.current?.focus();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   /** Applies filter/sort patches and resets to page 1. */
   const applyFilters = useCallback(
@@ -147,6 +179,7 @@ export function IssuesPage() {
         onApply={applyFilters}
         onClear={clearFilters}
         resetNonce={filterResetNonce}
+        searchInputRef={searchInputRef}
       />
 
       {query.isError && data ? (

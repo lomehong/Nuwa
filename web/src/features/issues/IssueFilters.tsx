@@ -1,6 +1,6 @@
 import { clsx } from "clsx";
 import { AlertTriangle, Check, Clock3, Eraser } from "lucide-react";
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 
 import {
   Button,
@@ -111,6 +111,8 @@ interface DebouncedTextInputProps {
   list?: string;
   maxLength?: number;
   resetNonce?: number;
+  /** Optional focus target (the page's `/` shortcut uses it for search). */
+  inputRef?: RefObject<HTMLInputElement | null>;
   onCommit: (next: string) => void;
 }
 
@@ -122,11 +124,13 @@ function DebouncedTextInput({
   list,
   maxLength,
   resetNonce,
+  inputRef,
   onCommit,
 }: DebouncedTextInputProps) {
   const [draft, setDraft] = useDebouncedText(value, onCommit, FILTER_DEBOUNCE_MS, resetNonce);
   return (
     <Input
+      ref={inputRef}
       label={label}
       type={type}
       value={draft}
@@ -164,6 +168,8 @@ interface IssueFiltersProps {
    * debounce drafts are dropped instead of committing after the reset.
    */
   resetNonce: number;
+  /** Focus target for the page-level `/` shortcut. */
+  searchInputRef?: RefObject<HTMLInputElement | null>;
 }
 
 /**
@@ -178,6 +184,7 @@ export function IssueFilters({
   onApply,
   onClear,
   resetNonce,
+  searchInputRef,
 }: IssueFiltersProps) {
   const repoListId = useId();
   const canClear = hasActiveFilters(filters) || filters.page > 1;
@@ -211,6 +218,7 @@ export function IssueFilters({
             placeholder="标题或指纹，例如 panic"
             maxLength={MAX_SEARCH_QUERY_CHARS}
             resetNonce={resetNonce}
+            inputRef={searchInputRef}
             onCommit={(q) => onApply({ q })}
           />
         </div>

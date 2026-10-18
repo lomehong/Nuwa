@@ -583,6 +583,36 @@ describe("IssuesPage", () => {
     expect(await screen.findByText("正在加载问题单")).toBeInTheDocument();
   });
 
+  it("focuses search on / and blurs on Escape without clearing it", async () => {
+    useIssuesHandler(pageResponse);
+    renderIssues();
+    await screen.findByRole("region", { name: "问题单列表" });
+
+    fireEvent.keyDown(document, { key: "/" });
+    const search = screen.getByRole("searchbox", { name: "搜索" });
+    expect(search).toHaveFocus();
+
+    fireEvent.change(search, { target: { value: "panic" } });
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(search).not.toHaveFocus();
+    // Escape only moves focus; the typed value survives until it is committed.
+    expect(search).toHaveValue("panic");
+  });
+
+  it("leaves the / shortcut alone while an editable control has focus", async () => {
+    useIssuesHandler(pageResponse);
+    renderIssues();
+    await screen.findByRole("region", { name: "问题单列表" });
+
+    const repo = screen.getByLabelText("仓库");
+    repo.focus();
+    fireEvent.keyDown(document, { key: "/" });
+
+    expect(repo).toHaveFocus();
+    expect(screen.getByRole("searchbox", { name: "搜索" })).not.toHaveFocus();
+  });
+
   it("round-trips filters, sort and pagination from the initial URL", async () => {
     const requests = useIssuesHandler((url) => {
       const page = Number(url.searchParams.get("page") ?? "1");
