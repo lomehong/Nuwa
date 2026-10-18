@@ -115,7 +115,7 @@ crates/nuwa/src/
     settings.rs     # schema、读写、测试、重启
     system.rs       # 版本、DB、uptime、systemd
     trends.rs       # 趋势桶
-  web.rs            # rust-embed、SPA fallback、缓存与安全头
+  web.rs            # rust-embed、SPA fallback、静态缓存
   settings.rs       # env schema、大小写迁移、原子写入（保留文件名）
   main.rs           # CLI + work 遥测接线
 crates/shanhaijing/src/
