@@ -351,4 +351,108 @@ describe("SettingsPage", () => {
     expect(screen.getByLabelText("Poll interval")).toHaveValue(90);
     expect(screen.getByText("1 项未保存")).toBeInTheDocument();
   });
+
+  it("probes GitHub with no values and the LLM with only non-empty drafts", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const base = makeSettings();
+    const providerSpec = base.schema.find((spec) => spec.key === "NUWA_PROVIDER")!;
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockSystem(),
+      mockSettings({
+        schema: [
+          ...base.schema,
+          {
+            ...providerSpec,
+            key: "NUWA_MODEL",
+            label: "Model",
+            type: "string",
+            options: [],
+            default: "",
+          },
+          {
+            ...providerSpec,
+            key: "NUWA_BASE_URL",
+            label: "Base URL",
+            type: "url",
+            options: [],
+            default: "",
+          },
+        ],
+        values: {
+          ...base.values,
+          NUWA_MODEL: { value: "", source: "default" },
+          NUWA_BASE_URL: { value: "", source: "default" },
+        },
+      }),
+      http.post("/api/v1/settings/test", async ({ request }) => {
+        const body = (await request.json()) as Record<string, unknown>;
+        bodies.push(body);
+        return HttpResponse.json({
+          ok: true,
+          detail: body.target === "github" ? "token accepted; 1/2" : "zai model responded",
+        });
+      }),
+    );
+    renderApp("/settings");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试 GitHub token" }));
+    await waitFor(() => expect(bodies[0]).toEqual({ target: "github" }));
+    expect(await screen.findByText("token accepted; 1/2")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("LLM Provider"), { target: { value: "zai" } });
+    fireEvent.change(screen.getByLabelText("Model"), {
+      target: { value: "glm-5.3-flash" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "测试模型配置" }));
+
+    await waitFor(() =>
+      expect(bodies[1]).toEqual({
+        target: "llm",
+        values: { NUWA_PROVIDER: "zai", NUWA_MODEL: "glm-5.3-flash" },
+      }),
+    );
+    expect(await screen.findByText("zai model responded")).toBeInTheDocument();
+  });
+
+  it("surfaces a probe 422 as a danger toast with the field message", async () => {
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockSystem(),
+      mockSettings(),
+      http.post("/api/v1/settings/test", () =>
+        HttpResponse.json(
+          {
+            error: {
+              code: "validation_failed",
+              message: "invalid settings",
+              fields: { NUWA_GITHUB_TOKEN: "token is required" },
+            },
+          },
+          { status: 422 },
+        ),
+      ),
+    );
+    renderApp("/settings");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试 GitHub token" }));
+
+    expect(await screen.findByText("GitHub token 测试失败")).toBeInTheDocument();
+    expect(
+      screen.getByText("NUWA_GITHUB_TOKEN：token is required"),
+    ).toBeInTheDocument();
+  });
+
+  it("opens the guarded restart dialog with the configured units", async () => {
+    signedIn();
+    renderApp("/settings");
+
+    fireEvent.click(await screen.findByRole("button", { name: "重启服务" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "重启服务？" });
+    expect(within(dialog).getByText(/nuwa-serve、nuwa-work/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "确认重启" })).toBeInTheDocument();
+  });
 });

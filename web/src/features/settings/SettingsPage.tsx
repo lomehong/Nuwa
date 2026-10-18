@@ -1,4 +1,5 @@
 import { clsx } from "clsx";
+import { FlaskConical, Power, ShieldCheck } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
@@ -19,11 +20,13 @@ import { describeError } from "../../lib/errors";
 import { SyncButton } from "../actions/SyncButton";
 import { formatDateTime, formatDuration, isoDateTime } from "../overview/format";
 import { PanelError } from "../overview/PanelChrome";
+import { RestartDialog } from "./RestartDialog";
 import { SettingField } from "./SettingField";
 import {
   useSaveSettingsMutation,
   useSettingsQuery,
   useSystemQuery,
+  useTestSettingsMutation,
 } from "./queries";
 import {
   isPlainValue,
@@ -83,6 +86,15 @@ const SECTIONS: readonly SectionDef[] = [
 ];
 
 const REPO_URL = "https://github.com/lomehong/nuwa";
+
+/** Keys the LLM probe sends as unsaved candidates when they hold a draft. */
+const LLM_PROBE_KEYS = [
+  "NUWA_PROVIDER",
+  "NUWA_MODEL",
+  "NUWA_BASE_URL",
+  "ZAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+] as const;
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) {
@@ -350,12 +362,15 @@ export function SettingsPage() {
   const settings = useSettingsQuery();
   const system = useSystemQuery();
   const save = useSaveSettingsMutation();
+  const testGithub = useTestSettingsMutation();
+  const testLlm = useTestSettingsMutation();
   const { toast } = useToast();
   const location = useLocation();
   const navigate = useNavigate();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [pendingHref, setPendingHref] = useState<string | null>(null);
+  const [restartOpen, setRestartOpen] = useState(false);
   const [lastSave, setLastSave] = useState<{
     changed: string[];
     restartRequired: boolean;
@@ -537,6 +552,60 @@ export function SettingsPage() {
     });
   }
 
+  function reportProbeError(error: unknown, title: string) {
+    const fields = error instanceof ApiError ? error.fields : undefined;
+    if (fields) {
+      // A 422 names the offending env keys: mirror them next to the fields and
+      // keep the toast readable by joining every message.
+      setFieldErrors((current) => ({ ...current, ...fields }));
+    }
+    const description = fields
+      ? Object.entries(fields)
+          .map(([key, message]) => `${key}：${message}`)
+          .join("；")
+      : describeError(error);
+    toast({ title, description, variant: "danger" });
+  }
+
+  function handleTestGithub() {
+    testGithub.mutate(
+      { target: "github" },
+      {
+        onSuccess: (result) => {
+          toast({
+            title: "GitHub token 可用",
+            description: result.detail,
+            variant: "success",
+          });
+        },
+        onError: (error) => reportProbeError(error, "GitHub token 测试失败"),
+      },
+    );
+  }
+
+  function handleTestLlm() {
+    const values: SettingsValues = {};
+    for (const key of LLM_PROBE_KEYS) {
+      const raw = drafts[key];
+      if (raw) {
+        values[key] = raw;
+      }
+    }
+    testLlm.mutate(
+      { target: "llm", values },
+      {
+        onSuccess: (result) => {
+          toast({
+            title: "模型配置可用",
+            description: result.detail,
+            variant: "success",
+          });
+        },
+        onError: (error) => reportProbeError(error, "模型配置测试失败"),
+      },
+    );
+  }
+
   if (settings.isPending && !data) {
     return <SettingsSkeleton />;
   }
@@ -625,8 +694,34 @@ export function SettingsPage() {
         </div>
       ) : null}
 
-      <SettingsSection {...sectionProps("credentials")} />
-      <SettingsSection {...sectionProps("model")} />
+      <SettingsSection
+        {...sectionProps("credentials")}
+        aside={
+          <Button
+            variant="secondary"
+            size="sm"
+            pending={testGithub.isPending}
+            onClick={handleTestGithub}
+          >
+            <ShieldCheck aria-hidden="true" className="size-3.5" />
+            测试 GitHub token
+          </Button>
+        }
+      />
+      <SettingsSection
+        {...sectionProps("model")}
+        aside={
+          <Button
+            variant="secondary"
+            size="sm"
+            pending={testLlm.isPending}
+            onClick={handleTestLlm}
+          >
+            <FlaskConical aria-hidden="true" className="size-3.5" />
+            测试模型配置
+          </Button>
+        }
+      />
       <SettingsSection {...sectionProps("runner")} />
 
       <SettingsSection
@@ -634,8 +729,14 @@ export function SettingsPage() {
         aside={
           <>
             <SyncButton />
-            {/* Task 7 mounts the guarded restart button in this slot. */}
-            <div data-testid="settings-restart-slot" className="flex" />
+            <Button
+              variant="danger"
+              size="sm"
+              onClick={() => setRestartOpen(true)}
+            >
+              <Power aria-hidden="true" className="size-3.5" />
+              重启服务
+            </Button>
           </>
         }
       >
@@ -715,6 +816,12 @@ export function SettingsPage() {
           }
         }}
         onCancel={() => setPendingHref(null)}
+      />
+
+      <RestartDialog
+        open={restartOpen}
+        onClose={() => setRestartOpen(false)}
+        units={system.data?.services.map((service) => service.unit) ?? []}
       />
     </div>
   );
