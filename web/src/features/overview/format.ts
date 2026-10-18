@@ -126,6 +126,8 @@ const EVENT_KIND_LABELS: Record<string, string> = {
   requeued: "重新排队",
   reopened: "重开",
   pr_opened: "PR 已开",
+  merged: "已合并",
+  rejected: "已拒绝",
   pr_merged: "PR 已合并",
   pr_closed: "PR 已关闭",
   ci_green: "CI 通过",
