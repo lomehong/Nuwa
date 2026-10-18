@@ -843,7 +843,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 - 过滤：kind 多选、repo、fingerprint、时间范围、聚合开关。
 - 行：时间、kind、问题单短指纹/标题、detail、repo、actor；`__config__` / `__system__` / `__runner__:` 前缀显示为系统标签。
-- 审计视图：config_changed / config_migrated / restart_requested / runner_started/stopped/error。
+- 审计视图：config_changed / config_migrated / restart_requested。
 - 分页；空态说明。
 
 ### 10.8 设置
