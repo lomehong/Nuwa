@@ -5,7 +5,7 @@
  * key so switching runs never flashes another run's messages.
  */
 
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { apiFetch } from "../../lib/api";
 import type { TranscriptResponse } from "./types";
@@ -48,5 +48,8 @@ export function useTranscriptQuery(
     enabled: fingerprint.length > 0,
     staleTime: TRANSCRIPT_STALE_MS,
     refetchOnWindowFocus: true,
+    // Keep the current page visible while the next one loads; the viewer
+    // focuses a page heading once the new data settles.
+    placeholderData: keepPreviousData,
   });
 }

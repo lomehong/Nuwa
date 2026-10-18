@@ -1,4 +1,5 @@
 import { ChevronRight, MessageSquareText } from "lucide-react";
+import { useEffect, useRef } from "react";
 
 import { Badge, Button, Skeleton, type BadgeVariant } from "../../components/ui";
 import { ApiError } from "../../lib/api";
@@ -320,6 +321,19 @@ export function TranscriptViewer({
   onRetry,
   onClearRun,
 }: TranscriptViewerProps) {
+  const pageHeadingRef = useRef<HTMLHeadingElement>(null);
+  const previousPage = useRef(page);
+
+  // After a page change settles, focus a heading so keyboard/screen-reader
+  // users land at the top of the new message block instead of at the footer.
+  useEffect(() => {
+    if (previousPage.current === page || isFetching) {
+      return;
+    }
+    previousPage.current = page;
+    pageHeadingRef.current?.focus();
+  }, [page, isFetching]);
+
   if (isPending) {
     return <TranscriptSkeleton />;
   }
@@ -362,6 +376,15 @@ export function TranscriptViewer({
 
   return (
     <div className="space-y-4" aria-busy={isFetching || undefined}>
+      <h3
+        ref={pageHeadingRef}
+        tabIndex={-1}
+        data-testid="transcript-page-heading"
+        className="sr-only"
+      >
+        会话消息 · 第 {page} / {totalPages} 页
+      </h3>
+
       {meta.truncated ? (
         <p
           role="status"

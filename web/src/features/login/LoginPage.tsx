@@ -2,6 +2,7 @@ import { AlertCircle, Gem } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 
+import { AuthErrorState } from "../../components/AuthErrorState";
 import { AuthLoading } from "../../components/AuthLoading";
 import { Button, Card, CardContent, Input } from "../../components/ui";
 import { ApiError } from "../../lib/api";
@@ -48,7 +49,7 @@ function loginErrorMessage(error: unknown): string {
  * visitor originally asked for (`location.state.from`).
  */
 export function LoginPage() {
-  const { status, login } = useAuth();
+  const { status, login, retry } = useAuth();
   const location = useLocation();
   const [token, setToken] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -56,6 +57,10 @@ export function LoginPage() {
 
   if (status === "loading") {
     return <AuthLoading />;
+  }
+
+  if (status === "error") {
+    return <AuthErrorState onRetry={retry} />;
   }
 
   if (status === "authenticated") {

@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { fireEvent, screen } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 
@@ -44,6 +44,36 @@ describe("AppRoutes", () => {
 
     expect(
       await screen.findByRole("heading", { name: "女娲 · 补天" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a retryable boot error instead of the login form when /auth/me is unreachable", async () => {
+    let fail = true;
+    server.use(
+      http.get("/api/v1/auth/me", () =>
+        fail
+          ? HttpResponse.error()
+          : HttpResponse.json({
+              authenticated: true,
+              local_mode: false,
+              expires_at_ms: 1_700_000_000_000,
+            }),
+      ),
+      ...mockOverviewResources(),
+    );
+
+    renderApp("/");
+
+    expect(
+      await screen.findByRole("heading", { name: "无法连接服务器" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("访问令牌")).not.toBeInTheDocument();
+
+    fail = false;
+    fireEvent.click(screen.getByRole("button", { name: "重试连接" }));
+
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "总览" }),
     ).toBeInTheDocument();
   });
 

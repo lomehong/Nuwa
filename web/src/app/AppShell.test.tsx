@@ -1,12 +1,15 @@
-import { fireEvent, screen, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { THEME_STORAGE_KEY } from "../lib/theme";
 import {
   makeOverview,
+  mockEvents,
+  mockIssues,
   mockMe,
   mockOverviewResources,
+  mockTrends,
   server,
 } from "../test/msw";
 import { renderApp } from "../test/render";
@@ -137,5 +140,94 @@ describe("AppShell", () => {
     expect(await screen.findByText("本地模式")).toBeInTheDocument();
     expect(screen.getByText("本地模式 · API 无鉴权")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "退出登录" })).not.toBeInTheDocument();
+  });
+
+  it("moves focus to <main> from the skip link", async () => {
+    signedIn();
+    renderApp("/");
+
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+    fireEvent.click(screen.getByRole("link", { name: "跳到主要内容" }));
+
+    expect(screen.getByRole("main")).toHaveFocus();
+  });
+
+  it("opens the drawer with focus trapped; Escape and backdrop close it", async () => {
+    signedIn();
+    const { container } = renderApp("/");
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+
+    const toggle = screen.getByRole("button", { name: "打开导航菜单" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(toggle);
+    const drawer = screen.getByRole("dialog", { name: "导航菜单" });
+    const close = screen.getByRole("button", { name: "关闭导航菜单" });
+
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(close).toHaveFocus();
+    expect(document.body).toHaveClass("nuwa-scroll-lock");
+    // The rest of the document is inert while the drawer is open.
+    expect(container).toHaveAttribute("inert");
+    expect(document.querySelector("[style]")).toBeNull();
+
+    // Tab from the last focusable element wraps to the first (close).
+    within(drawer).getByRole("link", { name: "问题单" }).focus();
+    fireEvent.keyDown(drawer, { key: "Tab" });
+    expect(close).toHaveFocus();
+
+    fireEvent.keyDown(drawer, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "导航菜单" })).not.toBeInTheDocument());
+    expect(toggle).toHaveFocus();
+    expect(document.body).not.toHaveClass("nuwa-scroll-lock");
+    expect(container).not.toHaveAttribute("inert");
+
+    fireEvent.click(toggle);
+    fireEvent.mouseDown(screen.getByTestId("nav-drawer-backdrop"));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "导航菜单" })).not.toBeInTheDocument());
+    expect(toggle).toHaveFocus();
+  });
+
+  it("closes the drawer on navigation and restores focus to the menu button", async () => {
+    signedIn();
+    server.use(mockIssues());
+    renderApp("/");
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+
+    const toggle = screen.getByRole("button", { name: "打开导航菜单" });
+    fireEvent.click(toggle);
+    const drawer = screen.getByRole("dialog", { name: "导航菜单" });
+    fireEvent.click(within(drawer).getByRole("link", { name: "问题单" }));
+
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "问题单" }),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "导航菜单" })).not.toBeInTheDocument(),
+    );
+    expect(toggle).toHaveFocus();
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("shows an offline banner when the transport fails and clears it on retry", async () => {
+    server.use(
+      mockMe(),
+      mockTrends(),
+      mockEvents(),
+      http.get("/api/v1/overview", () => HttpResponse.error()),
+    );
+
+    renderApp("/");
+
+    expect(await screen.findByText(/无法连接服务器。/)).toBeInTheDocument();
+    expect(await screen.findByText("serve 不可达")).toBeInTheDocument();
+
+    server.use(...mockOverviewResources());
+    fireEvent.click(screen.getByRole("button", { name: "立即重试" }));
+
+    await waitFor(() =>
+      expect(screen.queryByText(/无法连接服务器。/)).not.toBeInTheDocument(),
+    );
+    expect(await screen.findByText("serve 正常")).toBeInTheDocument();
   });
 });

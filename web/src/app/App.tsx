@@ -4,6 +4,7 @@ import { BrowserRouter } from "react-router-dom";
 import { ToastProvider } from "../components/ui";
 import { ApiError } from "../lib/api";
 import { AuthProvider } from "../lib/auth";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { AppRoutes } from "./router";
 
 /**
@@ -33,14 +34,16 @@ const queryClient = new QueryClient({
 
 export default function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <ToastProvider>
-        <AuthProvider>
-          <BrowserRouter>
-            <AppRoutes />
-          </BrowserRouter>
-        </AuthProvider>
-      </ToastProvider>
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <AuthProvider>
+            <BrowserRouter>
+              <AppRoutes />
+            </BrowserRouter>
+          </AuthProvider>
+        </ToastProvider>
+      </QueryClientProvider>
+    </ErrorBoundary>
   );
 }

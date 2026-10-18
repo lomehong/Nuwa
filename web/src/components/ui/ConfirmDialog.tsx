@@ -1,17 +1,10 @@
 import { clsx } from "clsx";
 import { X } from "lucide-react";
-import { useEffect, useId, useRef, type KeyboardEvent } from "react";
+import { useId, useRef } from "react";
+import { createPortal } from "react-dom";
 
+import { useModalBehavior } from "../../lib/modal";
 import { Button } from "./Button";
-
-const FOCUSABLE_SELECTOR = [
-  "a[href]",
-  "button:not([disabled])",
-  "input:not([disabled])",
-  "select:not([disabled])",
-  "textarea:not([disabled])",
-  '[tabindex]:not([tabindex="-1"])',
-].join(",");
 
 export interface ConfirmDialogProps {
   open: boolean;
@@ -26,8 +19,10 @@ export interface ConfirmDialogProps {
 }
 
 /**
- * Modal confirmation with a focus trap, Escape and backdrop dismissal, and
- * focus restoration to the invoking element (docs/09 §11.6).
+ * Modal confirmation with a focus trap, Escape and backdrop dismissal, focus
+ * restoration to the invoking element, background `inert` and body scroll lock
+ * (docs/09 §11.6). Rendered through a portal so the rest of the document can
+ * be inert while the dialog is open.
  */
 export function ConfirmDialog({
   open,
@@ -44,51 +39,18 @@ export function ConfirmDialog({
   const cancelRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
   const descriptionId = useId();
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    const previouslyFocused =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    cancelRef.current?.focus();
-    return () => {
-      previouslyFocused?.focus();
-    };
-  }, [open]);
+  const handleKeyDown = useModalBehavior({
+    active: open,
+    containerRef: dialogRef,
+    initialFocusRef: cancelRef,
+    onEscape: onCancel,
+  });
 
   if (!open) {
     return null;
   }
 
-  function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    if (event.key === "Escape") {
-      event.stopPropagation();
-      onCancel();
-      return;
-    }
-    if (event.key !== "Tab") {
-      return;
-    }
-
-    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
-    if (!focusable || focusable.length === 0) {
-      event.preventDefault();
-      return;
-    }
-
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
-
-  return (
+  return createPortal(
     <div
       role="presentation"
       className="nuwa-backdrop fixed inset-0 z-50 flex items-end justify-center bg-scrim p-4 sm:items-center"
@@ -140,6 +102,7 @@ export function ConfirmDialog({
           </Button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

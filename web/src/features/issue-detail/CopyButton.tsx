@@ -12,6 +12,11 @@ interface CopyButtonProps {
   className?: string;
 }
 
+/** Keeps a confirmation toast short even for multi-line stack samples. */
+function toastSummary(value: string): string {
+  return value.length > 64 ? `${value.slice(0, 61)}…` : value;
+}
+
 /**
  * Clipboard action used for fingerprints, commits, branches and stack samples.
  * The strict CSP is irrelevant here (no inline style/script); failure falls
@@ -40,7 +45,12 @@ export function CopyButton({
     }
     try {
       await navigator.clipboard.writeText(value);
-      toast({ title: toastTitle, description: value, variant: "success" });
+      toast({
+        title: toastTitle,
+        description: toastSummary(value),
+        variant: "success",
+        duration: 2500,
+      });
     } catch {
       toast({
         title: "复制失败",

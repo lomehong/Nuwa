@@ -83,6 +83,8 @@ nuwa work --db shanhaijing.db \
 
 **API 登录（v3 控制台）**：`POST /api/v1/auth/login`，必须带 `Content-Type: application/json`，body `{"token":"<NUWA_UI_TOKEN>"}`；成功 204 并设置 `nuwa_session`（HttpOnly）与 `nuwa_csrf`。后续非 GET 请求必须带 `X-NUWA-CSRF` 头，且其值须与 `nuwa_csrf` cookie 值一致（双提交校验，仅"带头"不够）。会话与 CSRF cookie 的 `Max-Age` 由 `NUWA_SESSION_TTL_SECS` 控制（默认 86400，允许 300–2592000）；`NUWA_COOKIE_SECURE=always` 强制加 `Secure`（TLS 代理下也可由 `X-Forwarded-Proto: https` 自动触发），`=never` 显式关闭且优先级最高（即使同时配置 `always` 或代理上报 https 也不加 `Secure`）。旧 `/ui` Basic 鉴权保留至 M6。
 
+**前端本地开发（v3 SPA）**：源码在 `web/`（Node ≥24.15）；`cd web && npm ci` 后可用 `npm run dev`（Vite 5173，把 `/api` 与 `/ingest` 代理到 `http://127.0.0.1:7321`，`changeOrigin: false` 保留 Host/Origin，否则写请求会被同源校验拒绝）、`npm run typecheck`、`npm test`、`npm run build`（typecheck + Vite）。生产构建 `web/dist` 由 `nuwa serve` 嵌入并在站点根路径 `/` 提供；`/login` 用 `NUWA_UI_TOKEN` 换取 HttpOnly 会话，未配置令牌时进入本地模式。旧服务端渲染控制台 `/ui`（Basic 鉴权）及 `/settings`、`/issue/{fp}` 旧页面保留至 M6。
+
 | 命令 | 用途 |
 |---|---|
 | `nuwa serve --db p [--listen 127.0.0.1:7321]` | HTTP ingest 服务端：`POST /ingest`（单信封或 JSONL，`application/json`），`GET /health`。青鸟 `HTTPSink` 直连 |

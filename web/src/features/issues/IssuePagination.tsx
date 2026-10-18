@@ -40,6 +40,7 @@ export function IssuePagination({ meta, page, fetching, onPageChange }: IssuePag
           size="sm"
           onClick={() => onPageChange(page - 1)}
           disabled={page <= 1 || fetching}
+          className="min-h-11 md:min-h-9"
         >
           <ChevronLeft aria-hidden="true" className="size-3.5" />
           上一页
@@ -49,6 +50,7 @@ export function IssuePagination({ meta, page, fetching, onPageChange }: IssuePag
           size="sm"
           onClick={() => onPageChange(page + 1)}
           disabled={page >= pageCount || fetching}
+          className="min-h-11 md:min-h-9"
         >
           下一页
           <ChevronRight aria-hidden="true" className="size-3.5" />

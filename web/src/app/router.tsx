@@ -1,5 +1,6 @@
 import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 
+import { AuthErrorState } from "../components/AuthErrorState";
 import { AuthLoading } from "../components/AuthLoading";
 import { IssueDetailPage } from "../features/issue-detail/IssueDetailPage";
 import { IssuesPage } from "../features/issues/IssuesPage";
@@ -14,11 +15,14 @@ import { AppShell } from "./AppShell";
  * router state so the login page can return there.
  */
 function RequireAuth() {
-  const { status } = useAuth();
+  const { status, retry } = useAuth();
   const location = useLocation();
 
   if (status === "loading") {
     return <AuthLoading />;
+  }
+  if (status === "error") {
+    return <AuthErrorState onRetry={retry} />;
   }
   if (status === "unauthenticated") {
     const from = `${location.pathname}${location.search}${location.hash}`;

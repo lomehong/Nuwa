@@ -325,6 +325,15 @@ describe("IssueDetailPage", () => {
       "/issues/fp-detail-001?run_id=run-old&page=2",
     );
 
+    // After the new page settles, focus lands on the page heading so keyboard
+    // users continue reading at the top of the fresh message block.
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-page-heading")).toHaveFocus(),
+    );
+    expect(screen.getByTestId("transcript-page-heading")).toHaveTextContent(
+      "会话消息 · 第 2 / 3 页",
+    );
+
     fireEvent.click(
       screen.getByRole("button", { name: "查看会话：run-latest" }),
     );

@@ -65,4 +65,26 @@ describe("ConfirmDialog", () => {
     fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
     expect(confirm).toHaveFocus();
   });
+
+  it("inerts the page and locks body scrolling while open", () => {
+    const { container, rerender } = render(
+      <ConfirmDialog open title="删除问题单？" onConfirm={() => {}} onCancel={() => {}} />,
+    );
+
+    expect(document.body).toHaveClass("nuwa-scroll-lock");
+    expect(container).toHaveAttribute("inert");
+
+    rerender(
+      <ConfirmDialog
+        open={false}
+        title="删除问题单？"
+        onConfirm={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+
+    expect(document.body).not.toHaveClass("nuwa-scroll-lock");
+    expect(container).not.toHaveAttribute("inert");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
 });

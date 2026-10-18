@@ -43,6 +43,21 @@ nuwa work  --db spike/demo.db \
 
 `--provider anthropic`（配 `ANTHROPIC_API_KEY`）切换真实 LLM；`--pr`（配 `NUWA_GITHUB_TOKEN`）在验证门通过后真实开 PR。完整接入步骤见 [docs/08-onboarding.md](docs/08-onboarding.md)。
 
+## Web 控制台（前端开发）
+
+前端源码在 `web/`（Vite + React + TypeScript + Tailwind 4）。`npm run build` 产出 `web/dist`，`nuwa serve` 将其嵌入并在站点根路径 `/` 提供；旧的服务端渲染控制台 `/ui` 保留至 M6。开发时先启动 `nuwa serve`（默认 7321），再：
+
+```bash
+cd web
+npm ci
+npm run dev      # http://localhost:5173；/api 与 /ingest 代理到 127.0.0.1:7321
+npm run typecheck
+npm test
+npm run build    # typecheck + vite build → web/dist
+```
+
+Vite 代理使用 `changeOrigin: false` 保留 Host/Origin，否则浏览器写请求会被同源校验拒绝。未配置 `NUWA_UI_TOKEN` 时控制台进入本地模式；配置后首次访问会跳转 `/login` 用 UI 令牌换取 HttpOnly 会话。
+
 ## 当前状态（2026-10-15）
 
 | 能力 | 状态 |

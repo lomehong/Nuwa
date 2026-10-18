@@ -1,10 +1,11 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 
 import { createTestQueryClient } from "../test/render";
 import { mockMe, mockUnauthorizedMe, server } from "../test/msw";
+import { apiFetch } from "./api";
 import { AuthProvider, useAuth } from "./auth";
 
 function AuthProbe() {
@@ -18,6 +19,9 @@ function AuthProbe() {
       </button>
       <button type="button" onClick={() => void auth.logout().catch(() => undefined)}>
         logout
+      </button>
+      <button type="button" onClick={() => auth.retry()}>
+        retry
       </button>
     </div>
   );
@@ -104,6 +108,83 @@ describe("AuthProvider", () => {
     );
     expect(method).toBe("POST");
     expect(csrfHeader).toBe("logout-csrf");
+    document.cookie = "nuwa_csrf=; Max-Age=0; path=/";
+  });
+
+  it("offers a retryable error state when the boot check is not a 401", async () => {
+    let fail = true;
+    server.use(
+      http.get("/api/v1/auth/me", () =>
+        fail
+          ? HttpResponse.error()
+          : HttpResponse.json({
+              authenticated: true,
+              local_mode: false,
+              expires_at_ms: 1_700_000_000_000,
+            }),
+      ),
+    );
+
+    renderAuth();
+    await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent("error"));
+
+    fail = false;
+    fireEvent.click(screen.getByRole("button", { name: "retry" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent("authenticated"),
+    );
+  });
+
+  it("clears cached server state when a background request returns 401", async () => {
+    server.use(
+      mockMe(),
+      http.get("/api/v1/issues", () =>
+        HttpResponse.json(
+          { error: { code: "unauthorized", message: "session expired" } },
+          { status: 401 },
+        ),
+      ),
+    );
+
+    const { queryClient } = renderAuth();
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent("authenticated"),
+    );
+    queryClient.setQueryData(["probe"], { stale: true });
+
+    await act(async () => {
+      await apiFetch("/issues").catch(() => undefined);
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent("unauthenticated"),
+    );
+    expect(queryClient.getQueryCache().getAll()).toHaveLength(0);
+  });
+
+  it("treats a 401 on logout as an already-expired session", async () => {
+    server.use(
+      mockMe(),
+      http.post("/api/v1/auth/logout", () =>
+        HttpResponse.json(
+          { error: { code: "unauthorized", message: "session expired" } },
+          { status: 401 },
+        ),
+      ),
+    );
+    document.cookie = "nuwa_csrf=logout-csrf; path=/";
+
+    renderAuth();
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent("authenticated"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "logout" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent("unauthenticated"),
+    );
     document.cookie = "nuwa_csrf=; Max-Age=0; path=/";
   });
 });

@@ -62,4 +62,9 @@
       transition-duration: 0.01ms !important;
     }
   }
+
+  /* Applied to <body> while a modal/drawer is open (lib/modal.ts). */
+  body.nuwa-scroll-lock {
+    overflow: hidden;
+  }
 }

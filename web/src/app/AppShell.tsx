@@ -6,18 +6,23 @@ import {
   LayoutDashboard,
   ListTodo,
   LogOut,
+  Menu,
   RefreshCw,
   Search,
   Settings,
+  X,
   type LucideIcon,
 } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 
+import { OfflineBanner } from "../components/OfflineBanner";
 import { ThemeToggle } from "../components/ThemeToggle";
 import { Badge, Button, Skeleton, useToast } from "../components/ui";
 import { useOverviewQuery } from "../features/overview/queries";
 import { useAuth } from "../lib/auth";
+import { useModalBehavior } from "../lib/modal";
 
 interface NavItem {
   label: string;
@@ -38,6 +43,8 @@ const NAV_ITEMS: readonly NavItem[] = [
 
 /** Bottom navigation keeps the four primary destinations (docs/09 §10.1). */
 const MOBILE_NAV_ITEMS = NAV_ITEMS.slice(0, 4);
+
+const DRAWER_ID = "nav-drawer";
 
 interface PageMeta {
   title: string;
@@ -85,6 +92,89 @@ function StatusDot({ tone }: { tone: "success" | "warning" | "danger" }) {
         tone === "danger" && "bg-danger",
       )}
     />
+  );
+}
+
+function ShellBrand() {
+  return (
+    <>
+      <span
+        aria-hidden="true"
+        className="flex size-9 shrink-0 items-center justify-center rounded-card border border-accent/40 bg-accent/10 text-accent"
+      >
+        <Gem className="size-4" />
+      </span>
+      <div className="min-w-0">
+        <p className="truncate text-body font-semibold text-text">女娲</p>
+        <p className="truncate text-caption text-text-secondary">Nuwa 控制台</p>
+      </div>
+    </>
+  );
+}
+
+function SidebarNavList({ onNavigate }: { onNavigate?: () => void }) {
+  return (
+    <ul className="space-y-1">
+      {NAV_ITEMS.map((item) => {
+        const Icon = item.icon;
+        return (
+          <li key={item.label}>
+            {item.to ? (
+              <NavLink
+                to={item.to}
+                end={item.end}
+                onClick={onNavigate}
+                className={({ isActive }) =>
+                  clsx(
+                    "flex min-h-11 items-center gap-2.5 rounded-card px-3 py-2 text-body transition-colors",
+                    isActive
+                      ? "bg-accent/10 font-medium text-text"
+                      : "text-text-secondary hover:bg-raised hover:text-text",
+                  )
+                }
+              >
+                {({ isActive }) => (
+                  <>
+                    <Icon
+                      aria-hidden="true"
+                      className={clsx(
+                        "size-4 shrink-0",
+                        isActive ? "text-accent" : "text-text-muted",
+                      )}
+                    />
+                    <span>{item.label}</span>
+                  </>
+                )}
+              </NavLink>
+            ) : (
+              <span
+                aria-disabled="true"
+                title={item.soon}
+                className="flex min-h-11 cursor-not-allowed items-center gap-2.5 rounded-card px-3 py-2 text-body text-text-muted"
+              >
+                <Icon aria-hidden="true" className="size-4 shrink-0" />
+                <span className="flex-1">{item.label}</span>
+                <span className="rounded-full border border-border px-1.5 py-0.5 text-caption">
+                  Soon
+                </span>
+              </span>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function SidebarFooter({ localMode }: { localMode: boolean }) {
+  return (
+    <div className="border-t border-border px-5 py-4">
+      {localMode ? (
+        <p className="text-caption text-text-secondary">本地模式 · API 无鉴权</p>
+      ) : (
+        <p className="text-caption text-text-secondary">会话由 HttpOnly Cookie 保护</p>
+      )}
+    </div>
   );
 }
 
@@ -187,7 +277,9 @@ export function HealthStrip() {
 /**
  * Application shell: fixed desktop sidebar (232px), sticky topbar with the
  * page title/breadcrumb, theme toggle and logout, the health strip, and a
- * four-slot bottom navigation under 1024px.
+ * four-slot bottom navigation under 1024px. Under 1024px the full navigation
+ * lives in a portaled drawer with focus trapping, Escape/backdrop dismissal,
+ * background inert, scroll lock and focus restoration to the menu button.
  */
 export function AppShell() {
   const { localMode, logout } = useAuth();
@@ -195,6 +287,25 @@ export function AppShell() {
   const location = useLocation();
   const { title, breadcrumb } = pageMeta(location.pathname);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const drawerRef = useRef<HTMLDivElement>(null);
+  const drawerCloseRef = useRef<HTMLButtonElement>(null);
+
+  const closeDrawer = useCallback(() => setDrawerOpen(false), []);
+  const handleDrawerKeyDown = useModalBehavior({
+    active: drawerOpen,
+    containerRef: drawerRef,
+    initialFocusRef: drawerCloseRef,
+    returnFocusRef: menuButtonRef,
+    onEscape: closeDrawer,
+  });
+
+  // A route change always dismisses the drawer (nav links call close too; this
+  // covers browser back/forward and redirects).
+  useEffect(() => {
+    setDrawerOpen(false);
+  }, [location.pathname]);
 
   async function handleLogout() {
     if (loggingOut) {
@@ -218,88 +329,46 @@ export function AppShell() {
     <div className="min-h-screen bg-bg text-text">
       <a
         href="#main-content"
-        className="sr-only focus:not-sr-only focus:block focus:bg-surface focus:px-4 focus:py-2 focus:text-body focus:text-text"
+        onClick={(event) => {
+          const main = document.getElementById("main-content");
+          if (main) {
+            // Keep the URL clean and move focus, not just the scroll position.
+            event.preventDefault();
+            main.focus();
+          }
+        }}
+        className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-3 focus:z-[60] focus:block focus:rounded-card focus:bg-surface focus:px-4 focus:py-2 focus:text-body focus:text-text"
       >
         跳到主要内容
       </a>
 
       <aside className="hidden border-r border-border bg-surface lg:fixed lg:inset-y-0 lg:left-0 lg:z-40 lg:flex lg:w-58 lg:flex-col">
         <div className="flex h-16 items-center gap-2.5 border-b border-border px-5">
-          <span
-            aria-hidden="true"
-            className="flex size-9 shrink-0 items-center justify-center rounded-card border border-accent/40 bg-accent/10 text-accent"
-          >
-            <Gem className="size-4" />
-          </span>
-          <div className="min-w-0">
-            <p className="truncate text-body font-semibold text-text">女娲</p>
-            <p className="truncate text-caption text-text-secondary">Nuwa 控制台</p>
-          </div>
+          <ShellBrand />
         </div>
 
         <nav aria-label="主导航" className="flex-1 overflow-y-auto px-3 py-4">
-          <ul className="space-y-1">
-            {NAV_ITEMS.map((item) => {
-              const Icon = item.icon;
-              return (
-                <li key={item.label}>
-                  {item.to ? (
-                    <NavLink
-                      to={item.to}
-                      end={item.end}
-                      className={({ isActive }) =>
-                        clsx(
-                          "flex items-center gap-2.5 rounded-card px-3 py-2 text-body transition-colors",
-                          isActive
-                            ? "bg-accent/10 font-medium text-text"
-                            : "text-text-secondary hover:bg-raised hover:text-text",
-                        )
-                      }
-                    >
-                      {({ isActive }) => (
-                        <>
-                          <Icon
-                            aria-hidden="true"
-                            className={clsx(
-                              "size-4 shrink-0",
-                              isActive ? "text-accent" : "text-text-muted",
-                            )}
-                          />
-                          <span>{item.label}</span>
-                        </>
-                      )}
-                    </NavLink>
-                  ) : (
-                    <span
-                      aria-disabled="true"
-                      title={item.soon}
-                      className="flex cursor-not-allowed items-center gap-2.5 rounded-card px-3 py-2 text-body text-text-muted"
-                    >
-                      <Icon aria-hidden="true" className="size-4 shrink-0" />
-                      <span className="flex-1">{item.label}</span>
-                      <span className="rounded-full border border-border px-1.5 py-0.5 text-caption">
-                        Soon
-                      </span>
-                    </span>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
+          <SidebarNavList />
         </nav>
 
-        <div className="border-t border-border px-5 py-4">
-          {localMode ? (
-            <p className="text-caption text-text-secondary">本地模式 · API 无鉴权</p>
-          ) : (
-            <p className="text-caption text-text-secondary">会话由 HttpOnly Cookie 保护</p>
-          )}
-        </div>
+        <SidebarFooter localMode={localMode} />
       </aside>
 
       <div className="lg:pl-58">
         <header className="sticky top-0 z-30 border-b border-border bg-bg/95">
-          <div className="mx-auto flex h-16 w-full max-w-page items-center gap-3 px-4 sm:px-6 lg:px-8">
+          <div className="mx-auto flex h-16 w-full max-w-page items-center gap-2 px-4 sm:gap-3 sm:px-6 lg:px-8">
+            <button
+              ref={menuButtonRef}
+              type="button"
+              aria-label="打开导航菜单"
+              aria-expanded={drawerOpen}
+              aria-controls={DRAWER_ID}
+              onClick={() => setDrawerOpen(true)}
+              className="flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-raised hover:text-text lg:hidden"
+            >
+              <Menu aria-hidden="true" className="size-5" />
+            </button>
+
             <Link
               to="/"
               aria-label="返回总览"
@@ -360,15 +429,65 @@ export function AppShell() {
           </div>
         </header>
 
+        <OfflineBanner />
+
         <HealthStrip />
 
         <main
           id="main-content"
+          tabIndex={-1}
           className="mx-auto w-full max-w-page px-4 py-6 pb-24 sm:px-6 lg:px-8 lg:pb-10"
         >
           <Outlet />
         </main>
       </div>
+
+      {drawerOpen
+        ? createPortal(
+            <div className="fixed inset-0 z-50 lg:hidden">
+              <div
+                aria-hidden="true"
+                data-testid="nav-drawer-backdrop"
+                className="nuwa-backdrop absolute inset-0 bg-scrim"
+                onMouseDown={(event) => {
+                  if (event.target === event.currentTarget) {
+                    closeDrawer();
+                  }
+                }}
+              />
+              <div
+                ref={drawerRef}
+                id={DRAWER_ID}
+                role="dialog"
+                aria-modal="true"
+                aria-label="导航菜单"
+                tabIndex={-1}
+                onKeyDown={handleDrawerKeyDown}
+                className="nuwa-dialog absolute inset-y-0 left-0 flex w-72 max-w-[85vw] flex-col border-r border-border bg-surface text-text shadow-overlay"
+              >
+                <div className="flex h-16 items-center gap-2.5 border-b border-border px-5">
+                  <ShellBrand />
+                  <button
+                    ref={drawerCloseRef}
+                    type="button"
+                    aria-label="关闭导航菜单"
+                    onClick={closeDrawer}
+                    className="ml-auto flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-raised hover:text-text"
+                  >
+                    <X aria-hidden="true" className="size-4" />
+                  </button>
+                </div>
+
+                <nav aria-label="抽屉主导航" className="flex-1 overflow-y-auto px-3 py-4">
+                  <SidebarNavList onNavigate={closeDrawer} />
+                </nav>
+
+                <SidebarFooter localMode={localMode} />
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
 
       <nav
         aria-label="移动导航"

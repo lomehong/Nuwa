@@ -3,6 +3,7 @@ import { useSearchParams } from "react-router-dom";
 
 import { useToast } from "../../components/ui";
 import { buildIssueSearchParams, hasActiveFilters, parseIssueFilters } from "./filters";
+import { shortFingerprint } from "./format";
 import { IssueCards } from "./IssueCards";
 import { IssueFilters } from "./IssueFilters";
 import {
@@ -92,8 +93,9 @@ export function IssuesPage() {
         await navigator.clipboard.writeText(issue.fingerprint);
         toast({
           title: "已复制指纹",
-          description: issue.fingerprint,
+          description: shortFingerprint(issue.fingerprint),
           variant: "success",
+          duration: 2500,
         });
       } catch {
         toast({

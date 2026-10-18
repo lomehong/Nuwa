@@ -190,7 +190,7 @@ export function IssueFilters({
   return (
     <section
       aria-labelledby="issue-filters-heading"
-      className="rounded-card border border-border bg-surface p-4"
+      className="rounded-card border border-border bg-surface p-4 md:sticky md:top-16 md:z-20"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 id="issue-filters-heading" className="text-heading-sm font-semibold text-text">

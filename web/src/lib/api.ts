@@ -14,6 +14,8 @@
  * once to `/auth/login` and afterwards only the HttpOnly cookie authenticates.
  */
 
+import { reportServerReachable, reportServerUnreachable } from "./connectivity";
+
 export const API_BASE = "/api/v1";
 export const CSRF_COOKIE_NAME = "nuwa_csrf";
 export const CSRF_HEADER_NAME = "X-NUWA-CSRF";
@@ -206,8 +208,12 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
     if (error instanceof Error && error.name === "AbortError") {
       throw error;
     }
+    reportServerUnreachable();
     throw new ApiError(0, "network_error", "无法连接服务器");
   }
+
+  // Any HTTP answer proves the server is alive, including 4xx/5xx.
+  reportServerReachable();
 
   if (response.status === 401 && !isAuthPath(path)) {
     unauthorizedHandler();

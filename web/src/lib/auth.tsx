@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from "react";
 
-import { apiFetch, setUnauthorizedHandler } from "./api";
+import { ApiError, apiFetch, setUnauthorizedHandler } from "./api";
 
 /** `GET /api/v1/auth/me` (docs/09 §6.1). */
 export interface MeResponse {
@@ -18,7 +18,12 @@ export interface MeResponse {
   expires_at_ms: number | null;
 }
 
-export type AuthStatus = "loading" | "authenticated" | "unauthenticated";
+/**
+ * `error` means the boot check failed for a non-401 reason (transport failure,
+ * 5xx): the operator sees a retryable "server unreachable" state instead of a
+ * login form that could never succeed.
+ */
+export type AuthStatus = "loading" | "authenticated" | "unauthenticated" | "error";
 
 export interface AuthContextValue {
   status: AuthStatus;
@@ -30,10 +35,26 @@ export interface AuthContextValue {
   login: (token: string) => Promise<void>;
   /** POST /auth/logout (CSRF-protected) and drop cached server state. */
   logout: () => Promise<void>;
+  /** Re-runs the `/auth/me` boot check after an `error` status. */
+  retry: () => void;
 }
 
-const UNAUTHENTICATED: Pick<AuthContextValue, "status" | "localMode" | "expiresAtMs"> = {
+type AuthBootState = Pick<AuthContextValue, "status" | "localMode" | "expiresAtMs">;
+
+const UNAUTHENTICATED: AuthBootState = {
   status: "unauthenticated",
+  localMode: false,
+  expiresAtMs: null,
+};
+
+const UNREACHABLE: AuthBootState = {
+  status: "error",
+  localMode: false,
+  expiresAtMs: null,
+};
+
+const LOADING: AuthBootState = {
+  status: "loading",
   localMode: false,
   expiresAtMs: null,
 };
@@ -49,43 +70,55 @@ const AuthContext = createContext<AuthContextValue | null>(null);
  *
  * A 401 from any non-auth endpoint (for example an expired session during a
  * background poll) notifies this provider through `setUnauthorizedHandler`, so
- * the protected route redirects to `/login` without a full page reload.
+ * the protected route redirects to `/login` without a full page reload and the
+ * cached server state is dropped. A boot failure that is not a 401 (transport
+ * error, 5xx) becomes `status: "error"` so the shell can offer a retry instead
+ * of pretending the operator is logged out.
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
-  const [state, setState] =
-    useState<Pick<AuthContextValue, "status" | "localMode" | "expiresAtMs">>({
-      status: "loading",
-      localMode: false,
-      expiresAtMs: null,
-    });
+  const [state, setState] = useState<AuthBootState>({ ...LOADING });
+
+  const loadMe = useCallback(async (isActive: () => boolean) => {
+    try {
+      const me = await apiFetch<MeResponse>("/auth/me");
+      if (isActive()) {
+        setState({
+          status: "authenticated",
+          localMode: me.local_mode,
+          expiresAtMs: me.expires_at_ms,
+        });
+      }
+    } catch (error) {
+      if (!isActive()) {
+        return;
+      }
+      // Only a 401 means "not logged in". Everything else (offline, proxy
+      // error, 5xx) is a server problem, not a credential problem.
+      setState(error instanceof ApiError && error.status === 401 ? UNAUTHENTICATED : UNREACHABLE);
+    }
+  }, []);
 
   useEffect(() => {
     let active = true;
-    void (async () => {
-      try {
-        const me = await apiFetch<MeResponse>("/auth/me");
-        if (active) {
-          setState({
-            status: "authenticated",
-            localMode: me.local_mode,
-            expiresAtMs: me.expires_at_ms,
-          });
-        }
-      } catch {
-        // A 401 is the expected "not logged in" answer. A network failure also
-        // lands on the login page, where the next submit reports the error.
-        if (active) {
-          setState(UNAUTHENTICATED);
-        }
-      }
-    })();
+    void loadMe(() => active);
     return () => {
       active = false;
     };
-  }, []);
+  }, [loadMe]);
 
-  useEffect(() => setUnauthorizedHandler(() => setState(UNAUTHENTICATED)), []);
+  useEffect(() => {
+    const restore = setUnauthorizedHandler(() => {
+      queryClient.clear();
+      setState(UNAUTHENTICATED);
+    });
+    return restore;
+  }, [queryClient]);
+
+  const retry = useCallback(() => {
+    setState({ ...LOADING });
+    void loadMe(() => true);
+  }, [loadMe]);
 
   const login = useCallback(
     async (token: string) => {
@@ -102,14 +135,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const logout = useCallback(async () => {
-    await apiFetch<void>("/auth/logout", { method: "POST" });
+    try {
+      await apiFetch<void>("/auth/logout", { method: "POST" });
+    } catch (error) {
+      // A 401 here means the session already expired: the desired end state.
+      if (!(error instanceof ApiError && error.status === 401)) {
+        throw error;
+      }
+    }
     setState(UNAUTHENTICATED);
     queryClient.clear();
   }, [queryClient]);
 
   const value = useMemo<AuthContextValue>(
-    () => ({ ...state, login, logout }),
-    [state, login, logout],
+    () => ({ ...state, login, logout, retry }),
+    [state, login, logout, retry],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
