@@ -177,6 +177,11 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         shanhaijing::Store::open(&db_path)
             .with_context(|| format!("open db {}", db_path.display()))?,
     );
+    match prune_on_start(&store, now_ms(), event_retention_days()) {
+        Ok(deleted) if deleted > 0 => println!("retention : pruned {deleted} rows"),
+        Ok(_) => {}
+        Err(error) => eprintln!("warning    : retention prune failed: {error}"),
+    }
     let env_path = crate::settings::env_file_path();
     // Shared collector token (NUWA_INGEST_TOKEN). Set it when serving beyond
     // localhost: without it anyone can spam the issue store. This is a
@@ -276,6 +281,24 @@ fn runner_units_from_env(raw: Option<&str>) -> Vec<String> {
     } else {
         units
     }
+}
+
+/// `NUWA_EVENT_RETENTION_DAYS` — normal events roll off after this many days.
+/// Out-of-range or malformed values fall back to the documented 90-day default.
+fn event_retention_days() -> u32 {
+    retention_days_from_env(std::env::var("NUWA_EVENT_RETENTION_DAYS").ok().as_deref())
+}
+
+fn retention_days_from_env(raw: Option<&str>) -> u32 {
+    raw.and_then(|value| value.trim().parse::<u32>().ok())
+        .map(|days| days.clamp(1, 3_650))
+        .unwrap_or(90)
+}
+
+/// Best-effort startup retention sweep: telemetry past its window goes away,
+/// audit events keep their own 365-day window inside `Store::prune`.
+fn prune_on_start(store: &shanhaijing::Store, now: i64, days: u32) -> anyhow::Result<u64> {
+    store.prune(now, days, 365).map_err(Into::into)
 }
 
 /// Whether the configured listen address stays on this host. Used only for
@@ -1262,6 +1285,53 @@ mod tests {
                 "nuwa-runner".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn serve_prunes_events_past_retention_but_keeps_audit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("prune.db");
+        let store = shanhaijing::Store::open(&path).expect("open");
+        let now = crate::now_ms();
+        store
+            .record_event(
+                "fp",
+                now - 120 * 86_400_000,
+                Some("example.com/spike"),
+                "system",
+                "reported",
+                "old",
+            )
+            .expect("old event");
+        store
+            .record_event(
+                "fp",
+                now,
+                Some("example.com/spike"),
+                "owner",
+                "config_changed",
+                "keep",
+            )
+            .expect("audit event");
+
+        let deleted = prune_on_start(&store, now, 90).expect("prune");
+        assert_eq!(deleted, 1);
+
+        let events = store
+            .list_events(&Default::default(), 100)
+            .expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "config_changed");
+        assert_eq!(events[0].detail, "keep");
+    }
+
+    #[test]
+    fn event_retention_days_defaults_and_clamps() {
+        assert_eq!(retention_days_from_env(None), 90);
+        assert_eq!(retention_days_from_env(Some("garbage")), 90);
+        assert_eq!(retention_days_from_env(Some("0")), 1);
+        assert_eq!(retention_days_from_env(Some("4000")), 3_650);
+        assert_eq!(retention_days_from_env(Some(" 30 ")), 30);
     }
 
     #[test]
