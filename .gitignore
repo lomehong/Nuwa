@@ -15,6 +15,7 @@ Cargo.lock.bak
 /web/node_modules/
 /web/dist/*
 !/web/dist/.gitkeep
+/web/coverage/
 
 # Secrets / local env — never in the repo
 .env
