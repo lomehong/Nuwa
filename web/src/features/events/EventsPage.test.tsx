@@ -364,6 +364,28 @@ describe("EventsPage", () => {
     );
   });
 
+  it("recovers from an out-of-range page", async () => {
+    const requests = useEventsHandler((url) =>
+      eventsResponse([], {
+        page: Number(url.searchParams.get("page") ?? "1"),
+        total: 60,
+      }),
+    );
+    renderApp("/events?page=2");
+
+    expect(await screen.findByText("该页没有事件")).toBeInTheDocument();
+    expect(screen.getByText(/共 60 条事件，当前页超出范围/)).toBeInTheDocument();
+    expect(requests[0].searchParams.get("page")).toBe("2");
+    expect(requests[0].searchParams.get("page_size")).toBe("50");
+
+    fireEvent.click(screen.getByRole("button", { name: "回到第一页" }));
+
+    await waitFor(() =>
+      expect(requests[requests.length - 1].searchParams.get("page")).toBe("1"),
+    );
+    expect(await screen.findByText("这个时间窗内没有事件")).toBeInTheDocument();
+  });
+
   it("shows the empty state for an eventless window", async () => {
     useEventsHandler(() => eventsResponse([]));
     renderApp("/events");

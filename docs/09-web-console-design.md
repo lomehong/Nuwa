@@ -827,7 +827,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 ### 10.6 运行器
 
 - 汇总条：在线/总数、工作中、待命、配额待命、异常。
-- runner 卡：id、repo、状态、心跳年龄、当前单/阶段/用时、provider/model、配额进度、最后错误、service unit。
+- runner 卡：id、repo、状态、心跳年龄、当前单/阶段、provider/model、配额进度、最后错误、service unit；`/runners` 不含 run 开始时间，运行用时推迟到 M5（与 run 详情一起展示）。
 - 状态语义：
   - `启动中`：刚注册，按在线处理；
   - `待命`：队列空；

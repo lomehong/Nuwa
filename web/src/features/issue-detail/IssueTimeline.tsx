@@ -1,12 +1,12 @@
 import { Badge, Card, CardContent, CardHeader, CardTitle } from "../../components/ui";
 import {
   actorLabel,
+  eventKindLabel,
+  eventKindVariant,
   formatAge,
   formatDateTime,
   isSystemFingerprint,
   isoDateTime,
-  timelineKindVariant,
-  eventKindLabel,
 } from "./format";
 import { IssueSection } from "./IssueSection";
 import type { TimelineItem } from "./types";
@@ -54,7 +54,7 @@ export function IssueTimeline({ items }: IssueTimelineProps) {
                       className="absolute top-1.5 -left-[1.45rem] size-2 rounded-full border border-surface bg-border-strong"
                     />
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                      <Badge variant={timelineKindVariant(item.kind)} title={item.kind}>
+                      <Badge variant={eventKindVariant(item.kind)} title={item.kind}>
                         {eventKindLabel(item.kind)}
                       </Badge>
                       {item.count !== undefined && item.count > 1 ? (

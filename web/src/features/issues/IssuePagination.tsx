@@ -38,7 +38,8 @@ export function IssuePagination({
         共 <span className="font-mono tabular-nums text-text">{formatCount(meta.total)}</span> 条
         <span aria-hidden="true"> · </span>
         {/* The URL page is authoritative: `meta.page` trails behind while
-            `keepPreviousData` paints the previous page during a transition. */}
+            previous-page placeholder data paints during a filter/page
+            transition (the events feed keeps its rows via keepPreviousData). */}
         第 <span className="font-mono tabular-nums text-text">{page}</span> /{" "}
         <span className="font-mono tabular-nums text-text">{pageCount}</span> 页
       </p>

@@ -4,9 +4,9 @@
  * library (the page only needs counts, durations and relative timestamps).
  */
 
-import type { BadgeVariant } from "../../components/ui";
 import { isValidTimestamp } from "../../lib/time";
 
+export { eventKindLabel, eventKindVariant } from "../../lib/eventKinds";
 export { isoDateTime } from "../../lib/time";
 
 const NUMBER_FORMAT = new Intl.NumberFormat("zh-CN");
@@ -118,51 +118,4 @@ export function isSystemFingerprint(fingerprint: string): boolean {
     fingerprint === "__system__" ||
     fingerprint.startsWith("__runner__:")
   );
-}
-
-const EVENT_KIND_LABELS: Record<string, string> = {
-  reported: "上报",
-  state_changed: "状态变更",
-  requeued: "重新排队",
-  reopened: "重开",
-  pr_opened: "PR 已开",
-  merged: "已合并",
-  rejected: "已拒绝",
-  pr_merged: "PR 已合并",
-  pr_closed: "PR 已关闭",
-  ci_green: "CI 通过",
-  ci_red: "CI 失败",
-  ci_timeout: "CI 超时",
-  config_changed: "配置变更",
-  config_migrated: "配置迁移",
-  restart_requested: "请求重启",
-  runner_started: "运行器启动",
-  runner_stopped: "运行器停止",
-  runner_error: "运行器异常",
-  sync: "对账",
-};
-
-export function eventKindLabel(kind: string): string {
-  return EVENT_KIND_LABELS[kind] ?? kind;
-}
-
-/**
- * Badge tone shared by the activity feed and the overview's recent-events
- * panel. Unknown kinds stay neutral so a new backend kind never breaks the UI.
- */
-const EVENT_KIND_VARIANTS: Record<string, BadgeVariant> = {
-  ci_green: "success",
-  merged: "success",
-  pr_merged: "success",
-  ci_red: "danger",
-  runner_error: "danger",
-  ci_timeout: "warning",
-  restart_requested: "warning",
-  pr_opened: "info",
-  state_changed: "info",
-  requeued: "info",
-};
-
-export function eventKindVariant(kind: string): BadgeVariant {
-  return EVENT_KIND_VARIANTS[kind] ?? "neutral";
 }

@@ -6,7 +6,7 @@
  * one cache entry; `from_ms` is computed inside the queryFn.
  */
 
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { apiFetch } from "../../lib/api";
 import { eventQueryString, type EventFilters } from "./filters";
@@ -35,6 +35,10 @@ export function useEventsQuery(filters: EventFilters) {
         signal,
       }),
     staleTime: EVENTS_POLL_MS,
+    // Keep the current rows painted while a filter/page transition loads so the
+    // feed never flashes the skeleton; `isInitialLoading` still only covers the
+    // very first request (no cached data at all).
+    placeholderData: keepPreviousData,
     refetchInterval: EVENTS_POLL_MS,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,

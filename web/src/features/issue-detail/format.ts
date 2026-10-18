@@ -1,14 +1,13 @@
 /**
  * Labels and small formatters for the issue detail page. Time, duration and
  * token helpers are shared with the overview instead of being re-derived;
- * only detail-specific vocabulary (run phase/outcome, event tone) lives here.
+ * only detail-specific vocabulary (run phase/outcome) lives here.
  */
 
 import { ApiError } from "../../lib/api";
 import type { BadgeVariant } from "../../components/ui";
 import { formatCount, shortFingerprint } from "../issues/format";
 import {
-  eventKindLabel,
   formatAge,
   formatDateTime,
   formatDuration,
@@ -19,7 +18,6 @@ import {
 import type { RunDto } from "./types";
 
 export {
-  eventKindLabel,
   formatAge,
   formatCount,
   formatDateTime,
@@ -29,6 +27,7 @@ export {
   isoDateTime,
   shortFingerprint,
 };
+export { eventKindLabel, eventKindVariant } from "../../lib/eventKinds";
 
 const RUN_PHASE_LABELS: Record<string, string> = {
   repair: "修复",
@@ -96,30 +95,6 @@ export function shortRunId(id: string, length = 18): string {
     return id;
   }
   return `${id.slice(0, length)}…`;
-}
-
-const TIMELINE_TONES: Record<string, BadgeVariant> = {
-  reported: "neutral",
-  state_changed: "info",
-  requeued: "warning",
-  reopened: "warning",
-  pr_opened: "info",
-  pr_merged: "success",
-  pr_closed: "danger",
-  ci_green: "success",
-  ci_red: "danger",
-  ci_timeout: "warning",
-  config_changed: "neutral",
-  config_migrated: "neutral",
-  restart_requested: "warning",
-  runner_started: "info",
-  runner_stopped: "neutral",
-  runner_error: "danger",
-  sync: "neutral",
-};
-
-export function timelineKindVariant(kind: string): BadgeVariant {
-  return TIMELINE_TONES[kind] ?? "neutral";
 }
 
 const ACTOR_LABELS: Record<string, string> = {

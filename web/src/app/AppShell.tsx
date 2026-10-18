@@ -82,10 +82,13 @@ function pageMeta(pathname: string): PageMeta {
 }
 
 const PILL_CLASS =
-  "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 text-caption whitespace-nowrap text-text-secondary";
+  "inline-flex min-h-7 shrink-0 items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 text-caption whitespace-nowrap text-text-secondary";
 const PILL_LINK_CLASS = clsx(
   PILL_CLASS,
   "transition-colors hover:border-border-strong hover:text-text",
+  // Interactive pills reach the 44px touch target on coarse pointers only;
+  // plain status pills stay compact at 28px.
+  "pointer-coarse:min-h-11",
 );
 
 function StatusDot({ tone }: { tone: "success" | "warning" | "danger" }) {

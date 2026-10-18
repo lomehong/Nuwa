@@ -104,13 +104,22 @@ describe("AppShell", () => {
       within(region).getByRole("link", { name: /^队列\s*3$/ }),
     ).toHaveAttribute("href", "/issues?state=new");
     expect(
+      within(region).getByRole("link", { name: /^队列\s*3$/ }),
+    ).toHaveClass("pointer-coarse:min-h-11");
+    expect(
       within(region).getByRole("link", { name: /^运行中\s*1$/ }),
     ).toHaveAttribute("href", "/issues?state=triggered,fixing");
+    expect(
+      within(region).getByRole("link", { name: /^运行中\s*1$/ }),
+    ).toHaveClass("pointer-coarse:min-h-11");
     expect(within(region).getByText("今日 PR").parentElement).toHaveTextContent("今日 PR2");
     expect(within(region).getByText("配额待命").parentElement).toHaveTextContent("配额待命1");
     expect(within(region).getByRole("link", { name: /^运行器\s*在线\s*1\/2$/ })).toHaveAttribute(
       "href",
       "/runners",
+    );
+    expect(within(region).getByRole("link", { name: /^运行器\s*在线\s*1\/2$/ })).toHaveClass(
+      "pointer-coarse:min-h-11",
     );
     expect(within(region).getByRole("link", { name: /^配额待命\s*1$/ })).toHaveAttribute(
       "href",

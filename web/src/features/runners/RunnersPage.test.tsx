@@ -1,4 +1,4 @@
-import { fireEvent, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -106,6 +106,48 @@ describe("RunnersPage", () => {
     expect(await screen.findByText("还没有运行器注册")).toBeInTheDocument();
     expect(screen.getByText(/nuwa work --loop --runner-id/)).toBeInTheDocument();
     expect(screen.queryByTestId(/^runner-card-/)).not.toBeInTheDocument();
+  });
+
+  it("keeps the stale fleet visible and retries after a failed refetch", async () => {
+    let calls = 0;
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      http.get("/api/v1/runners", () => {
+        calls += 1;
+        if (calls === 2) {
+          return HttpResponse.json(
+            { error: { code: "internal_error", message: "store read failed" } },
+            { status: 500 },
+          );
+        }
+        return HttpResponse.json({ data: [makeRunner({ id: "runner-after-stale" })] });
+      }),
+    );
+
+    const { queryClient } = renderApp("/runners");
+    await screen.findByTestId("runner-card-runner-after-stale");
+
+    await act(async () => {
+      await queryClient
+        .refetchQueries({ queryKey: ["runners"] })
+        .catch(() => undefined);
+    });
+
+    expect(
+      await screen.findByText("运行器状态更新失败，显示的是上次数据。"),
+    ).toBeInTheDocument();
+    // The cached cards stay visible below the stale notice.
+    expect(screen.getByTestId("runner-card-runner-after-stale")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+
+    await waitFor(() => expect(calls).toBe(3));
+    await waitFor(() =>
+      expect(
+        screen.queryByText("运行器状态更新失败，显示的是上次数据。"),
+      ).not.toBeInTheDocument(),
+    );
   });
 
   it("retries a failed fleet request", async () => {
