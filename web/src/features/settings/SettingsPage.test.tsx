@@ -33,6 +33,24 @@ function shellNavLink(name: string) {
   return within(nav).getByRole("link", { name });
 }
 
+/** Click a same-origin anchor that the real shell does not render. The extra
+ * capture listener runs after the guard's and cancels jsdom's unimplemented
+ * navigation, so the assertion only observes whether the guard opened. */
+function clickInjectedLink(href: string) {
+  const anchor = document.createElement("a");
+  anchor.href = href;
+  anchor.textContent = "当前地址";
+  const stopNavigation = (event: Event) => event.preventDefault();
+  document.addEventListener("click", stopNavigation, true);
+  document.body.append(anchor);
+  try {
+    fireEvent.click(anchor);
+  } finally {
+    document.removeEventListener("click", stopNavigation, true);
+    anchor.remove();
+  }
+}
+
 const LEAVE_DIALOG = "放弃未保存的更改？";
 
 describe("SettingsPage", () => {
@@ -226,6 +244,55 @@ describe("SettingsPage", () => {
 
     expect(await screen.findByRole("heading", { level: 1, name: "总览" })).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument();
+  });
+
+  it("closes the drawer behind the guard and unlocks scroll after cancel", async () => {
+    signedIn();
+    renderApp("/settings");
+    fireEvent.change(await screen.findByLabelText("Poll interval"), {
+      target: { value: "60" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "打开导航菜单" }));
+    const drawer = screen.getByRole("dialog", { name: "导航菜单" });
+    fireEvent.click(within(drawer).getByRole("link", { name: "总览" }));
+
+    expect(await screen.findByRole("dialog", { name: LEAVE_DIALOG })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "导航菜单" })).not.toBeInTheDocument();
+    expect(document.body).toHaveClass("nuwa-scroll-lock");
+
+    fireEvent.click(screen.getByRole("button", { name: "留在本页" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument(),
+    );
+    expect(document.body).not.toHaveClass("nuwa-scroll-lock");
+    expect(screen.getByLabelText("Poll interval")).toHaveValue(60);
+  });
+
+  it("ignores a current-route link that differs only by a trailing slash", async () => {
+    signedIn();
+    renderApp("/settings");
+    fireEvent.change(await screen.findByLabelText("Poll interval"), {
+      target: { value: "60" },
+    });
+
+    clickInjectedLink("/settings/");
+
+    expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument();
+    expect(screen.getByText("1 项未保存")).toBeInTheDocument();
+  });
+
+  it("ignores a current-route link whose query parameters are reordered", async () => {
+    signedIn();
+    renderApp("/settings?a=1&b=2");
+    fireEvent.change(await screen.findByLabelText("Poll interval"), {
+      target: { value: "60" },
+    });
+
+    clickInjectedLink("/settings?b=2&a=1");
+
+    expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument();
+    expect(screen.getByText("1 项未保存")).toBeInTheDocument();
   });
 
   it("warns that a console token change ends the session on restart", async () => {

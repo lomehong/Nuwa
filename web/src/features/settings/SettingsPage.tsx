@@ -117,6 +117,20 @@ function draftIsUnchanged(
   return raw === value.value;
 }
 
+/** `/settings/` and `/settings` are the same route; trailing slashes alone must
+ * not open the unsaved-changes guard. */
+function normalizePathname(pathname: string): string {
+  const trimmed = pathname.replace(/\/+$/, "");
+  return trimmed === "" ? "/" : trimmed;
+}
+
+/** Query order is not a navigation (`?a=1&b=2` equals `?b=2&a=1`). */
+function normalizeSearch(search: string): string {
+  const params = new URLSearchParams(search);
+  params.sort();
+  return params.toString();
+}
+
 function SettingsSkeleton() {
   return (
     <div role="status" aria-busy="true" className="space-y-4">
@@ -370,9 +384,11 @@ export function SettingsPage() {
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
   }, []);
 
-  // In-app navigation guard: links are caught in the capture phase so the
-  // router never sees the click while drafts are unsaved. Same-origin plain
-  // left clicks only; new tabs, downloads, external and hash links pass.
+  // In-app navigation guard: links are caught in the capture phase and
+  // default-prevented, so the router's own click handler bails out (it checks
+  // defaultPrevented) while other handlers, such as the drawer's close, still
+  // run. Same-origin plain left clicks only; new tabs, downloads, external,
+  // hash and same-location links pass.
   useEffect(() => {
     function handleLinkClick(event: MouseEvent) {
       if (!dirtyRef.current || event.defaultPrevented || event.button !== 0) {
@@ -406,14 +422,17 @@ export function SettingsPage() {
       if (url.origin !== window.location.origin) {
         return;
       }
-      const next = `${url.pathname}${url.search}${url.hash}`;
-      const current = `${location.pathname}${location.search}${location.hash}`;
-      if (next === current) {
+      const samePathname =
+        normalizePathname(url.pathname) === normalizePathname(location.pathname);
+      const sameSearch = normalizeSearch(url.search) === normalizeSearch(location.search);
+      const sameHash = url.hash === location.hash;
+      if (samePathname && sameSearch && sameHash) {
         return;
       }
+      // No stopPropagation: the drawer's NavLink onClick still runs and closes
+      // the drawer while the guard dialog opens.
       event.preventDefault();
-      event.stopPropagation();
-      setPendingHref(next);
+      setPendingHref(`${url.pathname}${url.search}${url.hash}`);
     }
     document.addEventListener("click", handleLinkClick, true);
     return () => document.removeEventListener("click", handleLinkClick, true);
