@@ -417,9 +417,10 @@ describe("EventsPage", () => {
     expect(alert).toHaveTextContent("无法加载活动");
     expect(alert).toHaveTextContent("store read failed");
     expect(alert).toHaveTextContent("(internal)");
+    expect(within(alert).queryByRole("button")).not.toBeInTheDocument();
 
     fail = false;
-    fireEvent.click(within(alert).getByRole("button", { name: "重试" }));
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
     expect(await screen.findByRole("region", { name: "活动列表" })).toBeInTheDocument();
   });
 

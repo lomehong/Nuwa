@@ -160,8 +160,16 @@
   --on-danger: #ffffff;
   --scrim: rgb(15 23 42 / 0.4);
 
-  /* The stones keep the §11.2 hues; state text uses darker variants so the
-     label still clears WCAG AA on the light surface. */
+  /* The stones keep the §11.2 hues for dark; the light theme uses darker
+     shades so the stone marks reach at least 3:1 against both page and
+     surface backgrounds. State text uses its own darker variants so the label
+     still clears WCAG AA on the light surface. */
+  --stone-critical: #c62828;
+  --stone-high: #a94f00;
+  --stone-medium: #7a5b00;
+  --stone-low: #0b7a55;
+  --stone-unknown: #6a4bc4;
+
   --state-new: #0b7a54;
   --state-triggered: #8a5a00;
   --state-fixing: #1f6fd0;

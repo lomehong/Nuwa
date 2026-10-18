@@ -18,4 +18,14 @@ describe("EmptyState", () => {
     expect(screen.getByText("接入 SDK 后会显示运行时信号。")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "查看接入手册" })).toBeInTheDocument();
   });
+
+  it("keeps the action outside the status live region", () => {
+    render(
+      <EmptyState title="没有数据" action={<button type="button">重试</button>} />,
+    );
+
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("没有数据");
+    expect(status).not.toContainElement(screen.getByRole("button", { name: "重试" }));
+  });
 });

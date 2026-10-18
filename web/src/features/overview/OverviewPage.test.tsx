@@ -418,9 +418,13 @@ describe("OverviewPage", () => {
     expect(alert).toHaveTextContent("无法加载总览");
     expect(alert).toHaveTextContent("store read failed");
     expect(alert).toHaveTextContent("(internal)");
+    // The live region holds only the message; the retry button stays outside.
+    expect(within(alert).queryByRole("button")).not.toBeInTheDocument();
 
     fail = false;
-    fireEvent.click(within(alert).getByRole("button", { name: "重试" }));
+    fireEvent.click(
+      within(alert.parentElement as HTMLElement).getByRole("button", { name: "重试" }),
+    );
 
     expect(
       await screen.findByRole("region", { name: "需要你处理" }),

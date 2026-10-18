@@ -1,5 +1,5 @@
 import { AlertCircle, Gem } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 
 import { AuthErrorState } from "../../components/AuthErrorState";
@@ -54,6 +54,10 @@ export function LoginPage() {
   const [token, setToken] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+
+  useEffect(() => {
+    document.title = "登录 · 女娲";
+  }, []);
 
   if (status === "loading") {
     return <AuthLoading />;

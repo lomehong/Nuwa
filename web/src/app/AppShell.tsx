@@ -311,6 +311,13 @@ export function AppShell() {
     onEscape: closeDrawer,
   });
 
+  // The document title follows the active route so tabs, history entries and
+  // screen-reader page announcements stay distinguishable. The login page sets
+  // its own title.
+  useEffect(() => {
+    document.title = title === "Nuwa 控制台" ? "女娲 · 补天" : `${title} · 女娲`;
+  }, [title]);
+
   // A route change always dismisses the drawer (nav links call close too; this
   // covers browser back/forward and redirects).
   useEffect(() => {

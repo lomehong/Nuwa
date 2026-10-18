@@ -6,6 +6,15 @@ import { mockIssues, mockMe, mockOverview, mockOverviewResources, mockUnauthoriz
 import { renderApp } from "../../test/render";
 
 describe("LoginPage", () => {
+  it("sets the login document title", async () => {
+    server.use(mockUnauthorizedMe());
+
+    renderApp("/login");
+
+    await screen.findByLabelText("访问令牌");
+    expect(document.title).toBe("登录 · 女娲");
+  });
+
   it("signs in and returns to the intended route", async () => {
     let received: unknown = null;
     server.use(

@@ -93,15 +93,19 @@ export function IssueListStaleNotice({ error, onRetry }: IssueListErrorProps) {
 export function IssueListError({ error, onRetry }: IssueListErrorProps) {
   const { title, message, code } = describeIssueListError(error);
   return (
-    <Card role="alert" className="border-danger/40">
+    <Card className="border-danger/40">
       <CardContent className="flex flex-wrap items-start gap-3 p-4">
-        <AlertCircle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" />
-        <div className="min-w-0 flex-1">
-          <p className="text-body font-medium text-text">{title}</p>
-          <p className="mt-0.5 text-body-sm text-text-secondary">{message}</p>
-          {code ? (
-            <p className="mt-1 font-mono text-caption text-text-muted">{code}</p>
-          ) : null}
+        {/* The live region carries the message only; the retry button stays
+            outside so it is not re-announced or swallowed by the alert. */}
+        <div role="alert" className="flex min-w-0 flex-1 items-start gap-3">
+          <AlertCircle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" />
+          <div className="min-w-0 flex-1">
+            <p className="text-body font-medium text-text">{title}</p>
+            <p className="mt-0.5 text-body-sm text-text-secondary">{message}</p>
+            {code ? (
+              <p className="mt-1 font-mono text-caption text-text-muted">{code}</p>
+            ) : null}
+          </div>
         </div>
         <Button variant="secondary" size="sm" onClick={onRetry}>
           <RefreshCw aria-hidden="true" className="size-3.5" />

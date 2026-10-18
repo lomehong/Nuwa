@@ -19,6 +19,13 @@ const STATE_VARIANTS = [
   "rejected",
   "escalated",
 ] as const;
+const STONE_NAMES = [
+  "stone-critical",
+  "stone-high",
+  "stone-medium",
+  "stone-low",
+  "stone-unknown",
+] as const;
 
 function declarationsFor(selector: RegExp): Record<string, string> {
   const match = tokensCss.match(selector);
@@ -183,6 +190,17 @@ describe.each(["dark", "light"] as const)("%s theme", (theme) => {
       .map((pair) => `${pair.label}: ${pair.ratio.toFixed(2)}:1`);
 
     expect(failures, "text pairs below WCAG AA 4.5:1").toEqual([]);
+  });
+});
+
+describe("severity stones", () => {
+  it("light stones reach 3:1 against both page and surface backgrounds", () => {
+    for (const name of STONE_NAMES) {
+      expect(contrastRatio(token("light", name), token("light", "surface")), name)
+        .toBeGreaterThanOrEqual(3);
+      expect(contrastRatio(token("light", name), token("light", "bg")), name)
+        .toBeGreaterThanOrEqual(3);
+    }
   });
 });
 

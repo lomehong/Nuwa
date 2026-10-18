@@ -56,9 +56,11 @@ interface PanelErrorProps {
 export function PanelError({ title, error, onRetry, compact = false }: PanelErrorProps) {
   const code = describeErrorCode(error);
   return (
-    <Card role="alert" className="border-danger/40">
+    <Card className="border-danger/40">
       <CardContent className={compact ? "p-4" : "flex flex-wrap items-start gap-3 p-4"}>
-        <div className="flex min-w-0 flex-1 items-start gap-3">
+        {/* Only the failure message is announced; the retry button stays
+            outside the alert so it keeps its own focus and label. */}
+        <div role="alert" className="flex min-w-0 flex-1 items-start gap-3">
           <AlertCircle aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" />
           <div className="min-w-0">
             <p className="text-body font-medium text-text">{title}</p>

@@ -8,6 +8,7 @@ import {
   mockIssues,
   mockMe,
   mockOverviewResources,
+  mockRunners,
   mockSettings,
   mockSystem,
   server,
@@ -53,6 +54,43 @@ describe("AppShell", () => {
       "/settings",
     );
     expect(within(nav).queryByText("Soon")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["/", "总览"],
+    ["/issues", "问题单"],
+    ["/runners", "运行器"],
+    ["/events", "活动"],
+    ["/settings", "设置"],
+  ] as const)("sets the document title on %s", async (route, title) => {
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockIssues(),
+      mockRunners(),
+      mockSettings(),
+      mockSystem(),
+    );
+    renderApp(route);
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: title }),
+    ).toBeInTheDocument();
+    expect(document.title).toBe(`${title} · 女娲`);
+  });
+
+  it("updates the document title after client-side navigation", async () => {
+    signedIn();
+    server.use(mockIssues());
+    renderApp("/");
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+    expect(document.title).toBe("总览 · 女娲");
+
+    const nav = screen.getByRole("navigation", { name: "主导航" });
+    fireEvent.click(within(nav).getByRole("link", { name: "问题单" }));
+
+    await screen.findByRole("heading", { level: 2, name: "问题单" });
+    expect(document.title).toBe("问题单 · 女娲");
   });
 
   it("marks the settings nav link current on /settings", async () => {
