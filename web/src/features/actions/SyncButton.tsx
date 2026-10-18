@@ -4,7 +4,7 @@ import { RefreshCw } from "lucide-react";
 import { Button, useToast } from "../../components/ui";
 import { ApiError, apiFetch } from "../../lib/api";
 import { describeError } from "../../lib/errors";
-import { invalidateIssueViews, invalidateSettingsViews } from "../../lib/queryInvalidation";
+import { invalidateIssueViews } from "../../lib/queryInvalidation";
 import { syncErrorText, type SyncResponse } from "./types";
 
 const SYNC_CONFLICT = "已有对账任务在运行，请稍后重试。";
@@ -33,13 +33,16 @@ export function SyncButton({ className }: SyncButtonProps) {
       }),
     onSuccess: (result) => {
       invalidateIssueViews(queryClient);
-      invalidateSettingsViews(queryClient);
       const failed = result.errors.length;
+      // Only MAX_ERROR_TOASTS get their own toast; the summary must still
+      // account for the rest so failures never disappear silently.
+      const hidden = failed - MAX_ERROR_TOASTS;
       toast({
         title: "对账完成",
         description:
           `检查 ${result.checked} · 合并 ${result.merged} · 拒绝 ${result.rejected} · 仍未合并 ${result.still_open}` +
-          (failed > 0 ? `；${failed} 个查询失败` : ""),
+          (failed > 0 ? `；${failed} 个查询失败` : "") +
+          (hidden > 0 ? `；另有 ${hidden} 条` : ""),
         variant: failed > 0 ? "warning" : "success",
       });
       for (const error of result.errors.slice(0, MAX_ERROR_TOASTS)) {

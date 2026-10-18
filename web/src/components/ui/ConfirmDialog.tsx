@@ -84,7 +84,7 @@ export function ConfirmDialog({
           </button>
         </div>
         {description ? (
-          <p id={descriptionId} className="mt-2 text-body-sm text-text-secondary">
+          <p id={descriptionId} className="mt-2 break-words text-body-sm text-text-secondary">
             {description}
           </p>
         ) : null}

@@ -219,7 +219,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               <div className="min-w-0 flex-1">
                 <p className="text-body-sm font-medium">{item.title}</p>
                 {item.description ? (
-                  <p className="mt-0.5 text-caption text-text-secondary">{item.description}</p>
+                  <p className="mt-0.5 break-words text-caption text-text-secondary">
+                    {item.description}
+                  </p>
                 ) : null}
               </div>
               <button

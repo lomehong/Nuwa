@@ -19,6 +19,9 @@ function signedIn(runners = [makeRunner()]) {
   server.use(mockMe(), ...mockOverviewResources(), mockRunners(runners));
 }
 
+/** A realistic content-addressed fingerprint: far longer than the dialog line. */
+const LONG_FP = "0123456789abcdef".repeat(4);
+
 describe("RestartRunnerButton", () => {
   it("warns about the active issue and surfaces a 501 manual command", async () => {
     signedIn([makeRunner({ id: "runner-a", current_fingerprint: "fp-1" })]);
@@ -55,6 +58,41 @@ describe("RestartRunnerButton", () => {
       await screen.findByText(/systemctl restart nuwa-work/),
     ).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the full 64-char fingerprint and wraps it in the dialog", async () => {
+    signedIn([makeRunner({ id: "runner-long", current_fingerprint: LONG_FP })]);
+
+    renderApp("/runners");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "重启 unit：runner-long" }),
+    );
+
+    const dialog = screen.getByRole("dialog", { name: "重启 runner unit？" });
+    const description = within(dialog).getByText(new RegExp(LONG_FP));
+    expect(description).toHaveClass("break-words");
+    expect(description).toHaveTextContent(`当前正在修复 ${LONG_FP}，重启会中断该 run。`);
+  });
+
+  it("explains a concurrent restart on 409", async () => {
+    signedIn();
+    server.use(
+      http.post("/api/v1/runners/:id/restart", () =>
+        HttpResponse.json(
+          { error: { code: "conflict", message: "restart already scheduled" } },
+          { status: 409 },
+        ),
+      ),
+    );
+
+    renderApp("/runners");
+    fireEvent.click(await screen.findByRole("button", { name: "重启 unit：runner-1" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认重启" }));
+
+    expect(await screen.findByText("重启失败")).toBeInTheDocument();
+    expect(
+      screen.getByText("已有重启任务在排程，请稍后重试。"),
+    ).toBeInTheDocument();
   });
 
   it("cancels without posting", async () => {
@@ -149,6 +187,9 @@ describe("RestartRunnerButton", () => {
 
     expect(button).toBeDisabled();
     expect(button).toHaveAttribute("title", "该 runner 未上报 service_unit，无法重启。");
+    const hint = screen.getByText("未上报 service_unit");
+    expect(hint).toBeVisible();
+    expect(button).toHaveAttribute("aria-describedby", hint.id);
     fireEvent.click(button);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(posts).toBe(0);

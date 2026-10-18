@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { RotateCw } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 
 import { Button, ConfirmDialog, useToast } from "../../components/ui";
 import { ApiError, apiFetch } from "../../lib/api";
@@ -42,6 +42,7 @@ export function RestartRunnerButton({ runner, className }: RestartRunnerButtonPr
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const disabledHintId = useId();
   const canRestart = Boolean(runner.service_unit);
 
   // A poll can clear `service_unit` (or the card can be reused for a runner
@@ -77,12 +78,20 @@ export function RestartRunnerButton({ runner, className }: RestartRunnerButtonPr
         pending={mutation.isPending}
         disabled={!canRestart}
         title={canRestart ? undefined : "该 runner 未上报 service_unit，无法重启。"}
+        aria-describedby={canRestart ? undefined : disabledHintId}
         aria-label={`重启 unit：${runner.id}`}
         onClick={() => setConfirmOpen(true)}
       >
         <RotateCw aria-hidden="true" className="size-4" />
         重启 unit
       </Button>
+      {canRestart ? null : (
+        // A disabled button swallows pointer events (and its title), so the
+        // reason must be visible next to it.
+        <span id={disabledHintId} className="text-caption text-text-secondary">
+          未上报 service_unit
+        </span>
+      )}
       <ConfirmDialog
         open={confirmOpen}
         title="重启 runner unit？"
