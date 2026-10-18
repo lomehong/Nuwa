@@ -598,8 +598,13 @@ export function SettingsPage() {
   }
 
   function handleTestGithub() {
+    // A token typed into the reveal input is an unsaved candidate; the probe
+    // must test it instead of the stored/environment value.
+    const token = drafts.NUWA_GITHUB_TOKEN;
     testGithub.mutate(
-      { target: "github" },
+      token
+        ? { target: "github", values: { NUWA_GITHUB_TOKEN: token } }
+        : { target: "github" },
       {
         onSuccess: (result) => {
           clearProbeErrors();
@@ -761,14 +766,22 @@ export function SettingsPage() {
         aside={
           <>
             <SyncButton />
-            <Button
-              variant="danger"
-              size="sm"
-              onClick={() => setRestartOpen(true)}
-            >
-              <Power aria-hidden="true" className="size-3.5" />
-              重启服务
-            </Button>
+            <div className="flex flex-col items-end gap-1">
+              <Button
+                variant="danger"
+                size="sm"
+                // The post-recovery navigation would hit the beforeunload
+                // guard; force a save/discard decision before restarting.
+                disabled={dirtyCount > 0}
+                onClick={() => setRestartOpen(true)}
+              >
+                <Power aria-hidden="true" className="size-3.5" />
+                重启服务
+              </Button>
+              {dirtyCount > 0 ? (
+                <p className="text-caption text-warning">请先保存或放弃未保存的更改</p>
+              ) : null}
+            </div>
           </>
         }
       >

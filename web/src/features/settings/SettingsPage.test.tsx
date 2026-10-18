@@ -178,6 +178,9 @@ describe("SettingsPage", () => {
     const repo = screen.getByRole("link", { name: /github\.com\/lomehong\/nuwa/ });
     expect(repo).toHaveAttribute("rel", "noreferrer");
     expect(screen.getByText("n/a")).toHaveClass("text-text-muted");
+    // Plain fields expose where their current value comes from.
+    expect(screen.getAllByText("来源 env 文件").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("来源 默认值").length).toBeGreaterThan(0);
   });
 
   it("renders the read-only env path as text, not an input", async () => {
@@ -421,6 +424,58 @@ describe("SettingsPage", () => {
     expect(csrf).toEqual(["csrf-token", "csrf-token"]);
   });
 
+  it("probes GitHub with the typed token instead of the stored one", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockSystem(),
+      mockSettings(),
+      http.post("/api/v1/settings/test", async ({ request }) => {
+        bodies.push((await request.json()) as Record<string, unknown>);
+        return HttpResponse.json({ ok: true, detail: "token accepted; 2/3" });
+      }),
+    );
+    renderApp("/settings");
+
+    fireEvent.click(await screen.findByRole("button", { name: "更新 GitHub token" }));
+    fireEvent.change(screen.getByPlaceholderText("留空保持不变"), {
+      target: { value: "ghp_candidate_token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "测试 GitHub token" }));
+
+    await waitFor(() =>
+      expect(bodies[0]).toEqual({
+        target: "github",
+        values: { NUWA_GITHUB_TOKEN: "ghp_candidate_token" },
+      }),
+    );
+    // The stored secret (only its last four characters are ever echoed) is
+    // never sent; the probe uses exactly what the operator typed.
+    expect(JSON.stringify(bodies[0])).not.toContain("1234");
+  });
+
+  it("disables restarting while drafts are unsaved", async () => {
+    signedIn();
+    renderApp("/settings");
+    const restart = await screen.findByRole("button", { name: "重启服务" });
+    expect(restart).toBeEnabled();
+
+    fireEvent.change(screen.getByLabelText("Poll interval"), {
+      target: { value: "60" },
+    });
+    expect(restart).toBeDisabled();
+    expect(
+      screen.getByText("请先保存或放弃未保存的更改"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "放弃更改" }));
+    expect(restart).toBeEnabled();
+    expect(
+      screen.queryByText("请先保存或放弃未保存的更改"),
+    ).not.toBeInTheDocument();
+  });
+
   it("surfaces a probe 422 as a danger toast with the field message", async () => {
     server.use(
       mockMe(),
@@ -528,11 +583,15 @@ describe("SettingsPage", () => {
       ),
     );
     renderApp("/settings");
-    fireEvent.change(await screen.findByLabelText("Poll interval"), {
+    fireEvent.click(await screen.findByRole("button", { name: "重启服务" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认重启" }));
+    await screen.findByText("fp-1");
+    // The restart button is disabled while drafts exist, so a dirty state can
+    // only appear after the dialog opened; the page-owned dialog must still
+    // let its active-run link navigate instead of stacking the leave guard.
+    fireEvent.change(screen.getByLabelText("Poll interval"), {
       target: { value: "60" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "重启服务" }));
-    fireEvent.click(await screen.findByRole("button", { name: "确认重启" }));
 
     fireEvent.click(await screen.findByRole("link", { name: "fp-1" }));
 

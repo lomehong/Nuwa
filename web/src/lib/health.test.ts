@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   RECOVERY_INITIAL_DELAY_MS,
+  SessionExpiredDuringRecoveryError,
+  navigateToLogin,
   probeServeOnce,
   reloadConsole,
   waitForServeRecovery,
@@ -9,8 +11,8 @@ import {
 
 type FetchMock = ReturnType<typeof vi.fn>;
 
-function response(ok: boolean): Response {
-  return { ok } as Response;
+function response(ok: boolean, status = ok ? 200 : 503): Response {
+  return { ok, status } as Response;
 }
 
 function mockFetch(...answers: Array<Response | Error | (() => Response | Error)>): FetchMock {
@@ -65,6 +67,14 @@ describe("probeServeOnce", () => {
 
     mockFetch(response(true), response(false));
     await expect(probeServeOnce()).resolves.toBe(false);
+  });
+
+  it("fails immediately when health is back but /auth/me rejects the session", async () => {
+    mockFetch(response(true), response(false, 401));
+
+    await expect(probeServeOnce()).rejects.toBeInstanceOf(
+      SessionExpiredDuringRecoveryError,
+    );
   });
 
   it("bounds each probe with a timeout signal that also follows the caller", async () => {
@@ -141,6 +151,21 @@ describe("waitForServeRecovery", () => {
     expect((error as Error).message).toBe("服务在 5 秒内未恢复");
   });
 
+  it("stops immediately when the restored process rejects the old session", async () => {
+    const fetchMock = mockFetch(response(true), response(false, 401));
+
+    const recovery = waitForServeRecovery(undefined, 10_000);
+    const settled = recovery.catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(RECOVERY_INITIAL_DELAY_MS);
+
+    const error = await settled;
+    expect(error).toBeInstanceOf(SessionExpiredDuringRecoveryError);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // A rotated token never accepts the old session, so no further poll runs.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("stops polling and rejects when the caller aborts", async () => {
     const controller = new AbortController();
     const fetchMock = mockFetch(response(true), response(true));
@@ -160,14 +185,25 @@ describe("waitForServeRecovery", () => {
 });
 
 describe("reloadConsole", () => {
-  it("reloads the console window", () => {
-    const reload = vi.fn();
-    // jsdom's Location.reload is non-configurable, so replace the whole
-    // window binding instead of trying to spy on the method.
-    vi.stubGlobal("window", { ...window, location: { reload } });
+  it("navigates to the SPA root instead of reloading the current path", () => {
+    const assign = vi.fn();
+    // jsdom's Location.assign is non-configurable, so replace the whole window
+    // binding instead of trying to spy on the method.
+    vi.stubGlobal("window", { ...window, location: { assign } });
 
     reloadConsole();
 
-    expect(reload).toHaveBeenCalledTimes(1);
+    expect(assign).toHaveBeenCalledWith("/");
+  });
+});
+
+describe("navigateToLogin", () => {
+  it("navigates to /login after a token rotation", () => {
+    const assign = vi.fn();
+    vi.stubGlobal("window", { ...window, location: { assign } });
+
+    navigateToLogin();
+
+    expect(assign).toHaveBeenCalledWith("/login");
   });
 });

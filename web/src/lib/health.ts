@@ -10,8 +10,9 @@
  * cookie is verified, and reloading against that state would bounce the
  * operator to `/login`.
  *
- * Plain `fetch` is deliberate. `apiFetch` would surface a transient 401 as a
- * session expiry and redirect to the login page mid-restart.
+ * Plain `fetch` is deliberate. `apiFetch` would surface a 401 as a session
+ * expiry and redirect to the login page mid-restart. A 401 is only terminal
+ * once `/health` is already back: that is the rotated-token case.
  */
 
 export const RECOVERY_POLL_MS = 1_000;
@@ -27,36 +28,58 @@ function abortError(): DOMException {
   return new DOMException("已取消等待服务恢复", "AbortError");
 }
 
-async function isOk(
+/**
+ * `/health` is back but `/auth/me` rejects the session. That happens when the
+ * restart loaded a rotated `NUWA_UI_TOKEN`: the HMAC session from the old
+ * token can never become valid again, so retrying until the timeout would only
+ * delay the unavoidable login.
+ */
+export class SessionExpiredDuringRecoveryError extends Error {
+  constructor() {
+    super("令牌已更改，请重新登录");
+    this.name = "SessionExpiredDuringRecoveryError";
+  }
+}
+
+/**
+ * Null means the request did not produce an HTTP answer (connection reset,
+ * timeout or caller abort); `waitForServeRecovery` owns abort decisions.
+ */
+async function fetchProbe(
   path: string,
   credentials: RequestCredentials,
   signal?: AbortSignal,
-): Promise<boolean> {
+): Promise<Response | null> {
   // `AbortSignal.any` keeps the caller's cancellation and the per-probe
   // timeout independent: either one aborts the fetch.
   const timeout = AbortSignal.timeout(RECOVERY_PROBE_TIMEOUT_MS);
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
   try {
-    const response = await fetch(path, { cache: "no-store", credentials, signal: combined });
-    return response.ok;
+    return await fetch(path, { cache: "no-store", credentials, signal: combined });
   } catch {
-    // Connection reset while the process restarts is the expected case; an
-    // external abort is re-thrown by `waitForServeRecovery`, which owns the
-    // decision to stop polling.
-    return false;
+    return null;
   }
 }
 
 /**
  * One recovery probe: `/health` proves the serve process is back, `/auth/me`
- * proves the session survived the restart. Exported so tests can exercise the
- * two steps without waiting on timers.
+ * proves the session survived the restart. A 401 after a healthy `/health` is
+ * terminal (token rotated), not a transient startup state. Exported so tests
+ * can exercise the two steps without waiting on timers.
  */
 export async function probeServeOnce(signal?: AbortSignal): Promise<boolean> {
-  if (!(await isOk("/health", "same-origin", signal))) {
+  const health = await fetchProbe("/health", "same-origin", signal);
+  if (!health?.ok) {
     return false;
   }
-  return isOk("/api/v1/auth/me", "include", signal);
+  const session = await fetchProbe("/api/v1/auth/me", "include", signal);
+  if (!session) {
+    return false;
+  }
+  if (session.status === 401) {
+    throw new SessionExpiredDuringRecoveryError();
+  }
+  return session.ok;
 }
 
 /** Abortable sleep: rejecting on abort stops the loop before the next probe. */
@@ -84,11 +107,22 @@ function throwIfAborted(signal?: AbortSignal): void {
 }
 
 /**
- * Hard reload after recovery. Isolated so the restart flow's decision is
- * observable in tests without jsdom's unimplemented navigation.
+ * Navigate to the SPA root after recovery. Deliberately not a reload of the
+ * current path: `/settings` is still the legacy server-rendered Basic-auth
+ * page until M6, so reloading there would drop out of the console. Isolated so
+ * the restart flow's decision is observable in tests without jsdom's
+ * unimplemented navigation.
  */
 export function reloadConsole(): void {
-  window.location.reload();
+  window.location.assign("/");
+}
+
+/**
+ * Full navigation to the login page after the restart loaded a rotated token.
+ * Isolated like `reloadConsole` so the restart flow can be asserted in jsdom.
+ */
+export function navigateToLogin(): void {
+  window.location.assign("/login");
 }
 
 /**

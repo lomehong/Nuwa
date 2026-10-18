@@ -9,6 +9,8 @@ import { ApiError } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import {
   RECOVERY_TIMEOUT_MS,
+  SessionExpiredDuringRecoveryError,
+  navigateToLogin,
   reloadConsole,
   waitForServeRecovery,
 } from "../../lib/health";
@@ -17,7 +19,7 @@ import { formatAge } from "../overview/format";
 import { useRestartServicesMutation } from "./queries";
 import type { ActiveRunSummary } from "./types";
 
-type Phase = "confirm" | "active" | "restarting" | "failed" | "manual";
+type Phase = "confirm" | "active" | "restarting" | "failed" | "manual" | "session-expired";
 
 export interface RestartDialogProps {
   open: boolean;
@@ -151,9 +153,16 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
         if (attempt === attemptRef.current && !controller.signal.aborted) {
           reloadConsole();
         }
-      } catch {
+      } catch (error) {
         // An unmount or a superseded attempt cancels the wait on purpose.
         if (controller.signal.aborted || attempt !== attemptRef.current) {
+          return;
+        }
+        // The new process is up but rejects the old session: the restart
+        // loaded a rotated token, so only a fresh login can recover.
+        if (error instanceof SessionExpiredDuringRecoveryError) {
+          setMessage(error.message);
+          setPhase("session-expired");
           return;
         }
         setMessage(
@@ -290,7 +299,9 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
                 ? "重启未完成"
                 : phase === "manual"
                   ? "无法自动重启"
-                  : "重启服务"}
+                  : phase === "session-expired"
+                    ? "会话已失效"
+                    : "重启服务"}
           </h2>
           {phase !== "restarting" ? (
             <button
@@ -388,6 +399,26 @@ export function RestartDialog({ open, onClose, units }: RestartDialogProps) {
                   重试
                 </Button>
               ) : null}
+            </div>
+          </>
+        ) : null}
+
+        {phase === "session-expired" ? (
+          <>
+            <p
+              id={descriptionId}
+              role="alert"
+              className={clsx(
+                "mt-3 rounded-card border border-danger/40 bg-danger/10 px-3 py-2",
+                "text-body-sm break-words text-text",
+              )}
+            >
+              {message}
+            </p>
+            <div className="mt-5 flex justify-end">
+              <Button variant="danger" onClick={navigateToLogin}>
+                重新登录
+              </Button>
             </div>
           </>
         ) : null}

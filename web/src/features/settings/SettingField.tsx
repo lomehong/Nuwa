@@ -32,6 +32,14 @@ function ReadOnlyField({ spec, current }: { spec: SettingDto; current: string })
   );
 }
 
+/** Where the displayed plain value comes from (`env` file or the default). */
+function sourceLabel(source: string): string {
+  if (source === "default") {
+    return "默认值";
+  }
+  return source === "env" ? "env 文件" : source;
+}
+
 /**
  * One schema row (docs/09 §10.8). The control follows `spec.type`; secrets
  * only ever show presence and the last four characters, and the value is
@@ -50,6 +58,11 @@ export function SettingField({ spec, value, diff, draft, error, onChange }: Sett
     <div className="flex flex-wrap items-center gap-1.5">
       {spec.requires_restart ? <Badge variant="warning">需重启</Badge> : null}
       <Badge>作用域 {spec.scope}</Badge>
+      {isPlainValue(value) ? (
+        <span className="text-caption text-text-muted">
+          来源 {sourceLabel(value.source)}
+        </span>
+      ) : null}
       {!spec.secret && !spec.read_only && spec.default !== null && spec.default !== "" ? (
         <span className="text-caption text-text-muted">
           默认值 <code>{spec.default}</code>

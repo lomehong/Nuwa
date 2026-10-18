@@ -17,7 +17,7 @@ v3 覆盖数据层、runner 遥测、JSON API、鉴权、SPA 与切流，单个�
 | [`M2c 动作与设置 API`](2026-10-17-web-console-m2c-actions-settings.md) | reopen/requeue/sync/restart/settings/system/transcript | 已完成 | 动作/设置/系统/转录集成测试 |
 | [`M3 SPA 核心`](2026-10-18-web-console-m3-spa-core.md) | Vite/React、登录、外壳、总览、问题单、详情、转录、响应式与无障碍 | 已完成 | 136 前端测试 + 浏览器三档 UAT |
 | [`M4 只读页面`](2026-10-18-web-console-m4-readonly-pages.md) | 运行器、活动/审计、趋势时间范围、深链 | 已完成 | 169 前端测试 + 浏览器三档 UAT |
-| [`M5 动作与设置`](2026-10-18-web-console-m5-actions-settings.md) | reopen/requeue/sync、重启、设置保存/测试/重启编排、E2E | 可执行 | 写操作审计 + Playwright 冒烟 |
+| [`M5 动作与设置`](2026-10-18-web-console-m5-actions-settings.md) | reopen/requeue/sync、重启、设置保存/测试/重启编排、E2E | 已完成 | 写操作审计 + Playwright 冒烟 |
 | [`M6 加固与切流`](2026-10-18-web-console-m6-cutover.md) | a11y/搜索/退避/保留清理、移除旧 UI、0.2.0、演练 | M5 完成后执行 | axe + 5k 基准 + 回滚演练 |
 
 ## 执行顺序

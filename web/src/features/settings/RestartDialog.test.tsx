@@ -10,11 +10,15 @@ import {
   server,
 } from "../../test/msw";
 import { renderApp } from "../../test/render";
-import { RECOVERY_TIMEOUT_MS } from "../../lib/health";
+import {
+  RECOVERY_TIMEOUT_MS,
+  SessionExpiredDuringRecoveryError,
+} from "../../lib/health";
 
 const health = vi.hoisted(() => ({
   waitForServeRecovery: vi.fn<(signal?: AbortSignal) => Promise<void>>(),
   reloadConsole: vi.fn(),
+  navigateToLogin: vi.fn(),
 }));
 
 vi.mock("../../lib/health", async (importOriginal) => {
@@ -23,6 +27,7 @@ vi.mock("../../lib/health", async (importOriginal) => {
     ...actual,
     waitForServeRecovery: health.waitForServeRecovery,
     reloadConsole: health.reloadConsole,
+    navigateToLogin: health.navigateToLogin,
   };
 });
 
@@ -51,6 +56,7 @@ beforeEach(() => {
   health.waitForServeRecovery.mockReset();
   health.waitForServeRecovery.mockResolvedValue(undefined);
   health.reloadConsole.mockReset();
+  health.navigateToLogin.mockReset();
 });
 
 describe("RestartDialog", () => {
@@ -138,6 +144,25 @@ describe("RestartDialog", () => {
       resolveRecovery();
     });
     await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+  });
+
+  it("asks for a fresh login when the rotated token expires the session", async () => {
+    signedIn(
+      http.post("/api/v1/settings/restart", () => new HttpResponse(null, { status: 202 })),
+    );
+    health.waitForServeRecovery.mockRejectedValue(
+      new SessionExpiredDuringRecoveryError(),
+    );
+    renderApp("/settings");
+
+    await openRestart();
+
+    expect(await screen.findByText("令牌已更改，请重新登录")).toBeInTheDocument();
+    const login = screen.getByRole("button", { name: "重新登录" });
+    fireEvent.click(login);
+
+    expect(health.navigateToLogin).toHaveBeenCalledTimes(1);
+    expect(health.reloadConsole).not.toHaveBeenCalled();
   });
 
   it("shows the 501 manual command without a retry that cannot succeed", async () => {

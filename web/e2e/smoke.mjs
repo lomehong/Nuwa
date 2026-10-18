@@ -31,9 +31,14 @@ const ARTIFACTS = resolve(
 );
 
 const failures = [];
+const consoleEntries = [];
 const consoleErrors = [];
 const pageErrors = [];
 const writeRequests = [];
+
+/** Responses before login completes; only `/auth/me` 401s are expected. */
+let pendingLoginProbe401 = 0;
+let loginComplete = false;
 
 function fail(message) {
   failures.push(message);
@@ -224,14 +229,24 @@ async function main() {
       if (message.type() !== "error") {
         return;
       }
-      const text = message.text();
-      // The login page probes /auth/me first; that 401 is expected.
-      if (text.includes("401")) {
-        return;
-      }
-      consoleErrors.push(text);
+      // The login page probes /auth/me and the browser logs that 401. Keep
+      // every entry with its timing so only those pre-login probes are
+      // dropped once the matching response has been counted.
+      consoleEntries.push({
+        text: message.text(),
+        beforeLogin: !loginComplete,
+      });
     });
     page.on("pageerror", (error) => pageErrors.push(String(error)));
+    page.on("response", (response) => {
+      if (loginComplete || response.status() !== 401) {
+        return;
+      }
+      const url = new URL(response.url());
+      if (url.pathname === "/api/v1/auth/me") {
+        pendingLoginProbe401 += 1;
+      }
+    });
     page.on("request", (request) => {
       if (request.method() !== "POST") {
         return;
@@ -245,6 +260,7 @@ async function main() {
 
     await login(page);
     loggedIn = true;
+    loginComplete = true;
     pass("logged in through NUWA_UI_TOKEN");
 
     try {
@@ -261,6 +277,17 @@ async function main() {
     fail(`browser/login failure: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     await browser.close();
+  }
+
+  // Drop only the pre-login console errors that correspond to an observed
+  // `/auth/me` 401; every other error is still reported.
+  let expectedLogin401 = pendingLoginProbe401;
+  for (const entry of consoleEntries) {
+    if (entry.beforeLogin && expectedLogin401 > 0 && entry.text.includes("401")) {
+      expectedLogin401 -= 1;
+      continue;
+    }
+    consoleErrors.push(entry.text);
   }
 
   for (const error of consoleErrors) {

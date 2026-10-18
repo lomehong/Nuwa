@@ -58,7 +58,7 @@
 - `invalidateIssueViews(queryClient, fingerprint?)` invalidates `overview`, `issues`, `issue`(fingerprint), `events`, `trends`, `runners`.
 - `invalidateSettingsViews(queryClient)` invalidates `settings`, `system`, `events`.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 `api.test.ts`:
 
@@ -105,11 +105,11 @@ it("invalidates every view affected by an issue write", async () => {
 });
 ```
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cd web && npx vitest run src/lib/api.test.ts src/lib/queryInvalidation.test.ts` → FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `apiErrorFromResponse`, parse the JSON once:
 
@@ -155,11 +155,11 @@ export function invalidateSettingsViews(queryClient: QueryClient): void {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 `cd web && npx vitest run src/lib/api.test.ts src/lib/queryInvalidation.test.ts` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/lib/api.ts web/src/lib/api.test.ts web/src/lib/queryInvalidation.ts web/src/lib/queryInvalidation.test.ts
@@ -186,7 +186,7 @@ git commit -m "feat(web): keep 409 bodies and centralize write invalidation"
 - `useReopenIssue()`, `useRequeueIssue()` mutations.
 - `IssueActionButton` props `{ fingerprint: string; state: IssueState; stuck: boolean; size?: "sm" | "md"; className?: string }`.
 
-- [ ] **Step 1: Write failing action tests**
+- [x] **Step 1: Write failing action tests**
 
 ```tsx
 it("reopens a rejected issue immediately and invalidates views", async () => {
@@ -232,11 +232,11 @@ it("asks for confirmation before requeueing a stuck issue", async () => {
 
 Use the real `makeIssueDetail` factory and override `state`/`stuck` consistently.
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cd web && npx vitest run src/features/issues/IssueActionButton.test.tsx` → FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `actions.ts`:
 
@@ -291,11 +291,11 @@ Integrations:
 - `IssueTable`: add to the operation cell before the detail arrow; icon variant not needed — use `size="sm"` with text.
 - `AttentionQueue`: add to each card's footer; the queue item includes `state` and `stuck`.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 `cd web && npx vitest run src/features/issues src/features/issue-detail src/features/overview` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/features/issues web/src/features/issue-detail web/src/features/overview
@@ -315,7 +315,7 @@ git commit -m "feat(web): reopen and requeue issue actions"
 - `POST /sync` → `{checked,merged,rejected,still_open,errors[]}`.
 - `SyncButton` invalidates all data views.
 
-- [ ] **Step 1: Write failing test**
+- [x] **Step 1: Write failing test**
 
 ```tsx
 it("syncs and reports a summary, including per-issue errors", async () => {
@@ -339,11 +339,11 @@ it("syncs and reports a summary, including per-issue errors", async () => {
 });
 ```
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cd web && npx vitest run src/features/actions/SyncButton.test.tsx` → FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```tsx
 export function SyncButton({ className }: { className?: string }) {
@@ -382,11 +382,11 @@ export function SyncButton({ className }: { className?: string }) {
 
 Type `SyncResponse` in `features/actions/types.ts`; `errors` is `string[]` (server guarantee). Add the button to the issues page header aside.
 
-- [ ] **Step 4: Run test**
+- [x] **Step 4: Run test**
 
 `cd web && npx vitest run src/features/actions` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/features/actions web/src/features/issues/IssuesPage.tsx
@@ -407,7 +407,7 @@ git commit -m "feat(web): GitHub sync action"
 - `POST /runners/{id}/restart` → 202; errors 404/409/422/501.
 - Confirmation text includes the current fingerprint when present; 501 shows the manual command from `ApiError.message`.
 
-- [ ] **Step 1: Write failing test**
+- [x] **Step 1: Write failing test**
 
 ```tsx
 it("warns about the active issue and surfaces a 501 manual command", async () => {
@@ -429,11 +429,11 @@ it("warns about the active issue and surfaces a 501 manual command", async () =>
 });
 ```
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cd web && npx vitest run src/features/runners/RestartRunnerButton.test.tsx` → FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 - Button `variant="secondary" size="sm"` label `重启 unit`, disabled when `!runner.service_unit`.
 - Confirm dialog title `重启 runner unit？`; description lists:
@@ -448,11 +448,11 @@ it("warns about the active issue and surfaces a 501 manual command", async () =>
 
 Add the button to `RunnerCard` header actions. On coarse pointers both buttons remain ≥44px.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 `cd web && npx vitest run src/features/runners` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/features/runners
@@ -477,7 +477,7 @@ git commit -m "feat(web): restart runner unit with impact warning"
 - Frontend types mirror the settings/system responses.
 - `validateSettingValue(spec, raw): string | null` returns a human-safe Chinese error.
 
-- [ ] **Step 1: Write the failing Rust test**
+- [x] **Step 1: Write the failing Rust test**
 
 In the settings API test module:
 
@@ -502,11 +502,11 @@ async fn schema_exposes_numeric_bounds() {
 }
 ```
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cargo test -p nuwa api::settings::tests::schema_exposes_numeric_bounds` → FAIL (unknown field / null).
 
-- [ ] **Step 3: Implement Rust**
+- [x] **Step 3: Implement Rust**
 
 Add fields to `SettingDto` and `From<&SettingSpec>`:
 
@@ -518,7 +518,7 @@ min: spec.min,
 max: spec.max,
 ```
 
-- [ ] **Step 4: Write the failing frontend validation test**
+- [x] **Step 4: Write the failing frontend validation test**
 
 ```ts
 describe("validateSettingValue", () => {
@@ -537,7 +537,7 @@ describe("validateSettingValue", () => {
 });
 ```
 
-- [ ] **Step 5: Implement frontend types/queries/validation**
+- [x] **Step 5: Implement frontend types/queries/validation**
 
 `types.ts` mirrors `SettingsResponse`, `SettingDto` (including `min`/`max`), `SettingValueDto`, `DiffDto`, `LastChangeDto`, `SystemResponse`, `ServiceState`, and mutation request/response types.
 
@@ -574,7 +574,7 @@ export function validateSettingValue(spec: SettingDto, raw: string): string | nu
 
 Add `makeSettings`, `makeSystem`, `mockSettings`, `mockSystem` factories to `test/msw.ts`.
 
-- [ ] **Step 6: Run both suites**
+- [x] **Step 6: Run both suites**
 
 ```bash
 cargo test -p nuwa api::settings::tests
@@ -582,7 +582,7 @@ cd web && npx vitest run src/features/settings/validation.test.ts
 ```
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/nuwa/src/api/settings.rs web/src/features/settings web/src/test/msw.ts
@@ -605,7 +605,7 @@ git commit -m "feat(settings): expose numeric bounds and add settings data layer
 - Consumes `useSettingsQuery`, `useSystemQuery`, mutations, `validateSettingValue`.
 - Produces `/settings` route and active nav.
 
-- [ ] **Step 1: Write failing page tests**
+- [x] **Step 1: Write failing page tests**
 
 ```tsx
 it("only sends changed keys and shows the restart notice", async () => {
@@ -653,11 +653,11 @@ it("shows server field errors next to the field", async () => {
 });
 ```
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cd web && npx vitest run src/features/settings/SettingsPage.test.tsx` → FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `SettingsPage` layout:
 - Header `设置` + description + dirty badge.
@@ -685,11 +685,11 @@ it("shows server field errors next to the field", async () => {
   - version, license `MIT`? Check repository license. Use `License` text from `Cargo.toml` workspace (`license.workspace = true`; inspect root). If unknown, show `见仓库 LICENSE`. Doc link `/docs`? Use GitHub repo external link `https://github.com/lomehong/nuwa` with `rel="noreferrer"` (known repo from AGENTS).
 - Route/nav: add `/settings`, remove Soon.
 
-- [ ] **Step 4: Run page tests**
+- [x] **Step 4: Run page tests**
 
 `cd web && npx vitest run src/features/settings` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/features/settings web/src/app/router.tsx web/src/app/AppShell.tsx
@@ -712,7 +712,7 @@ git commit -m "feat(web): schema-driven settings page"
 - Restart flow: 202 → set `restarting`; poll; on recovery `window.location.reload()`.
 - 409 body `active_runs` → open the guard state showing runs; require the `强制重启` checkbox before enabling confirm.
 
-- [ ] **Step 1: Write failing restart test**
+- [x] **Step 1: Write failing restart test**
 
 ```tsx
 it("shows active runs on 409 and only enables force after confirmation", async () => {
@@ -749,11 +749,11 @@ it("shows active runs on 409 and only enables force after confirmation", async (
 
 Mock `waitForServeRecovery` with `vi.mock` for the 202 path; assert it is called.
 
-- [ ] **Step 2: Run and watch fail**
+- [x] **Step 2: Run and watch fail**
 
 `cd web && npx vitest run src/features/settings/RestartDialog.test.tsx` → FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `health.ts`:
 
@@ -786,11 +786,11 @@ export async function waitForServeRecovery(timeoutMs = 60_000): Promise<void> {
   - `测试模型配置` → `{target:"llm", values: draftsFor([...llm keys])}`; toast detail.
   - Both pending and disabled appropriately.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 `cd web && npx vitest run src/features/settings src/lib/health.test.ts` → PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add web/src/features/settings web/src/lib/health.ts web/src/lib/health.test.ts
@@ -809,14 +809,14 @@ git commit -m "feat(web): settings probes and guarded restart"
 - Modify: `docs/08-onboarding.md`
 - Modify: `web/README.md` (if present)
 
-- [ ] **Step 1: Add the seed script**
+- [x] **Step 1: Add the seed script**
 
 `web/e2e/seed.py` (Python 3 stdlib) takes `--db` and `--bin`:
 1. Run `<bin> status --db <db>` to create/migrate the DB.
 2. Insert 8 issues across all states, 3 runners, 4 runs, events over 14 days, and one transcript under `--sessions` (absolute path). No credentials.
 3. Print the issue fingerprints.
 
-- [ ] **Step 2: Add the smoke script**
+- [x] **Step 2: Add the smoke script**
 
 `web/e2e/smoke.mjs` uses `playwright-core` + system Chrome (`channel: "chrome"`), env `NUWA_E2E_BASE_URL`, `NUWA_E2E_TOKEN`, `NUWA_E2E_ENV_FILE`:
 - Login.
@@ -829,7 +829,7 @@ git commit -m "feat(web): settings probes and guarded restart"
 
 Add `.gitignore` entry for `web/e2e/artifacts/`.
 
-- [ ] **Step 3: Run E2E locally**
+- [x] **Step 3: Run E2E locally**
 
 ```bash
 cd web && npm install
@@ -839,7 +839,7 @@ NUWA_E2E_BASE_URL=http://127.0.0.1:7403 NUWA_E2E_TOKEN=dummy NUWA_E2E_ENV_FILE=/
 ```
 Expected: all flows pass, artifacts written.
 
-- [ ] **Step 4: Full verification**
+- [x] **Step 4: Full verification**
 
 ```bash
 cd web && npm run typecheck && npm run lint && npm test && npm run build
@@ -847,12 +847,12 @@ cargo clippy --no-deps -p nuwa -p shanhaijing --all-targets -- -D warnings
 cargo test -p nuwa -p shanhaijing
 ```
 
-- [ ] **Step 5: Docs**
+- [x] **Step 5: Docs**
 
 - docs/07: M5 bullet with actions/settings/E2E evidence and deferred M6 items.
 - docs/08: new console settings/actions instructions; remove “old UI only” wording where it conflicts (legacy removal is M6).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add web/e2e web/package.json web/package-lock.json .gitignore docs/07-open-items.md docs/08-onboarding.md web/README.md
