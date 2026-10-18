@@ -173,9 +173,9 @@ fn restart_runner_now(store: &Store, runner_id: &str) -> Result<(), ApiError> {
         ));
     }
     if !schedule_restart(&[unit.to_string()]) {
-        return Err(ApiError::not_supported(
-            "systemd-run is unavailable; restart the unit manually",
-        ));
+        return Err(ApiError::not_supported(format!(
+            "systemd-run is unavailable; restart the unit manually: systemctl restart {unit}"
+        )));
     }
     Ok(())
 }

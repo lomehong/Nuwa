@@ -240,14 +240,35 @@ pub async fn test(payload: Result<Json<TestSettingsRequest>, JsonRejection>) -> 
         Err(error) => return error.into_response(),
     };
     let target = request.target.as_deref().map(str::trim).unwrap_or("");
+    if !matches!(target, "github" | "llm") {
+        return field_error("target", "must be github or llm").into_response();
+    }
+    if let Err(error) = reject_unknown_values(&request.values) {
+        return error.into_response();
+    }
     let result = match target {
         "github" => probe_github(&request.values).await,
-        "llm" => probe_llm(&request.values).await,
-        _ => Err(field_error("target", "must be github or llm")),
+        _ => probe_llm(&request.values).await,
     };
     match result {
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_response(),
+    }
+}
+
+/// Unknown `values` keys are a 422 for the same reason as PUT: silently
+/// ignoring a mistyped key would make the probe test a different value than
+/// the operator typed (docs/09 §9.2).
+fn reject_unknown_values(values: &BTreeMap<String, Value>) -> Result<(), ApiError> {
+    let unknown: BTreeMap<String, String> = values
+        .keys()
+        .filter(|key| settings::setting_spec(key).is_none())
+        .map(|key| (key.clone(), "unknown key".to_string()))
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::validation(unknown))
     }
 }
 
@@ -259,6 +280,8 @@ fn field_error(field: &str, message: impl Into<String>) -> ApiError {
 
 /// An explicit `values` entry wins over the environment, even when empty: the
 /// operator is testing the value on screen, not the running process default.
+/// Credentials and the GitHub token use this rule; the LLM model/base/provider
+/// fall through on empty instead (see [`resolve_llm_setting`]).
 fn provided_value(values: &BTreeMap<String, Value>, key: &str) -> Result<Option<String>, ApiError> {
     match values.get(key) {
         Some(Value::String(text)) => Ok(Some(text.trim().to_string())),
@@ -275,7 +298,8 @@ fn env_value(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// Candidate value, else process env, else `default`.
+/// Candidate value, else process env, else `default`; an explicit empty entry
+/// still wins (credentials must never fall back to the environment).
 fn resolve_value(
     values: &BTreeMap<String, Value>,
     key: &str,
@@ -285,6 +309,24 @@ fn resolve_value(
         return Ok(value);
     }
     Ok(env_value(key).unwrap_or_else(|| default.to_string()))
+}
+
+/// Candidate value, else `env`, else `default`, where an empty candidate means
+/// "unset". The runtime filters empty `NUWA_PROVIDER` / `NUWA_MODEL` /
+/// `NUWA_BASE_URL` (`main.rs::env_d` / `env_provider_default`), so the console
+/// must fall through to the provider default instead of rejecting a 422.
+/// `env` is injected so the rule is testable without touching the process
+/// environment.
+fn resolve_llm_setting(
+    values: &BTreeMap<String, Value>,
+    key: &str,
+    env: Option<String>,
+    default: &str,
+) -> Result<String, ApiError> {
+    let provided = provided_value(values, key)?.filter(|value| !value.is_empty());
+    Ok(provided
+        .or_else(|| env.filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| default.to_string()))
 }
 
 fn test_http_client() -> Result<reqwest::Client, ApiError> {
@@ -347,7 +389,12 @@ async fn probe_github(values: &BTreeMap<String, Value>) -> Result<TestSettingsRe
 }
 
 async fn probe_llm(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
-    let provider = resolve_value(values, "NUWA_PROVIDER", "anthropic")?;
+    let provider = resolve_llm_setting(
+        values,
+        "NUWA_PROVIDER",
+        env_value("NUWA_PROVIDER"),
+        "anthropic",
+    )?;
     match provider.as_str() {
         "faux" => Ok(TestSettingsResponse {
             ok: true,
@@ -371,28 +418,35 @@ fn llm_key(values: &BTreeMap<String, Value>, key: &str) -> Result<String, ApiErr
 }
 
 fn llm_model(values: &BTreeMap<String, Value>, default: &str) -> Result<String, ApiError> {
-    let model = resolve_value(values, "NUWA_MODEL", default)?;
-    if model.is_empty() {
-        return Err(field_error("NUWA_MODEL", "model is required"));
-    }
-    Ok(model)
+    resolve_llm_setting(values, "NUWA_MODEL", env_value("NUWA_MODEL"), default)
 }
 
 fn llm_base(values: &BTreeMap<String, Value>, default: &str) -> Result<String, ApiError> {
-    let base = resolve_value(values, "NUWA_BASE_URL", default)?;
+    let base =
+        resolve_llm_setting(values, "NUWA_BASE_URL", env_value("NUWA_BASE_URL"), default)?;
     if !valid_http_url(&base) {
         return Err(field_error("NUWA_BASE_URL", "must be an http(s) URL"));
     }
     Ok(base.trim_end_matches('/').to_string())
 }
 
-/// First catalog model, mirroring the anthropic default in `repair::run`.
-fn default_anthropic_model() -> String {
-    rpi_ai::providers::anthropic::models::anthropic_models()
-        .into_iter()
-        .next()
-        .map(|model| model.id)
-        .unwrap_or_else(|| "claude-opus-4-8".to_string())
+/// Resolve the anthropic probe target exactly like `repair::run`: the public
+/// API host is fixed (the runtime ignores `NUWA_BASE_URL` for anthropic), and
+/// the model must come from the vendored catalog — an absent or unknown id
+/// falls back to the catalog's first entry.
+fn resolve_anthropic_probe(
+    values: &BTreeMap<String, Value>,
+    env_model: Option<String>,
+) -> Result<(&'static str, String), ApiError> {
+    let requested = resolve_llm_setting(values, "NUWA_MODEL", env_model, "")?;
+    let catalog = rpi_ai::providers::anthropic::models::anthropic_models();
+    let model = catalog
+        .iter()
+        .find(|model| model.id == requested)
+        .or_else(|| catalog.first())
+        .map(|model| model.id.clone())
+        .unwrap_or_else(|| "claude-opus-4-8".to_string());
+    Ok((ANTHROPIC_DEFAULT_BASE_URL, model))
 }
 
 /// Minimal non-streaming completion (`max_tokens = 1`) — the cheapest proof
@@ -419,8 +473,7 @@ async fn probe_zai(values: &BTreeMap<String, Value>) -> Result<TestSettingsRespo
 
 async fn probe_anthropic(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
     let key = llm_key(values, "ANTHROPIC_API_KEY")?;
-    let model = llm_model(values, &default_anthropic_model())?;
-    let base = llm_base(values, ANTHROPIC_DEFAULT_BASE_URL)?;
+    let (base, model) = resolve_anthropic_probe(values, env_value("NUWA_MODEL"))?;
     let request = test_http_client()?
         .post(format!("{base}/v1/messages"))
         .header("x-api-key", key)
@@ -491,37 +544,54 @@ pub async fn restart(
     }
 
     let forced = request.force && !active.is_empty();
+    let detail = if forced {
+        format!("{} (forced)", units.join(","))
+    } else {
+        units.join(",")
+    };
+    // Audit first: a slow database write must not consume the 2-second timer
+    // window and cut off the 202. A failed audit is logged and never blocks
+    // the restart, matching the settings PUT policy.
     let scheduled_units = units.clone();
-    let scheduled = tokio::task::spawn_blocking(move || schedule_restart(&scheduled_units)).await;
+    let store = Arc::clone(&state.store);
+    let now = crate::now_ms();
+    let scheduled = tokio::task::spawn_blocking(move || {
+        audit_then_schedule(&store, now, &detail, || schedule_restart(&scheduled_units))
+    })
+    .await;
     match scheduled {
-        Ok(true) => {
-            let detail = if forced {
-                format!("{} (forced)", units.join(","))
-            } else {
-                units.join(",")
-            };
-            let store = Arc::clone(&state.store);
-            let now = crate::now_ms();
-            let audited = tokio::task::spawn_blocking(move || {
-                store.record_event("__system__", now, None, "owner", "restart_requested", &detail)
-            })
-            .await;
-            match audited {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!("settings restart: audit failed: {error}"),
-                Err(error) => eprintln!("settings restart: audit task failed: {error}"),
-            }
-            StatusCode::ACCEPTED.into_response()
-        }
-        Ok(false) => ApiError::not_supported(
-            "systemd-run is unavailable; restart the units manually",
-        )
-        .into_response(),
+        Ok(true) => StatusCode::ACCEPTED.into_response(),
+        Ok(false) => ApiError::not_supported(restart_unavailable_message(&units)).into_response(),
         Err(error) => {
             eprintln!("settings restart: blocking task failed: {error}");
             internal_error("failed to schedule restart").into_response()
         }
     }
+}
+
+/// Write `restart_requested` BEFORE scheduling `systemd-run` (docs/09 §9.2).
+/// `schedule` reports whether systemd-run accepted the timer; the audit stays
+/// even when it did not, because the attempt happened.
+fn audit_then_schedule(
+    store: &Store,
+    now: i64,
+    detail: &str,
+    schedule: impl FnOnce() -> bool,
+) -> bool {
+    if let Err(error) =
+        store.record_event("__system__", now, None, "owner", "restart_requested", detail)
+    {
+        eprintln!("settings restart: audit failed: {error}");
+    }
+    schedule()
+}
+
+/// Manual fallback shown by the systemd-run 501 (docs/09 §9.2).
+fn restart_unavailable_message(units: &[String]) -> String {
+    format!(
+        "systemd-run is unavailable; restart the units manually: systemctl restart {}",
+        units.join(" ")
+    )
 }
 
 fn active_run_summaries(runs: &[RunRow]) -> Vec<ActiveRunSummary> {
@@ -953,7 +1023,7 @@ fn effective_diff(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -961,10 +1031,14 @@ mod tests {
     use axum::http::{header, Request, StatusCode};
     use axum::response::Response;
     use axum::Router;
+    use serde_json::Value;
     use shanhaijing::{ReportOutcome, RunStart, RunnerUpsert, Signal, Store};
     use tower::ServiceExt;
 
-    use super::last_four;
+    use super::{
+        audit_then_schedule, last_four, llm_key, resolve_anthropic_probe, resolve_llm_setting,
+        restart_unavailable_message,
+    };
     use crate::serve::{build_app, AppState};
 
     /// docs/09 §13.1, in table order.
@@ -1657,6 +1731,123 @@ mod tests {
         assert_eq!(last_four("密钥测试值"), Some("钥测试值".to_string()));
     }
 
+    #[test]
+    fn empty_llm_model_base_and_provider_mean_unset() {
+        let mut values = BTreeMap::new();
+        values.insert("NUWA_MODEL".to_string(), Value::String("  ".to_string()));
+        values.insert("NUWA_BASE_URL".to_string(), Value::String(String::new()));
+        values.insert("NUWA_PROVIDER".to_string(), Value::String(String::new()));
+
+        // Empty/blank candidate -> environment value.
+        assert_eq!(
+            resolve_llm_setting(
+                &values,
+                "NUWA_MODEL",
+                Some("env-model".to_string()),
+                "default-model",
+            )
+            .expect("model"),
+            "env-model"
+        );
+        // Empty candidate and empty env -> provider default.
+        assert_eq!(
+            resolve_llm_setting(&values, "NUWA_BASE_URL", Some(String::new()), "https://d.test")
+                .expect("base"),
+            "https://d.test"
+        );
+        assert_eq!(
+            resolve_llm_setting(&values, "NUWA_PROVIDER", None, "anthropic").expect("provider"),
+            "anthropic"
+        );
+        // A non-empty candidate always wins over env and default.
+        values.insert("NUWA_MODEL".to_string(), Value::String("typed-model".to_string()));
+        assert_eq!(
+            resolve_llm_setting(
+                &values,
+                "NUWA_MODEL",
+                Some("env-model".to_string()),
+                "default-model",
+            )
+            .expect("model"),
+            "typed-model"
+        );
+        // Empty secrets stay an error: they never fall back to the environment.
+        values.insert("ZAI_API_KEY".to_string(), Value::String(String::new()));
+        let error = llm_key(&values, "ZAI_API_KEY").expect_err("an empty secret must 422");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            error
+                .fields
+                .as_ref()
+                .and_then(|fields| fields.get("ZAI_API_KEY"))
+                .map(String::as_str),
+            Some("API key is required")
+        );
+    }
+
+    #[test]
+    fn anthropic_probe_ignores_base_override_and_uses_the_catalog() {
+        let catalog = rpi_ai::providers::anthropic::models::anthropic_models();
+        let first = catalog.first().expect("anthropic catalog").id.clone();
+        let known = catalog.last().expect("anthropic catalog").id.clone();
+
+        // An empty value falls through to the environment; an unknown id then
+        // falls back to the catalog head, and NUWA_BASE_URL is never used.
+        let mut values = BTreeMap::new();
+        values.insert(
+            "NUWA_BASE_URL".to_string(),
+            Value::String("https://proxy.example.test".to_string()),
+        );
+        values.insert("NUWA_MODEL".to_string(), Value::String(String::new()));
+        let (base, model) = resolve_anthropic_probe(&values, Some("not-in-catalog".to_string()))
+            .expect("resolve");
+        assert_eq!(base, "https://api.anthropic.com");
+        assert_eq!(model, first);
+
+        // A catalog model typed into the console wins over the env value.
+        values.insert("NUWA_MODEL".to_string(), Value::String(known.clone()));
+        let (base, model) =
+            resolve_anthropic_probe(&values, Some("env-model".to_string())).expect("resolve");
+        assert_eq!(base, "https://api.anthropic.com");
+        assert_eq!(model, known);
+
+        // Nothing configured at all: catalog head, fixed base.
+        let (base, model) = resolve_anthropic_probe(&BTreeMap::new(), None).expect("resolve");
+        assert_eq!(base, "https://api.anthropic.com");
+        assert_eq!(model, first);
+    }
+
+    #[test]
+    fn restart_audit_is_written_before_systemd_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let now = crate::now_ms();
+        let scheduled = audit_then_schedule(&store, now, "nuwa-serve,nuwa-work", || {
+            let events = store.events_for("__system__", 10).expect("events");
+            assert!(
+                events.iter().any(|event| event.kind == "restart_requested"),
+                "the audit row must exist before systemd-run is attempted"
+            );
+            false
+        });
+        assert!(!scheduled, "the 501 path keeps the audit but reports failure");
+        let events = store.events_for("__system__", 10).expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "restart_requested");
+        assert_eq!(events[0].detail, "nuwa-serve,nuwa-work");
+        assert_eq!(events[0].actor.as_deref(), Some("owner"));
+        assert_eq!(events[0].ts, now);
+    }
+
+    #[test]
+    fn restart_unavailable_message_names_the_manual_command() {
+        let message = restart_unavailable_message(&["nuwa-serve".to_string(), "nuwa-work".to_string()]);
+        assert!(
+            message.contains("systemctl restart nuwa-serve nuwa-work"),
+            "{message}"
+        );
+    }
+
     #[tokio::test]
     async fn effective_diff_lists_only_differing_non_secret_keys() {
         let now = crate::now_ms();
@@ -1794,6 +1985,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_test_rejects_unknown_values_keys_without_network() {
+        let (_dir, app, _store, _env_path) = test_app(None);
+        let csrf = csrf_token(&app).await;
+
+        let response = post_json(
+            &app,
+            "/api/v1/settings/test",
+            Some(&csrf),
+            r#"{"target":"llm","values":{
+                "NUWA_PROVIDER":"faux",
+                "NOPE":"x",
+                "ANTHROPIC_KEY":"typo"
+            }}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "validation_failed");
+        assert!(value["error"]["fields"]["NOPE"].is_string(), "{value}");
+        assert!(
+            value["error"]["fields"]["ANTHROPIC_KEY"].is_string(),
+            "{value}"
+        );
+
+        // Known keys and empty model/base are accepted (empty means unset).
+        let response = post_json(
+            &app,
+            "/api/v1/settings/test",
+            Some(&csrf),
+            r#"{"target":"llm","values":{
+                "NUWA_PROVIDER":"faux",
+                "NUWA_MODEL":"",
+                "NUWA_BASE_URL":""
+            }}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["ok"], true);
+    }
+
+    #[tokio::test]
     async fn restart_is_guarded_by_active_runs() {
         let now = crate::now_ms();
         let (_dir, app, store, _env_path) = test_app(None);
@@ -1881,12 +2114,25 @@ mod tests {
 
     #[tokio::test]
     async fn restart_without_configured_units_is_501() {
-        let (_dir, app, _store, _env_path) = test_app_custom(None, crate::now_ms(), "", &[]);
+        let (_dir, app, store, _env_path) = test_app_custom(None, crate::now_ms(), "", &[]);
         let csrf = csrf_token(&app).await;
 
         let response = post_json(&app, "/api/v1/settings/restart", Some(&csrf), "{}").await;
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let value = json_body(response).await;
         assert_eq!(value["error"]["code"], "not_supported");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("manually")),
+            "the 501 must carry the manual fallback hint: {value}"
+        );
+        assert!(
+            store
+                .events_for("__system__", 10)
+                .expect("events")
+                .is_empty(),
+            "a restart rejected before scheduling is audit-free"
+        );
     }
 }
