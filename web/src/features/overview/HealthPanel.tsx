@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertTriangle,
+  ArrowRight,
   CloudOff,
   Coffee,
   FileCheck2,
@@ -10,6 +11,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
+import { Link } from "react-router-dom";
 
 import { Badge, Card, CardContent } from "../../components/ui";
 import { formatNumber } from "./format";
@@ -164,7 +166,18 @@ export function HealthPanel({ health, ci }: HealthPanelProps) {
       id="overview-health"
       title="系统健康"
       description="运行器状态、最近 24 小时 CI 结果与今日产出。"
-      aside={<Badge>运行器总数 {formatNumber(health.runners_total)}</Badge>}
+      aside={
+        <>
+          <Badge>运行器总数 {formatNumber(health.runners_total)}</Badge>
+          <Link
+            to="/runners"
+            className="inline-flex min-h-11 items-center gap-1 rounded-card px-2 text-caption font-medium text-text-secondary transition-colors hover:text-accent pointer-fine:min-h-8"
+          >
+            查看运行器
+            <ArrowRight aria-hidden="true" className="size-3.5" />
+          </Link>
+        </>
+      }
     >
       <div className="space-y-3">
         <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">

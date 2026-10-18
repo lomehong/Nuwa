@@ -1,4 +1,4 @@
-import { fireEvent, screen, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { http, HttpResponse, delay } from "msw";
 import { describe, expect, it, vi } from "vitest";
 
@@ -214,6 +214,10 @@ describe("OverviewPage", () => {
     );
     expect(within(health).getByText("今日上报").parentElement).toHaveTextContent("今日上报12");
     expect(within(health).getByText("今日 PR").parentElement).toHaveTextContent("今日 PR2");
+    expect(within(health).getByRole("link", { name: "查看运行器" })).toHaveAttribute(
+      "href",
+      "/runners",
+    );
 
     const funnel = screen.getByRole("region", { name: "状态漏斗" });
     expect(
@@ -246,8 +250,69 @@ describe("OverviewPage", () => {
     );
     expect(within(events).getByText("系统")).toBeInTheDocument();
     expect(within(events).queryByRole("link", { name: /__config__/ })).not.toBeInTheDocument();
+    expect(within(events).getByRole("link", { name: "查看全部" })).toHaveAttribute(
+      "href",
+      "/events",
+    );
 
     expect(container.querySelector("[style]")).toBeNull();
+  });
+
+  it("refetches trends for the selected range", async () => {
+    const ranges: string[] = [];
+    server.use(
+      mockMe(),
+      mockOverview(),
+      mockEvents(),
+      http.get("/api/v1/metrics/trends", ({ request }) => {
+        const range = new URL(request.url).searchParams.get("range") ?? "14d";
+        ranges.push(range);
+        return HttpResponse.json(
+          makeTrends({
+            range,
+            buckets: [
+              {
+                day: "2026-10-18",
+                reports: 3,
+                new_issues: 1,
+                prs_opened: 0,
+                merged: 0,
+                rejected: 0,
+                tokens: 10,
+                ci_green: 0,
+                ci_red: 0,
+              },
+            ],
+            totals: {
+              reports: 3,
+              new_issues: 1,
+              prs_opened: 0,
+              merged: 0,
+              rejected: 0,
+              tokens: 10,
+              median_time_to_pr_secs: null,
+            },
+          }),
+        );
+      }),
+    );
+
+    renderApp("/");
+    await screen.findByText("最近 14 天 · 按 UTC 日分桶");
+    expect(screen.getByRole("button", { name: "14 天" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await waitFor(() => expect(ranges).toContain("14d"));
+
+    fireEvent.click(screen.getByRole("button", { name: "30 天" }));
+    expect(await screen.findByText("最近 30 天 · 按 UTC 日分桶")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "30 天" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await waitFor(() => expect(ranges).toContain("30d"));
+    expect(ranges[0]).toBe("14d");
   });
 
   it("renders empty states and the queue preview when nothing is running", async () => {

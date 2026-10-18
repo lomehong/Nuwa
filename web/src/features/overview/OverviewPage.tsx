@@ -1,4 +1,5 @@
 import { RefreshCw } from "lucide-react";
+import { useState } from "react";
 
 import { Button, Skeleton } from "../../components/ui";
 import { ActiveRuns } from "./ActiveRuns";
@@ -9,6 +10,7 @@ import { PipelineFunnel } from "./PipelineFunnel";
 import { useOverviewQuery, useRecentEventsQuery, useTrendsQuery } from "./queries";
 import { RecentEvents } from "./RecentEvents";
 import { TrendsPanel } from "./TrendsPanel";
+import type { TrendsRange } from "./types";
 
 function CoreSkeleton() {
   return (
@@ -40,8 +42,9 @@ function CoreSkeleton() {
  * focus (see `queries.ts`).
  */
 export function OverviewPage() {
+  const [range, setRange] = useState<TrendsRange>("14d");
   const overview = useOverviewQuery(null, { refetchInterval: false });
-  const trends = useTrendsQuery();
+  const trends = useTrendsQuery(range);
   const events = useRecentEventsQuery();
 
   return (
@@ -49,7 +52,7 @@ export function OverviewPage() {
       <header>
         <h2 className="text-title font-semibold text-text">总览</h2>
         <p className="mt-1 text-body-sm text-text-secondary">
-          需要你处理的事项、正在发生的运行、系统健康与最近 14 天的趋势。
+          需要你处理的事项、正在发生的运行、系统健康与可按 7/14/30/90 天切换的趋势。
         </p>
         <p className="mt-1 text-caption text-text-muted">
           核心数据每 10 秒自动刷新，趋势每 60 秒、最近活动每 30 秒；窗口重新聚焦时立即更新。
@@ -89,6 +92,8 @@ export function OverviewPage() {
         isPending={trends.isPending}
         error={trends.error}
         onRetry={() => void trends.refetch()}
+        range={range}
+        onRangeChange={setRange}
       />
 
       {overview.data ? <PipelineFunnel counts={overview.data.counts} /> : null}

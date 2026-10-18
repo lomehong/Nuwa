@@ -1,4 +1,4 @@
-import { Activity } from "lucide-react";
+import { Activity, ArrowRight } from "lucide-react";
 import { Link } from "react-router-dom";
 
 import {
@@ -55,7 +55,18 @@ export function RecentEvents({ events, isPending, error, onRetry }: RecentEvents
       id="overview-events"
       title="最近活动"
       description="生命周期事件与系统审计记录。"
-      aside={<Badge>最新 8 条</Badge>}
+      aside={
+        <>
+          <Badge>最新 8 条</Badge>
+          <Link
+            to="/events"
+            className="inline-flex min-h-11 items-center gap-1 rounded-card px-2 text-caption font-medium text-text-secondary transition-colors hover:text-accent pointer-fine:min-h-8"
+          >
+            查看全部
+            <ArrowRight aria-hidden="true" className="size-3.5" />
+          </Link>
+        </>
+      }
     >
       <Card>
         <CardContent className="p-4">

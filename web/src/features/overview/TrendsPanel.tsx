@@ -1,10 +1,11 @@
+import { clsx } from "clsx";
 import { ChartColumn } from "lucide-react";
 
-import { Badge, Card, CardContent, EmptyState, Skeleton } from "../../components/ui";
+import { Card, CardContent, EmptyState, Skeleton } from "../../components/ui";
 import { Sparkline, type SparklineDatum } from "../../components/charts/Sparkline";
 import { formatDayShort, formatNumber, formatTokens } from "./format";
 import { OverviewSection, PanelError } from "./PanelChrome";
-import type { TrendBucket, TrendTotals, TrendsResponse } from "./types";
+import type { TrendBucket, TrendTotals, TrendsRange, TrendsResponse } from "./types";
 
 interface TrendMetric {
   key: keyof Pick<
@@ -42,25 +43,75 @@ function TrendSkeleton() {
   );
 }
 
+const TREND_RANGES: readonly { value: TrendsRange; label: string; days: number }[] = [
+  { value: "7d", label: "7 天", days: 7 },
+  { value: "14d", label: "14 天", days: 14 },
+  { value: "30d", label: "30 天", days: 30 },
+  { value: "90d", label: "90 天", days: 90 },
+];
+
+export function trendRangeDays(range: TrendsRange): number {
+  return TREND_RANGES.find((entry) => entry.value === range)?.days ?? 14;
+}
+
 interface TrendsPanelProps {
   trends: TrendsResponse | undefined;
   isPending: boolean;
   error: unknown;
   onRetry: () => void;
+  range: TrendsRange;
+  onRangeChange: (range: TrendsRange) => void;
 }
 
 /**
- * "趋势" (docs/09 §10.3.4): 14 UTC daily buckets, one bar sparkline per metric
- * plus the range total. The API zero-fills missing days, but an empty bucket
- * list is handled explicitly so a fresh database never renders NaN geometry.
+ * "趋势" (docs/09 §10.3.4): 7/14/30/90 UTC daily buckets, one bar sparkline
+ * per metric plus the range total. The API zero-fills missing days, but an
+ * empty bucket list is handled explicitly so a fresh database never renders
+ * NaN geometry.
  */
-export function TrendsPanel({ trends, isPending, error, onRetry }: TrendsPanelProps) {
+export function TrendsPanel({
+  trends,
+  isPending,
+  error,
+  onRetry,
+  range,
+  onRangeChange,
+}: TrendsPanelProps) {
+  const days = trendRangeDays(range);
+
   return (
     <OverviewSection
       id="overview-trends"
       title="趋势"
-      description="最近 14 天 · 按 UTC 日分桶"
-      aside={<Badge>14 天</Badge>}
+      description={`最近 ${days} 天 · 按 UTC 日分桶`}
+      aside={
+        <div
+          role="group"
+          aria-label="趋势时间范围"
+          className="inline-flex items-center rounded-full border border-border bg-surface p-0.5"
+        >
+          {TREND_RANGES.map((entry) => {
+            const pressed = entry.value === range;
+            return (
+              <button
+                key={entry.value}
+                type="button"
+                aria-pressed={pressed}
+                onClick={() => onRangeChange(entry.value)}
+                className={clsx(
+                  "inline-flex min-h-11 items-center rounded-full px-3 text-caption font-medium",
+                  "transition-colors duration-150 ease-out pointer-fine:min-h-8",
+                  pressed
+                    ? "bg-accent/10 text-text"
+                    : "text-text-secondary hover:text-text",
+                )}
+              >
+                {entry.label}
+              </button>
+            );
+          })}
+        </div>
+      }
     >
       <Card>
         <CardContent className="p-4">
@@ -72,7 +123,7 @@ export function TrendsPanel({ trends, isPending, error, onRetry }: TrendsPanelPr
             <EmptyState
               icon={ChartColumn}
               title="暂无趋势数据"
-              description="最近 14 天还没有记录；新的上报、PR 与 CI 结果会按 UTC 日汇总在这里。"
+              description={`最近 ${days} 天还没有记录；新的上报、PR 与 CI 结果会按 UTC 日汇总在这里。`}
             />
           ) : (
             <>
