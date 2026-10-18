@@ -2,7 +2,14 @@ import { screen } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 
-import { mockMe, mockOverview, mockUnauthorizedMe, server } from "../test/msw";
+import {
+  mockEvents,
+  mockMe,
+  mockOverviewResources,
+  mockTrends,
+  mockUnauthorizedMe,
+  server,
+} from "../test/msw";
 import { renderApp } from "../test/render";
 
 describe("AppRoutes", () => {
@@ -25,6 +32,8 @@ describe("AppRoutes", () => {
           { status: 401 },
         ),
       ),
+      mockTrends(),
+      mockEvents(),
     );
 
     renderApp("/");
@@ -35,15 +44,17 @@ describe("AppRoutes", () => {
   });
 
   it("returns unknown paths to the overview", async () => {
-    server.use(mockMe(), mockOverview());
+    server.use(mockMe(), ...mockOverviewResources());
 
     renderApp("/does-not-exist");
 
-    expect(await screen.findByText("总览即将上线")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "总览" }),
+    ).toBeInTheDocument();
   });
 
   it("renders the issues list placeholder", async () => {
-    server.use(mockMe(), mockOverview());
+    server.use(mockMe(), ...mockOverviewResources());
 
     renderApp("/issues");
 
@@ -54,7 +65,7 @@ describe("AppRoutes", () => {
   });
 
   it("renders the issue detail placeholder with the fingerprint", async () => {
-    server.use(mockMe(), mockOverview());
+    server.use(mockMe(), ...mockOverviewResources());
 
     renderApp("/issues/fp-123");
 

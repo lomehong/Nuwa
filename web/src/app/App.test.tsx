@@ -1,12 +1,12 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
-import { mockMe, mockOverview, server } from "../test/msw";
+import { mockMe, mockOverviewResources, server } from "../test/msw";
 import App from "./App";
 
 describe("App", () => {
   it("boots into the authenticated shell without inline styles", async () => {
-    server.use(mockMe(), mockOverview());
+    server.use(mockMe(), ...mockOverviewResources());
 
     const { container } = render(<App />);
 

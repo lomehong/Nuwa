@@ -2,7 +2,7 @@ import { fireEvent, screen } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 
-import { mockMe, mockOverview, mockUnauthorizedMe, server } from "../../test/msw";
+import { mockMe, mockOverview, mockOverviewResources, mockUnauthorizedMe, server } from "../../test/msw";
 import { renderApp } from "../../test/render";
 
 describe("LoginPage", () => {
@@ -71,11 +71,13 @@ describe("LoginPage", () => {
   });
 
   it("skips the form in local mode and goes straight to the overview", async () => {
-    server.use(mockMe({ local_mode: true, expires_at_ms: null }), mockOverview());
+    server.use(mockMe({ local_mode: true, expires_at_ms: null }), ...mockOverviewResources());
 
     renderApp("/login");
 
-    expect(await screen.findByText("总览即将上线")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "总览" }),
+    ).toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "女娲 · 补天" }),
     ).not.toBeInTheDocument();

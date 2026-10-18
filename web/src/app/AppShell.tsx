@@ -1,4 +1,3 @@
-import { useQuery } from "@tanstack/react-query";
 import { clsx } from "clsx";
 import {
   Activity,
@@ -17,8 +16,7 @@ import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 
 import { ThemeToggle } from "../components/ThemeToggle";
 import { Badge, Button, Skeleton, useToast } from "../components/ui";
-import { overviewQueryKey, type OverviewResponse } from "../features/overview/types";
-import { apiFetch } from "../lib/api";
+import { useOverviewQuery } from "../features/overview/queries";
 import { useAuth } from "../lib/auth";
 
 interface NavItem {
@@ -40,8 +38,6 @@ const NAV_ITEMS: readonly NavItem[] = [
 
 /** Bottom navigation keeps the four primary destinations (docs/09 §10.1). */
 const MOBILE_NAV_ITEMS = NAV_ITEMS.slice(0, 4);
-
-const HEALTH_POLL_MS = 10_000;
 
 interface PageMeta {
   title: string;
@@ -93,18 +89,13 @@ function StatusDot({ tone }: { tone: "success" | "warning" | "danger" }) {
 }
 
 /**
- * Compact health strip fed by `/overview` (docs/09 §10.1). TanStack Query
- * pauses the 10s poll while the tab is hidden and refreshes when it returns.
- * Values are links only where a page exists today; runner/settings links
- * arrive with M4/M5.
+ * Compact health strip fed by `/overview` (docs/09 §10.1). It shares the
+ * overview query (and key) with the page: the 10s poll pauses while the tab is
+ * hidden and refreshes immediately on focus. Values are links only where a
+ * page exists today; runner/settings links arrive with M4/M5.
  */
 export function HealthStrip() {
-  const overview = useQuery({
-    queryKey: overviewQueryKey(),
-    queryFn: ({ signal }) => apiFetch<OverviewResponse>("/overview", { signal }),
-    refetchInterval: HEALTH_POLL_MS,
-    staleTime: HEALTH_POLL_MS,
-  });
+  const overview = useOverviewQuery();
 
   let content: ReactNode;
   if (overview.isPending) {
@@ -185,7 +176,7 @@ export function HealthStrip() {
   }
 
   return (
-    <section aria-label="系统健康" className="border-b border-border bg-bg">
+    <section aria-label="全局健康条" className="border-b border-border bg-bg">
       <div className="mx-auto flex w-full max-w-page items-center gap-2 overflow-x-auto px-4 py-2 sm:px-6 lg:px-8">
         {content}
       </div>

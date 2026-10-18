@@ -1,7 +1,11 @@
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 
-import type { OverviewResponse } from "../features/overview/types";
+import type {
+  EventsResponse,
+  OverviewResponse,
+  TrendsResponse,
+} from "../features/overview/types";
 import type { MeResponse } from "../lib/auth";
 
 /** One MSW server per test file; handlers are registered with `server.use`. */
@@ -58,4 +62,47 @@ export function makeOverview(overrides: Partial<OverviewResponse> = {}): Overvie
 export function mockOverview(overrides: Partial<OverviewResponse> = {}) {
   const body = makeOverview(overrides);
   return http.get("/api/v1/overview", () => HttpResponse.json(body));
+}
+
+export function makeTrends(overrides: Partial<TrendsResponse> = {}): TrendsResponse {
+  return {
+    range: "14d",
+    buckets: [],
+    totals: {
+      reports: 0,
+      new_issues: 0,
+      prs_opened: 0,
+      merged: 0,
+      rejected: 0,
+      tokens: 0,
+      median_time_to_pr_secs: null,
+    },
+    ...overrides,
+  };
+}
+
+export function mockTrends(overrides: Partial<TrendsResponse> = {}) {
+  const body = makeTrends(overrides);
+  return http.get("/api/v1/metrics/trends", () => HttpResponse.json(body));
+}
+
+export function makeEvents(overrides: Partial<EventsResponse> = {}): EventsResponse {
+  return {
+    data: [],
+    meta: { page: 1, page_size: 8, total: 0 },
+    ...overrides,
+  };
+}
+
+export function mockEvents(overrides: Partial<EventsResponse> = {}) {
+  const body = makeEvents(overrides);
+  return http.get("/api/v1/events", () => HttpResponse.json(body));
+}
+
+/**
+ * The overview route now reads three endpoints. Most shell/router tests only
+ * care that the page renders, so register all of them together.
+ */
+export function mockOverviewResources(overrides: Partial<OverviewResponse> = {}) {
+  return [mockOverview(overrides), mockTrends(), mockEvents()];
 }

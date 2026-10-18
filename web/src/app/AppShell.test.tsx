@@ -3,11 +3,16 @@ import { http, HttpResponse } from "msw";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { THEME_STORAGE_KEY } from "../lib/theme";
-import { makeOverview, mockMe, mockOverview, server } from "../test/msw";
+import {
+  makeOverview,
+  mockMe,
+  mockOverviewResources,
+  server,
+} from "../test/msw";
 import { renderApp } from "../test/render";
 
 function signedIn(overrides: Parameters<typeof makeOverview>[0] = {}) {
-  server.use(mockMe(), mockOverview(overrides));
+  server.use(mockMe(), ...mockOverviewResources(overrides));
 }
 
 beforeEach(() => {
@@ -70,7 +75,7 @@ describe("AppShell", () => {
 
     renderApp("/");
 
-    const region = await screen.findByRole("region", { name: "系统健康" });
+    const region = await screen.findByRole("region", { name: "全局健康条" });
     expect(await within(region).findByText("serve 正常")).toBeInTheDocument();
     expect(within(region).getByText("在线")).toBeInTheDocument();
     expect(within(region).getByText("1/2")).toBeInTheDocument();
@@ -126,7 +131,7 @@ describe("AppShell", () => {
   });
 
   it("shows local mode instead of a logout action", async () => {
-    server.use(mockMe({ local_mode: true, expires_at_ms: null }), mockOverview());
+    server.use(mockMe({ local_mode: true, expires_at_ms: null }), ...mockOverviewResources());
     renderApp("/");
 
     expect(await screen.findByText("本地模式")).toBeInTheDocument();

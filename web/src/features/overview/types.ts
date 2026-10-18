@@ -1,8 +1,9 @@
 /**
- * Response types for `GET /api/v1/overview?repo=` (docs/09 §9.2).
+ * Response types for the overview page's three read endpoints (docs/09 §9.2):
+ * `GET /overview?repo=`, `GET /metrics/trends?range=14d&repo=` and
+ * `GET /events?page_size=8`.
  *
- * The shell's HealthStrip consumes the `health`, `queue` and `active_runs`
- * slices; Task 4 fills in the full overview page against the same shape.
+ * The shell's HealthStrip shares `OverviewResponse` and the query key.
  */
 
 import type { IssueState, Severity } from "../../components/ui";
@@ -75,4 +76,69 @@ export interface OverviewResponse {
 /** Shared TanStack Query key: `repo` undefined means the whole instance. */
 export function overviewQueryKey(repo?: string | null) {
   return ["overview", repo ?? null] as const;
+}
+
+export type TrendsRange = "7d" | "14d" | "30d" | "90d";
+
+export const DEFAULT_TRENDS_RANGE: TrendsRange = "14d";
+
+/** One UTC day bucket; missing days arrive zero-filled from the API. */
+export interface TrendBucket {
+  day: string;
+  reports: number;
+  new_issues: number;
+  prs_opened: number;
+  merged: number;
+  rejected: number;
+  tokens: number;
+  ci_green: number;
+  ci_red: number;
+}
+
+export interface TrendTotals {
+  reports: number;
+  new_issues: number;
+  prs_opened: number;
+  merged: number;
+  rejected: number;
+  tokens: number;
+  median_time_to_pr_secs: number | null;
+}
+
+export interface TrendsResponse {
+  range: string;
+  buckets: TrendBucket[];
+  totals: TrendTotals;
+}
+
+export function trendsQueryKey(range: TrendsRange = DEFAULT_TRENDS_RANGE, repo?: string | null) {
+  return ["trends", range, repo ?? null] as const;
+}
+
+/** One row of `GET /events`; raw rows carry `count=1` and equal timestamps. */
+export interface EventItem {
+  fingerprint: string;
+  kind: string;
+  detail: string;
+  ts_ms: number;
+  repo: string;
+  actor: string | null;
+  count: number;
+  first_ts_ms: number;
+  last_ts_ms: number;
+}
+
+export interface PageMeta {
+  page: number;
+  page_size: number;
+  total: number;
+}
+
+export interface EventsResponse {
+  data: EventItem[];
+  meta: PageMeta;
+}
+
+export function recentEventsQueryKey(pageSize: number) {
+  return ["events", "recent", pageSize] as const;
 }
