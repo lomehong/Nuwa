@@ -28,10 +28,8 @@ import { useModalBehavior } from "../lib/modal";
 interface NavItem {
   label: string;
   icon: LucideIcon;
-  /** Present for routes that exist today; absent items are "Soon". */
-  to?: string;
+  to: string;
   end?: boolean;
-  soon?: string;
 }
 
 const NAV_ITEMS: readonly NavItem[] = [
@@ -39,7 +37,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { label: "问题单", icon: ListTodo, to: "/issues" },
   { label: "运行器", icon: Cpu, to: "/runners" },
   { label: "活动", icon: Activity, to: "/events" },
-  { label: "设置", icon: Settings, soon: "设置页面将在 M5 提供" },
+  { label: "设置", icon: Settings, to: "/settings" },
 ];
 
 /** Bottom navigation keeps the four primary destinations (docs/09 §10.1). */
@@ -64,6 +62,9 @@ function pageMeta(pathname: string): PageMeta {
   }
   if (pathname === "/events" || pathname === "/events/") {
     return { title: "活动", breadcrumb: null };
+  }
+  if (pathname === "/settings" || pathname === "/settings/") {
+    return { title: "设置", breadcrumb: null };
   }
   if (pathname.startsWith("/issues/")) {
     const raw = pathname.slice("/issues/".length);
@@ -129,46 +130,32 @@ function SidebarNavList({ onNavigate }: { onNavigate?: () => void }) {
         const Icon = item.icon;
         return (
           <li key={item.label}>
-            {item.to ? (
-              <NavLink
-                to={item.to}
-                end={item.end}
-                onClick={onNavigate}
-                className={({ isActive }) =>
-                  clsx(
-                    "flex min-h-11 items-center gap-2.5 rounded-card px-3 py-2 text-body transition-colors",
-                    isActive
-                      ? "bg-accent/10 font-medium text-text"
-                      : "text-text-secondary hover:bg-raised hover:text-text",
-                  )
-                }
-              >
-                {({ isActive }) => (
-                  <>
-                    <Icon
-                      aria-hidden="true"
-                      className={clsx(
-                        "size-4 shrink-0",
-                        isActive ? "text-accent" : "text-text-muted",
-                      )}
-                    />
-                    <span>{item.label}</span>
-                  </>
-                )}
-              </NavLink>
-            ) : (
-              <span
-                aria-disabled="true"
-                title={item.soon}
-                className="flex min-h-11 cursor-not-allowed items-center gap-2.5 rounded-card px-3 py-2 text-body text-text-muted"
-              >
-                <Icon aria-hidden="true" className="size-4 shrink-0" />
-                <span className="flex-1">{item.label}</span>
-                <span className="rounded-full border border-border px-1.5 py-0.5 text-caption">
-                  Soon
-                </span>
-              </span>
-            )}
+            <NavLink
+              to={item.to}
+              end={item.end}
+              onClick={onNavigate}
+              className={({ isActive }) =>
+                clsx(
+                  "flex min-h-11 items-center gap-2.5 rounded-card px-3 py-2 text-body transition-colors",
+                  isActive
+                    ? "bg-accent/10 font-medium text-text"
+                    : "text-text-secondary hover:bg-raised hover:text-text",
+                )
+              }
+            >
+              {({ isActive }) => (
+                <>
+                  <Icon
+                    aria-hidden="true"
+                    className={clsx(
+                      "size-4 shrink-0",
+                      isActive ? "text-accent" : "text-text-muted",
+                    )}
+                  />
+                  <span>{item.label}</span>
+                </>
+              )}
+            </NavLink>
           </li>
         );
       })}
@@ -546,33 +533,19 @@ export function AppShell() {
             const Icon = item.icon;
             return (
               <li key={item.label}>
-                {item.to ? (
-                  <NavLink
-                    to={item.to}
-                    end={item.end}
-                    className={({ isActive }) =>
-                      clsx(
-                        "flex h-14 flex-col items-center justify-center gap-1 text-caption transition-colors",
-                        isActive ? "text-accent" : "text-text-secondary hover:text-text",
-                      )
-                    }
-                  >
-                    <Icon aria-hidden="true" className="size-5" />
-                    <span>{item.label}</span>
-                  </NavLink>
-                ) : (
-                  <span
-                    aria-disabled="true"
-                    title={item.soon}
-                    className="flex h-14 flex-col items-center justify-center gap-1 text-caption text-text-muted"
-                  >
-                    <Icon aria-hidden="true" className="size-5" />
-                    <span>
-                      {item.label}
-                      <span className="sr-only">（即将提供）</span>
-                    </span>
-                  </span>
-                )}
+                <NavLink
+                  to={item.to}
+                  end={item.end}
+                  className={({ isActive }) =>
+                    clsx(
+                      "flex h-14 flex-col items-center justify-center gap-1 text-caption transition-colors",
+                      isActive ? "text-accent" : "text-text-secondary hover:text-text",
+                    )
+                  }
+                >
+                  <Icon aria-hidden="true" className="size-5" />
+                  <span>{item.label}</span>
+                </NavLink>
               </li>
             );
           })}

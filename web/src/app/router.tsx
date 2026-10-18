@@ -8,6 +8,7 @@ import { IssuesPage } from "../features/issues/IssuesPage";
 import { LoginPage } from "../features/login/LoginPage";
 import { OverviewPage } from "../features/overview/OverviewPage";
 import { RunnersPage } from "../features/runners/RunnersPage";
+import { SettingsPage } from "../features/settings/SettingsPage";
 import { useAuth } from "../lib/auth";
 import { AppShell } from "./AppShell";
 
@@ -35,9 +36,8 @@ function RequireAuth() {
 
 /**
  * Route table (docs/09 §10): `/login`, `/` overview, `/issues` list and
- * `/issues/:fp` detail, plus the read-only `/runners` and `/events` pages.
- * `/settings` stays a disabled navigation entry until M5; unknown paths return
- * to the overview.
+ * `/issues/:fp` detail, the read-only `/runners` and `/events` pages, and the
+ * schema-driven `/settings` editor. Unknown paths return to the overview.
  */
 export function AppRoutes() {
   return (
@@ -50,6 +50,7 @@ export function AppRoutes() {
           <Route path="issues/:fp" element={<IssueDetailPage />} />
           <Route path="runners" element={<RunnersPage />} />
           <Route path="events" element={<EventsPage />} />
+          <Route path="settings" element={<SettingsPage />} />
         </Route>
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

@@ -28,7 +28,7 @@ afterEach(() => {
 });
 
 describe("AppShell", () => {
-  it("renders the sidebar nav with settings marked as Soon", async () => {
+  it("renders the sidebar nav with settings as an active route", async () => {
     signedIn();
     renderApp("/");
 
@@ -46,8 +46,11 @@ describe("AppShell", () => {
       "href",
       "/events",
     );
-    expect(within(nav).getByText("设置").closest("[aria-disabled='true']")).not.toBeNull();
-    expect(within(nav).getAllByText("Soon")).toHaveLength(1);
+    expect(within(nav).getByRole("link", { name: "设置" })).toHaveAttribute(
+      "href",
+      "/settings",
+    );
+    expect(within(nav).queryByText("Soon")).not.toBeInTheDocument();
   });
 
   it("renders the runners route with the page title and placeholder", async () => {
@@ -241,7 +244,7 @@ describe("AppShell", () => {
     expect(document.querySelector("[style]")).toBeNull();
 
     // Tab from the last focusable element wraps to the first (close).
-    within(drawer).getByRole("link", { name: "活动" }).focus();
+    within(drawer).getByRole("link", { name: "设置" }).focus();
     fireEvent.keyDown(drawer, { key: "Tab" });
     expect(close).toHaveFocus();
 
