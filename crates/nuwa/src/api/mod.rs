@@ -5,6 +5,7 @@ pub mod events;
 pub mod issues;
 pub mod overview;
 pub mod runners;
+pub mod settings;
 pub mod trends;
 
 use axum::http::StatusCode;
@@ -125,6 +126,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/runners", get(runners::list))
         .route("/runners/{id}/restart", post(actions::restart_runner))
         .route("/sync", post(actions::sync))
+        .route("/settings", get(settings::get).put(settings::put))
         .route("/events", get(events::list))
         .route("/metrics/trends", get(trends::trends))
         .route_layer(axum::middleware::from_fn_with_state(

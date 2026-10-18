@@ -551,7 +551,8 @@ mod tests {
 
     fn test_state() -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
+        let db_path = dir.path().join("s.db");
+        let store = Arc::new(shanhaijing::Store::open(&db_path).expect("open"));
         let state = AppState {
             store,
             ui_token: Arc::new(None),
@@ -559,6 +560,8 @@ mod tests {
             session: Arc::new(crate::session::SessionManager::new("", 86_400_000)),
             limiter: Arc::new(crate::session::LoginLimiter::new()),
             started_at_ms: crate::now_ms(),
+            env_path: dir.path().join("nuwa.env"),
+            db_path,
             cookie_secure: false,
             serve_unit: "nuwa-serve".to_string(),
             runner_units: vec!["nuwa-work".to_string()],

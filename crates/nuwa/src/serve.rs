@@ -3,6 +3,7 @@
 //! router can be assembled and route-tested without binding a socket.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
@@ -34,9 +35,15 @@ pub struct AppState {
     pub ingest_token: Arc<Option<String>>,
     pub session: Arc<crate::session::SessionManager>,
     pub limiter: Arc<crate::session::LoginLimiter>,
-    /// Read by the M2c system-status endpoint.
-    #[allow(dead_code)]
+    /// Process start time; a `config_changed` event newer than this means the
+    /// running processes still use the previous env.
     pub started_at_ms: i64,
+    /// `NUWA_ENV_FILE` (default `/opt/nuwa/nuwa.env`) — read and written by
+    /// the settings API.
+    pub env_path: PathBuf,
+    /// `--db` path; shown by the M2c system endpoint (Task 4).
+    #[allow(dead_code)]
+    pub db_path: PathBuf,
     pub cookie_secure: bool,
     /// `NUWA_SERVE_UNIT` (default `nuwa-serve`); read by the M2c settings
     /// restart endpoint.
@@ -169,6 +176,7 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         shanhaijing::Store::open(&db_path)
             .with_context(|| format!("open db {}", db_path.display()))?,
     );
+    let env_path = crate::settings::env_file_path();
     // Shared collector token (NUWA_INGEST_TOKEN). Set it when serving beyond
     // localhost: without it anyone can spam the issue store. This is a
     // report-only token — leak consequence is junk signals, rotate freely;
@@ -195,6 +203,8 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         )),
         limiter: Arc::new(crate::session::LoginLimiter::new()),
         started_at_ms: now_ms(),
+        env_path,
+        db_path,
         cookie_secure,
         serve_unit,
         runner_units,
@@ -328,7 +338,8 @@ mod tests {
 
     fn test_state(ui_token: Option<&str>) -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
+        let db_path = dir.path().join("s.db");
+        let store = Arc::new(shanhaijing::Store::open(&db_path).expect("open"));
         let ui_token = Arc::new(ui_token.map(str::to_string));
         let session_key = ui_token.as_deref().unwrap_or("");
         let state = AppState {
@@ -341,6 +352,8 @@ mod tests {
             )),
             limiter: Arc::new(crate::session::LoginLimiter::new()),
             started_at_ms: crate::now_ms(),
+            env_path: dir.path().join("nuwa.env"),
+            db_path,
             cookie_secure: false,
             serve_unit: "nuwa-serve".to_string(),
             runner_units: vec!["nuwa-work".to_string()],

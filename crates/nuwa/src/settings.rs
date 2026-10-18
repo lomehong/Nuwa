@@ -13,9 +13,12 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// Every key the console knows (docs/09 §13.1). Uppercase is canonical; the
+/// startup migration rewrites historical lowercase spellings.
 pub const ENV_KEYS: &[&str] = &[
     "NUWA_GITHUB_TOKEN",
     "ZAI_API_KEY",
+    "ANTHROPIC_API_KEY",
     "NUWA_INGEST_TOKEN",
     "NUWA_UI_TOKEN",
     "NUWA_PROVIDER",
@@ -26,14 +29,371 @@ pub const ENV_KEYS: &[&str] = &[
     "NUWA_DAILY_PR_LIMIT",
     "NUWA_MAX_TURNS",
     "NUWA_MAX_TOKENS",
+    "NUWA_RUNNER_ID",
+    "NUWA_SERVICE_UNIT",
+    "NUWA_SERVE_UNIT",
+    "NUWA_RUNNER_UNITS",
+    "NUWA_COOKIE_SECURE",
+    "NUWA_SESSION_TTL_SECS",
+    "NUWA_STUCK_AFTER_SECS",
+    "NUWA_EVENT_RETENTION_DAYS",
+    "NUWA_ENV_FILE",
 ];
 
 const SECRET_KEYS: &[&str] = &[
     "NUWA_GITHUB_TOKEN",
     "ZAI_API_KEY",
+    "ANTHROPIC_API_KEY",
     "NUWA_INGEST_TOKEN",
     "NUWA_UI_TOKEN",
 ];
+
+/// One canonical setting (docs/09 §9.2 settings schema, §13.1 key table).
+/// Static so the API can serve the schema without allocating or copying.
+#[derive(Debug, Clone, Copy)]
+pub struct SettingSpec {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub group: &'static str,
+    /// `secret` | `string` | `int` | `enum` | `url` | `csv` | `path`.
+    pub kind: &'static str,
+    /// `None` for keys without a default (the secrets).
+    pub default: Option<&'static str>,
+    pub options: &'static [&'static str],
+    pub secret: bool,
+    /// `both` | `work` | `serve`.
+    pub scope: &'static str,
+    /// The env file is read at process start, so every write needs a restart.
+    pub requires_restart: bool,
+    pub read_only: bool,
+    pub help: &'static str,
+    pub min: Option<u64>,
+    pub max: Option<u64>,
+}
+
+// One call per schema row; grouping the arguments into a struct would make
+// the table harder to scan than the lint is worth.
+#[allow(clippy::too_many_arguments)]
+const fn spec(
+    key: &'static str,
+    label: &'static str,
+    group: &'static str,
+    kind: &'static str,
+    default: Option<&'static str>,
+    options: &'static [&'static str],
+    secret: bool,
+    scope: &'static str,
+    help: &'static str,
+) -> SettingSpec {
+    SettingSpec {
+        key,
+        label,
+        group,
+        kind,
+        default,
+        options,
+        secret,
+        scope,
+        requires_restart: true,
+        read_only: false,
+        help,
+        min: None,
+        max: None,
+    }
+}
+
+const fn bounded(mut setting: SettingSpec, min: u64, max: u64) -> SettingSpec {
+    setting.min = Some(min);
+    setting.max = Some(max);
+    setting
+}
+
+const fn read_only(mut setting: SettingSpec) -> SettingSpec {
+    setting.read_only = true;
+    setting
+}
+
+/// Canonical key schema from docs/09 §13.1, in table order.
+pub const SETTINGS_SCHEMA: &[SettingSpec] = &[
+    spec(
+        "NUWA_GITHUB_TOKEN",
+        "GitHub token",
+        "credentials",
+        "secret",
+        None,
+        &[],
+        true,
+        "both",
+        "GitHub 细粒度 PAT：Contents 读写 + Actions 只读",
+    ),
+    spec(
+        "ZAI_API_KEY",
+        "Z.AI API key",
+        "credentials",
+        "secret",
+        None,
+        &[],
+        true,
+        "work",
+        "智谱 API Key（provider=zai 时使用）",
+    ),
+    spec(
+        "ANTHROPIC_API_KEY",
+        "Anthropic API key",
+        "credentials",
+        "secret",
+        None,
+        &[],
+        true,
+        "work",
+        "Anthropic API Key（provider=anthropic 时使用）",
+    ),
+    spec(
+        "NUWA_INGEST_TOKEN",
+        "Ingest token",
+        "credentials",
+        "secret",
+        None,
+        &[],
+        true,
+        "serve",
+        "上报令牌（X-NUWA-Token）；留空 = 本地模式",
+    ),
+    spec(
+        "NUWA_UI_TOKEN",
+        "Console token",
+        "credentials",
+        "secret",
+        None,
+        &[],
+        true,
+        "serve",
+        "控制台登录令牌；留空则回退到上报令牌",
+    ),
+    spec(
+        "NUWA_PROVIDER",
+        "LLM Provider",
+        "model",
+        "enum",
+        Some("anthropic"),
+        &["zai", "anthropic", "faux"],
+        false,
+        "work",
+        "修复 runner 使用的模型提供方",
+    ),
+    spec(
+        "NUWA_MODEL",
+        "Model",
+        "model",
+        "string",
+        Some(""),
+        &[],
+        false,
+        "work",
+        "模型名称，由 provider 决定",
+    ),
+    spec(
+        "NUWA_BASE_URL",
+        "Base URL",
+        "model",
+        "url",
+        Some(""),
+        &[],
+        false,
+        "work",
+        "OpenAI 兼容端点；必须是 http/https URL",
+    ),
+    bounded(
+        spec(
+            "NUWA_INTERVAL",
+            "Poll interval",
+            "runner",
+            "int",
+            Some("30"),
+            &[],
+            false,
+            "work",
+            "轮询间隔（秒）",
+        ),
+        1,
+        86_400,
+    ),
+    bounded(
+        spec(
+            "NUWA_CI_TIMEOUT",
+            "CI timeout",
+            "runner",
+            "int",
+            Some("600"),
+            &[],
+            false,
+            "work",
+            "CI 等待上限（秒）",
+        ),
+        1,
+        86_400,
+    ),
+    bounded(
+        spec(
+            "NUWA_DAILY_PR_LIMIT",
+            "Daily PR limit",
+            "runner",
+            "int",
+            Some("5"),
+            &[],
+            false,
+            "work",
+            "每日 PR 上限",
+        ),
+        1,
+        100,
+    ),
+    bounded(
+        spec(
+            "NUWA_MAX_TURNS",
+            "Max turns",
+            "runner",
+            "int",
+            Some("30"),
+            &[],
+            false,
+            "work",
+            "单问题单次修复 turn 上限",
+        ),
+        1,
+        1_000,
+    ),
+    bounded(
+        spec(
+            "NUWA_MAX_TOKENS",
+            "Max tokens",
+            "runner",
+            "int",
+            Some("1500000"),
+            &[],
+            false,
+            "work",
+            "单问题 token 上限",
+        ),
+        1,
+        100_000_000,
+    ),
+    spec(
+        "NUWA_RUNNER_ID",
+        "Runner ID",
+        "runner",
+        "string",
+        Some("host:repo"),
+        &[],
+        false,
+        "work",
+        "runner 身份；[A-Za-z0-9._:-]，≤128 字符",
+    ),
+    spec(
+        "NUWA_SERVICE_UNIT",
+        "Service unit",
+        "runner",
+        "string",
+        Some("nuwa-work"),
+        &[],
+        false,
+        "work",
+        "work 进程的 systemd unit",
+    ),
+    spec(
+        "NUWA_SERVE_UNIT",
+        "Serve unit",
+        "service",
+        "string",
+        Some("nuwa-serve"),
+        &[],
+        false,
+        "serve",
+        "serve 进程的 systemd unit",
+    ),
+    spec(
+        "NUWA_RUNNER_UNITS",
+        "Runner units",
+        "service",
+        "csv",
+        Some("nuwa-work"),
+        &[],
+        false,
+        "serve",
+        "重启时一并重启的 work units（逗号分隔）",
+    ),
+    spec(
+        "NUWA_COOKIE_SECURE",
+        "Cookie secure",
+        "security",
+        "enum",
+        Some("auto"),
+        &["auto", "always", "never"],
+        false,
+        "serve",
+        "会话 cookie 的 Secure 策略",
+    ),
+    bounded(
+        spec(
+            "NUWA_SESSION_TTL_SECS",
+            "Session TTL",
+            "security",
+            "int",
+            Some("86400"),
+            &[],
+            false,
+            "serve",
+            "控制台会话有效期（秒）",
+        ),
+        300,
+        2_592_000,
+    ),
+    bounded(
+        spec(
+            "NUWA_STUCK_AFTER_SECS",
+            "Stuck floor",
+            "ops",
+            "int",
+            Some("300"),
+            &[],
+            false,
+            "serve",
+            "卡单判定下限（秒）",
+        ),
+        60,
+        86_400,
+    ),
+    bounded(
+        spec(
+            "NUWA_EVENT_RETENTION_DAYS",
+            "Event retention",
+            "ops",
+            "int",
+            Some("90"),
+            &[],
+            false,
+            "serve",
+            "事件保留天数",
+        ),
+        1,
+        3_650,
+    ),
+    read_only(spec(
+        "NUWA_ENV_FILE",
+        "Env file",
+        "advanced",
+        "path",
+        Some("/opt/nuwa/nuwa.env"),
+        &[],
+        false,
+        "both",
+        "env 文件路径（只读展示）",
+    )),
+];
+
+pub fn setting_spec(key: &str) -> Option<&'static SettingSpec> {
+    SETTINGS_SCHEMA.iter().find(|setting| setting.key == key)
+}
 
 pub fn env_file_path() -> std::path::PathBuf {
     std::env::var("NUWA_ENV_FILE")
@@ -91,7 +451,7 @@ pub fn migrate_env_file_at(path: &std::path::Path) -> Result<Vec<String>, String
 }
 
 /// 原子写：Unix 先写临时文件（chmod 600）再 rename 覆盖；失败时清理临时文件。
-fn write_env_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
+pub(crate) fn write_env_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -371,7 +731,8 @@ a{{color:#58a6ff}} .row{{display:flex;gap:10px;margin-top:18px}}
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_form, migrate_env_file_at, normalize_known_keys, render_env, render_settings,
+        apply_form, migrate_env_file_at, normalize_known_keys, parse_env, render_env,
+        render_settings,
     };
     use std::collections::{BTreeMap, HashMap};
 
@@ -427,6 +788,21 @@ mod tests {
         assert!(html.contains("name=\"NUWA_MODEL\" value=\"custom-model\""));
         assert!(html.contains("name=\"NUWA_BASE_URL\" value=\"https://example.test/v1\""));
         assert!(html.contains("placeholder=\"glm-5.3-flash\""));
+    }
+
+    #[test]
+    fn legacy_page_renders_migrated_values_and_masks_secrets() {
+        let text = "# operator note\n\
+                    nuwa_interval=45\n\
+                    NUWA_GITHUB_TOKEN=abcdefgh1234\n\
+                    NUWA_MODEL=custom-model\n";
+        let (map, changed) = normalize_known_keys(&parse_env(text));
+        assert_eq!(changed, vec!["NUWA_INTERVAL".to_string()]);
+        let html = render_settings(&map, None);
+        assert!(html.contains("name=\"NUWA_INTERVAL\" value=\"45\""));
+        assert!(html.contains("name=\"NUWA_MODEL\" value=\"custom-model\""));
+        assert!(html.contains("••••1234"));
+        assert!(!html.contains("abcdefgh1234"));
     }
 
     #[test]

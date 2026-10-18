@@ -9,10 +9,11 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
-use crate::api::common::{issue_stuck_after_ms, runner_intervals, stuck_floor_ms};
+use crate::api::common::{
+    issue_stuck_after_ms, parse_json_body, runner_intervals, stuck_floor_ms, valid_systemd_unit,
+};
 use crate::api::ApiError;
 use crate::ci;
 use crate::serve::AppState;
@@ -42,7 +43,7 @@ pub async fn reopen(
     Path(fingerprint): Path<String>,
     payload: Result<Json<ReopenRequest>, JsonRejection>,
 ) -> Response {
-    let request = match parse_body(payload) {
+    let request = match parse_json_body(payload) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -72,7 +73,7 @@ pub async fn requeue(
     Path(fingerprint): Path<String>,
     payload: Result<Json<RequeueRequest>, JsonRejection>,
 ) -> Response {
-    let request = match parse_body(payload) {
+    let request = match parse_json_body(payload) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -165,7 +166,7 @@ fn restart_runner_now(store: &Store, runner_id: &str) -> Result<(), ApiError> {
         .as_deref()
         .filter(|unit| !unit.is_empty())
         .ok_or_else(|| unit_error("runner has no service_unit; restart needs a systemd unit"))?;
-    if !valid_unit(unit) {
+    if !valid_systemd_unit(unit) {
         return Err(unit_error(
             "service_unit may only contain letters, digits and @ . _ : -",
         ));
@@ -182,15 +183,6 @@ fn unit_error(message: &str) -> ApiError {
     let mut fields = BTreeMap::new();
     fields.insert("service_unit".to_string(), message.to_string());
     ApiError::validation(fields)
-}
-
-/// systemd unit whitelist (docs/09 §13): letters, digits and `@ . _ : -`.
-/// The value is always passed as one `Command` argument, never shell text.
-fn valid_unit(unit: &str) -> bool {
-    !unit.is_empty()
-        && unit
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | ':' | '-'))
 }
 
 /// `systemd-run --on-active=2 systemctl restart <unit>`: the systemd manager
@@ -243,33 +235,6 @@ fn find_issue(store: &Store, fingerprint: &str) -> Result<Option<IssueRow>, ApiE
         })
 }
 
-fn parse_body<T: DeserializeOwned>(
-    payload: Result<Json<T>, JsonRejection>,
-) -> Result<T, ApiError> {
-    match payload {
-        Ok(Json(body)) => Ok(body),
-        Err(rejection) => Err(rejection_error(rejection)),
-    }
-}
-
-/// Keep extractor failures inside the JSON error contract: syntax errors stay
-/// 400, well-formed bodies with wrong field types become 422 field errors.
-fn rejection_error(rejection: JsonRejection) -> ApiError {
-    let status = rejection.status();
-    let message = rejection.body_text();
-    match status {
-        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
-            ApiError::new(status, "unsupported_media_type", message)
-        }
-        StatusCode::UNPROCESSABLE_ENTITY => {
-            let mut fields = BTreeMap::new();
-            fields.insert("body".to_string(), message);
-            ApiError::validation(fields)
-        }
-        _ => ApiError::invalid_request(message),
-    }
-}
-
 /// Map Store action errors without leaking internals: unknown fingerprint is
 /// 404, state guards are 409, everything else is a logged 500.
 fn store_error(allowed: &'static str, error: ShanError) -> ApiError {
@@ -316,7 +281,8 @@ mod tests {
 
     fn test_state() -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(Store::open(dir.path().join("s.db")).expect("open"));
+        let db_path = dir.path().join("s.db");
+        let store = Arc::new(Store::open(&db_path).expect("open"));
         let state = AppState {
             store,
             ui_token: Arc::new(None),
@@ -324,6 +290,8 @@ mod tests {
             session: Arc::new(crate::session::SessionManager::new("", 86_400_000)),
             limiter: Arc::new(crate::session::LoginLimiter::new()),
             started_at_ms: crate::now_ms(),
+            env_path: dir.path().join("nuwa.env"),
+            db_path,
             cookie_secure: false,
             serve_unit: "nuwa-serve".to_string(),
             runner_units: vec!["nuwa-work".to_string()],
@@ -958,7 +926,7 @@ mod tests {
     #[test]
     fn service_unit_whitelist_accepts_systemd_names_only() {
         for unit in ["nuwa-work", "nuwa-work@1.service", "nuwa-serve", "a.b_c:d"] {
-            assert!(super::valid_unit(unit), "{unit}");
+            assert!(crate::api::common::valid_systemd_unit(unit), "{unit}");
         }
         for unit in [
             "",
@@ -968,7 +936,7 @@ mod tests {
             "nuwa-work;rm",
             "nuwa-work\n",
         ] {
-            assert!(!super::valid_unit(unit), "{unit:?}");
+            assert!(!crate::api::common::valid_systemd_unit(unit), "{unit:?}");
         }
     }
 

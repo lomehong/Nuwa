@@ -2,8 +2,14 @@
 
 use std::collections::BTreeMap;
 
+use axum::extract::rejection::JsonRejection;
+use axum::http::StatusCode;
+use axum::Json;
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use shanhaijing::{EventQuery, IssueRow, RunnerRow, ShanResult, Store};
+
+use crate::api::ApiError;
 
 /// Poll interval assumed when a runner's `config_json` has no usable
 /// `interval_secs` (docs/09 §8.4).
@@ -299,6 +305,42 @@ fn ci_timeout_within_day(store: &Store, fingerprint: &str, now: i64) -> ShanResu
         ..EventQuery::default()
     };
     Ok(!store.list_events(&query, 1)?.is_empty())
+}
+
+/// systemd unit whitelist (docs/09 §13): letters, digits and `@ . _ : -`.
+/// Values are always passed as one `Command` argument, never shell text.
+pub(crate) fn valid_systemd_unit(unit: &str) -> bool {
+    !unit.is_empty()
+        && unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | ':' | '-'))
+}
+
+/// Keep extractor failures inside the JSON error contract: syntax errors stay
+/// 400, well-formed bodies with wrong field types become 422 field errors.
+pub(crate) fn parse_json_body<T: DeserializeOwned>(
+    payload: Result<Json<T>, JsonRejection>,
+) -> Result<T, ApiError> {
+    match payload {
+        Ok(Json(body)) => Ok(body),
+        Err(rejection) => Err(rejection_error(rejection)),
+    }
+}
+
+fn rejection_error(rejection: JsonRejection) -> ApiError {
+    let status = rejection.status();
+    let message = rejection.body_text();
+    match status {
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            ApiError::new(status, "unsupported_media_type", message)
+        }
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            let mut fields = BTreeMap::new();
+            fields.insert("body".to_string(), message);
+            ApiError::validation(fields)
+        }
+        _ => ApiError::invalid_request(message),
+    }
 }
 
 #[cfg(test)]
