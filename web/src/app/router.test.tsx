@@ -3,7 +3,9 @@ import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 
 import {
+  makeIssue,
   mockEvents,
+  mockIssues,
   mockMe,
   mockOverviewResources,
   mockTrends,
@@ -53,15 +55,24 @@ describe("AppRoutes", () => {
     ).toBeInTheDocument();
   });
 
-  it("renders the issues list placeholder", async () => {
-    server.use(mockMe(), ...mockOverviewResources());
+  it("renders the issues list", async () => {
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockIssues({
+        data: [makeIssue()],
+        meta: { page: 1, page_size: 50, total: 1 },
+      }),
+    );
 
     renderApp("/issues");
 
     expect(
       await screen.findByRole("heading", { level: 1, name: "问题单" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("问题单列表即将上线")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("region", { name: "问题单列表" }),
+    ).toBeInTheDocument();
   });
 
   it("renders the issue detail placeholder with the fingerprint", async () => {

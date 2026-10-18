@@ -6,6 +6,7 @@ import type {
   OverviewResponse,
   TrendsResponse,
 } from "../features/overview/types";
+import type { IssueListItem, IssueListResponse } from "../features/issues/types";
 import type { MeResponse } from "../lib/auth";
 
 /** One MSW server per test file; handlers are registered with `server.use`. */
@@ -97,6 +98,40 @@ export function makeEvents(overrides: Partial<EventsResponse> = {}): EventsRespo
 export function mockEvents(overrides: Partial<EventsResponse> = {}) {
   const body = makeEvents(overrides);
   return http.get("/api/v1/events", () => HttpResponse.json(body));
+}
+
+export function makeIssue(overrides: Partial<IssueListItem> = {}): IssueListItem {
+  return {
+    fingerprint: "fp-default",
+    title: "Default issue",
+    language: "go",
+    repo: "example.com/app",
+    severity: "medium",
+    state: "new",
+    occurrences: 1,
+    pr_url: null,
+    first_seen_ms: 1_700_000_000_000,
+    last_seen_ms: 1_700_000_000_000,
+    state_changed_at_ms: 1_700_000_000_000,
+    owner_runner_id: null,
+    ci_verdict: null,
+    stuck: false,
+    ...overrides,
+  };
+}
+
+export function makeIssues(overrides: Partial<IssueListResponse> = {}): IssueListResponse {
+  return {
+    data: [],
+    meta: { page: 1, page_size: 50, total: 0 },
+    ...overrides,
+  };
+}
+
+/** Static issues-list handler; tests override it when they need query-aware bodies. */
+export function mockIssues(overrides: Partial<IssueListResponse> = {}) {
+  const body = makeIssues(overrides);
+  return http.get("/api/v1/issues", () => HttpResponse.json(body));
 }
 
 /**

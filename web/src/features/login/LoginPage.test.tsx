@@ -2,7 +2,7 @@ import { fireEvent, screen } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 
-import { mockMe, mockOverview, mockOverviewResources, mockUnauthorizedMe, server } from "../../test/msw";
+import { mockIssues, mockMe, mockOverview, mockOverviewResources, mockUnauthorizedMe, server } from "../../test/msw";
 import { renderApp } from "../../test/render";
 
 describe("LoginPage", () => {
@@ -15,6 +15,7 @@ describe("LoginPage", () => {
         return new HttpResponse(null, { status: 204 });
       }),
       mockOverview(),
+      mockIssues(),
     );
 
     renderApp({ pathname: "/login", state: { from: "/issues" } });
@@ -23,7 +24,7 @@ describe("LoginPage", () => {
     fireEvent.change(input, { target: { value: "ui-token" } });
     fireEvent.click(screen.getByRole("button", { name: "进入控制台" }));
 
-    expect(await screen.findByText("问题单列表即将上线")).toBeInTheDocument();
+    expect(await screen.findByText("暂无问题单")).toBeInTheDocument();
     expect(received).toEqual({ token: "ui-token" });
   });
 
