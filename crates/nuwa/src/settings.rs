@@ -40,7 +40,7 @@ pub const ENV_KEYS: &[&str] = &[
     "NUWA_ENV_FILE",
 ];
 
-const SECRET_KEYS: &[&str] = &[
+pub(crate) const SECRET_KEYS: &[&str] = &[
     "NUWA_GITHUB_TOKEN",
     "ZAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -485,9 +485,110 @@ pub fn render_env(map: &BTreeMap<String, String>) -> String {
     out
 }
 
+/// Copy `path` to the sibling `.bak` slot before a rewrite. A missing file is
+/// a no-op; any other failure aborts the caller, so the original is never
+/// lost by a write that could not be backed up.
+pub(crate) fn backup_env_file(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let backup = path.with_extension("env.bak");
+    std::fs::copy(path, &backup)
+        .map(|_| ())
+        .map_err(|e| format!("backup {} -> {}: {e}", path.display(), backup.display()))
+}
+
+/// Rewrite `text` in place without reordering it (docs/09 §13.2):
+///
+/// * historical lowercase known keys move to their canonical uppercase
+///   spelling on the same line; a lowercase duplicate is dropped when the
+///   uppercase spelling is also present (uppercase wins);
+/// * every `KEY=VALUE` line matching a key in `updates` gets the new value,
+///   keeping its position and line ending;
+/// * keys in `updates` that do not appear in the file are appended;
+/// * comments, blank lines, unknown keys, malformed lines and CRLF endings
+///   are preserved byte for byte.
+pub(crate) fn update_env_text(text: &str, updates: &BTreeMap<String, String>) -> String {
+    let parsed = parse_env(text);
+    let present: BTreeSet<String> = parsed.keys().cloned().collect();
+    // Only used for lines we append; existing line endings are kept verbatim.
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut written: BTreeSet<String> = BTreeSet::new();
+    let mut out = String::with_capacity(text.len() + updates.len() * 24);
+
+    for line in text.split_inclusive('\n') {
+        let (body, ending) = split_line_ending(line);
+        let trimmed = body.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            out.push_str(body);
+            out.push_str(ending);
+            continue;
+        }
+        let Some((raw_key, _)) = body.split_once('=') else {
+            // Malformed lines are preserved; a known key they mention is not
+            // seen by parse_env either, so an update for it is appended.
+            out.push_str(body);
+            out.push_str(ending);
+            continue;
+        };
+        let raw_key = raw_key.trim();
+        let key = raw_key.to_ascii_uppercase();
+        if !ENV_KEYS.contains(&key.as_str()) {
+            out.push_str(body);
+            out.push_str(ending);
+            continue;
+        }
+        if raw_key != key && present.contains(&key) {
+            // Uppercase spelling wins; drop the historical lowercase duplicate.
+            continue;
+        }
+        if raw_key == key && !updates.contains_key(&key) {
+            out.push_str(body);
+        } else {
+            let value = updates
+                .get(&key)
+                .or_else(|| parsed.get(&key))
+                .or_else(|| parsed.get(raw_key))
+                .map(String::as_str)
+                .unwrap_or_default();
+            out.push_str(&format!("{key}={value}"));
+            written.insert(key);
+        }
+        out.push_str(ending);
+    }
+
+    for (key, value) in updates {
+        if written.contains(key) || present.contains(key) {
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(eol);
+        }
+        out.push_str(&format!("{key}={value}{eol}"));
+    }
+    out
+}
+
+/// Split one `split_inclusive('\n')` segment into its body and line ending.
+fn split_line_ending(line: &str) -> (&str, &str) {
+    if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    }
+}
+
 pub fn mask(v: Option<&str>) -> String {
     match v {
-        Some(v) if !v.is_empty() => format!("••••{}", &v[v.len().saturating_sub(4)..]),
+        Some(v) if !v.is_empty() => {
+            // Character-based: a byte slice would panic when the cut point
+            // falls inside a multi-byte character.
+            let chars: Vec<char> = v.chars().collect();
+            let tail: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+            format!("••••{tail}")
+        }
         _ => "(未设置)".to_string(),
     }
 }
@@ -731,8 +832,8 @@ a{{color:#58a6ff}} .row{{display:flex;gap:10px;margin-top:18px}}
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_form, migrate_env_file_at, normalize_known_keys, parse_env, render_env,
-        render_settings,
+        apply_form, backup_env_file, mask, migrate_env_file_at, normalize_known_keys, parse_env,
+        render_env, render_settings, update_env_text, SECRET_KEYS, SETTINGS_SCHEMA,
     };
     use std::collections::{BTreeMap, HashMap};
 
@@ -776,6 +877,93 @@ mod tests {
         let out = render_env(&map(&[("NUWA_INTERVAL", "60")]));
         assert!(out.contains("NUWA_INTERVAL=60"));
         assert!(!out.contains("nuwa_interval"));
+    }
+
+    #[test]
+    fn update_env_text_replaces_in_place_and_appends_new_keys() {
+        let text = "# operator note\n\
+                    NUWA_MODEL=custom-model\n\
+                    \n\
+                    NUWA_INTERVAL=30\n\
+                    LEGACY_KEY=keep-me\n";
+        let updates = map(&[("NUWA_INTERVAL", "60"), ("NUWA_MAX_TURNS", "50")]);
+        let out = update_env_text(text, &updates);
+        assert_eq!(
+            out,
+            "# operator note\n\
+             NUWA_MODEL=custom-model\n\
+             \n\
+             NUWA_INTERVAL=60\n\
+             LEGACY_KEY=keep-me\n\
+             NUWA_MAX_TURNS=50\n",
+            "comments, order and unknown keys stay; only the target line and the appended key change"
+        );
+    }
+
+    #[test]
+    fn update_env_text_keeps_crlf_and_missing_trailing_newline() {
+        let text = "# note\r\nNUWA_INTERVAL=30";
+        let updates = map(&[("NUWA_INTERVAL", "60"), ("NUWA_MODEL", "glm")]);
+        let out = update_env_text(text, &updates);
+        assert_eq!(
+            out, "# note\r\nNUWA_INTERVAL=60\r\nNUWA_MODEL=glm\r\n",
+            "CRLF is kept and appended keys start on a new line"
+        );
+    }
+
+    #[test]
+    fn update_env_text_migrates_lowercase_keys_in_place() {
+        let text = "# note\n\
+                    nuwa_interval=45\n\
+                    nuwa_provider=zai\n";
+        let out = update_env_text(text, &BTreeMap::new());
+        assert_eq!(out, "# note\nNUWA_INTERVAL=45\nNUWA_PROVIDER=zai\n");
+    }
+
+    #[test]
+    fn update_env_text_drops_lowercase_duplicate_when_uppercase_wins() {
+        let text = "NUWA_INTERVAL=60\n\
+                    nuwa_interval=30\n";
+        let out = update_env_text(text, &BTreeMap::new());
+        assert_eq!(out, "NUWA_INTERVAL=60\n");
+    }
+
+    #[test]
+    fn schema_secret_flags_match_the_secret_key_list() {
+        for spec in SETTINGS_SCHEMA {
+            assert_eq!(
+                spec.secret,
+                SECRET_KEYS.contains(&spec.key),
+                "{}: secret flag and SECRET_KEYS must agree",
+                spec.key
+            );
+        }
+    }
+
+    #[test]
+    fn mask_is_char_safe_for_non_ascii_secrets() {
+        assert_eq!(mask(Some("密钥")), "••••密钥");
+        // A byte slice would panic on the second character here.
+        assert_eq!(mask(Some("😀a")), "••••😀a");
+        assert_eq!(mask(Some("abcde")), "••••bcde");
+        assert_eq!(mask(None), "(未设置)");
+    }
+
+    #[test]
+    fn backup_env_file_copies_next_to_the_original() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nuwa.env");
+        std::fs::write(&path, "NUWA_INTERVAL=30\n").expect("write");
+        backup_env_file(&path).expect("backup");
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("env.bak")).expect("read backup"),
+            "NUWA_INTERVAL=30\n"
+        );
+
+        // A missing file has nothing to back up.
+        let absent = dir.path().join("absent.env");
+        backup_env_file(&absent).expect("missing file is a no-op");
+        assert!(!absent.with_extension("env.bak").exists());
     }
 
     #[test]

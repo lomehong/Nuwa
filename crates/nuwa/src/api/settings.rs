@@ -103,8 +103,12 @@ pub enum SettingValueDto {
 
 #[derive(Debug, Serialize)]
 pub struct DiffDto {
+    /// File value, or the schema default when the key is absent.
     pub file: String,
     pub runtime: String,
+    /// `file` when the compared value comes from the env file, `default` when
+    /// the key is absent and the schema default is shown instead.
+    pub source: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -197,7 +201,9 @@ fn read_settings(
     changes.sort_by(|a, b| b.ts.cmp(&a.ts));
 
     let mut values = BTreeMap::new();
-    let mut plain = BTreeMap::new();
+    // Values plus the diff source label (`file` / `default`) for
+    // `effective_diff`.
+    let mut plain: BTreeMap<String, (String, &'static str)> = BTreeMap::new();
     for spec in settings::SETTINGS_SCHEMA {
         if spec.secret {
             let raw = map.get(spec.key).map(String::as_str).unwrap_or("");
@@ -224,7 +230,8 @@ fn read_settings(
             } else {
                 (spec.default.unwrap_or("").to_string(), "default")
             };
-            plain.insert(spec.key.to_string(), value.clone());
+            let diff_source = if source == "default" { "default" } else { "file" };
+            plain.insert(spec.key.to_string(), (value.clone(), diff_source));
             values.insert(
                 spec.key.to_string(),
                 SettingValueDto::Plain { value, source },
@@ -285,20 +292,49 @@ fn write_settings(
     let (map, migrated) = settings::normalize_known_keys(&settings::parse_env(&text));
     let (new_map, changed) = validate_updates(&map, updates).map_err(ApiError::validation)?;
 
-    // Validate everything first: an invalid field never touches the file.
-    if !migrated.is_empty() {
-        settings::migrate_env_file_at(path).map_err(|error| {
-            eprintln!("settings: migration failed: {error}");
+    // Write only the lines that actually change (plus lowercase keys being
+    // migrated), so comments, order, unknown keys and untouched values stay
+    // byte for byte (docs/09 §13.2).
+    let mut write_map: BTreeMap<String, String> = BTreeMap::new();
+    for key in &migrated {
+        if let Some(value) = map.get(key) {
+            write_map.insert(key.clone(), value.clone());
+        }
+    }
+    for key in &changed {
+        if let Some(value) = new_map.get(key) {
+            write_map.insert(key.clone(), value.clone());
+        }
+    }
+
+    if !write_map.is_empty() {
+        // Validate everything first: an invalid field never touches the file.
+        // A `.bak` also covers an ordinary PUT, not just migration.
+        settings::backup_env_file(path).map_err(|error| {
+            eprintln!("settings: {error}");
             internal_error("failed to write settings")
         })?;
-    }
-    if !changed.is_empty() {
-        settings::write_env_atomic(path, &settings::render_env(&new_map)).map_err(|error| {
+        let updated = settings::update_env_text(&text, &write_map);
+        settings::write_env_atomic(path, &updated).map_err(|error| {
             eprintln!("settings: write failed: {error}");
             internal_error("failed to write settings")
         })?;
     }
 
+    if !migrated.is_empty() {
+        // One audit row for the lowercase -> uppercase rewrite (detail = key
+        // list, docs/09 §13.2), alongside the per-key config_changed rows.
+        if let Err(error) = store.record_event(
+            "__config__",
+            now,
+            None,
+            "owner",
+            "config_migrated",
+            &migrated.join(","),
+        ) {
+            eprintln!("settings: migration audit failed: {error}");
+        }
+    }
     for key in &changed {
         // The file is the source of truth; a failed audit row must not turn a
         // successful save into an error.
@@ -349,6 +385,15 @@ fn validate_updates(
                 continue;
             }
         };
+        // `KEY=VALUE\n` cannot carry raw line breaks or control characters:
+        // they would inject extra keys and bypass the changed/audit contract.
+        if !raw_text.is_empty() && raw_text.chars().any(|c| c.is_ascii_control()) {
+            fields.insert(
+                key.clone(),
+                "must not contain line breaks or control characters".to_string(),
+            );
+            continue;
+        }
         let value = raw_text.trim();
 
         // An empty secret keeps the current value (docs/09 §9.2 settings).
@@ -477,11 +522,12 @@ fn validate_string_value(key: &str, value: &str) -> Result<String, String> {
 }
 
 fn last_four(value: &str) -> Option<String> {
-    if value.is_empty() {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 4 {
+        // Echoing a short secret in full would defeat the masking.
         return None;
     }
-    let chars: Vec<char> = value.chars().collect();
-    Some(chars[chars.len().saturating_sub(4)..].iter().collect())
+    Some(chars[chars.len() - 4..].iter().collect())
 }
 
 fn env_permissions(path: &Path) -> Option<String> {
@@ -503,7 +549,7 @@ fn env_permissions(path: &Path) -> Option<String> {
 /// wins, and a key already listed is not repeated by an older runner.
 fn effective_diff(
     runners: &[RunnerRow],
-    values: &BTreeMap<String, String>,
+    values: &BTreeMap<String, (String, &'static str)>,
 ) -> BTreeMap<String, DiffDto> {
     let mut diff = BTreeMap::new();
     let mut runners: Vec<&RunnerRow> = runners.iter().collect();
@@ -523,7 +569,7 @@ fn effective_diff(
             let Some(runtime) = config.get(*field).and_then(Value::as_u64) else {
                 continue;
             };
-            let Some(file) = values.get(*key) else {
+            let Some((file, source)) = values.get(*key) else {
                 continue;
             };
             let differs = match file.trim().parse::<u64>() {
@@ -536,6 +582,7 @@ fn effective_diff(
                     DiffDto {
                         file: file.clone(),
                         runtime: runtime.to_string(),
+                        source,
                     },
                 );
             }
@@ -557,6 +604,7 @@ mod tests {
     use shanhaijing::{RunnerUpsert, Store};
     use tower::ServiceExt;
 
+    use super::last_four;
     use crate::serve::{build_app, AppState};
 
     /// docs/09 §13.1, in table order.
@@ -721,6 +769,12 @@ mod tests {
                 spec.scope
             );
             assert!(spec.requires_restart, "{}", spec.key);
+            assert_eq!(
+                spec.secret,
+                crate::settings::SECRET_KEYS.contains(&spec.key),
+                "{}: secret flag must match SECRET_KEYS",
+                spec.key
+            );
             if spec.kind == "enum" {
                 assert!(!spec.options.is_empty(), "{}", spec.key);
             }
@@ -743,6 +797,7 @@ mod tests {
     async fn get_returns_schema_masked_values_and_metadata() {
         let file = "# managed by test\n\
                     NUWA_GITHUB_TOKEN=ghp_secretvalue1234\n\
+                    NUWA_INGEST_TOKEN=abcd\n\
                     nuwa_interval=45\n\
                     NUWA_MODEL=custom-model\n\
                     LEGACY_KEY=keep-me\n";
@@ -805,6 +860,12 @@ mod tests {
         let anthropic = &value["values"]["ANTHROPIC_API_KEY"];
         assert_eq!(anthropic["set"], false);
         assert!(anthropic["last4"].is_null());
+        let short = &value["values"]["NUWA_INGEST_TOKEN"];
+        assert_eq!(short["set"], true);
+        assert!(
+            short["last4"].is_null(),
+            "a secret of four characters or fewer must not echo its tail: {short}"
+        );
 
         assert_eq!(value["values"]["NUWA_INTERVAL"]["value"], "45");
         assert_eq!(value["values"]["NUWA_INTERVAL"]["source"], "env");
@@ -903,17 +964,122 @@ mod tests {
         assert!(backup.contains("nuwa_provider=zai"), "{backup}");
 
         let events = store.events_for("__config__", 10).expect("events");
-        assert_eq!(events.len(), 3, "one config_changed per changed key");
-        let details: BTreeSet<&str> = events.iter().map(|event| event.detail.as_str()).collect();
+        let changed_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == "config_changed")
+            .collect();
+        assert_eq!(
+            changed_events.len(),
+            3,
+            "one config_changed per changed key"
+        );
+        let details: BTreeSet<&str> = changed_events
+            .iter()
+            .map(|event| event.detail.as_str())
+            .collect();
         assert_eq!(
             details,
             BTreeSet::from(["NUWA_INTERVAL", "NUWA_MODEL", "NUWA_UI_TOKEN"])
         );
-        for event in &events {
-            assert_eq!(event.kind, "config_changed");
+        for event in &changed_events {
             assert_eq!(event.actor.as_deref(), Some("owner"));
             assert!(event.repo.is_empty(), "config events are repo-less");
         }
+
+        let migrated_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == "config_migrated")
+            .collect();
+        assert_eq!(migrated_events.len(), 1, "one config_migrated per PUT");
+        assert_eq!(migrated_events[0].detail, "NUWA_PROVIDER");
+        assert_eq!(migrated_events[0].actor.as_deref(), Some("owner"));
+        assert!(migrated_events[0].repo.is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_preserves_comments_order_and_unknown_keys() {
+        let file = "# operator note\n\
+                    NUWA_GITHUB_TOKEN=old-token-9999\n\
+                    \n\
+                    # runner tuning\n\
+                    NUWA_INTERVAL=30\n\
+                    LEGACY_KEY=keep-me\n\
+                    NUWA_MODEL=custom-model\n";
+        let (_dir, app, _store, env_path) = test_app(Some(file));
+        let csrf = csrf_token(&app).await;
+
+        let response = put_json(
+            &app,
+            r#"{"values":{"NUWA_INTERVAL":"60","NUWA_MAX_TURNS":"50"}}"#,
+            Some(&csrf),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(
+            value["changed"],
+            serde_json::json!(["NUWA_INTERVAL", "NUWA_MAX_TURNS"])
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&env_path).expect("read env"),
+            "# operator note\n\
+             NUWA_GITHUB_TOKEN=old-token-9999\n\
+             \n\
+             # runner tuning\n\
+             NUWA_INTERVAL=60\n\
+             LEGACY_KEY=keep-me\n\
+             NUWA_MODEL=custom-model\n\
+             NUWA_MAX_TURNS=50\n",
+            "only the updated line and the appended key may change"
+        );
+
+        let backup = std::fs::read_to_string(env_path.with_extension("env.bak"))
+            .expect("ordinary PUT backup");
+        assert_eq!(backup, file, "the pre-PUT file is preserved in .bak");
+    }
+
+    #[tokio::test]
+    async fn put_rejects_line_breaking_values_without_touching_the_file() {
+        let file = "NUWA_MODEL=custom-model\n\
+                    NUWA_GITHUB_TOKEN=old-token-9999\n\
+                    LEGACY_KEY=keep-me\n";
+        let (_dir, app, store, env_path) = test_app(Some(file));
+        let csrf = csrf_token(&app).await;
+
+        let response = put_json(
+            &app,
+            r#"{"values":{
+                "NUWA_MODEL":"custom-model\nNUWA_PROVIDER=faux",
+                "NUWA_GITHUB_TOKEN":"token\nLEGACY_KEY=injected",
+                "NUWA_RUNNER_ID":"runner\u0000id"
+            }}"#,
+            Some(&csrf),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "validation_failed");
+        for key in ["NUWA_MODEL", "NUWA_GITHUB_TOKEN", "NUWA_RUNNER_ID"] {
+            assert!(value["error"]["fields"][key].is_string(), "{key}: {value}");
+        }
+
+        assert_eq!(
+            std::fs::read(&env_path).expect("read env"),
+            file.as_bytes(),
+            "a rejected PUT must leave the file byte-identical"
+        );
+        assert!(
+            !env_path.with_extension("env.bak").exists(),
+            "validation runs before the backup and write"
+        );
+        assert!(
+            store
+                .events_for("__config__", 10)
+                .expect("events")
+                .is_empty(),
+            "a rejected PUT must not journal any config event"
+        );
     }
 
     #[tokio::test]
@@ -1093,11 +1259,19 @@ mod tests {
         assert_eq!(after["values"]["NUWA_GITHUB_TOKEN"]["last4"], "abcd");
     }
 
+    #[test]
+    fn last_four_hides_short_secrets_and_handles_multibyte_values() {
+        assert_eq!(last_four(""), None);
+        assert_eq!(last_four("abcd"), None);
+        assert_eq!(last_four("密钥测试"), None);
+        assert_eq!(last_four("abcde"), Some("bcde".to_string()));
+        assert_eq!(last_four("密钥测试值"), Some("钥测试值".to_string()));
+    }
+
     #[tokio::test]
     async fn effective_diff_lists_only_differing_non_secret_keys() {
         let now = crate::now_ms();
-        let (_dir, app, store, _env_path) =
-            test_app_with(Some("NUWA_INTERVAL=60\nNUWA_MAX_TURNS=30\n"), now);
+        let (_dir, app, store, _env_path) = test_app_with(Some("NUWA_INTERVAL=60\n"), now);
 
         store
             .upsert_runner(&RunnerUpsert {
@@ -1113,7 +1287,7 @@ mod tests {
                 daily_pr_limit: Some(5),
                 repo_path: None,
                 service_unit: None,
-                config_json: r#"{"interval_secs":30,"ci_timeout_secs":600,"max_turns":30,"max_tokens":1500000}"#
+                config_json: r#"{"interval_secs":30,"ci_timeout_secs":600,"max_turns":50,"max_tokens":1500000}"#
                     .to_string(),
             })
             .expect("upsert runner");
@@ -1123,9 +1297,10 @@ mod tests {
         assert_eq!(
             value["effective_diff"],
             serde_json::json!({
-                "NUWA_INTERVAL": { "file": "60", "runtime": "30" }
+                "NUWA_INTERVAL": { "file": "60", "runtime": "30", "source": "file" },
+                "NUWA_MAX_TURNS": { "file": "30", "runtime": "50", "source": "default" }
             }),
-            "only the non-secret key whose runtime differs is listed"
+            "only differing non-secret keys are listed; absent keys are labelled default"
         );
         let diff = value["effective_diff"].as_object().expect("diff");
         assert!(
