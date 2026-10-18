@@ -43,6 +43,16 @@ export default [
     },
   },
   {
+    // Playwright smoke script: Node APIs at the top level, browser globals
+    // inside `page.evaluate` callbacks.
+    files: ["e2e/**/*.mjs"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "module",
+      globals: { ...globals.node, ...globals.browser },
+    },
+  },
+  {
     files: ["eslint.config.js"],
     languageOptions: {
       sourceType: "module",

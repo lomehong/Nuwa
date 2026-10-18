@@ -75,15 +75,33 @@ nuwa work --db shanhaijing.db \
 ```
 
 - `--runner-id`：控制台可见的 runner 身份，默认 `hostname:repo`；仅保留字母数字与 `.:_-`，超长截断
-- `--service-unit`：记录 systemd 单元名（默认 `nuwa-work`）。当前只落库展示，M2 的“重启服务”动作才会消费它
+- `--service-unit`：记录 systemd 单元名（默认 `nuwa-work`）。控制台的「重启 unit」动作会消费它（缺失/非法时该动作禁用或 422）
 
 ## 4 · 日常运维命令
 
-**Web 控制台**：`http://<server>:7321/ui`（Basic 鉴权，用户名任意，**密码 = 有效 UI 令牌：`NUWA_UI_TOKEN`，未设置时回退 `NUWA_INGEST_TOKEN`**）——问题单总览（状态徽章/PR 链接，60s 自刷）、escalated 一键 reopen、sync 对账按钮、serve/work 活性。服务端渲染，无 JS 框架；鉴权复用 UI 令牌（未配置 UI 令牌时即上报令牌，泄露后果同级、可轮换）。
+**Web 控制台（v3 SPA）**：`http://<server>:7321/`，在 `/login` 用 `NUWA_UI_TOKEN` 换取 HttpOnly 会话（**不再使用 Basic 头**）。旧服务端渲染 `/ui`（Basic 鉴权）及旧 `/settings`、`/issue/{fp}` 页面保留至 M6，仅作过渡。SPA 提供总览、问题单列表/详情（含会话转录）、运行器、活动与设置。
+
+- **问题单动作**：rejected/escalated 可 `重新打开`（立即回到 `new` 并清冷却，无确认）；卡单（`triggered`/`fixing` 且超过卡单窗口）可 `重排`（破坏性确认，清归属重新入队）。动作出现在详情头部、列表与总览待处理队列；成功 toast、失败逐条显示服务端错误。
+- **对账与重启**：`GitHub 对账` 汇总 checked/merged/rejected/still_open，并逐条展示 `errors[]`；runner `重启 unit` 先确认影响（显示当前修复指纹，提示同一 unit 承载的多个 runner 会一起重启）。409 表示已有重启在排程，422 指出 `service_unit` 缺失/非法，501 直接给出手动 `systemctl restart <unit>` 命令。
+- **设置**：按 22 键 schema 分组编辑；密钥只显示「已设置 · 末 4 位」，留空保存表示保持不变；只提交改动键，保存写 `NUWA_ENV_FILE`（自动 `.bak` 备份）并提示 `重启后生效`。`测试 GitHub token` / `测试模型配置` 使用未保存的候选值探测（不落盘）；`重启服务` 在存在活动 run 时返回 409 `active_runs`，必须勾选「我了解这会中断正在进行的修复」后才允许 `强制重启`，202 后页面轮询 `/health` 与 `/auth/me` 等待恢复，systemd 不可用则显示手动命令。修改 `NUWA_UI_TOKEN` 后重启会使当前会话失效，需要重新登录。
+- 旧 `/ui` 的 Basic 页面与 SPA 的 `/settings` **路径冲突**：SPA 内请用侧栏/抽屉导航进入；直接刷新 `/settings` 会命中旧 Basic 页（M6 移除旧页后消失）。
 
 **API 登录（v3 控制台）**：`POST /api/v1/auth/login`，必须带 `Content-Type: application/json`，body `{"token":"<NUWA_UI_TOKEN>"}`；成功 204 并设置 `nuwa_session`（HttpOnly）与 `nuwa_csrf`。后续非 GET 请求必须带 `X-NUWA-CSRF` 头，且其值须与 `nuwa_csrf` cookie 值一致（双提交校验，仅"带头"不够）。会话与 CSRF cookie 的 `Max-Age` 由 `NUWA_SESSION_TTL_SECS` 控制（默认 86400，允许 300–2592000）；`NUWA_COOKIE_SECURE=always` 强制加 `Secure`（TLS 代理下也可由 `X-Forwarded-Proto: https` 自动触发），`=never` 显式关闭且优先级最高（即使同时配置 `always` 或代理上报 https 也不加 `Secure`）。旧 `/ui` Basic 鉴权保留至 M6。
 
 **前端本地开发（v3 SPA）**：源码在 `web/`（Node ≥24.15）；`cd web && npm ci` 后可用 `npm run dev`（Vite 5173，把 `/api` 与 `/ingest` 代理到 `http://127.0.0.1:7321`，`changeOrigin: false` 保留 Host/Origin，否则写请求会被同源校验拒绝）、`npm run typecheck`、`npm test`、`npm run build`（typecheck + Vite）。生产构建 `web/dist` 由 `nuwa serve` 嵌入并在站点根路径 `/` 提供；`/login` 用 `NUWA_UI_TOKEN` 换取 HttpOnly 会话，未配置令牌时进入本地模式。旧服务端渲染控制台 `/ui`（Basic 鉴权）及 `/settings`、`/issue/{fp}` 旧页面保留至 M6。
+
+**M5 控制台 E2E（本地 UAT）**：`web/e2e/seed.py` 用 stdlib 造 7 状态问题单、3 runner、4 run、14 天事件与一份真实转录（`--issues N` 可批量造 M6 压测数据）；`web/e2e/smoke.mjs` 用 `playwright-core` + 本机 Chrome（不下载浏览器）跑登录、rejected 重新打开、runner 重启确认（只取消）、审计预设、设置保存，并在 390/1024/1440 截图断言无横向溢出/内联样式/console error。示例（临时 DB/env/sessions 建议放 `.superpowers/tmp-m5-e2e/`，均 gitignored）：
+
+```bash
+python web/e2e/seed.py --db .superpowers/tmp-m5-e2e/e2e.db \
+  --bin "$HOME/.cargo/shared-target/debug/nuwa.exe" \
+  --sessions .superpowers/tmp-m5-e2e/sessions
+NUWA_UI_TOKEN=dummy NUWA_ENV_FILE=$PWD/.superpowers/tmp-m5-e2e/nuwa.env \
+  nuwa serve --db .superpowers/tmp-m5-e2e/e2e.db --listen 127.0.0.1:7404
+cd web && NUWA_E2E_BASE_URL=http://127.0.0.1:7404 NUWA_E2E_TOKEN=dummy npm run test:e2e
+```
+
+`NUWA_E2E_CHROME` 可指定 Chrome/Chromium 可执行文件，`NUWA_E2E_ARTIFACTS` 可改截图目录（默认 `web/e2e/artifacts/`，gitignored）。
 
 | 命令 | 用途 |
 |---|---|

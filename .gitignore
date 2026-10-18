@@ -16,6 +16,8 @@ Cargo.lock.bak
 /web/dist/*
 !/web/dist/.gitkeep
 /web/coverage/
+# Local UAT screenshots from `npm run test:e2e`
+/web/e2e/artifacts/
 
 # Secrets / local env — never in the repo
 .env
