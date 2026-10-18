@@ -507,16 +507,18 @@ function RepoGroupCard({ group, nowMs }: { group: RepoGroup; nowMs: number }) {
         : String(runner.effective.forbidden_paths_count),
     ),
   );
-  const limited = runners.filter(
-    (runner) => runner.daily_pr_limit !== null && runner.daily_pr_limit > 0,
+  // `prs_today` is repo-scoped by the API (every runner of a repo reports the
+  // same value), so sum limits but never sum today's count.
+  const prsToday = Math.max(0, ...runners.map((runner) => runner.prs_today));
+  const quotaLimits = distinctStrings(
+    runners.map((runner) =>
+      runner.daily_pr_limit !== null && runner.daily_pr_limit > 0
+        ? String(runner.daily_pr_limit)
+        : null,
+    ),
   );
   const quota =
-    limited.length > 0
-      ? `${limited.reduce((sum, runner) => sum + runner.prs_today, 0)}/${limited.reduce(
-          (sum, runner) => sum + (runner.daily_pr_limit ?? 0),
-          0,
-        )}`
-      : "未上报配额";
+    quotaLimits.length > 0 ? `${prsToday}/${quotaLimits.join(" / ")}` : "未上报配额";
   const working = runners.filter((runner) => runner.current_fingerprint);
   const lastErrors = distinctStrings(runners.map((runner) => runner.last_error));
   const variant = online === runners.length ? "success" : online === 0 ? "danger" : "warning";
@@ -1029,6 +1031,37 @@ export function SettingsPage() {
           </div>
         ) : null}
       </header>
+
+      <nav aria-label="设置分区（移动端）" className="lg:hidden">
+        <div className="flex gap-2 overflow-x-auto pb-1">
+          {NAV_ITEMS.map((item) => {
+            const dirty = isSchemaGroup(item.id) && dirtyGroups.has(item.id);
+            const restart = isSchemaGroup(item.id) && restartGroups.has(item.id);
+            return (
+              <a
+                key={item.id}
+                href={`#${sectionElementId(item.id)}`}
+                className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-full border border-border bg-surface px-3 text-caption text-text-secondary transition-colors duration-150 ease-out hover:border-border-strong hover:text-text"
+              >
+                <span className="whitespace-nowrap">{item.label}</span>
+                {dirty ? (
+                  <span aria-hidden="true" className="size-2 shrink-0 rounded-full bg-warning" />
+                ) : null}
+                {dirty ? <span className="sr-only">有未保存更改</span> : null}
+                {restart ? <Badge variant="warning">重启</Badge> : null}
+              </a>
+            );
+          })}
+        </div>
+        <div className="mt-2 flex gap-2">
+          <Button variant="ghost" size="sm" onClick={() => setAllSections(true)}>
+            展开全部
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => setAllSections(false)}>
+            收起全部
+          </Button>
+        </div>
+      </nav>
 
       {settings.isError ? (
         <p

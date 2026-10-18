@@ -35,6 +35,12 @@ function signedIn(settings: SettingsOverrides = {}, system: SystemOverrides = {}
   );
 }
 
+function bulkButton(name: string) {
+  // Desktop and mobile section navs both expose the bulk controls; jsdom sees
+  // both, so target the first (desktop) one.
+  return screen.getAllByRole("button", { name })[0];
+}
+
 function saveBar() {
   return screen.getByTestId("settings-save-bar");
 }
@@ -201,7 +207,7 @@ describe("SettingsPage", () => {
       expect(screen.getByRole("heading", { name: title })).toBeInTheDocument();
     }
     // Hidden panels stay mounted; expand them before asserting their content.
-    fireEvent.click(screen.getByRole("button", { name: "展开全部" }));
+    fireEvent.click(bulkButton("展开全部"));
     expect(screen.getAllByText("0.2.0").length).toBeGreaterThan(0);
     expect(screen.getByText("MIT")).toBeInTheDocument();
     const repo = screen.getByRole("link", { name: /github\.com\/lomehong\/nuwa/ });
@@ -649,8 +655,9 @@ describe("SettingsPage", () => {
           repo_path: "/srv/app",
           heartbeat_at_ms: Date.now() - 600_000,
           offline: true,
-          prs_today: 0,
-          daily_pr_limit: null,
+          // `prs_today` is repo-scoped: both runners report the same count.
+          prs_today: 1,
+          daily_pr_limit: 5,
         }),
         makeRunner({ id: "runner-c", repo: "example.com/other", repo_path: "/srv/other" }),
       ]),
@@ -738,10 +745,10 @@ describe("SettingsPage", () => {
     );
     expect(screen.getByLabelText("Cookie secure")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "收起全部" }));
+    fireEvent.click(bulkButton("收起全部"));
     expect(screen.getByLabelText("Cookie secure")).not.toBeVisible();
     expect(screen.getByLabelText("Poll interval")).not.toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "展开全部" }));
+    fireEvent.click(bulkButton("展开全部"));
     expect(screen.getByLabelText("Cookie secure")).toBeVisible();
     expect(screen.getByLabelText("Poll interval")).toBeVisible();
   });
