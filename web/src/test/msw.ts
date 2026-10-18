@@ -9,6 +9,11 @@ import type {
 import type { IssueDetailResponse, RunDto } from "../features/issue-detail/types";
 import type { IssueListItem, IssueListResponse } from "../features/issues/types";
 import type { RunnerDto, RunnerListResponse } from "../features/runners/types";
+import type {
+  SettingDto,
+  SettingsResponse,
+  SystemResponse,
+} from "../features/settings/types";
 import type { TranscriptResponse } from "../features/transcript/types";
 import type { MeResponse } from "../lib/auth";
 
@@ -265,4 +270,161 @@ export function mockRunners(runners: RunnerDto[] = [makeRunner()]) {
  */
 export function mockOverviewResources(overrides: Partial<OverviewResponse> = {}) {
   return [mockOverview(overrides), mockTrends(), mockEvents()];
+}
+
+function settingSpec(overrides: Partial<SettingDto> = {}): SettingDto {
+  return {
+    key: "NUWA_TEST",
+    label: "Test setting",
+    group: "runner",
+    type: "string",
+    default: "",
+    options: [],
+    secret: false,
+    scope: "work",
+    requires_restart: true,
+    read_only: false,
+    help: "Test help",
+    min: null,
+    max: null,
+    ...overrides,
+  };
+}
+
+/**
+ * `GET /api/v1/settings` fixture. One representative key per group keeps every
+ * section renderable, with the credentials/interval/secret cases the page
+ * tests depend on (docs/09 §9.2 settings).
+ */
+export function makeSettings(overrides: Partial<SettingsResponse> = {}): SettingsResponse {
+  return {
+    schema: [
+      settingSpec({
+        key: "NUWA_GITHUB_TOKEN",
+        label: "GitHub token",
+        group: "credentials",
+        type: "secret",
+        secret: true,
+        scope: "both",
+        default: null,
+        help: "GitHub 细粒度 PAT：Contents 读写 + Actions 只读",
+      }),
+      settingSpec({
+        key: "NUWA_PROVIDER",
+        label: "LLM Provider",
+        group: "model",
+        type: "enum",
+        options: ["zai", "anthropic", "faux"],
+        default: "anthropic",
+        help: "修复 runner 使用的模型提供方",
+      }),
+      settingSpec({
+        key: "NUWA_INTERVAL",
+        label: "Poll interval",
+        group: "runner",
+        type: "int",
+        default: "30",
+        min: 1,
+        max: 86_400,
+        help: "轮询间隔（秒）",
+      }),
+      settingSpec({
+        key: "NUWA_SERVE_UNIT",
+        label: "Serve unit",
+        group: "service",
+        default: "nuwa-serve",
+        scope: "serve",
+        help: "serve 进程的 systemd unit",
+      }),
+      settingSpec({
+        key: "NUWA_COOKIE_SECURE",
+        label: "Cookie secure",
+        group: "security",
+        type: "enum",
+        options: ["auto", "always", "never"],
+        default: "auto",
+        scope: "serve",
+        help: "会话 cookie 的 Secure 策略",
+      }),
+      settingSpec({
+        key: "NUWA_STUCK_AFTER_SECS",
+        label: "Stuck floor",
+        group: "ops",
+        type: "int",
+        default: "300",
+        min: 60,
+        max: 86_400,
+        scope: "serve",
+        help: "卡单判定下限（秒）",
+      }),
+      settingSpec({
+        key: "NUWA_ENV_FILE",
+        label: "Env file",
+        group: "advanced",
+        type: "path",
+        default: "/opt/nuwa/nuwa.env",
+        scope: "both",
+        read_only: true,
+        help: "env 文件路径（只读展示）",
+      }),
+    ],
+    values: {
+      NUWA_GITHUB_TOKEN: {
+        set: true,
+        last4: "1234",
+        updated_at_ms: 1_700_000_000_000,
+      },
+      NUWA_PROVIDER: { value: "anthropic", source: "env" },
+      NUWA_INTERVAL: { value: "30", source: "env" },
+      NUWA_SERVE_UNIT: { value: "nuwa-serve", source: "env" },
+      NUWA_COOKIE_SECURE: { value: "auto", source: "default" },
+      NUWA_STUCK_AFTER_SECS: { value: "300", source: "default" },
+      NUWA_ENV_FILE: { value: "/opt/nuwa/nuwa.env", source: "env" },
+    },
+    env_path: "/opt/nuwa/nuwa.env",
+    env_exists: true,
+    env_permissions: "600",
+    needs_migration: false,
+    restart_pending: false,
+    effective_diff: {
+      NUWA_INTERVAL: { file: "30", runtime: "60", source: "file" },
+    },
+    unknown_keys: ["LEGACY_KEY"],
+    last_changes: [
+      {
+        key: "NUWA_MAX_TURNS",
+        ts_ms: 1_700_000_000_000,
+        actor: "owner",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+export function mockSettings(overrides: Partial<SettingsResponse> = {}) {
+  const body = makeSettings(overrides);
+  return http.get("/api/v1/settings", () => HttpResponse.json(body));
+}
+
+/** `GET /api/v1/system` fixture: one active unit, one `n/a` (no systemd). */
+export function makeSystem(overrides: Partial<SystemResponse> = {}): SystemResponse {
+  return {
+    version: "0.2.0",
+    build_commit: "0123456",
+    started_at_ms: 1_700_000_000_000,
+    uptime_secs: 5_400,
+    db_path: "/opt/nuwa/shanhaijing.db",
+    db_size_bytes: 45_056,
+    local_mode: false,
+    services: [
+      { unit: "nuwa-serve", active: "active" },
+      { unit: "nuwa-work", active: "n/a" },
+    ],
+    ...overrides,
+  };
+}
+
+export function mockSystem(overrides: Partial<SystemResponse> = {}) {
+  const body = makeSystem(overrides);
+  return http.get("/api/v1/system", () => HttpResponse.json(body));
 }

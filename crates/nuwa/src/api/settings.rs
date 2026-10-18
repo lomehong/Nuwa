@@ -76,6 +76,10 @@ pub struct SettingDto {
     pub requires_restart: bool,
     pub read_only: bool,
     pub help: &'static str,
+    /// Inclusive numeric bounds for `int` keys; the console echoes them so the
+    /// browser can reject an out-of-range value before the PUT (docs/09 §9.2).
+    pub min: Option<u64>,
+    pub max: Option<u64>,
 }
 
 impl From<&SettingSpec> for SettingDto {
@@ -92,6 +96,8 @@ impl From<&SettingSpec> for SettingDto {
             requires_restart: spec.requires_restart,
             read_only: spec.read_only,
             help: spec.help,
+            min: spec.min,
+            max: spec.max,
         }
     }
 }
@@ -1283,6 +1289,25 @@ mod tests {
             .map(|spec| spec.key)
             .collect();
         assert_eq!(read_only, vec!["NUWA_ENV_FILE"]);
+    }
+
+    #[tokio::test]
+    async fn schema_exposes_numeric_bounds() {
+        let (_dir, app, _store, _env_path) = test_app(None);
+        let value = json_body(get(&app, "/api/v1/settings").await).await;
+        let schema = value["schema"].as_array().expect("schema");
+        let interval = schema
+            .iter()
+            .find(|entry| entry["key"] == "NUWA_INTERVAL")
+            .expect("NUWA_INTERVAL");
+        assert_eq!(interval["min"], 1);
+        assert_eq!(interval["max"], 86_400);
+        let github = schema
+            .iter()
+            .find(|entry| entry["key"] == "NUWA_GITHUB_TOKEN")
+            .expect("github");
+        assert!(github["min"].is_null());
+        assert!(github["max"].is_null());
     }
 
     #[tokio::test]
