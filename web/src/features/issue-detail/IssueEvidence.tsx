@@ -44,7 +44,7 @@ function VerificationBlock({ run }: { run: RunDto }) {
       </div>
       {detail ? (
         <details className="group mt-2 rounded-card border border-border bg-surface">
-          <summary className="flex min-h-9 cursor-pointer list-none items-center gap-2 px-3 py-1.5 text-caption font-medium text-text-secondary transition-colors hover:text-text [&::-webkit-details-marker]:hidden">
+          <summary className="flex min-h-11 cursor-pointer list-none items-center gap-2 px-3 py-1.5 text-caption font-medium text-text-secondary transition-colors hover:text-text pointer-fine:min-h-9 [&::-webkit-details-marker]:hidden">
             <span
               aria-hidden="true"
               className="font-mono text-text-muted transition-transform duration-150 group-open:rotate-90"

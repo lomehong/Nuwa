@@ -34,7 +34,9 @@ describe("Button", () => {
 
     const small = screen.getByRole("button", { name: "小号" });
     expect(small).toHaveClass("min-h-11");
+    expect(small).toHaveClass("min-w-11");
     expect(small).toHaveClass("pointer-fine:min-h-9");
+    expect(small).toHaveClass("pointer-fine:min-w-9");
 
     const medium = screen.getByRole("button", { name: "中号" });
     expect(medium).toHaveClass("min-h-11");

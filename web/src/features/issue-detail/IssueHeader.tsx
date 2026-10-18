@@ -42,7 +42,7 @@ export function IssueHeader({ issue }: IssueHeaderProps) {
     <header className="space-y-4">
       <Link
         to="/issues"
-        className="inline-flex min-h-9 items-center gap-1.5 rounded-sm text-body-sm text-text-secondary transition-colors hover:text-accent"
+        className="inline-flex min-h-11 items-center gap-1.5 rounded-sm text-body-sm text-text-secondary transition-colors hover:text-accent pointer-fine:min-h-9"
       >
         <ArrowLeft aria-hidden="true" className="size-3.5" />
         返回问题单列表
@@ -109,7 +109,7 @@ export function IssueHeader({ issue }: IssueHeaderProps) {
             href={issue.pr_url}
             target="_blank"
             rel="noreferrer"
-            className="inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-card border border-border-strong bg-raised px-3 text-caption font-medium text-text transition-colors hover:border-accent hover:text-accent"
+            className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-card border border-border-strong bg-raised px-3 text-caption font-medium text-text transition-colors hover:border-accent hover:text-accent pointer-fine:min-h-9"
           >
             打开 PR
             <span className="sr-only">（新标签页）</span>

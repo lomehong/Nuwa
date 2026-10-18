@@ -24,8 +24,8 @@ import { CiVerdictBadge, PrLink, StuckBadge } from "./IssueBadges";
 import type { IssueListItem, IssueSort, IssueSortOrder } from "./types";
 
 const ICON_ACTION =
-  "inline-flex size-9 items-center justify-center rounded-card text-text-secondary " +
-  "transition-colors duration-150 ease-out hover:bg-raised hover:text-text";
+  "inline-flex size-11 items-center justify-center rounded-card text-text-secondary " +
+  "transition-colors duration-150 ease-out hover:bg-raised hover:text-text pointer-fine:size-9";
 
 interface SortableHeaderProps {
   field: IssueSort;
@@ -51,7 +51,7 @@ function SortableHeader({ field, label, sort, order, onSort, className }: Sortab
         onClick={() => onSort(field)}
         aria-label={`按${label}排序${active ? `，当前${direction === "ascending" ? "升序" : "降序"}` : ""}`}
         className={clsx(
-          "inline-flex min-h-9 items-center gap-1 rounded-sm font-medium transition-colors hover:text-text",
+          "inline-flex min-h-11 items-center gap-1 rounded-sm font-medium transition-colors hover:text-text pointer-fine:min-h-9",
           active && "text-text",
         )}
       >
@@ -140,7 +140,7 @@ export function IssueTable({ issues, sort, order, onSort, onCopyFingerprint }: I
                       onClick={() => onCopyFingerprint(issue)}
                       aria-label={`复制指纹（完整）：${issue.fingerprint}`}
                       title="复制指纹（完整）"
-                      className="mt-0.5 flex max-w-full items-center gap-1 rounded-sm text-left font-mono text-caption text-text-muted transition-colors hover:text-text"
+                      className="mt-0.5 flex min-h-11 max-w-full items-center gap-1 rounded-sm text-left font-mono text-caption text-text-muted transition-colors hover:text-text pointer-fine:min-h-0"
                     >
                       <span className="truncate">{shortFingerprint(issue.fingerprint)}</span>
                       <Copy aria-hidden="true" className="size-3 shrink-0" />

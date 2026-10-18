@@ -72,7 +72,7 @@ export function IssueNotFound({ fingerprint }: IssueNotFoundProps) {
       action={
         <Link
           to="/issues"
-          className="inline-flex min-h-9 items-center rounded-card border border-border-strong bg-raised px-3 text-caption font-medium text-text transition-colors hover:border-accent hover:text-accent"
+          className="inline-flex min-h-11 items-center rounded-card border border-border-strong bg-raised px-3 text-caption font-medium text-text transition-colors hover:border-accent hover:text-accent pointer-fine:min-h-9"
         >
           返回问题单列表
         </Link>
