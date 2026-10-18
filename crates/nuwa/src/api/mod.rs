@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod auth;
 pub mod common;
 pub mod events;
@@ -64,8 +65,6 @@ impl ApiError {
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
     }
-    // Consumed by the issue/deliver endpoints in M2b/M2c.
-    #[allow(dead_code)]
     pub fn invalid_state(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "invalid_state", message)
     }
@@ -114,6 +113,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/overview", get(overview::overview))
         .route("/issues", get(issues::list))
         .route("/issues/{fp}", get(issues::detail))
+        .route("/issues/{fp}/reopen", post(actions::reopen))
+        .route("/issues/{fp}/requeue", post(actions::requeue))
         .route("/runners", get(runners::list))
         .route("/events", get(events::list))
         .route("/metrics/trends", get(trends::trends))
