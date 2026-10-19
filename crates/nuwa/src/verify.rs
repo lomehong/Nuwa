@@ -647,7 +647,15 @@ mod tests {
             .await
             .expect_err("timeout");
         assert!(format!("{err:#}").contains("timed out"));
-        assert!(start.elapsed() < Duration::from_secs(10));
+        // 语义：超时被主动中止，而不是等满 sleep 30 的全程。预算从 10s 放宽
+        // 到 25s——CI 双核冷缓存下 worktree/spawn 开销起伏大（31-37s 的
+        // binary 总时长里 git 操作占大头），10s 曾假红；真正的回归（杀进程
+        // 失效）是 30s+，仍被 25s 可靠区分。
+        assert!(start.elapsed() < Duration::from_secs(25));
+        eprintln!(
+            "check_timeout_is_bounded: verify elapsed {:?} (budget 25s, kill-failure regression = 30s+)",
+            start.elapsed()
+        );
     }
 
     #[test]
