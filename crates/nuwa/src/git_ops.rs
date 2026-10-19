@@ -85,8 +85,17 @@ pub async fn run_process(
         }
         if start.elapsed() >= timeout {
             timed_out = true;
+            // 组杀尽力覆盖孙进程；`start_kill` 是内核级 SIGKILL，不依赖
+            // 外部 kill 命令的 PATH/权限——CI runner 上外部 kill 曾失效，
+            // sleep 30 跑满全程才返回（2026-10-20）。
             kill_tree(pid).await;
-            break child.wait().await.context("wait after timeout")?;
+            let _ = child.start_kill();
+            match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+                Ok(status) => break status.context("wait after timeout")?,
+                Err(_) => {
+                    bail!("child {pid} still alive 5s after SIGKILL — sandbox refused the kill")
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
