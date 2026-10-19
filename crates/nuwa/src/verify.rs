@@ -652,6 +652,7 @@ mod tests {
         // 这里故意不断言墙钟：CI 双核 runner 上 237 个并行 tokio 测试会
         // 饱和 CPU，轮询循环被调度延迟拖长（10s/25s 预算两次假红，
         // 2026-10-20）；墙钟回归防护留在 git_ops 层（单测试无竞争）。
+        assert!(format!("{err:#}").contains("timed out"));
         eprintln!(
             "check_timeout_is_bounded: verify elapsed {:?} (informational)",
             start.elapsed()
