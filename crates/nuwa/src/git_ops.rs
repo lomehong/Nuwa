@@ -128,6 +128,27 @@ pub fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Run one git command without a timeout (local, fast operations only) and
+/// return the **raw stdout bytes**. Unlike [`git`] this never trims: `git show
+/// <rev>:<file>` must round-trip the blob byte-for-byte (a trimmed trailing
+/// newline would make every restore rewrite the file and fight the next
+/// `reset --hard` forever).
+pub fn git_raw(repo: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out.stdout)
+}
+
 pub async fn git_ok(
     repo: &Path,
     args: &[&str],

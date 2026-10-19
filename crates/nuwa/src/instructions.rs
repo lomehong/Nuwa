@@ -176,8 +176,10 @@ impl TrustedInstructions {
 fn read_tracked(repo_dir: &Path, base: &str) -> anyhow::Result<Option<(Vec<u8>, TrustSource)>> {
     for reference in [format!("origin/{base}"), base.to_string()] {
         let spec = format!("{reference}:{INSTRUCTION_FILE}");
-        if let Ok(text) = git_ops::git(repo_dir, &["show", &spec]) {
-            return Ok(Some((text.into_bytes(), TrustSource::Tracked)));
+        // Raw bytes: `git show` must round-trip the blob exactly (git() trims,
+        // which corrupts blobs ending in a newline and makes restore loop).
+        if let Ok(bytes) = git_ops::git_raw(repo_dir, &["show", &spec]) {
+            return Ok(Some((bytes, TrustSource::Tracked)));
         }
     }
     if git_ops::git(repo_dir, &["ls-files", "--error-unmatch", INSTRUCTION_FILE]).is_ok() {
@@ -241,6 +243,29 @@ mod tests {
         format!(
             r#"{{"repo":"{repo}","failing_check":{{"command":"echo ok"}},"forbidden_paths":["go.sum"]}}"#
         )
+    }
+
+    /// 回归（2026-10-20 生产实战）：blob 以 `\n` 结尾时，trim 过的 `git show`
+    /// 输出比磁盘文件少一字节，verify_and_restore 会与 `reset --hard` 每轮互
+    /// 相打架（每分钟一次 restore 刷屏）。修复后字节一致必须判"未修改"。
+    #[test]
+    fn byte_identical_blob_with_trailing_newline_is_not_restored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo, true);
+        // 工作树与 base blob 字节一致（含尾换行——config_json 以 }\n 结尾）。
+        let trusted = TrustedInstructions::load(
+            &repo,
+            &repo.join(INSTRUCTION_FILE),
+            "main",
+            &dir.path().join("trust"),
+        )
+        .expect("load");
+        assert_eq!(trusted.source, TrustSource::Tracked);
+        assert!(
+            !trusted.verify_and_restore().expect("restore"),
+            "byte-identical worktree must not be rewritten (restore/reset loop)"
+        );
     }
 
     #[test]
