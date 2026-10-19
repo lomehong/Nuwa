@@ -1,6 +1,6 @@
 import { clsx } from "clsx";
 import { Check, Eraser, ShieldCheck } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type RefObject } from "react";
 
 import { Button, Input, Select } from "../../components/ui";
 import { eventKindLabel } from "../overview/format";
@@ -57,6 +57,8 @@ interface CommitInputProps {
   value: string;
   placeholder: string;
   onCommit: (next: string) => void;
+  /** Focus target for the page's `/` shortcut (docs/09 §12). */
+  inputRef?: RefObject<HTMLInputElement | null>;
 }
 
 /**
@@ -64,7 +66,7 @@ interface CommitInputProps {
  * activity feed is an audit log, so partial terms must not spam the request
  * log. The draft is adopted again when the URL changes (clear/preset/back).
  */
-function CommitInput({ label, value, placeholder, onCommit }: CommitInputProps) {
+function CommitInput({ label, value, placeholder, onCommit, inputRef }: CommitInputProps) {
   const [draft, setDraft] = useState(value);
 
   useEffect(() => {
@@ -80,6 +82,7 @@ function CommitInput({ label, value, placeholder, onCommit }: CommitInputProps) 
 
   return (
     <Input
+      ref={inputRef}
       label={label}
       type="search"
       value={draft}
@@ -100,6 +103,8 @@ interface EventFiltersProps {
   filters: EventFilterState;
   /** Applies a filter patch and resets the page to 1 unless `page` is set. */
   onChange: (patch: Partial<EventFilterState>) => void;
+  /** Receives the first text field so `/` can focus it (docs/09 §12). */
+  searchInputRef?: RefObject<HTMLInputElement | null>;
 }
 
 /**
@@ -107,7 +112,7 @@ interface EventFiltersProps {
  * repo/fingerprint, range and hourly aggregation. Every control writes through
  * the URL; only the text drafts live in component state.
  */
-export function EventFilters({ filters, onChange }: EventFiltersProps) {
+export function EventFilters({ filters, onChange, searchInputRef }: EventFiltersProps) {
   const auditView = isAuditView(filters);
   const canClear = hasActiveEventFilters(filters) || filters.page > 1;
   const rangeValue: EventRange = filters.range;
@@ -157,6 +162,7 @@ export function EventFilters({ filters, onChange }: EventFiltersProps) {
           value={filters.repo}
           placeholder="example.com/app"
           onCommit={(repo) => onChange({ repo })}
+          inputRef={searchInputRef}
         />
         <CommitInput
           label="指纹"

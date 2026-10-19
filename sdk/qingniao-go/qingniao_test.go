@@ -147,6 +147,86 @@ func TestHTTPSinkSendsTokenHeader(t *testing.T) {
 	}
 }
 
+func TestHTTPSinkRetriesTransientFailureThenSucceeds(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	sink := HTTPSink{Endpoint: srv.URL, Timeout: time.Second, MaxAttempts: 2}
+	if err := sink.Send(PanicEnvelope(testMeta, "x", nil, time.Now())); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+}
+
+func TestHTTPSinkDoesNotRetryClientError(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	sink := HTTPSink{Endpoint: srv.URL, Timeout: time.Second, MaxAttempts: 3}
+	if err := sink.Send(PanicEnvelope(testMeta, "x", nil, time.Now())); err == nil {
+		t.Fatal("want error")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 for a 403", calls)
+	}
+}
+
+func TestHTTPSinkFallsBackToFile(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	path := filepath.Join(t.TempDir(), "fallback.jsonl")
+	sink := HTTPSink{
+		Endpoint:     srv.URL,
+		Timeout:      100 * time.Millisecond,
+		MaxAttempts:  2,
+		FallbackFile: path,
+	}
+	if err := sink.Send(PanicEnvelope(testMeta, "fallback me", nil, time.Now())); err != nil {
+		t.Fatalf("fallback should preserve the signal: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fallback: %v", err)
+	}
+	if !strings.Contains(string(data), "fallback me") {
+		t.Fatalf("fallback file missing envelope: %s", data)
+	}
+}
+
+func TestHTTPSinkTimeoutIsBounded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	sink := HTTPSink{Endpoint: srv.URL, Timeout: 50 * time.Millisecond, MaxAttempts: 1}
+	if err := sink.Send(PanicEnvelope(testMeta, "x", nil, time.Now())); err == nil {
+		t.Fatal("want timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("timeout was not bounded: %v", elapsed)
+	}
+}
+
 // collectFunc adapts a closure into a Sink.
 type collectFunc func(Envelope) error
 

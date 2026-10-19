@@ -154,6 +154,11 @@ export function IssueTable({ issues, sort, order, onSort, onCopyFingerprint }: I
                 <div className="flex flex-wrap items-center gap-1.5">
                   <StateBadge state={issue.state} />
                   {issue.stuck ? <StuckBadge /> : null}
+                  {(issue.attempts ?? 0) > 0 ? (
+                    <span className="font-mono text-caption text-text-muted">
+                      尝试 {issue.attempts}
+                    </span>
+                  ) : null}
                 </div>
               </TableCell>
               <TableCell>

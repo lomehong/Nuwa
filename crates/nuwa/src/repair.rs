@@ -52,6 +52,8 @@ pub struct RepairJob {
     pub provider: ProviderKind,
     pub max_turns: u32,
     pub guards: Arc<Guards>,
+    /// Credentials read at startup and scrubbed from the process environment.
+    pub secrets: Arc<crate::secrets::Secrets>,
     /// Repo-instruction notes appended to the runner system prompt.
     pub notes: String,
     /// Live progress sink, invoked on every completed turn that carries usage.
@@ -77,6 +79,34 @@ pub struct RepairReport {
     pub session_dir: String,
 }
 
+/// Resolve the requested Anthropic model. A typo must fail loudly instead of
+/// silently burning tokens on the catalog's first entry.
+fn pick_anthropic_model(
+    catalog: &[rpi_ai::Model],
+    requested: Option<&str>,
+) -> anyhow::Result<rpi_ai::Model> {
+    match requested {
+        None => catalog
+            .first()
+            .cloned()
+            .context("anthropic model catalog is empty"),
+        Some(requested) => catalog
+            .iter()
+            .find(|model| model.id == requested)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "unknown Anthropic model `{requested}`; available: {}",
+                    catalog
+                        .iter()
+                        .map(|model| model.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }),
+    }
+}
+
 pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
     // Turn budget (rpi-harness RunBudget reads this per run). Token-level caps
     // land with the 运行器池 scheduler; the turn cap bounds runaway loops now.
@@ -96,6 +126,17 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
 
+    // Child processes get an explicit environment whitelist. The work process
+    // removed its credentials at startup; this is the second layer that keeps
+    // unrelated host secrets out of build/test commands.
+    let allowlist: std::collections::HashMap<String, String> =
+        crate::secrets::agent_env_allowlist().into_iter().collect();
+    let prepare: rpi_tools::BashPrepare =
+        Arc::new(move |exec: &mut rpi_tools::BashExecution| {
+            exec.inherit_env = false;
+            exec.env = allowlist.clone();
+            Box::pin(async { Ok(()) })
+        });
     let tools: Vec<Arc<dyn AgentTool>> = vec![
         create_read_tool(&ctx, None),
         create_edit_tool(&ctx),
@@ -107,6 +148,7 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
             &ctx,
             Some(rpi_tools::BashToolOptions {
                 default_timeout: Some(300.0),
+                prepare: Some(prepare),
                 ..Default::default()
             }),
         ),
@@ -159,6 +201,15 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
                         }]
                     }),
                 )
+                // The offline proof also leaves a marker so the delivery
+                // gate's red→green check is language- and shell-agnostic.
+                .with_tool_call(
+                    "write",
+                    serde_json::json!({
+                        "path": "fixed.marker",
+                        "content": "fixed\n"
+                    }),
+                )
                 .with_text(
                     "ROOT CAUSE: Average iterated with i <= len(xs), indexing one past the last element — index out of range panic on every non-empty window.\n\
                      CHANGE: bounded the loop at i < len(xs) so the sum covers exactly the slice.\n\
@@ -169,7 +220,10 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
             (model, vec![provider as Arc<dyn Provider>])
         }
         ProviderKind::Zai { base_url, model } => {
-            let key = std::env::var("ZAI_API_KEY")
+            let key = job
+                .secrets
+                .zai_key
+                .clone()
                 .context("ZAI_API_KEY not set (智谱 coding plan 的 API key)")?;
             let base = base_url.clone().unwrap_or_else(|| {
                 "https://open.bigmodel.cn/api/coding/paas/v4".to_string()
@@ -197,18 +251,15 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
             (picked, vec![Arc::new(provider) as Arc<dyn Provider>])
         }
         ProviderKind::Anthropic { model } => {
-            let key = std::env::var("ANTHROPIC_API_KEY")
+            let key = job
+                .secrets
+                .anthropic_key
+                .clone()
                 .context("ANTHROPIC_API_KEY not set (or use --provider faux for the offline path)")?;
             let http = rpi_ai::http::build_client("https://api.anthropic.com", None, None)
                 .unwrap_or_else(|_| reqwest::Client::new());
             let provider = AnthropicProvider::new(Some(key), http);
-            let catalog = anthropic_models();
-            let picked = catalog
-                .iter()
-                .find(|m| Some(m.id.as_str()) == model.as_deref())
-                .or_else(|| catalog.first())
-                .with_context(|| "anthropic model catalog is empty")?
-                .clone();
+            let picked = pick_anthropic_model(&anthropic_models(), model.as_deref())?;
             (picked, vec![Arc::new(provider) as Arc<dyn Provider>])
         }
     };
@@ -352,12 +403,28 @@ mod tests {
             last_seen: String::new(),
             stack_trace: "panic: boom".into(),
             log_window: Vec::new(),
+            prior_context: String::new(),
             failing_check: crate::issue::FailingCheck {
                 command: "echo ok".into(),
                 target: None,
+                timeout_secs: 600,
             },
+            reproduce_check: None,
             forbidden_paths: Vec::new(),
         }
+    }
+
+    #[test]
+    fn unknown_anthropic_model_is_rejected() {
+        let catalog = anthropic_models();
+        let selected = pick_anthropic_model(&catalog, None).expect("default");
+        assert_eq!(selected.id, catalog[0].id);
+
+        let err = pick_anthropic_model(&catalog, Some("definitely-not-a-model"))
+            .expect_err("unknown model");
+        let text = format!("{err:#}");
+        assert!(text.contains("unknown Anthropic model"), "{text}");
+        assert!(text.contains("available:"), "{text}");
     }
 
     // The harness calls `block_in_place` (rpi-harness agent_harness.rs), which
@@ -389,6 +456,7 @@ mod tests {
             provider: ProviderKind::Faux,
             max_turns: 5,
             guards: Arc::new(Guards::new(Vec::new())),
+            secrets: Arc::new(crate::secrets::Secrets::default()),
             notes: String::new(),
             progress: Some(Arc::new(move |p| {
                 seen_cb.lock().expect("lock").push(p);

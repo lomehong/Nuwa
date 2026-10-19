@@ -51,6 +51,7 @@ export function makeOverview(overrides: Partial<OverviewResponse> = {}): Overvie
       merged: 0,
       rejected: 0,
       escalated: 0,
+      ignored: 0,
     },
     attention: [],
     active_runs: [],

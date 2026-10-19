@@ -40,7 +40,12 @@ pub struct Guards {
 }
 
 impl Guards {
-    pub fn new(forbidden: Vec<String>) -> Self {
+    pub fn new(mut forbidden: Vec<String>) -> Self {
+        // The instruction file is runner configuration. It is never a valid
+        // agent edit target, even when the repo owner forgot to list it.
+        if !forbidden.iter().any(|path| path == "nuwa.repo.json") {
+            forbidden.push("nuwa.repo.json".to_string());
+        }
         Self { forbidden }
     }
 
@@ -177,5 +182,20 @@ mod tests {
     fn read_only_tools_pass_through() {
         assert!(guards().check("read", &json!({"path": "go.sum"})).is_ok());
         assert!(guards().check("grep", &json!({})).is_ok());
+    }
+
+    #[test]
+    fn instruction_file_is_implicitly_forbidden() {
+        for tool in ["edit", "write"] {
+            assert!(
+                guards()
+                    .check(tool, &json!({"path": "nuwa.repo.json"}))
+                    .is_err(),
+                "{tool} must not touch the instruction file"
+            );
+        }
+        assert!(guards()
+            .check("bash", &json!({"command": "printf x > nuwa.repo.json"}))
+            .is_err());
     }
 }

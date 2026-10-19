@@ -1,5 +1,5 @@
 import { Activity, FileQuestion, RefreshCw } from "lucide-react";
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import {
@@ -14,6 +14,7 @@ import {
   TableHead,
   TableHeaderCell,
 } from "../../components/ui";
+import { hasVisibleModal } from "../../lib/modal";
 import { describeError, PanelError } from "../overview/PanelChrome";
 import { IssuePagination } from "../issues/IssuePagination";
 import {
@@ -99,6 +100,42 @@ export function EventsPage() {
   const filters = useMemo(() => parseEventFilters(searchParams), [searchParams]);
   const query = useEventsQuery(filters);
   const auditView = isAuditView(filters);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // docs/09 §12: `/` focuses the page's first filter field, same contract as
+  // the issue list (skipped while a modal or another editable control owns
+  // the keyboard; Escape only blurs).
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const active = document.activeElement;
+      if (event.key === "Escape") {
+        if (active === searchInputRef.current) {
+          event.preventDefault();
+          searchInputRef.current?.blur();
+        }
+        return;
+      }
+      if (event.key !== "/" || event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+      if (hasVisibleModal()) {
+        return;
+      }
+      if (
+        active instanceof HTMLElement &&
+        (active.isContentEditable ||
+          active.tagName === "INPUT" ||
+          active.tagName === "TEXTAREA" ||
+          active.tagName === "SELECT")
+      ) {
+        return;
+      }
+      event.preventDefault();
+      searchInputRef.current?.focus();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const applyFilters = useCallback(
     (patch: Partial<EventFilterState>) => {
@@ -139,7 +176,11 @@ export function EventsPage() {
         </p>
       </header>
 
-      <EventFilters filters={filters} onChange={applyFilters} />
+      <EventFilters
+        filters={filters}
+        onChange={applyFilters}
+        searchInputRef={searchInputRef}
+      />
 
       {query.isError && data ? (
         <div className="flex flex-wrap items-start justify-between gap-2 rounded-card border border-warning/40 bg-warning/10 px-4 py-2 text-body-sm text-text">

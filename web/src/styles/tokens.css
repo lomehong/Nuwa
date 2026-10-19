@@ -87,6 +87,10 @@
   --radius-modal: 12px;
   --container-page: 1440px;
   --shadow-overlay: var(--overlay-shadow);
+
+  /* docs/09 §11.7: the "≥1440" tier is the 2xl breakpoint, so the documented
+     four-tier responsive behaviour matches the utilities actually used. */
+  --breakpoint-2xl: 90rem;
 }
 
 :root,
@@ -96,8 +100,12 @@
   --font-family-sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
     "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB",
     "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  /* CJK fallbacks sit before the generic monospace: JetBrains Mono has no
+     Chinese glyphs, so without them mixed strings (e.g. "45 秒") drift to an
+     arbitrary system mono for the CJK runs (docs/09 §11.3). */
   --font-family-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
-    Consolas, "Liberation Mono", "Courier New", monospace;
+    Consolas, "Liberation Mono", "Courier New", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans SC", monospace;
 
   /* docs/09 §11.1 — dark palette */
   --bg: #0a0d14;
@@ -132,6 +140,7 @@
   --state-merged: #3ddc97;
   --state-rejected: #ff6b6b;
   --state-escalated: #ff8a5c;
+  --state-ignored: #9aa3b5;
 
   --overlay-shadow: 0 24px 64px rgb(0 0 0 / 0.55), 0 4px 16px rgb(0 0 0 / 0.35);
   --motion-fast: 120ms;
@@ -176,7 +185,10 @@
   --state-pr_open: #6d4ad1;
   --state-merged: #0e7a55;
   --state-rejected: #c62828;
-  --state-escalated: #c2410c;
+  /* Red, not orange: escalated must stay distinguishable from the high stone
+     (#a94f00) because attention cards render the two marks side by side. */
+  --state-escalated: #b91c1c;
+  --state-ignored: #5f6c82;
 
   --overlay-shadow: 0 24px 64px rgb(15 23 42 / 0.18), 0 4px 16px rgb(15 23 42 / 0.08);
 }
@@ -276,6 +288,17 @@
     --state-color: var(--state-escalated);
   }
 
+  .state-ignored {
+    --state-color: var(--state-ignored);
+  }
+
+  /* Shape channel for the state badge (docs/09 §11.2 "never colour alone"):
+     the per-state icon inherits the state hue that the dot used to carry. */
+  .state-badge__icon {
+    flex: none;
+    color: var(--state-color);
+  }
+
   .ui-button {
     touch-action: manipulation;
   }
@@ -291,6 +314,13 @@
 
   .nuwa-backdrop {
     animation: nuwa-fade-in var(--motion-fast) var(--motion-ease);
+  }
+
+  /* docs/09 §11.5 — a polled value (turns, tokens, queue depth) flashes once
+     when it changes so "it moved" is visible without a full repaint. Applied
+     by <FlashOnChange>, which re-mounts the span with a bumped key. */
+  .nuwa-flash {
+    animation: nuwa-flash var(--motion-base) var(--motion-ease);
   }
 }
 
@@ -328,10 +358,21 @@
   }
 }
 
+@keyframes nuwa-flash {
+  from {
+    background-color: color-mix(in srgb, var(--warning) 30%, transparent);
+  }
+
+  to {
+    background-color: transparent;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .nuwa-toast,
   .nuwa-dialog,
-  .nuwa-backdrop {
+  .nuwa-backdrop,
+  .nuwa-flash {
     animation: none;
   }
 }

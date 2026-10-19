@@ -33,7 +33,7 @@ pub struct TrendsResponse {
     pub totals: TrendTotals,
 }
 
-#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct TrendTotals {
     pub reports: u64,
     pub new_issues: u64,
@@ -41,7 +41,15 @@ pub struct TrendTotals {
     pub merged: u64,
     pub rejected: u64,
     pub tokens: u64,
+    pub ci_green: u64,
+    pub ci_red: u64,
     pub median_time_to_pr_secs: Option<u64>,
+    /// rejected / (merged + rejected); `None` until there is a terminal PR.
+    pub false_positive_rate: Option<f64>,
+    /// Median pr_opened → merged/rejected event, in whole seconds.
+    pub review_latency_p50_secs: Option<u64>,
+    /// ci_red / (ci_green + ci_red); `None` until CI has a verdict.
+    pub ci_red_rate: Option<f64>,
 }
 
 /// `GET /api/v1/metrics/trends?range=7d|14d|30d|90d&repo=`.
@@ -103,14 +111,24 @@ fn build_trends(
     let window_start = today_start - (i64::from(days) - 1) * DAY_MS;
     let window_end = today_start + DAY_MS;
     let median = median_time_to_pr_secs(store, repo, window_start, window_end)?;
+    let review_latency = review_latency_p50_secs(store, repo, window_start, window_end)?;
+    let false_positive_rate = ratio(totals.rejected, totals.merged + totals.rejected);
+    let ci_red_rate = ratio(totals.ci_red, totals.ci_green + totals.ci_red);
     Ok(TrendsResponse {
         range: range.to_string(),
         buckets,
         totals: TrendTotals {
             median_time_to_pr_secs: median,
+            review_latency_p50_secs: review_latency,
+            false_positive_rate,
+            ci_red_rate,
             ..totals
         },
     })
+}
+
+fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
+    (denominator > 0).then(|| numerator as f64 / denominator as f64)
 }
 
 fn total_buckets(buckets: &[TrendBucket]) -> TrendTotals {
@@ -122,6 +140,8 @@ fn total_buckets(buckets: &[TrendBucket]) -> TrendTotals {
         totals.merged = totals.merged.saturating_add(bucket.merged);
         totals.rejected = totals.rejected.saturating_add(bucket.rejected);
         totals.tokens = totals.tokens.saturating_add(bucket.tokens);
+        totals.ci_green = totals.ci_green.saturating_add(bucket.ci_green);
+        totals.ci_red = totals.ci_red.saturating_add(bucket.ci_red);
     }
     totals
 }
@@ -153,6 +173,54 @@ fn median_time_to_pr_secs(
             }
             durations.push(pr_opened_at.saturating_sub(run.started_at).max(0) / 1_000);
         }
+    }
+    if durations.is_empty() {
+        return Ok(None);
+    }
+    durations.sort_unstable();
+    let mid = durations.len() / 2;
+    let median = if durations.len() % 2 == 1 {
+        durations[mid]
+    } else {
+        (durations[mid - 1] + durations[mid]) / 2
+    };
+    Ok(Some(u64::try_from(median).unwrap_or(0)))
+}
+
+/// Median time from PR opening to the terminal merge/reject event. Only
+/// issues whose terminal event falls inside the window are included.
+fn review_latency_p50_secs(
+    store: &Store,
+    repo: Option<&str>,
+    window_start: i64,
+    window_end: i64,
+) -> ShanResult<Option<u64>> {
+    let mut durations: Vec<i64> = Vec::new();
+    for issue in store.list_issues()? {
+        if repo.is_some_and(|repo| issue.repo != repo) {
+            continue;
+        }
+        if issue.state != "merged" && issue.state != "rejected" {
+            continue;
+        }
+        let Some(run) = store.latest_run(&issue.fingerprint)? else {
+            continue;
+        };
+        let Some(opened_at) = run.pr_opened_at else {
+            continue;
+        };
+        let terminal_at = store
+            .events_for(&issue.fingerprint, 200)?
+            .into_iter()
+            .find(|event| event.kind == "merged" || event.kind == "rejected")
+            .map(|event| event.ts);
+        let Some(terminal_at) = terminal_at else {
+            continue;
+        };
+        if terminal_at < window_start || terminal_at >= window_end {
+            continue;
+        }
+        durations.push(terminal_at.saturating_sub(opened_at).max(0) / 1_000);
     }
     if durations.is_empty() {
         return Ok(None);

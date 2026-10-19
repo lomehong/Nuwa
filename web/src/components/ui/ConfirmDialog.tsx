@@ -1,6 +1,6 @@
 import { clsx } from "clsx";
 import { X } from "lucide-react";
-import { useId, useRef } from "react";
+import { useEffect, useId, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
 import { useModalBehavior } from "../../lib/modal";
@@ -16,6 +16,8 @@ export interface ConfirmDialogProps {
   pending?: boolean;
   /** Locks the cancel button while the confirm action is in flight. */
   cancelDisabled?: boolean;
+  /** Optional form controls rendered between the description and buttons. */
+  children?: ReactNode;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -35,6 +37,7 @@ export function ConfirmDialog({
   danger = false,
   pending = false,
   cancelDisabled = false,
+  children,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -48,6 +51,16 @@ export function ConfirmDialog({
     initialFocusRef: cancelRef,
     onEscape: onCancel,
   });
+
+  // While the confirm action is in flight the confirm Button is disabled,
+  // which makes the browser drop focus to <body>: Esc stops working and the
+  // keyboard user is stranded outside the dialog. Park focus on the dialog
+  // itself and announce the wait instead (same pattern as RestartDialog).
+  useEffect(() => {
+    if (pending) {
+      dialogRef.current?.focus();
+    }
+  }, [pending]);
 
   if (!open) {
     return null;
@@ -91,6 +104,10 @@ export function ConfirmDialog({
             {description}
           </p>
         ) : null}
+        {children ? <div className="mt-4">{children}</div> : null}
+        <p role="status" className="sr-only">
+          {pending ? "正在处理，请稍候…" : ""}
+        </p>
         <div className="mt-5 flex flex-wrap justify-end gap-2">
           <Button ref={cancelRef} variant="secondary" disabled={cancelDisabled} onClick={onCancel}>
             {cancelLabel}

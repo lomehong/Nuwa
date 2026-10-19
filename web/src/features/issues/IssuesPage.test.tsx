@@ -123,7 +123,7 @@ describe("IssuesPage", () => {
     ).toBeInTheDocument();
     expect(within(table).getByText("严重")).toBeInTheDocument();
     expect(within(table).getByText("已升级")).toBeInTheDocument();
-    expect(within(table).getByText("卡单")).toBeInTheDocument();
+    expect(within(table).getByText("疑似卡单")).toBeInTheDocument();
     expect(within(table).getByText("example.com/app")).toBeInTheDocument();
     expect(within(table).getByText("17")).toBeInTheDocument();
     expect(within(table).getByText(/分钟前/)).toBeInTheDocument();

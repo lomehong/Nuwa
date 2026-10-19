@@ -67,9 +67,9 @@ function isInside(event: FocusEvent<HTMLElement>): boolean {
 }
 
 /**
- * Toast provider. The live region is mounted up front (empty) so assistive
- * technology reliably announces additions; announcements are polite because
- * toasts are informational, not a replacement for inline errors.
+ * Toast provider. Both live regions mount up front (empty) so assistive
+ * technology reliably announces additions: informational toasts are polite,
+ * danger toasts (failed writes) announce assertively.
  *
  * Auto-dismiss (WCAG 2.2.1) stops while the pointer is over the toast, while
  * focus is inside it, and while the tab is hidden, then resumes with the
@@ -182,59 +182,78 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo(() => ({ toast, dismiss }), [toast, dismiss]);
 
+  // Danger toasts (failed writes) announce assertively; informational ones
+  // stay polite. Both regions mount up front (empty) so assistive technology
+  // reliably announces additions; `display: contents` keeps one visual column.
+  const urgent = toasts.filter((item) => item.variant === "danger");
+  const calm = toasts.filter((item) => item.variant !== "danger");
+
+  const renderToast = (item: ToastRecord) => {
+    const Icon = VARIANT_ICONS[item.variant];
+    return (
+      <div
+        key={item.id}
+        data-toast={item.id}
+        onPointerEnter={() => pause(item.id, "pointer")}
+        onPointerLeave={() => resume(item.id, "pointer")}
+        onFocus={(event) => {
+          if (!isInside(event)) {
+            pause(item.id, "focus");
+          }
+        }}
+        onBlur={(event) => {
+          if (!isInside(event)) {
+            resume(item.id, "focus");
+          }
+        }}
+        className="nuwa-toast pointer-events-auto flex w-full max-w-sm items-start gap-3 rounded-modal border border-border-strong bg-raised p-3 text-text shadow-overlay"
+      >
+        <Icon
+          aria-hidden="true"
+          className={clsx("mt-0.5 size-4 shrink-0", VARIANT_ICON_CLASSES[item.variant])}
+        />
+        <div className="min-w-0 flex-1">
+          <p className="text-body-sm font-medium">{item.title}</p>
+          {item.description ? (
+            <p className="mt-0.5 break-words text-caption text-text-secondary">
+              {item.description}
+            </p>
+          ) : null}
+        </div>
+        <button
+          type="button"
+          aria-label={`关闭通知：${item.title}`}
+          onClick={() => dismiss(item.id)}
+          className="-mr-1 -mt-1 flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-surface hover:text-text"
+        >
+          <X aria-hidden="true" className="size-4" />
+        </button>
+      </div>
+    );
+  };
+
   return (
     <ToastContext.Provider value={value}>
       {children}
       <div
-        role="status"
-        aria-live="polite"
-        aria-atomic="false"
-        aria-label="通知"
+        role="presentation"
         className="pointer-events-none fixed inset-x-0 bottom-0 z-50 flex flex-col items-center gap-2 p-4 sm:items-end sm:p-6"
       >
-        {toasts.map((item) => {
-          const Icon = VARIANT_ICONS[item.variant];
-          return (
-            <div
-              key={item.id}
-              data-toast={item.id}
-              onPointerEnter={() => pause(item.id, "pointer")}
-              onPointerLeave={() => resume(item.id, "pointer")}
-              onFocus={(event) => {
-                if (!isInside(event)) {
-                  pause(item.id, "focus");
-                }
-              }}
-              onBlur={(event) => {
-                if (!isInside(event)) {
-                  resume(item.id, "focus");
-                }
-              }}
-              className="nuwa-toast pointer-events-auto flex w-full max-w-sm items-start gap-3 rounded-modal border border-border-strong bg-raised p-3 text-text shadow-overlay"
-            >
-              <Icon
-                aria-hidden="true"
-                className={clsx("mt-0.5 size-4 shrink-0", VARIANT_ICON_CLASSES[item.variant])}
-              />
-              <div className="min-w-0 flex-1">
-                <p className="text-body-sm font-medium">{item.title}</p>
-                {item.description ? (
-                  <p className="mt-0.5 break-words text-caption text-text-secondary">
-                    {item.description}
-                  </p>
-                ) : null}
-              </div>
-              <button
-                type="button"
-                aria-label={`关闭通知：${item.title}`}
-                onClick={() => dismiss(item.id)}
-                className="-mr-1 -mt-1 flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-surface hover:text-text"
-              >
-                <X aria-hidden="true" className="size-4" />
-              </button>
-            </div>
-          );
-        })}
+        {/* No `role="alert"` here: a persistent alert region would collide with
+            every page's own findByRole("alert") error panels. Explicit
+            aria-live carries the assertive announcement on its own. */}
+        <div className="contents" aria-live="assertive" aria-atomic="false">
+          {urgent.map(renderToast)}
+        </div>
+        <div
+          className="contents"
+          role="status"
+          aria-live="polite"
+          aria-atomic="false"
+          aria-label="通知"
+        >
+          {calm.map(renderToast)}
+        </div>
       </div>
     </ToastContext.Provider>
   );

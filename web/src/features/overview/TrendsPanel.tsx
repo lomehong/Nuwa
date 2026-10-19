@@ -3,7 +3,13 @@ import { ChartColumn } from "lucide-react";
 
 import { Card, CardContent, EmptyState, Skeleton } from "../../components/ui";
 import { Sparkline, type SparklineDatum } from "../../components/charts/Sparkline";
-import { formatDayShort, formatNumber, formatTokens } from "./format";
+import {
+  formatDayShort,
+  formatNumber,
+  formatPercent,
+  formatSeconds,
+  formatTokens,
+} from "./format";
 import { OverviewSection, PanelError } from "./PanelChrome";
 import type { TrendBucket, TrendTotals, TrendsRange, TrendsResponse } from "./types";
 
@@ -50,8 +56,53 @@ const TREND_RANGES: readonly { value: TrendsRange; label: string; days: number }
   { value: "90d", label: "90 天", days: 90 },
 ];
 
+/** URL guard for the `?range=` param (docs/09 §10.3.4, range is linkable). */
+export function isTrendsRange(value: string | null): value is TrendsRange {
+  return TREND_RANGES.some((entry) => entry.value === value);
+}
+
 function trendRangeDays(range: TrendsRange): number {
   return TREND_RANGES.find((entry) => entry.value === range)?.days ?? 14;
+}
+
+/**
+ * Direction read: the later half of the window vs the earlier half. The API
+ * exposes no offset query, and this stays within already-fetched buckets —
+ * it answers "变好还是变坏" without a second request.
+ */
+function halfSplit(
+  buckets: TrendBucket[],
+  key: TrendMetric["key"],
+): { earlier: number; later: number } | null {
+  const n = buckets.length;
+  if (n < 4) {
+    return null;
+  }
+  const half = Math.floor(n / 2);
+  const sum = (rows: TrendBucket[]) =>
+    rows.reduce((acc, bucket) => acc + (bucket[key] ?? 0), 0);
+  return { earlier: sum(buckets.slice(0, half)), later: sum(buckets.slice(n - half)) };
+}
+
+function HalfDelta({ earlier, later }: { earlier: number; later: number }) {
+  if (earlier === 0 && later === 0) {
+    return null;
+  }
+  let text: string;
+  if (earlier === 0) {
+    text = "后半程新增";
+  } else {
+    const pct = Math.round(((later - earlier) / earlier) * 100);
+    text = pct === 0 ? "持平" : `${pct > 0 ? "▲" : "▼"} ${Math.abs(pct)}%`;
+  }
+  return (
+    <span
+      className="text-caption font-normal tabular-nums text-text-muted"
+      title={`后半程合计 ${later}，前半程合计 ${earlier}`}
+    >
+      {text}
+    </span>
+  );
 }
 
 interface TrendsPanelProps {
@@ -138,6 +189,7 @@ export function TrendsPanel({
                     label: formatDayShort(bucket.day),
                     value: bucket[metric.key],
                   }));
+                  const split = halfSplit(trends.buckets, metric.key);
                   return (
                     <li
                       key={metric.key}
@@ -145,8 +197,11 @@ export function TrendsPanel({
                     >
                       <div className="min-w-0">
                         <p className="truncate text-body-sm text-text-secondary">{metric.label}</p>
-                        <p className="font-mono text-body font-semibold tabular-nums text-text">
+                        <p className="flex flex-wrap items-baseline gap-x-1.5 font-mono text-body font-semibold tabular-nums text-text">
                           {metric.format(totalsFor(trends.totals, metric.key))}
+                          {split ? (
+                            <HalfDelta earlier={split.earlier} later={split.later} />
+                          ) : null}
                         </p>
                       </div>
                       <Sparkline
@@ -159,6 +214,29 @@ export function TrendsPanel({
                   );
                 })}
               </ul>
+              <dl className="mt-4 grid grid-cols-1 gap-3 border-t border-border pt-3 text-caption sm:grid-cols-3">
+                <div>
+                  <dt className="text-text-muted">误报 PR 率</dt>
+                  <dd className="mt-0.5 font-mono text-body text-text">
+                    {formatPercent(trends.totals.false_positive_rate)}
+                  </dd>
+                  <p className="text-caption text-text-muted">拒绝 /（合并 + 拒绝）</p>
+                </div>
+                <div>
+                  <dt className="text-text-muted">Review 延迟中位数</dt>
+                  <dd className="mt-0.5 font-mono text-body text-text">
+                    {formatSeconds(trends.totals.review_latency_p50_secs)}
+                  </dd>
+                  <p className="text-caption text-text-muted">PR 打开 → 合并/拒绝</p>
+                </div>
+                <div>
+                  <dt className="text-text-muted">CI 红率</dt>
+                  <dd className="mt-0.5 font-mono text-body text-text">
+                    {formatPercent(trends.totals.ci_red_rate)}
+                  </dd>
+                  <p className="text-caption text-text-muted">红 /（绿 + 红）</p>
+                </div>
+              </dl>
             </>
           )}
         </CardContent>

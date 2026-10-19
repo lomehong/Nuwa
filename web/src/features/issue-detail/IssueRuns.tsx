@@ -1,4 +1,4 @@
-import { Badge, Button, Card, CardContent } from "../../components/ui";
+import { Badge, Button, Card, CardContent, FlashOnChange } from "../../components/ui";
 import type { BadgeVariant } from "../../components/ui";
 import { PrLink } from "../issues/IssueBadges";
 import { CopyButton } from "./CopyButton";
@@ -35,7 +35,12 @@ function RunRow({
   selected: boolean;
   onSelect: () => void;
 }) {
-  const duration = run.finished_at_ms === null ? "进行中" : formatDuration(runDurationMs(run));
+  // In-progress runs show live elapsed time; the 15s detail poll re-renders
+  // the row, which is the same cadence the data itself updates at.
+  const duration =
+    run.finished_at_ms === null
+      ? formatDuration(Date.now() - run.started_at_ms)
+      : formatDuration(runDurationMs(run));
   const outcomeVariant: BadgeVariant = runOutcomeVariant(run.outcome);
   const provider = [run.provider, run.model].filter(Boolean).join(" / ") || "—";
 
@@ -85,7 +90,9 @@ function RunRow({
         </div>
         <div className="min-w-0">
           <dt className="text-text-muted">Turns</dt>
-          <dd className="mt-0.5 font-mono tabular-nums text-text-secondary">{run.turns}</dd>
+          <dd className="mt-0.5 font-mono tabular-nums text-text-secondary">
+            <FlashOnChange value={run.turns} />
+          </dd>
         </div>
         <div className="min-w-0">
           <dt className="text-text-muted">Tokens</dt>
@@ -93,7 +100,7 @@ function RunRow({
             className="mt-0.5 font-mono tabular-nums text-text-secondary"
             title={`未缓存 ${run.tokens_uncached} · 缓存 ${run.tokens_cached}`}
           >
-            {formatTokens(runTokenTotal(run))}
+            <FlashOnChange value={formatTokens(runTokenTotal(run))} />
           </dd>
         </div>
         <div className="min-w-0">

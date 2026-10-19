@@ -10,9 +10,10 @@ const CI_VERDICTS: Record<string, { label: string; variant: BadgeVariant }> = {
   pending: { label: "CI 待定", variant: "info" },
 };
 
-/** Server-side stuck flag; text + icon-tinted badge, never colour alone. */
+/** Server-side stuck flag; text + icon-tinted badge, never colour alone.
+ * "疑似" is the operative word — the flag is a heuristic (docs/09 §8.4). */
 export function StuckBadge() {
-  return <Badge variant="warning">卡单</Badge>;
+  return <Badge variant="warning">疑似卡单</Badge>;
 }
 
 interface PrLinkProps {

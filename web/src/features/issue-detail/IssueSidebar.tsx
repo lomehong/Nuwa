@@ -89,14 +89,45 @@ interface IssueSidebarProps {
   similarItems: SimilarItem[];
 }
 
+/** In-page anchors for the long detail main column (docs/09 §10.5). */
+const SECTION_ANCHORS: readonly { id: string; label: string }[] = [
+  { id: "issue-timeline", label: "时间线" },
+  { id: "issue-evidence", label: "证据" },
+  { id: "issue-stack", label: "堆栈样本" },
+  { id: "issue-runs", label: "运行记录" },
+  { id: "issue-transcript", label: "会话转录" },
+];
+
 /**
- * Detail sidebar (docs/09 §10.5): raw identity/ownership metadata, the latest
- * run summary and same-title neighbours. Under 1024px this column stacks under
- * the main timeline/evidence column.
+ * Detail sidebar (docs/09 §10.5): in-page navigation for the long audit
+ * column, raw identity/ownership metadata, the latest run summary and
+ * same-title neighbours. Under 1024px this column stacks under the main
+ * timeline/evidence column.
  */
 export function IssueSidebar({ issue, latestRun, similarCount, similarItems }: IssueSidebarProps) {
   return (
     <div className="space-y-6">
+      <IssueSection id="issue-contents" title="本页内容">
+        <Card>
+          <CardContent className="p-2">
+            <nav aria-label="详情页内容导航">
+              <ul className="space-y-0.5">
+                {SECTION_ANCHORS.map((anchor) => (
+                  <li key={anchor.id}>
+                    <a
+                      href={`#${anchor.id}`}
+                      className="flex min-h-9 items-center rounded-card px-3 text-body-sm text-text-secondary transition-colors hover:bg-raised hover:text-text pointer-fine:min-h-7"
+                    >
+                      {anchor.label}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </nav>
+          </CardContent>
+        </Card>
+      </IssueSection>
+
       <IssueSection id="issue-meta" title="元数据">
         <Card>
           <CardContent className="space-y-3 p-4">

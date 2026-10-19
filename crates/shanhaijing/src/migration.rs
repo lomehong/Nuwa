@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::ShanResult;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub fn apply(conn: &mut Connection) -> ShanResult<()> {
     conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
@@ -22,9 +22,16 @@ pub fn apply(conn: &mut Connection) -> ShanResult<()> {
         tx.commit()?;
         version = 1;
     }
-    if version < SCHEMA_VERSION {
+    if version < 2 {
         let tx = conn.transaction()?;
         migrate_v2(&tx)?;
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+        version = 2;
+    }
+    if version < SCHEMA_VERSION {
+        let tx = conn.transaction()?;
+        migrate_v3(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
     }
@@ -130,6 +137,17 @@ fn migrate_v2(conn: &Connection) -> ShanResult<()> {
     Ok(())
 }
 
+/// v3: owner mute (`ignored`), issue-level attempt counting, and the runner's
+/// last real progress timestamp (heartbeat liveness is separate).
+fn migrate_v3(conn: &Connection) -> ShanResult<()> {
+    add_column_if_missing(conn, "issues", "attempts", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "runners", "progress_at", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_issues_state_attempts ON issues(state, attempts);",
+    )?;
+    Ok(())
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -206,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_is_v2() {
+    fn fresh_database_is_v3() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fresh.db");
         let _store = Store::open(&path).expect("open");
@@ -214,13 +232,15 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         for table in ["issues", "events", "runners", "runs", "signal_daily", "repos"] {
             assert!(table_exists(&conn, table), "missing {table}");
         }
         for (table, column) in [
             ("issues", "state_changed_at"),
             ("issues", "owner_runner_id"),
+            ("issues", "attempts"),
+            ("runners", "progress_at"),
             ("events", "repo"),
             ("events", "actor"),
             ("repos", "created_at"),
@@ -243,7 +263,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 2, "v0 must run v1 and v2");
+        assert_eq!(version, 3, "v0 must run v1, v2 and v3");
         assert!(table_exists(&conn, "repos"));
         let (state_changed_at, owner): (i64, Option<String>) = conn
             .query_row(
@@ -263,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_database_to_v2() {
+    fn migrates_v1_database_to_current() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v1.db");
         {
@@ -272,14 +292,42 @@ mod tests {
             migrate_v1(&conn).expect("v1 migration");
             conn.pragma_update(None, "user_version", 1).expect("version");
         }
-        let _store = Store::open(&path).expect("migrate v2");
+        let _store = Store::open(&path).expect("migrate v2/v3");
         let conn = Connection::open(&path).expect("reopen");
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert!(table_exists(&conn, "repos"));
+        assert!(column_exists(&conn, "issues", "attempts"));
         // v1 data survives the upgrade.
+        let title: String = conn
+            .query_row("SELECT title FROM issues WHERE fingerprint='fp1'", [], |row| {
+                row.get(0)
+            })
+            .expect("issue title");
+        assert_eq!(title, "t");
+    }
+
+    #[test]
+    fn migrates_v2_database_to_v3() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v2.db");
+        {
+            let conn = Connection::open(&path).expect("open");
+            v0_schema(&conn);
+            migrate_v1(&conn).expect("v1");
+            migrate_v2(&conn).expect("v2");
+            conn.pragma_update(None, "user_version", 2).expect("version");
+        }
+        let _store = Store::open(&path).expect("migrate v3");
+        let conn = Connection::open(&path).expect("reopen");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 3);
+        assert!(column_exists(&conn, "issues", "attempts"));
+        assert!(column_exists(&conn, "runners", "progress_at"));
         let title: String = conn
             .query_row("SELECT title FROM issues WHERE fingerprint='fp1'", [], |row| {
                 row.get(0)
@@ -298,7 +346,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]

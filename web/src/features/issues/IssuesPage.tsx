@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { useToast } from "../../components/ui";
+import { hasVisibleModal } from "../../lib/modal";
 import { SyncButton } from "../actions/SyncButton";
 import { buildIssueSearchParams, hasActiveFilters, parseIssueFilters } from "./filters";
 import { shortFingerprint } from "./format";
@@ -17,29 +18,6 @@ import { IssuePagination } from "./IssuePagination";
 import { IssueTable } from "./IssueTable";
 import { useIssuesQuery } from "./queries";
 import type { IssueListItem, IssueListFilters, IssueSort } from "./types";
-
-/**
- * True when a rendered modal dialog covers the page (the drawer, the command
- * palette, a confirmation). Dialogs that are explicitly not displayed do not
- * count. Page shortcuts must stand down: focusing an input behind a trap, or
- * swallowing the key, would strand the user inside the dialog.
- */
-function hasVisibleModal(): boolean {
-  const dialogs = document.querySelectorAll<HTMLElement>(
-    '[role="dialog"][aria-modal="true"]',
-  );
-  for (const dialog of dialogs) {
-    if (!dialog.isConnected) {
-      continue;
-    }
-    const style = window.getComputedStyle(dialog);
-    if (style.display === "none" || style.visibility === "hidden") {
-      continue;
-    }
-    return true;
-  }
-  return false;
-}
 
 /**
  * Issue list (docs/09 §10.4).

@@ -20,12 +20,16 @@ use crate::ci;
 use crate::serve::AppState;
 use shanhaijing::{IssueRow, ShanError, Store};
 
-/// The console's optional operator note. The Store methods journal the action
-/// with a fixed detail (`reopened by owner` / `stuck requeued by owner`), so
-/// persisting the reason separately would duplicate that audit row: the field
-/// is accepted and validated as part of the body contract but not stored.
+/// The console's optional operator note. The reason is persisted in the
+/// action's audit event and fed back into the next repair prompt.
 #[derive(Debug, Default, Deserialize)]
 pub struct ReopenRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct IgnoreRequest {
     #[serde(default)]
     reason: Option<String>,
 }
@@ -48,14 +52,13 @@ pub async fn reopen(
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
-    // Accepted for the documented body, intentionally not persisted.
-    let _reason = request.reason;
+    let reason = request.reason;
     let now = crate::now_ms();
     let store = Arc::clone(&state.store);
     match tokio::task::spawn_blocking(move || {
         store
-            .reopen_issue(&fingerprint, now)
-            .map_err(|error| store_error("escalated/rejected", error))
+            .reopen_issue(&fingerprint, now, reason.as_deref())
+            .map_err(|error| store_error("escalated/rejected/ignored", error))
     })
     .await
     {
@@ -63,6 +66,45 @@ pub async fn reopen(
         Ok(Err(error)) => error.into_response(),
         Err(error) => {
             eprintln!("reopen: blocking task failed: {error}");
+            internal_error().into_response()
+        }
+    }
+}
+
+/// `POST /api/v1/issues/{fp}/ignore` — owner mute; new/escalated/rejected →
+/// ignored. Reports are counted but never auto-reopen the issue.
+pub async fn ignore(
+    State(state): State<AppState>,
+    Path(fingerprint): Path<String>,
+    payload: Result<Json<IgnoreRequest>, JsonRejection>,
+) -> Response {
+    let request = match parse_json_body(payload) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let reason = request.reason.unwrap_or_default();
+    let now = crate::now_ms();
+    let event_fingerprint = fingerprint.clone();
+    let store = Arc::clone(&state.store);
+    match tokio::task::spawn_blocking(move || {
+        store
+            .ignore_issue(&fingerprint, &reason, "owner", now)
+            .map_err(|error| store_error("new/escalated/rejected", error))
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            crate::webhook::emit(crate::webhook::WebhookEvent::new(
+                "ignored",
+                Some(event_fingerprint),
+                None,
+                "ignored by owner",
+            ));
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Err(error)) => error.into_response(),
+        Err(error) => {
+            eprintln!("ignore: blocking task failed: {error}");
             internal_error().into_response()
         }
     }
@@ -99,7 +141,7 @@ const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Process-wide guard: one GitHub reconcile at a time. `try_lock` turns a
 /// concurrent POST into a 409 instead of queuing expensive GitHub calls.
-fn sync_lock() -> &'static tokio::sync::Mutex<()> {
+pub(crate) fn sync_lock() -> &'static tokio::sync::Mutex<()> {
     static SYNC_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     SYNC_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -745,7 +787,7 @@ mod tests {
             .expect("latest event")
             .expect("event");
         assert_eq!(event.kind, "state_changed");
-        assert_eq!(event.detail, "reopened by owner");
+        assert_eq!(event.detail, "reopened by owner: reviewed by owner");
         assert_eq!(event.actor.as_deref(), Some("owner"));
 
         let response = post_json(
@@ -779,6 +821,44 @@ mod tests {
             message.contains("escalated/rejected"),
             "message must name the allowed states: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn ignore_mutes_and_reopen_restores() {
+        let (_dir, app, store, seed) = seeded_app();
+        let csrf = csrf_token(&app).await;
+
+        let response = post_json(
+            &app,
+            &format!("/api/v1/issues/{}/ignore", seed.rejected),
+            Some(&csrf),
+            r#"{"reason":"known upstream noise"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let row = issue_row(&store, &seed.rejected);
+        assert_eq!(row.state, "ignored");
+        assert_eq!(row.attempts, 0);
+        let event = store
+            .latest_event(&seed.rejected)
+            .expect("event")
+            .expect("event");
+        assert!(
+            event.detail.contains("known upstream noise"),
+            "{:?}",
+            event.detail
+        );
+
+        // Ignored reports are muted, but the owner can reopen explicitly.
+        let response = post_json(
+            &app,
+            &format!("/api/v1/issues/{}/reopen", seed.rejected),
+            Some(&csrf),
+            r#"{"reason":"deploy fixed the root cause"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(issue_row(&store, &seed.rejected).state, "new");
     }
 
     // ---- requeue -----------------------------------------------------------
@@ -1195,7 +1275,7 @@ mod tests {
             .expect("event query")
             .expect("event");
         assert_eq!(event.kind, "state_changed");
-        assert_eq!(event.detail, "reopened by owner");
+        assert_eq!(event.detail, "reopened by owner: combined reopen");
         assert_eq!(event.actor.as_deref(), Some("owner"));
 
         // Escalated issues reopen too, and the owner is cleared.

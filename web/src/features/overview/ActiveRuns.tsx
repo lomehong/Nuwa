@@ -1,3 +1,4 @@
+import { clsx } from "clsx";
 import {
   ArrowRight,
   Circle,
@@ -13,6 +14,7 @@ import {
   Badge,
   Card,
   CardContent,
+  FlashOnChange,
   SeverityStone,
 } from "../../components/ui";
 import { issueDetailPath } from "./AttentionQueue";
@@ -34,8 +36,8 @@ export function runPhaseIndex(phase: string): number {
   return RUN_PHASES.findIndex((step) => step.id === phase);
 }
 
-/** Re-render elapsed times without waiting for the next 10s overview poll. */
-function useNow(intervalMs = 30_000): number {
+/** Re-render elapsed times at the same cadence as the 10s overview poll. */
+function useNow(intervalMs = 10_000): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), intervalMs);
@@ -74,15 +76,17 @@ function PhaseStepper({ phase }: { phase: string }) {
               {index > 0 ? (
                 <span
                   aria-hidden="true"
-                  className={state === "pending" ? "h-px w-2 bg-border" : "h-px w-2 bg-success/60"}
+                  className={clsx(
+                    "h-px w-4 transition-colors duration-300",
+                    state === "pending" ? "bg-border" : "bg-success/60",
+                  )}
                 />
               ) : null}
               <span
-                className={
-                  state === "current"
-                    ? "inline-flex items-center gap-1 text-caption font-medium text-text"
-                    : "inline-flex items-center gap-1 text-caption text-text-muted"
-                }
+                className={clsx(
+                  "inline-flex items-center gap-1 text-caption transition-colors duration-300",
+                  state === "current" ? "font-medium text-text" : "text-text-muted",
+                )}
               >
                 {state === "done" ? (
                   <CircleCheck aria-hidden="true" className="size-3.5 text-success" />
@@ -213,12 +217,14 @@ export function ActiveRuns({ runs, queue }: ActiveRunsProps) {
                     </div>
                     <div>
                       <dt className="text-text-muted">turns</dt>
-                      <dd className="font-mono tabular-nums text-text-secondary">{run.turns}</dd>
+                      <dd className="font-mono tabular-nums text-text-secondary">
+                        <FlashOnChange value={run.turns} />
+                      </dd>
                     </div>
                     <div>
                       <dt className="text-text-muted">tokens</dt>
                       <dd className="font-mono tabular-nums text-text-secondary">
-                        {formatTokens(run.tokens)}
+                        <FlashOnChange value={formatTokens(run.tokens)} />
                       </dd>
                     </div>
                     <div className="min-w-0">

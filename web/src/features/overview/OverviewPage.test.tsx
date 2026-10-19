@@ -25,6 +25,7 @@ function richOverview(): OverviewResponse {
       merged: 4,
       rejected: 1,
       escalated: 2,
+      ignored: 0,
     },
     attention: [
       {

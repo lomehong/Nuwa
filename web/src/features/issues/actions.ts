@@ -13,29 +13,44 @@ import type { IssueState } from "../../components/ui";
 import { apiFetch } from "../../lib/api";
 import { invalidateIssueViews } from "../../lib/queryInvalidation";
 
-export type IssueAction = "reopen" | "requeue";
+export type IssueAction = "reopen" | "requeue" | "ignore";
 
 /**
- * The state machine decides which owner action is legal; the UI never offers
- * an action the server would reject.
+ * The state machine decides which owner actions are legal; the UI never offers
+ * an action the server would reject. `ignored` can only be reopened; `new`
+ * can only be muted; escalated/rejected offer both.
  */
-export function issueActionFor(issue: { state: IssueState; stuck: boolean }): IssueAction | null {
-  if (issue.state === "escalated" || issue.state === "rejected") {
-    return "reopen";
-  }
-  if ((issue.state === "triggered" || issue.state === "fixing") && issue.stuck) {
-    return "requeue";
-  }
-  return null;
+export function canReopen(state: IssueState): boolean {
+  return state === "escalated" || state === "rejected" || state === "ignored";
+}
+
+export function canIgnore(state: IssueState): boolean {
+  return state === "new" || state === "escalated" || state === "rejected";
+}
+
+export function canRequeue(state: IssueState, stuck: boolean): boolean {
+  return (state === "triggered" || state === "fixing") && stuck;
 }
 
 export function useReopenIssue(fingerprint: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: () =>
+    mutationFn: (reason?: string) =>
       apiFetch<void>(`/issues/${encodeURIComponent(fingerprint)}/reopen`, {
         method: "POST",
-        body: JSON.stringify({}),
+        body: JSON.stringify(reason?.trim() ? { reason: reason.trim() } : {}),
+      }),
+    onSuccess: () => invalidateIssueViews(queryClient, fingerprint),
+  });
+}
+
+export function useIgnoreIssue(fingerprint: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (reason: string) =>
+      apiFetch<void>(`/issues/${encodeURIComponent(fingerprint)}/ignore`, {
+        method: "POST",
+        body: JSON.stringify(reason.trim() ? { reason: reason.trim() } : {}),
       }),
     onSuccess: () => invalidateIssueViews(queryClient, fingerprint),
   });

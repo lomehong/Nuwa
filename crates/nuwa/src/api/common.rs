@@ -112,7 +112,7 @@ pub(crate) fn parse_ms(
 }
 
 /// Funnel keys; every key is present even when its count is zero.
-pub(crate) const STATES: [&str; 7] = [
+pub(crate) const STATES: [&str; 8] = [
     "new",
     "triggered",
     "fixing",
@@ -120,6 +120,7 @@ pub(crate) const STATES: [&str; 7] = [
     "merged",
     "rejected",
     "escalated",
+    "ignored",
 ];
 
 const REASON_REPAIR_FAILED: (&str, &str) = ("repair_failed", "修复 runner 失败，需要复核");

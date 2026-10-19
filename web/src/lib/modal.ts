@@ -184,3 +184,26 @@ export function useModalBehavior({
     [containerRef, onEscape],
   );
 }
+
+/**
+ * True when a rendered modal dialog covers the page (the drawer, the command
+ * palette, a confirmation). Dialogs that are explicitly not displayed do not
+ * count. Page shortcuts must stand down: focusing an input behind a trap, or
+ * swallowing the key, would strand the user inside the dialog.
+ */
+export function hasVisibleModal(): boolean {
+  const dialogs = document.querySelectorAll<HTMLElement>(
+    '[role="dialog"][aria-modal="true"]',
+  );
+  for (const dialog of dialogs) {
+    if (!dialog.isConnected) {
+      continue;
+    }
+    const style = window.getComputedStyle(dialog);
+    if (style.display === "none" || style.visibility === "hidden") {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}

@@ -25,6 +25,7 @@
 - 状态：已接受
 - 决策：验证通过后直接开 PR，CI 与所有者人工合并为闸门。
 - 伴随义务（不可选）：分支命名空间隔离、频控/预算上限、禁改路径清单、复现验证证据五件套护栏。
+- **补充（2026-10-20）**：默认仍为非 draft；新增每仓 `draft_first_n`（前 N 个 PR 可 draft）与 PR 风险画像，并记录误报 PR 率/review 延迟/CI 红率。未改为自动渐进放权——当前历史数据不足以支撑信任状态机。
 
 ## ADR-004 · 目标仓库全部为所有者私有仓库，源码可达
 
@@ -93,3 +94,42 @@
 - **版本 0.2.0**：`crates/nuwa` 与 `Cargo.lock` 已更新；未打 tag、未 push、未部署。
 - **验证已完成（2026-10-18）**：axe WCAG 2.0/2.1 A+AA 26 个组合 0 violation；5k issues / 17k events 性能基准达标；回滚演练通过。生产库副本未提供，按计划以 5k 种子库替代（schema v1 兼容）。
 - **发布门（仅待所有者授权）**：tag `v0.2.0`、push 与部署须由所有者明确批准后执行。
+
+---
+
+## ADR-010 · 交付验证：base 红 / 分支绿
+
+- 状态：已接受（2026-10-20）
+- 背景：v0 验证门只在 agent 改过的同一棵树上重跑 `failing_check`，不能证明修复前失败；测试文件可被改写；运行时 panic 往往不被单测覆盖。
+- 决策：
+  1. `nuwa.repo.json` 支持可选 `reproduce_check`，必须在干净 base worktree 上失败、在分支上通过。
+  2. 未配置时，先跑 `failing_check`：base 红则作为复现；base 绿则要求分支提供自包含 `.nuwa/repro.sh`（Windows `.repro.cmd`），复制到 base worktree 验证红→绿；否则 escalate，不开 PR。
+  3. `failing_check` 始终必须在分支上通过。
+  4. 交付面用 `git diff --name-status` + glob 终检 `forbidden_paths`，并把测试/CI 变更写入 PR 风险画像。
+- 被否决备选：
+  - 只保留“分支绿”：零信息量，无法区分“修好了”与“测试本来就不覆盖”。
+  - 一律要求 base 红：会让运行时 panic 全部升级，除非 agent 先提交复现测试；因此保留 reproducer 回退。
+  - 直接拒绝所有测试变更：会阻止合法回归测试；改为风险画像 + 复现门。
+
+---
+
+## ADR-011 · 状态变更 webhook（窄范围）
+
+- 状态：已接受（2026-10-20）
+- 背景：无人值守系统没有门铃；escalated/pr_open/CI 红/runner 挂死只能靠所有者主动打开控制台。
+- 决策：提供一个 owner-configured HTTP webhook，发送 Nuwa 自己的生命周期事件（escalated/ignored/provider_stand_down/heartbeat_stale/ci_red/sync_error/pr_opened），JSON + 可选 HMAC-SHA256，10s 超时、3 次退避重试。serve 与 work 都可发送。
+- 理由：这是产品闭环的“呼叫所有者”，不是监控指标采集/通用告警路由；事件集合固定、无第三方 SDK、无路由/抑制/分级。
+- 被否决备选：Slack/飞书专用集成（耦合渠道）；通用告警路由（违反 docs/01 非目标）；只靠控制台轮询（发现时机取决于所有者）。
+
+---
+
+## ADR-012 · `ignored` 终态与 attempt cap
+
+- 状态：已接受（2026-10-20）
+- 背景：rejected 同时承载“PR 被拒”和“owner 判定不是 bug”；噪音指纹会走 rejected → 回归重开 → 再修；无 attempt 上限。
+- 决策：
+  1. 新增 `ignored` 终态；owner 可对 new/escalated/rejected 执行 ignore（带原因），reports 只计数不自动重开。
+  2. issue-level 失败累计 attempts；达到 `max_attempts`（默认 3）自动 ignored；provider 瞬时故障和环境故障不计数。
+  3. reopen 由 owner 显式执行，重置 attempts 并把 reason 写入事件，下一轮 prompt 作为 OWNER NOTE。
+  4. 优先级改为 severity 字典序优先，occurrences 只做同级排序。
+- 被否决备选：复用 rejected + muted 标记（状态语义混淆）；无上限自动重试（成本不可控）；把 provider 故障计入 attempts（会让基础设施抖动消耗业务单）。

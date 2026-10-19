@@ -33,5 +33,5 @@
 
 - 保留 crates 必须补 `[lints]` 工作区配置，clippy 进 CI（上游零 lint 配置，生产 unwrap ≈730 处——嵌入前削减）
 - vendor/锁定 pi-rust 衍生代码版本；上游（≈0.85 版/天）只做选择性 cherry-pick
-- 上下文包与上报日志脱敏：密钥、敏感数据不进 LLM 上下文
+- 上下文包与上报日志脱敏：密钥、敏感数据不进 LLM 上下文（2026-10-20 落地：work 启动清秘 + stack/title/prior context 已知 secret/常见 token pattern redaction；owner-authored `notes` 仍是自由文本）
 - 服务端 LLM key 只存在于运行器池一处；现场组件不含任何密钥

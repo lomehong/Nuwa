@@ -170,7 +170,8 @@ async function runFlow(page) {
   await interval.fill("60");
   const saveBar = page.getByTestId("settings-save-bar");
   await saveBar.waitFor({ timeout: 10_000 });
-  await page.getByRole("button", { name: "保存更改" }).click();
+  // The page also renders a header save action; click the sticky bar's one.
+  await saveBar.getByRole("button", { name: "保存更改" }).click();
   await page.getByText("设置已保存", { exact: true }).waitFor({ timeout: 15_000 });
   await saveBar.waitFor({ state: "detached", timeout: 15_000 });
   if ((await page.getByText(/未保存/).count()) > 0) {

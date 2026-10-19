@@ -31,6 +31,8 @@ pub struct RunnerDto {
     pub started_at: i64,
     #[serde(rename = "heartbeat_at_ms")]
     pub heartbeat_at: i64,
+    #[serde(rename = "progress_at_ms")]
+    pub progress_at: i64,
     pub status: String,
     pub offline: bool,
     pub current_fingerprint: Option<String>,
@@ -55,7 +57,13 @@ pub struct EffectiveConfig {
     pub max_turns: Option<u64>,
     pub max_tokens: Option<u64>,
     pub failing_check: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reproduce_check: Option<String>,
     pub forbidden_paths_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_first_n: Option<u64>,
 }
 
 /// `GET /api/v1/runners` — every registered runner, newest heartbeat first.
@@ -112,6 +120,7 @@ fn runner_dto(runner: &RunnerRow, now: i64, prs_today: u64) -> RunnerDto {
         pid: runner.pid,
         started_at: runner.started_at,
         heartbeat_at: runner.heartbeat_at,
+        progress_at: runner.progress_at,
         status: runner.status.clone(),
         offline: now.saturating_sub(runner.heartbeat_at) > RUNNER_OFFLINE_MS,
         current_fingerprint: runner.current_fingerprint.clone(),
@@ -141,7 +150,13 @@ fn effective_config(config_json: &str) -> EffectiveConfig {
             .get("failing_check")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
+        reproduce_check: config
+            .get("reproduce_check")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         forbidden_paths_count: number("forbidden_paths_count"),
+        max_attempts: number("max_attempts"),
+        draft_first_n: number("draft_first_n"),
     }
 }
 

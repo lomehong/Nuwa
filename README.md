@@ -10,9 +10,9 @@
 flowchart LR
     Q["青鸟 qingniao-go<br/>panic/错误采集"] -->|"signal JSONL"| S["山海经 shanhaijing<br/>SQLite · 指纹/去重/冷却/状态机"]
     S -->|"claim_ready_issue 原子领单"| Y["应龙 nuwa work<br/>rpi-harness 修复循环 + 护栏"]
-    Y --> V{"验证门<br/>独立重跑 failing_check"}
+    Y --> V{"验证门<br/>base 红 / 分支绿"}
     V -->|pass| B["agent/fix/* 分支"]
-    V -->|fail| E["escalated → 人工复核 (nuwa reopen)"]
+    V -->|fail| E["escalated → webhook / 人工复核 (nuwa reopen)"]
     B -->|"REST API + 细粒度 token"| P["Pull Request"]
     P --> CI["CI + 人工合并"]
 ```
@@ -41,7 +41,7 @@ nuwa work  --db spike/demo.db \
            --instructions spike/target-repo/nuwa.repo.json --provider faux
 ```
 
-`--provider anthropic`（配 `ANTHROPIC_API_KEY`）切换真实 LLM；`--pr`（配 `NUWA_GITHUB_TOKEN`）在验证门通过后真实开 PR。完整接入步骤见 [docs/08-onboarding.md](docs/08-onboarding.md)。
+`--provider anthropic`（配 `ANTHROPIC_API_KEY`）或 `--provider zai`（配 `ZAI_API_KEY`）切换真实 LLM；`--pr`（配 `NUWA_GITHUB_TOKEN`）在验证门通过后真实开 PR。首次接入先跑 `nuwa check --instructions <repo>/nuwa.repo.json` 验证指令文件。完整接入步骤见 [docs/08-onboarding.md](docs/08-onboarding.md)。
 
 ## Web 控制台（前端开发）
 
@@ -58,15 +58,20 @@ npm run build    # typecheck + vite build → web/dist
 
 Vite 代理使用 `changeOrigin: false` 保留 Host/Origin，否则浏览器写请求会被同源校验拒绝。未配置 `NUWA_UI_TOKEN` 时控制台进入本地模式；配置后首次访问会跳转 `/login` 用 UI 令牌换取 HttpOnly 会话。
 
-## 当前状态（2026-10-15）
+## 当前状态（2026-10-20）
 
 | 能力 | 状态 |
 |---|---|
-| 采集 → 指纹 → 去重 → 领单 → 修复 → 验证门 → 分支 | ✅ 离线全链路实测（faux provider + 真实 panic 信号） |
-| 真实 LLM 修复 | 接线完成，待 `ANTHROPIC_API_KEY` 实测 |
-| 自动开 PR | 代码就绪（GitHub REST API + 细粒度 token），待凭证实测 |
-| 并发 runner | 原子领单就绪（`UPDATE…RETURNING`），串行执行；并发池/镜像矩阵待做 |
-| 验证探针协议 | 刻意推迟——等第一个真实环境特定 bug 出现再设计 |
+| 采集 → 指纹 → 去重 → 领单 → 修复 → 验证门 → 分支 | ✅ 离线 + 真实 panic 信号全链路实测 |
+| 真实 LLM 修复 | ✅ anthropic / zai 真实闭环（spike #3/#5/#6；mindloop #7） |
+| 自动开 PR | ✅ GitHub REST API + 细粒度 token；PR #7 已合并进 mindloop main |
+| 验证门 | ✅ base 红 / 分支绿；可选 `reproduce_check` / `.nuwa/repro.sh`；交付面 glob 禁改终检 |
+| 基线/分支生命周期 | ✅ 每周 fetch + reset、失败回滚、终态分支清理 |
+| 密钥与子进程 | ✅ 启动清秘、bash/验证 env 白名单、PR/证据/转录脱敏 |
+| 人的闭环 | ✅ `ignored` 终态、attempt cap、reopen reason + 历史回灌 |
+| 无人值守 | ✅ pr_open 自动对账、HMAC webhook（escalated/ignored/heartbeat_stale/ci_red/sync_error/pr_opened） |
+| 并发 runner | 原子领单 + repo 过滤就绪；串行执行，并发池/镜像矩阵待做 |
+| 验证探针协议（A-4） | 刻意推迟——等第一个真实环境特定 bug 出现再设计 |
 
 AI coding agent 在本仓库工作？先读 [AGENTS.md](AGENTS.md)。设计与决策记录见 [docs/](docs/README.md)（ADR 在 docs/04）。
 

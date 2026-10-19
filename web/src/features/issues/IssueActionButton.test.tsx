@@ -210,13 +210,49 @@ describe("IssueActionButton", () => {
     }
   });
 
-  it.each(["new", "pr_open", "merged"] as const)(
+  it.each(["pr_open", "merged"] as const)(
     "offers no action for %s issues",
     (state) => {
       renderAction({ state });
       expect(screen.queryByRole("button")).not.toBeInTheDocument();
     },
   );
+
+  it("offers ignore for a new issue", () => {
+    renderAction({ state: "new" });
+    expect(screen.getByRole("button", { name: "忽略：fp-1" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^重新打开：/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("mutes with a persisted reason and invalidates views", async () => {
+    let body: unknown;
+    let posted = false;
+    server.use(
+      http.post("/api/v1/issues/:fp/ignore", async ({ request }) => {
+        posted = true;
+        body = await request.json();
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+
+    const { invalidate } = renderAction({ state: "rejected" });
+    fireEvent.click(screen.getByRole("button", { name: "忽略：fp-1" }));
+    expect(screen.getByRole("dialog", { name: "忽略问题？" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("忽略原因（可选）"), {
+      target: { value: "known upstream noise" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "确认忽略" }));
+
+    await waitFor(() => expect(posted).toBe(true));
+    expect(body).toEqual({ reason: "known upstream noise" });
+    expect(await screen.findByText("已忽略")).toBeInTheDocument();
+    const keys = invalidate.mock.calls.map(([filters]) => filters?.queryKey);
+    expect(keys).toEqual(
+      expect.arrayContaining([["issue", "fp-1"], ["overview"], ["issues"]]),
+    );
+  });
 
   it.each([
     ["triggered", false],
@@ -248,7 +284,9 @@ describe("IssueActionButton", () => {
 
     expect(await screen.findByText("重新打开失败")).toBeInTheDocument();
     expect(
-      screen.getByText("state is merged（state：expected escalated or rejected）"),
+      screen.getByText(
+        "问题单状态已变化（可能已被其他操作处理），请刷新后重试（state：expected escalated or rejected）",
+      ),
     ).toBeInTheDocument();
   });
 

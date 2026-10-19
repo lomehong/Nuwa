@@ -49,7 +49,7 @@ function TruncatedBadge() {
 function TruncatedNote() {
   return (
     <p className="mt-1 text-caption text-text-muted">
-      内容超过服务端 16KB 上限，仅显示前段。
+      内容超过服务端 16KB 上限，仅显示前段；完整内容保存在运行器上的会话文件中。
     </p>
   );
 }
@@ -433,7 +433,7 @@ export function TranscriptViewer({
             <p className="max-w-prose text-body-sm text-text-secondary">
               {runId
                 ? "所选运行没有可显示的会话消息，可能未产生转录文件。"
-                : "该问题单还没有可读取的会话转录。运行产生会话后会自动出现在这里。"}
+                : "该问题单还没有可读取的会话转录。修复运行进行中时此视图会自动刷新；结束后可重试。"}
             </p>
           </div>
         </div>
@@ -452,6 +452,14 @@ export function TranscriptViewer({
               variant="secondary"
               size="sm"
               disabled={page <= 1}
+              onClick={() => onPageChange(1)}
+            >
+              首页
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={page <= 1}
               onClick={() => onPageChange(page - 1)}
             >
               上一页
@@ -463,6 +471,16 @@ export function TranscriptViewer({
               onClick={() => onPageChange(page + 1)}
             >
               下一页
+            </Button>
+            {/* Messages stream in ascending order, so the last page tracks the
+                live tail of an in-flight run (docs/09 §10.5). */}
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={page >= totalPages}
+              onClick={() => onPageChange(totalPages)}
+            >
+              末页（最新）
             </Button>
           </div>
         </nav>

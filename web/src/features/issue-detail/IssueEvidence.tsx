@@ -15,8 +15,11 @@ import { IssueSection } from "./IssueSection";
 import type { RunDto } from "./types";
 
 interface IssueEvidenceProps {
-  /** The newest run; `undefined` means the runner has not claimed the issue. */
+  /** The run the evidence describes (selected or newest); `undefined` means
+   * the runner has not claimed the issue. */
   run: RunDto | undefined;
+  /** 1-based attempt index of `run` within the issue's recent runs; 0 hides it. */
+  attempt?: number;
 }
 
 function VerificationBlock({ run }: { run: RunDto }) {
@@ -119,12 +122,12 @@ function BranchCommitBlock({ run }: { run: RunDto }) {
  * single audit view because all four fields are needed together to judge a
  * repair; each block keeps its own heading for navigation.
  */
-export function IssueEvidence({ run }: IssueEvidenceProps) {
+export function IssueEvidence({ run, attempt = 0 }: IssueEvidenceProps) {
   return (
     <IssueSection
       id="issue-evidence"
       title="证据"
-      description="最近一次运行留下的根因、改动、验证与 CI 结论。"
+      description="所选运行留下的根因、改动、验证与 CI 结论。"
       aside={
         run ? (
           <Badge variant={runOutcomeVariant(run.outcome)}>
@@ -138,7 +141,9 @@ export function IssueEvidence({ run }: IssueEvidenceProps) {
           <>
             <CardHeader className="py-3">
               <div className="min-w-0">
-                <CardTitle as="h4">最近一次运行</CardTitle>
+                <CardTitle as="h4">
+                  {attempt > 0 ? `第 ${attempt} 次运行的证据` : "运行证据"}
+                </CardTitle>
                 <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-text-muted">
                   <span className="font-mono" title={run.id}>
                     {shortRunId(run.id)}

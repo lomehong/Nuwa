@@ -1,6 +1,6 @@
 # 08 · 接入手册
 
-状态：v0（2026-10-15，随 runner v0 落地）
+状态：v0.2 hardening（2026-10-20；随 A–F 可靠性加固更新）
 
 把一个自有系统接入 Nuwa = 下面四步。全程不改 nuwa 本体一行代码（ADR-006）。
 
@@ -44,8 +44,27 @@ qingniao.Capture(sink, qingniao.Meta{Repo: "example.com/your-repo", Service: "ap
 qingniao.Report(sink, qingniao.Meta{Repo: "…"}, "healthcheck failed", err)
 ```
 
-sink 二选一：`FileSink{Path}`（JSONL，落盘后 `nuwa ingest`）或 `HTTPSink{Endpoint}`（POST 到 ingest 服务端，待建）。
+SDK 目前是仓库内模块（`module example.com/nuwa/qingniao`），尚未发布到公共 module。目标仓用 `replace example.com/nuwa/qingniao => /path/to/nuwa/sdk/qingniao-go`，或像 mindloop 一样把 `qingniao` 源码复制进 `internal/qingniao`；不要直接 `go get`。
+
+sink 二选一：`FileSink{Path}`（JSONL，落盘后 `nuwa ingest`）或 `HTTPSink{Endpoint}`（POST 到 ingest 服务端）。`HTTPSink` 默认每次尝试 3s 超时、最多 2 次重试；可设置 `FallbackFile`，全部失败时把信封追加到本地 JSONL，避免崩溃进程丢信号。
 信封 schema = `qingniao/v1`，是 ingest Signal 的超集；新增字段不破坏旧服务端。
+
+非 Go 系统不需要 SDK，直接 POST 同一个信封：
+
+```bash
+curl -sS -X POST "$NUWA_INGEST_URL/ingest" \
+  -H "Content-Type: application/json" \
+  -H "X-NUWA-Token: $NUWA_INGEST_TOKEN" \
+  -d '{
+    "schema":"qingniao/v1","repo":"example.com/your-service","language":"python",
+    "service":"worker","title":"panic: queue empty",
+    "severity":"high","message":"IndexError: list index out of range",
+    "stack_trace":"Traceback (most recent call last):\n  ...",
+    "ts_unix_ms":1790000000000
+  }'
+```
+
+字段最小集是 `repo/title/severity/message/stack_trace`；其余字段可省略。
 
 ## 2 · 目标仓库放指令文件
 
@@ -54,15 +73,30 @@ sink 二选一：`FileSink{Path}`（JSONL，落盘后 `nuwa ingest`）或 `HTTPS
 ```json
 {
   "repo": "example.com/your-repo",
-  "failing_check": { "command": "go test ./..." },
+  "failing_check": { "command": "go test ./...", "timeout_secs": 600 },
+  "reproduce_check": { "command": "sh .nuwa/repro.sh", "timeout_secs": 300 },
   "forbidden_paths": [".github/", "deploy/", "*.pem", "go.mod", "go.sum"],
+  "max_attempts": 3,
+  "draft_first_n": 0,
   "notes": "给修复 runner 的自由文本说明（规范、禁区原因、注意事项）"
 }
 ```
 
-- `repo` 必须与采集信封里的 repo 一致，runner 不匹配即拒单（ADR-004 防越权）
-- `failing_check.command` 是"当前失败、修复后必须过"的命令，交付前 nuwa 会**独立重跑**它
-- `forbidden_paths` 由 `before_tool_call` 硬否决，不靠模型自觉
+- `repo` 必须与采集信封里的 repo 一致；runner 只领自己 repo 的单（多 runner 共享库时也不会互抢）
+- `failing_check.command` 是"当前失败、修复后必须过"的回归门；`timeout_secs` 默认 600
+- `reproduce_check` 可选：交付门要求它在 **base 上失败、分支上通过**。没有配置时，先跑 `failing_check`：base 红则直接作为复现；base 绿则要求分支提交自包含的 `.nuwa/repro.sh`（Windows 为 `.nuwa/repro.cmd`），否则 `escalated` 不开 PR
+- `forbidden_paths` 在工具调用前做子串否决（拦截诚实错误），并在交付面对 `git diff --name-status` 做 glob 终检（权威；`*.pem` 现在真的能匹配嵌套文件）
+- `max_attempts`：problem-level 失败累计到阈值后自动 `ignored`，避免自动重试循环
+- `draft_first_n`：该仓前 N 个 PR 以 draft 打开；0 保持 ADR-003 的非 draft 默认
+
+接入前先跑预检（不消耗 LLM、不创建分支）：
+
+```bash
+nuwa check --instructions /path/to/your-repo/nuwa.repo.json
+nuwa check --instructions /path/to/repo/nuwa.repo.json --json
+```
+
+预检会校验 JSON、repo 身份、glob、`max_attempts`，并在干净 base worktree 上探测 `failing_check`/`reproduce_check`。`failing_check` 在 base 上已是绿色会给出 warning（需要复现脚本），`reproduce_check` 在 base 上绿色则是 error。退出码非 0 表示配置不可用。
 
 ## 3 · 启动 runner（应龙）
 
@@ -76,6 +110,12 @@ nuwa work --db shanhaijing.db \
 
 - `--runner-id`：控制台可见的 runner 身份，默认 `hostname:repo`；仅保留字母数字与 `.:_-`，超长截断
 - `--service-unit`：记录 systemd 单元名（默认 `nuwa-work`）。控制台的「重启 unit」动作会消费它（缺失/非法时该动作禁用或 422）
+- `--daily-token-limit` / `--monthly-token-limit`：每仓库每日 / 滚动 30 天 token 上限（默认 5M / 50M；失败尝试也计入）
+- 密钥隔离：work 启动时把 `NUWA_GITHUB_TOKEN`/`GITHUB_TOKEN`/`ZAI_API_KEY`/`ANTHROPIC_API_KEY` 读入内存并从 env 移除；bash/验证子进程只收到白名单（PATH/HOME/GOCACHE 等）。非敏感的额外变量用 `NUWA_AGENT_ENV_ALLOW` 逗号追加。ssh-agent / credential store 仍需部署侧隔离（建议 runner 专用用户）。
+- 指令文件：tracked 配置以 `origin/<base>:nuwa.repo.json` 为权威；untracked 配置首次启动复制到 `<sessions>/_trusted/`。每轮领单前校验并恢复被改写的文件，`nuwa.repo.json` 本身也在隐式禁改名单。合并到 main 的新配置会在下一轮恢复文件，但 runner 进程内的配置对象要重启后再生效。
+- pr_open 自动对账：serve 每 `NUWA_SYNC_INTERVAL` 秒（默认 600）对账一次，与手动 `nuwa sync` 共用锁。
+- 通知（可选）：`NUWA_WEBHOOK_URL`、`NUWA_WEBHOOK_SECRET`、`NUWA_WEBHOOK_EVENTS`；事件 JSON 带 `X-Nuwa-Signature: sha256=<HMAC>`，默认订阅 `escalated,ignored,provider_stand_down,heartbeat_stale,ci_red,sync_error,pr_opened`。
+- 会话保留：work 启动及运行中定期清理超过 365 天无新 run 的 `sessions/<fp>` 目录；`_trusted` 永不清理。
 
 ## 5 · 第一个真实系统接入（mindloop，进行中）
 
@@ -90,9 +130,9 @@ nuwa work --db shanhaijing.db \
 
 **Web 控制台（v3 SPA，0.2.0 起是唯一控制台）**：`http://<server>:7321/`，在 `/login` 用 `NUWA_UI_TOKEN` 换取 HttpOnly 会话（**不再使用 Basic 头**）。`/` 就是 SPA 控制台；`/ui*` 308 永久重定向到 `/`，`/issue/{fp}` 重定向到 `/issues/{fp}`，`/settings` 直接由 SPA 提供；`/ingest` 与 `/health` 的路径和鉴权不变。SPA 提供总览、问题单列表/详情（含会话转录）、运行器、活动与设置。
 
-- **问题单动作**：rejected/escalated 可 `重新打开`（立即回到 `new` 并清冷却，无确认）；卡单（`triggered`/`fixing` 且超过卡单窗口）可 `重排`（破坏性确认，清归属重新入队）。动作出现在详情头部、列表与总览待处理队列；成功 toast、失败逐条显示服务端错误。
+- **问题单动作**：escalated/rejected/ignored 可 `重新打开`（回到 `new`、清冷却并重置 attempts）；new/escalated/rejected 可 `忽略`（填写原因；ignored 后同指纹报告只计数，不再自动修复）；卡单（`triggered`/`fixing` 且超过卡单窗口）可 `重排`。动作出现在详情头部、列表与总览待处理队列；成功 toast、失败逐条显示服务端错误。CLI 对应 `nuwa reopen --reason` / `nuwa ignore --reason`，理由会写入事件并在下一轮 prompt 中作为 OWNER NOTE。
 - **对账与重启**：`GitHub 对账` 汇总 checked/merged/rejected/still_open，并逐条展示 `errors[]`；runner `重启 unit` 先确认影响（显示当前修复指纹，提示同一 unit 承载的多个 runner 会一起重启）。409 表示已有重启在排程，422 指出 `service_unit` 缺失/非法，501 直接给出手动 `systemctl restart <unit>` 命令。
-- **设置**：按 22 键 schema 分组编辑；密钥只显示「已设置 · 末 4 位」，留空保存表示保持不变；只提交改动键，保存写 `NUWA_ENV_FILE`（自动 `.bak` 备份）并提示 `重启后生效`。`测试 GitHub token` / `测试模型配置` 使用未保存的候选值探测（不落盘）；`重启服务` 在存在活动 run 时返回 409 `active_runs`，必须勾选「我了解这会中断正在进行的修复」后才允许 `强制重启`，202 后页面轮询 `/health` 与 `/auth/me` 等待恢复，systemd 不可用则显示手动命令。修改 `NUWA_UI_TOKEN` 后重启会使当前会话失效，页面会提示重新登录；有未保存的草稿时重启按钮禁用，需先保存或放弃。重启恢复后控制台回到 SPA 根路径 `/`。
+- **设置**：按 29 键 schema 分组编辑；密钥只显示「已设置 · 末 4 位」，留空保存表示保持不变；只提交改动键，保存写 `NUWA_ENV_FILE`（自动 `.bak` 备份）并提示 `重启后生效`。`测试 GitHub token` / `测试模型配置` 使用未保存的候选值探测（不落盘）；`重启服务` 在存在活动 run 时返回 409 `active_runs`，必须勾选「我了解这会中断正在进行的修复」后才允许 `强制重启`，202 后页面轮询 `/health` 与 `/auth/me` 等待恢复，systemd 不可用则显示手动命令。修改 `NUWA_UI_TOKEN` 后重启会使当前会话失效，页面会提示重新登录；有未保存的草稿时重启按钮禁用，需先保存或放弃。重启恢复后控制台回到 SPA 根路径 `/`。
 
 **API 登录（v3 控制台）**：`POST /api/v1/auth/login`，必须带 `Content-Type: application/json`，body `{"token":"<NUWA_UI_TOKEN>"}`；成功 204 并设置 `nuwa_session`（HttpOnly）与 `nuwa_csrf`。后续非 GET 请求必须带 `X-NUWA-CSRF` 头，且其值须与 `nuwa_csrf` cookie 值一致（双提交校验，仅"带头"不够）。会话与 CSRF cookie 的 `Max-Age` 由 `NUWA_SESSION_TTL_SECS` 控制（默认 86400，允许 300–2592000）；`NUWA_COOKIE_SECURE=always` 强制加 `Secure`（TLS 代理下也可由 `X-Forwarded-Proto: https` 自动触发），`=never` 显式关闭且优先级最高（即使同时配置 `always` 或代理上报 https 也不加 `Secure`）。
 
@@ -173,7 +213,7 @@ cd web && NUWA_E2E_BASE_URL=http://127.0.0.1:7404 NUWA_E2E_TOKEN=dummy npm run t
 ### 6.3 设置
 
 - **事实源**：`NUWA_ENV_FILE`（默认 `/opt/nuwa/nuwa.env`，systemd `EnvironmentFile`）。设置页不写 shell 变量、不热更新进程；保存后 `restart_pending=true`，需重启 serve/work 才生效。
-- `GET /api/v1/settings`：返回 22 键 schema（分组/类型/默认/scope/是否密钥/是否只读）、掩码值、`env_path/env_exists/env_permissions`、`needs_migration`、`restart_pending`、`effective_diff`（runner 心跳的实际配置 vs 文件值，仅非密钥）、`unknown_keys`（只给键名）、`last_changes`。密钥只返回 `set/last4/updated_at_ms`，**永不回显值**；四位以内不返回 `last4`。
+- `GET /api/v1/settings`：返回 29 键 schema（分组/类型/默认/scope/是否密钥/是否只读）、掩码值、`env_path/env_exists/env_permissions`、`needs_migration`、`restart_pending`、`effective_diff`（runner 心跳的实际配置 vs 文件值，仅非密钥）、`unknown_keys`（只给键名）、`last_changes`。密钥只返回 `set/last4/updated_at_ms`，**永不回显值**；四位以内不返回 `last4`。
 - `PUT /api/v1/settings`：`{"values":{"NUWA_INTERVAL":"60","NUWA_GITHUB_TOKEN":""}}`。空密钥 = 保持不变；未知键与只读键（`NUWA_ENV_FILE`）422；任一字段非法则整单 422 且文件逐字节不变。成功保留注释/顺序/未知键，更新既有行或追加新键；写前备份 `<env>.bak`，Unix 同目录临时文件 + chmod 600 + rename。每个变更键写 `config_changed`（detail=key，actor=owner），历史小写已知键先迁移并写 `config_migrated`。
 - `POST /api/v1/settings/test`：`{"target":"github|llm","values":{…}}`；`values` 是未保存的候选值（不落盘、不写日志），未知键 422；**每个已知键的取值都做类型校验**——只接受字符串、数字或布尔（env 标量），对象/数组/null 一律 422（不会静默忽略后去测别的值）。github 调 `GET https://api.github.com/rate_limit`（不耗配额）；llm 用 `max_tokens=1` 的真实请求（可能产生极小费用）。空 model/base/provider 视为未设置（回退环境变量/默认值）；anthropic 的 base 固定 `https://api.anthropic.com`（忽略 `NUWA_BASE_URL`），模型取自 vendored catalog，未知名回退 catalog 首项；zai 默认 base `https://open.bigmodel.cn/api/coding/paas/v4`、默认模型 `glm-5.3-flash`；faux 完全离线。显式空密钥不回落环境变量，直接 422。网络失败/非 2xx/10s 超时 → 502，且不回显 provider 响应体。
 - `POST /api/v1/settings/restart`：`{"force":false}`。有未结束 run（`runs.finished_at IS NULL`）→ 409 `conflict`，body 含 `active_runs`；`force=true` 才继续。重启目标 = `NUWA_SERVE_UNIT`（默认 `nuwa-serve`）+ `NUWA_RUNNER_UNITS`（默认 `nuwa-work`，逗号分隔），逐个白名单校验；先写 `restart_requested` 审计（`__system__`），再 `systemd-run --on-active=2`，成功 202。无 unit 配置或 `systemd-run` 不可用 → 501 并给出手动命令。改 `NUWA_UI_TOKEN` 后重启会使当前会话失效，需重新登录。
@@ -200,9 +240,11 @@ escalated 只能人工 reopen → new
 4. 禁改路径：`guard.rs` `before_tool_call` 硬否决（编辑路径、shell 命令双检查）
 5. 复现验证证据：`deliver.rs` 独立重跑 failing_check，证据落 `sessions/<fp>/verification.txt`
 
-## 已知边界（v0）
+## 已知边界（v0.2 hardening）
 
 - runner 串行；并发池与 runner 镜像矩阵（A-3 后半）未做
-- 真实 PR 未开过（等 token）；真实 LLM 修复质量未验证（等 key）
+- 真实 LLM / PR 已闭环（spike #3/#5/#6；mindloop #7 已合并）
 - 验证探针协议（A-4）按设计推迟到第一个环境特定 bug 出现
-- ingest 的 HTTP 服务端形态未建（现用 CLI/文件投喂）
+- ingest HTTP 服务端已建（`nuwa serve` + `POST /ingest`）
+- agent 沙箱只在进程 env 层隔离；ssh-agent / credential store 仍建议用独立 OS 用户/容器隔离
+- 通知是窄范围状态 webhook，不是通用告警路由/指标采集系统

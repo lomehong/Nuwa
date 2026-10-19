@@ -8,6 +8,7 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { apiFetch } from "../../lib/api";
+import { backoffInterval } from "../../lib/polling";
 import type { TranscriptResponse } from "./types";
 
 export const TRANSCRIPT_PAGE_SIZE = 20;
@@ -36,10 +37,17 @@ export function transcriptApiPath(
   return `/issues/${encodeURIComponent(fingerprint)}/transcript?${params.toString()}`;
 }
 
+/** Optional behaviour for the transcript query. */
+interface TranscriptQueryOptions {
+  /** Poll cadence (ms) while the selected run is still in flight. */
+  refetchIntervalMs?: number;
+}
+
 export function useTranscriptQuery(
   fingerprint: string,
   runId: string | null,
   page: number,
+  options?: TranscriptQueryOptions,
 ) {
   return useQuery({
     queryKey: transcriptQueryKey(fingerprint, runId, page),
@@ -48,6 +56,11 @@ export function useTranscriptQuery(
     enabled: fingerprint.length > 0,
     staleTime: TRANSCRIPT_STALE_MS,
     refetchOnWindowFocus: true,
+    // docs/09 §10.5: an in-flight run appends messages continuously, so the
+    // live view polls (with the shared backoff); finished runs stay static.
+    refetchInterval: options?.refetchIntervalMs
+      ? backoffInterval(options.refetchIntervalMs)
+      : false,
     // Keep the current page visible while the next one loads; the viewer
     // focuses a page heading once the new data settles.
     placeholderData: keepPreviousData,

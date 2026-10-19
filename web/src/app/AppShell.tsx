@@ -177,6 +177,32 @@ function SidebarFooter({ localMode }: { localMode: boolean }) {
 }
 
 /**
+ * Polite announcement when the needs-attention count grows: the console polls
+ * in the background, so a screen-reader user otherwise never learns that a
+ * new escalated/stuck issue arrived while they were on another page.
+ */
+function AttentionAnnounce({ count }: { count: number }) {
+  const [announced, setAnnounced] = useState<number | null>(null);
+  const previous = useRef(count);
+
+  useEffect(() => {
+    if (count > previous.current) {
+      setAnnounced(count);
+    }
+    previous.current = count;
+  }, [count]);
+
+  if (announced === null) {
+    return null;
+  }
+  return (
+    <p role="status" className="sr-only">
+      需要你处理的事项增加，当前共 {announced} 项
+    </p>
+  );
+}
+
+/**
  * Compact health strip fed by `/overview` (docs/09 §10.1). It shares the
  * overview query (and key) with the page: the 10s poll pauses while the tab is
  * hidden and refreshes immediately on focus. Runner and issue counts link to
@@ -210,9 +236,28 @@ export function HealthStrip() {
       </div>
     );
   } else {
-    const { active_runs: activeRuns, health, queue } = overview.data;
+    const {
+      active_runs: activeRuns,
+      attention,
+      health,
+      queue,
+    } = overview.data;
     content = (
       <>
+        {/* The needs-attention count is the strip's most important signal — it
+            is the only "the system is calling you" cue visible from every page
+            (docs/09 §10.1). It leads the strip and links to the filtered list. */}
+        {attention.length > 0 ? (
+          <Link
+            to="/issues?attention=1"
+            className={clsx(PILL_LINK_CLASS, "border-danger/50 bg-danger/10 font-medium text-text")}
+            title={`需要你处理的事项：${attention.length} 项，点击查看列表`}
+          >
+            <StatusDot tone="danger" />
+            <span>需处理</span>
+            <span className="font-mono tabular-nums">{attention.length}</span>
+          </Link>
+        ) : null}
         <span className={PILL_CLASS} title="控制台 API 可达">
           <StatusDot tone="success" />
           serve 正常
@@ -279,6 +324,7 @@ export function HealthStrip() {
   return (
     <section aria-label="全局健康条" className="border-b border-border bg-bg">
       <div className="mx-auto flex w-full max-w-page items-center gap-2 overflow-x-auto px-4 py-2 sm:px-6 lg:px-8">
+        {overview.data ? <AttentionAnnounce count={overview.data.attention.length} /> : null}
         {content}
       </div>
     </section>

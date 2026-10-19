@@ -1,5 +1,5 @@
 import { RefreshCw } from "lucide-react";
-import { useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
 import { Button, Skeleton } from "../../components/ui";
 import { ActiveRuns } from "./ActiveRuns";
@@ -9,7 +9,7 @@ import { PanelError } from "./PanelChrome";
 import { PipelineFunnel } from "./PipelineFunnel";
 import { useOverviewQuery, useRecentEventsQuery, useTrendsQuery } from "./queries";
 import { RecentEvents } from "./RecentEvents";
-import { TrendsPanel } from "./TrendsPanel";
+import { TrendsPanel, isTrendsRange } from "./TrendsPanel";
 import type { TrendsRange } from "./types";
 
 function CoreSkeleton() {
@@ -42,7 +42,22 @@ function CoreSkeleton() {
  * focus (see `queries.ts`).
  */
 export function OverviewPage() {
-  const [range, setRange] = useState<TrendsRange>("14d");
+  // Trend range lives in the URL like every other filter: a "90d 趋势" link
+  // survives reloads and shares like the issue-list filters do.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const rangeParam = searchParams.get("range");
+  const range: TrendsRange = isTrendsRange(rangeParam) ? rangeParam : "14d";
+  const handleRangeChange = (next: TrendsRange) => {
+    setSearchParams((previous) => {
+      const nextParams = new URLSearchParams(previous);
+      if (next === "14d") {
+        nextParams.delete("range");
+      } else {
+        nextParams.set("range", next);
+      }
+      return nextParams;
+    });
+  };
   const overview = useOverviewQuery(null, { refetchInterval: false });
   const trends = useTrendsQuery(range);
   const events = useRecentEventsQuery();
@@ -92,7 +107,7 @@ export function OverviewPage() {
         error={trends.error}
         onRetry={() => void trends.refetch()}
         range={range}
-        onRangeChange={setRange}
+        onRangeChange={handleRangeChange}
       />
 
       {overview.data ? <PipelineFunnel counts={overview.data.counts} /> : null}

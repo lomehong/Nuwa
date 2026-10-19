@@ -20,6 +20,7 @@ export {
 } from "./Card";
 export { ConfirmDialog, type ConfirmDialogProps } from "./ConfirmDialog";
 export { EmptyState, type EmptyStateProps } from "./EmptyState";
+export { FlashOnChange, type FlashOnChangeProps } from "./FlashOnChange";
 export {
   Input,
   type InputProps,

@@ -17,6 +17,8 @@ export interface IssueListItem {
   severity: Severity;
   state: IssueState;
   occurrences: number;
+  /** Issue-level repair attempts (provider/environment faults excluded). */
+  attempts?: number;
   pr_url: string | null;
   first_seen_ms: number;
   last_seen_ms: number;

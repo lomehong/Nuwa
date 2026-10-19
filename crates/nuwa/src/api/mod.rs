@@ -126,6 +126,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/issues/{fp}", get(issues::detail))
         .route("/issues/{fp}/transcript", get(transcript::transcript))
         .route("/issues/{fp}/reopen", post(actions::reopen))
+        .route("/issues/{fp}/ignore", post(actions::ignore))
         .route("/issues/{fp}/requeue", post(actions::requeue))
         .route("/runners", get(runners::list))
         .route("/runners/{id}/restart", post(actions::restart_runner))

@@ -89,6 +89,12 @@ export function IssueCards({ issues, onCopyFingerprint }: IssueCardsProps) {
                       {formatCount(issue.occurrences)}
                     </dd>
                   </div>
+                  <div>
+                    <dt className="text-text-muted">修复尝试</dt>
+                    <dd className="font-mono tabular-nums text-text">
+                      {formatCount(issue.attempts ?? 0)}
+                    </dd>
+                  </div>
                   <div className="min-w-0">
                     <dt className="text-text-muted">PR / CI</dt>
                     <dd className="mt-0.5 flex flex-wrap items-center gap-1.5">

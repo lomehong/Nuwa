@@ -178,6 +178,7 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
 /// POST /ingest with one envelope JSON or JSONL body; GET /health for checks.
 /// v0 binds localhost by default: the collector runs on the same trust domain.
 pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
+    crate::webhook::init_from_env();
     let mut db_path = std::path::PathBuf::from("shanhaijing.db");
     let mut listen = String::from("127.0.0.1:7321");
     let mut it = args.into_iter();
@@ -208,6 +209,15 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
     // same sweep daily from the tokio runtime. The returned handle is dropped
     // on purpose — the task runs until the runtime shuts down.
     spawn_daily_prune(Arc::clone(&store), event_days, RETENTION_PERIOD);
+    // pr_open issues no longer depend on the owner remembering to click
+    // "sync"; the same reconciler also feeds sync_error webhooks.
+    let sync_token = std::env::var("NUWA_GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
+    spawn_reconciler(Arc::clone(&store), sync_token, sync_interval_from_env());
+    spawn_heartbeat_monitor(Arc::clone(&store));
     let env_path = crate::settings::env_file_path();
     // Shared collector token (NUWA_INGEST_TOKEN). Set it when serving beyond
     // localhost: without it anyone can spam the issue store. This is a
@@ -347,6 +357,141 @@ fn report_prune(result: anyhow::Result<u64>) {
         Ok(_) => {}
         Err(error) => eprintln!("warning    : retention prune failed: {error}"),
     }
+}
+
+/// Progress older than this while a runner still reports `working` is treated
+/// as a hung run for the webhook (the console's requeue floor stays shorter).
+const HEARTBEAT_STALE_MS: i64 = 15 * 60_000;
+const HEARTBEAT_MONITOR_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn sync_interval_from_env() -> std::time::Duration {
+    let raw = std::env::var("NUWA_SYNC_INTERVAL").ok();
+    sync_interval_from_secs(raw.as_deref())
+}
+
+fn sync_interval_from_secs(raw: Option<&str>) -> std::time::Duration {
+    let secs = raw
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(600)
+        .clamp(60, 86_400);
+    std::time::Duration::from_secs(secs)
+}
+
+fn spawn_reconciler(
+    store: Arc<shanhaijing::Store>,
+    token: Option<String>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // the startup path does not reconcile immediately
+        loop {
+            ticker.tick().await;
+            let Some(token) = token.clone() else {
+                continue;
+            };
+            let Ok(_guard) = crate::api::actions::sync_lock().try_lock() else {
+                continue;
+            };
+            match crate::ci::reconcile_all(&store, &token, now_ms()).await {
+                Ok(lines) => {
+                    for line in lines {
+                        if line.starts_with("error") || line.starts_with("skip") {
+                            crate::webhook::emit(crate::webhook::WebhookEvent::new(
+                                "sync_error",
+                                None,
+                                None,
+                                line,
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    crate::webhook::emit(crate::webhook::WebhookEvent::new(
+                        "sync_error",
+                        None,
+                        None,
+                        format!("auto reconcile failed: {error:#}"),
+                    ));
+                }
+            }
+        }
+    })
+}
+
+/// Runners whose liveness heartbeat is fresh but whose real progress is stale.
+fn stale_progress(
+    store: &shanhaijing::Store,
+    now: i64,
+    threshold_ms: i64,
+) -> shanhaijing::ShanResult<Vec<shanhaijing::RunnerRow>> {
+    Ok(store
+        .list_runners()?
+        .into_iter()
+        .filter(|runner| {
+            if runner.status != "working" || runner.current_fingerprint.is_none() {
+                return false;
+            }
+            let last = if runner.progress_at > 0 {
+                runner.progress_at
+            } else {
+                runner.heartbeat_at
+            };
+            now.saturating_sub(last) > threshold_ms
+        })
+        .collect())
+}
+
+fn spawn_heartbeat_monitor(store: Arc<shanhaijing::Store>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HEARTBEAT_MONITOR_PERIOD);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        let mut alerted: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        loop {
+            ticker.tick().await;
+            let now = now_ms();
+            let Ok(stale) = stale_progress(&store, now, HEARTBEAT_STALE_MS) else {
+                continue;
+            };
+            let current: std::collections::HashSet<(String, String)> = stale
+                .iter()
+                .filter_map(|runner| {
+                    runner
+                        .current_fingerprint
+                        .as_ref()
+                        .map(|fp| (runner.id.clone(), fp.clone()))
+                })
+                .collect();
+            alerted.retain(|key| current.contains(key));
+            for runner in stale {
+                let Some(fingerprint) = runner.current_fingerprint.clone() else {
+                    continue;
+                };
+                if !alerted.insert((runner.id.clone(), fingerprint.clone())) {
+                    continue;
+                }
+                let last = if runner.progress_at > 0 {
+                    runner.progress_at
+                } else {
+                    runner.heartbeat_at
+                };
+                crate::webhook::emit(crate::webhook::WebhookEvent::new(
+                    "heartbeat_stale",
+                    Some(fingerprint.clone()),
+                    Some(runner.repo.clone()),
+                    format!(
+                        "runner {} has no progress for {}s (phase {:?})",
+                        runner.id,
+                        (now - last) / 1000,
+                        runner.phase
+                    ),
+                ));
+            }
+        }
+    })
 }
 
 /// Spawn the once-a-day retention sweep. `tokio::time::interval` fires an
@@ -1472,6 +1617,68 @@ mod tests {
         assert_eq!(events[0].detail, "audit");
     }
 
+    #[test]
+    fn sync_interval_is_clamped_and_defaults_to_ten_minutes() {
+        assert_eq!(sync_interval_from_secs(None).as_secs(), 600);
+        assert_eq!(sync_interval_from_secs(Some("5")).as_secs(), 60);
+        assert_eq!(sync_interval_from_secs(Some("999999")).as_secs(), 86_400);
+        assert_eq!(sync_interval_from_secs(Some("nope")).as_secs(), 600);
+    }
+
+    #[test]
+    fn stale_progress_uses_progress_not_the_heartbeat() {
+        use shanhaijing::{RunnerHeartbeat, RunnerUpsert};
+
+        let (_dir, state) = test_state(None);
+        let store = &state.store;
+        let now = crate::now_ms();
+        store
+            .upsert_runner(&RunnerUpsert {
+                id: "runner-a".into(),
+                repo: "example.com/app".into(),
+                host: "host".into(),
+                pid: None,
+                started_at: now - 60_000,
+                heartbeat_at: now,
+                status: "working".into(),
+                provider: None,
+                model: None,
+                daily_pr_limit: None,
+                repo_path: None,
+                service_unit: None,
+                config_json: "{}".into(),
+            })
+            .expect("upsert");
+        store
+            .heartbeat_runner(
+                "runner-a",
+                &RunnerHeartbeat {
+                    heartbeat_at: now,
+                    status: "working".into(),
+                    current_fingerprint: Some("fp".into()),
+                    phase: Some("repair".into()),
+                    config_json: None,
+                    last_error: None,
+                },
+            )
+            .expect("heartbeat");
+        store
+            .set_runner_progress("runner-a", now - 20 * 60_000)
+            .expect("progress");
+
+        let stale = stale_progress(store, now, HEARTBEAT_STALE_MS).expect("stale");
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, "runner-a");
+
+        // Fresh progress removes the alert even with the same heartbeat.
+        store
+            .set_runner_progress("runner-a", now)
+            .expect("progress");
+        assert!(stale_progress(store, now, HEARTBEAT_STALE_MS)
+            .expect("fresh")
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn daily_prune_task_sweeps_after_the_first_period() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1867,10 +2074,13 @@ mod tests {
             .expect("response")
     }
 
-    fn overview_counts(value: &serde_json::Value) -> [u64; 7] {
+    fn overview_counts(value: &serde_json::Value) -> [u64; 8] {
         let counts = &value["counts"];
-        ["new", "triggered", "fixing", "pr_open", "merged", "rejected", "escalated"]
-            .map(|state| counts[state].as_u64().unwrap_or_else(|| panic!("counts.{state} missing")))
+        [
+            "new", "triggered", "fixing", "pr_open", "merged", "rejected", "escalated",
+            "ignored",
+        ]
+        .map(|state| counts[state].as_u64().unwrap_or_else(|| panic!("counts.{state} missing")))
     }
 
     #[tokio::test]
@@ -1889,9 +2099,9 @@ mod tests {
         assert_eq!(header_str(&response, header::CACHE_CONTROL), "no-store");
         let value = json_body(response).await;
 
-        // The state funnel keeps all seven keys, zeros included.
-        assert_eq!(overview_counts(&value), [5, 0, 3, 3, 1, 2, 2]);
-        assert_eq!(value["counts"].as_object().expect("counts object").len(), 7);
+        // The state funnel keeps all eight keys, zeros included.
+        assert_eq!(overview_counts(&value), [5, 0, 3, 3, 1, 2, 2, 0]);
+        assert_eq!(value["counts"].as_object().expect("counts object").len(), 8);
 
         // Escalated > stuck > rejected > ci_timeout; same level by last_seen asc.
         let attention = value["attention"].as_array().expect("attention array");
@@ -1992,7 +2202,7 @@ mod tests {
         let response = overview_request(&app, "/api/v1/overview?repo=example.com%2Fapp").await;
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        assert_eq!(overview_counts(&value), [4, 0, 2, 2, 1, 2, 2]);
+        assert_eq!(overview_counts(&value), [4, 0, 2, 2, 1, 2, 2, 0]);
         assert_eq!(value["attention"].as_array().expect("attention").len(), 6);
         let runs = value["active_runs"].as_array().expect("active runs");
         assert_eq!(runs.len(), 1);
@@ -2028,7 +2238,7 @@ mod tests {
         let response = overview_request(&app, "/api/v1/overview?repo=example.com%2Fother").await;
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        assert_eq!(overview_counts(&value), [1, 0, 1, 1, 0, 0, 0]);
+        assert_eq!(overview_counts(&value), [1, 0, 1, 1, 0, 0, 0, 0]);
         assert!(value["attention"].as_array().expect("attention").is_empty());
         assert_eq!(value["attention"].as_array().expect("attention").len(), 0);
         let runs = value["active_runs"].as_array().expect("active runs");
@@ -2055,7 +2265,7 @@ mod tests {
         let response = overview_request(&app, "/api/v1/overview?repo=").await;
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        assert_eq!(overview_counts(&value), [5, 0, 3, 3, 1, 2, 2]);
+        assert_eq!(overview_counts(&value), [5, 0, 3, 3, 1, 2, 2, 0]);
         assert_eq!(value["active_runs"].as_array().expect("active runs").len(), 2);
         assert_eq!(value["queue"]["ready_count"].as_u64(), Some(5));
         assert_eq!(value["health"]["runners_total"].as_u64(), Some(6));
@@ -2370,7 +2580,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_read_api_headers(&response);
         let overview = json_body(response).await;
-        assert_eq!(overview_counts(&overview), [1, 0, 1, 0, 1, 0, 1]);
+        assert_eq!(overview_counts(&overview), [1, 0, 1, 0, 1, 0, 1, 0]);
         let attention = overview["attention"].as_array().expect("attention");
         assert_eq!(attention.len(), 1);
         assert_eq!(
@@ -2740,7 +2950,12 @@ mod tests {
                 "merged": 1,
                 "rejected": 0,
                 "tokens": 18_600,
+                "ci_green": 1,
+                "ci_red": 0,
                 "median_time_to_pr_secs": 3,
+                "false_positive_rate": 0.0,
+                "review_latency_p50_secs": 2,
+                "ci_red_rate": 0.0,
             })
         );
 

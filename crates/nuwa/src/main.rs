@@ -1,17 +1,23 @@
 mod api;
+mod check;
 mod ci;
 mod deliver;
+mod git_ops;
 mod guard;
 mod instructions;
 mod issue;
 mod repair;
+mod secrets;
 mod serve;
 mod session;
 mod settings;
+mod verify;
 mod web;
+mod webhook;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 
@@ -100,9 +106,11 @@ async fn main() -> anyhow::Result<()> {
         Some("status") => run_status(argv.collect()),
         Some("sync") => run_sync(argv.collect()).await,
         Some("reopen") => run_reopen(argv.collect()),
+        Some("ignore") => run_ignore(argv.collect()),
+        Some("check") => check::run(argv.collect()).await,
         Some("migrate-env") => run_migrate_env(argv.collect()),
         other => bail!(
-            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--runner-id <id>] [--service-unit <unit>] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp>   (owner reviewed an escalation)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
+            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--runner-id <id>] [--service-unit <unit>] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp> [--reason <text>]   (owner reviewed an escalation)\n            nuwa ignore --db <path> --fingerprint <fp> [--reason <text>]   (owner mute / not a bug)\n            nuwa check --instructions <path> [--repo <path>] [--base main] [--json]   (preflight a repo config)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
         ),
     }
 }
@@ -129,6 +137,7 @@ pub(crate) fn parse_signals(raw: &str) -> anyhow::Result<Vec<shanhaijing::Signal
 fn run_reopen(args: Vec<String>) -> anyhow::Result<()> {
     let mut db_path = std::path::PathBuf::from("shanhaijing.db");
     let mut fingerprint = None;
+    let mut reason = None;
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -136,15 +145,41 @@ fn run_reopen(args: Vec<String>) -> anyhow::Result<()> {
             "--fingerprint" => {
                 fingerprint = Some(it.next().context("--fingerprint needs a value")?)
             }
+            "--reason" => reason = Some(it.next().context("--reason needs a value")?),
             other => bail!("unknown reopen flag {other}"),
         }
     }
     let fp = fingerprint.context("--fingerprint is required")?;
     let store =
         shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
-    store.set_state_as(&fp, shanhaijing::State::New, now_ms(), Some("reopened by owner"), "owner")?;
+    store.reopen_issue(&fp, now_ms(), reason.as_deref())?;
     store.set_cooldown(&fp, 0)?;
     println!("reopened   : {fp} — ready for pickup");
+    Ok(())
+}
+
+/// Owner mute: `new`/`escalated`/`rejected` → `ignored`. Reports are counted
+/// but never auto-reopen it; only an explicit reopen does.
+fn run_ignore(args: Vec<String>) -> anyhow::Result<()> {
+    let mut db_path = std::path::PathBuf::from("shanhaijing.db");
+    let mut fingerprint = None;
+    let mut reason = String::new();
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--db" => db_path = PathBuf::from(it.next().context("--db needs a value")?),
+            "--fingerprint" => {
+                fingerprint = Some(it.next().context("--fingerprint needs a value")?)
+            }
+            "--reason" => reason = it.next().context("--reason needs a value")?,
+            other => bail!("unknown ignore flag {other}"),
+        }
+    }
+    let fp = fingerprint.context("--fingerprint is required")?;
+    let store =
+        shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    store.ignore_issue(&fp, &reason, "owner", now_ms())?;
+    println!("ignored    : {fp} — reports will be counted, not repaired");
     Ok(())
 }
 
@@ -241,6 +276,12 @@ pub(crate) fn report_one(
         } => {
             format!("cooldown   : {fingerprint} — retry in {retry_after_ms}ms")
         }
+        shanhaijing::ReportOutcome::Muted {
+            fingerprint,
+            occurrences,
+        } => {
+            format!("muted      : {fingerprint} — ignored by owner, occurrences={occurrences}")
+        }
         shanhaijing::ReportOutcome::Regression {
             fingerprint,
             occurrences,
@@ -266,6 +307,7 @@ fn absolute_sessions_dir(path: PathBuf) -> anyhow::Result<PathBuf> {
 /// escalates the issue (docs/07 A-1 回炉升级). `--loop` keeps polling
 /// (serial runner; the concurrent pool is A-3's remaining half).
 async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
+    webhook::init_from_env();
     // env 默认（设置页写入 nuwa.env）→ CLI 显式 flag 覆盖。
     let mut db_path = std::path::PathBuf::from("shanhaijing.db");
     let mut instructions_path = None;
@@ -278,6 +320,12 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let mut interval_secs: u64 = env_d("NUWA_INTERVAL", "30").parse().unwrap_or(30);
     let mut daily_pr_limit: u64 = env_d("NUWA_DAILY_PR_LIMIT", "5").parse().unwrap_or(5);
     let mut max_tokens: u64 = env_d("NUWA_MAX_TOKENS", "1500000").parse().unwrap_or(1_500_000);
+    let mut daily_token_limit: u64 = env_d("NUWA_DAILY_TOKEN_LIMIT", "5000000")
+        .parse()
+        .unwrap_or(5_000_000);
+    let mut monthly_token_limit: u64 = env_d("NUWA_MONTHLY_TOKEN_LIMIT", "50000000")
+        .parse()
+        .unwrap_or(50_000_000);
     let mut ci_timeout_secs: u64 = env_d("NUWA_CI_TIMEOUT", "600").parse().unwrap_or(600);
     let mut runner_id_given: Option<String> =
         std::env::var("NUWA_RUNNER_ID").ok().filter(|v| !v.is_empty());
@@ -330,12 +378,17 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             "--interval" => interval_secs = value("--interval")?.parse()?,
             "--daily-pr-limit" => daily_pr_limit = value("--daily-pr-limit")?.parse()?,
             "--max-tokens" => max_tokens = value("--max-tokens")?.parse()?,
+            "--daily-token-limit" => daily_token_limit = value("--daily-token-limit")?.parse()?,
+            "--monthly-token-limit" => {
+                monthly_token_limit = value("--monthly-token-limit")?.parse()?
+            }
             "--ci-timeout" => ci_timeout_secs = value("--ci-timeout")?.parse()?,
             "--runner-id" => runner_id_given = Some(value("--runner-id")?),
             "--service-unit" => service_unit = value("--service-unit")?,
             other => bail!("unknown work flag {other}"),
         }
     }
+    let secrets = Arc::new(secrets::Secrets::load_and_scrub_env());
     let provider = provider_given.unwrap_or_else(env_provider_default);
     let instructions_path = instructions_path.context("--instructions <path> is required")?;
     // One absolute root drives both the pre-repair `runs.session_dir` write
@@ -346,7 +399,29 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         shanhaijing::Store::open(&db_path)
             .with_context(|| format!("open db {}", db_path.display()))?,
     );
-    let (repo_config, repo_dir) = instructions::RepoInstructions::load(&instructions_path)?;
+    let repo_dir = instructions_path
+        .parent()
+        .map(Path::to_path_buf)
+        .context("instructions path has no parent")?;
+    let base = resolve_base(&repo_dir)?;
+    let trusted = instructions::TrustedInstructions::load(
+        &repo_dir,
+        &instructions_path,
+        base,
+        &sessions_dir.join("_trusted"),
+    )?;
+    let repo_config = trusted.instructions.clone();
+    println!(
+        "preflight   : instructions {:?} sha256 {}",
+        trusted.source(),
+        &trusted.sha256[..12.min(trusted.sha256.len())]
+    );
+    if trusted.verify_and_restore()? {
+        eprintln!(
+            "preflight   : restored {} from the trusted instruction source",
+            trusted.path().display()
+        );
+    }
 
     let runner_id = runner_id_given
         .map(|id| sanitize_runner_id(&id))
@@ -358,6 +433,8 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         ci_timeout_secs,
         max_turns,
         max_tokens,
+        daily_token_limit,
+        monthly_token_limit,
     );
     let now = now_ms();
     let _ = store.mark_interrupted(&runner_id, now);
@@ -401,9 +478,44 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         Ok(n) => println!("revive      : {n} orphaned fixing issue(s) requeued at startup"),
         Err(e) => eprintln!("warning : revive orphaned fixing failed: {e}"),
     }
+    match cleanup_terminal_branches(&store, &repo_dir, push).await {
+        Ok(0) => {}
+        Ok(n) => println!("cleanup     : removed {n} terminal branch(es) at startup"),
+        Err(e) => eprintln!("warning : terminal branch cleanup failed: {e:#}"),
+    }
+    match cleanup_sessions(&sessions_dir, &store, now, 365) {
+        Ok(0) => {}
+        Ok(n) => println!("cleanup     : removed {n} expired session dir(s) at startup"),
+        Err(e) => eprintln!("warning : session cleanup failed: {e:#}"),
+    }
 
+    let mut cycles: u64 = 0;
     let result: anyhow::Result<()> = async {
         loop {
+            // Integrity check before any claim: an agent that bypassed the
+            // tool guard cannot persist a weakened failing_check/forbidden
+            // list across a restart.
+            match trusted.verify_and_restore() {
+                Ok(true) => {
+                    eprintln!(
+                        "preflight   : {} was modified — restored from the trusted source",
+                        trusted.path().display()
+                    );
+                    let _ = store.record_event(
+                        "__system__",
+                        now_ms(),
+                        Some(&repo_config.repo),
+                        "runner",
+                        "config_tampered",
+                        "nuwa.repo.json restored from trusted source",
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
+                    return Err(e);
+                }
+            }
             let worked = work_once(
                 &store,
                 &repo_config,
@@ -415,11 +527,29 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
                 create_pr,
                 daily_pr_limit,
                 max_tokens,
+                daily_token_limit,
+                monthly_token_limit,
                 ci_timeout_secs,
                 &runner_id,
                 Arc::clone(&live),
+                &secrets,
             )
             .await?;
+            if worked {
+                if let Ok(n) = cleanup_terminal_branches(&store, &repo_dir, push).await {
+                    if n > 0 {
+                        println!("cleanup     : removed {n} terminal branch(es)");
+                    }
+                }
+            }
+            cycles += 1;
+            if cycles % 100 == 0 {
+                if let Ok(n) = cleanup_sessions(&sessions_dir, &store, now_ms(), 365) {
+                    if n > 0 {
+                        println!("cleanup     : removed {n} expired session dir(s)");
+                    }
+                }
+            }
             if !loop_run {
                 break;
             }
@@ -441,6 +571,12 @@ struct RunnerLive {
     current_fingerprint: Option<String>,
     phase: Option<String>,
     last_error: Option<String>,
+    /// Real progress (phase/turn), not the independent liveness heartbeat.
+    progress_at_ms: i64,
+    /// Consecutive provider-side failures across runs.
+    consecutive_provider_failures: u32,
+    /// While this is in the future, the runner does not claim issues.
+    stand_down_until_ms: i64,
 }
 
 impl RunnerLive {
@@ -450,8 +586,91 @@ impl RunnerLive {
             current_fingerprint: None,
             phase: None,
             last_error: None,
+            progress_at_ms: 0,
+            consecutive_provider_failures: 0,
+            stand_down_until_ms: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    ProviderTransient,
+    ProviderConfig,
+    Environment,
+    Issue,
+}
+
+fn classify_failure(error: &anyhow::Error) -> FailureClass {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    // Tool/verification failures belong to the issue, even when the text says
+    // "timed out" (a hung test or a 300s bash timeout).
+    if text.contains("command timed out")
+        || text.contains("verification")
+        || text.contains("reproduce_check")
+        || text.contains("failing_check")
+        || text.contains("run aborted")
+        || text.contains("budget")
+    {
+        return FailureClass::Issue;
+    }
+    if text.contains("401")
+        || text.contains("403")
+        || text.contains("unauthorized")
+        || (text.contains("not set")
+            && (text.contains("api_key") || text.contains("api key")))
+    {
+        return FailureClass::ProviderConfig;
+    }
+    if text.contains("429")
+        || text.contains("rate limit")
+        || text.contains("provider")
+        || text.contains("stream")
+        || text.contains("connection")
+        || text.contains("network")
+        || text.contains("502")
+        || text.contains("503")
+        || text.contains("504")
+        || text.contains("timed out")
+        || text.contains("timeout")
+    {
+        return FailureClass::ProviderTransient;
+    }
+    if text.contains("dirty")
+        || text.contains("working tree")
+        || text.contains("toolchain")
+        || text.contains("preflight")
+    {
+        return FailureClass::Environment;
+    }
+    FailureClass::Issue
+}
+
+async fn mark_provider_failure(live: &SharedLive, now: i64) -> bool {
+    let mut state = live.lock().await;
+    state.consecutive_provider_failures += 1;
+    if state.consecutive_provider_failures >= 3 {
+        state.stand_down_until_ms = now + 15 * 60_000;
+        true
+    } else {
+        false
+    }
+}
+
+async fn reset_provider_health(live: &SharedLive) {
+    let mut state = live.lock().await;
+    state.consecutive_provider_failures = 0;
+    state.stand_down_until_ms = 0;
+}
+
+async fn mark_stand_down(live: &SharedLive, until_ms: i64) {
+    let mut state = live.lock().await;
+    state.stand_down_until_ms = until_ms;
+}
+
+async fn stand_down_remaining(live: &SharedLive, now: i64) -> Option<i64> {
+    let state = live.lock().await;
+    (state.stand_down_until_ms > now).then_some(state.stand_down_until_ms - now)
 }
 
 type SharedLive = Arc<tokio::sync::Mutex<RunnerLive>>;
@@ -499,25 +718,41 @@ fn effective_config_json(
     ci_timeout_secs: u64,
     max_turns: u32,
     max_tokens: u64,
+    daily_token_limit: u64,
+    monthly_token_limit: u64,
 ) -> String {
     serde_json::json!({
         "interval_secs": interval_secs,
         "ci_timeout_secs": ci_timeout_secs,
         "max_turns": max_turns,
         "max_tokens": max_tokens,
+        "daily_token_limit": daily_token_limit,
+        "monthly_token_limit": monthly_token_limit,
         "failing_check": repo_config.failing_check.command,
+        "reproduce_check": repo_config.reproduce_check.as_ref().map(|c| c.command.clone()),
         "forbidden_paths_count": repo_config.forbidden_paths.len(),
+        "max_attempts": repo_config.max_attempts,
+        "draft_first_n": repo_config.draft_first_n,
     })
     .to_string()
 }
 
-async fn live_snapshot(live: &SharedLive) -> (String, Option<String>, Option<String>, Option<String>) {
+async fn live_snapshot(
+    live: &SharedLive,
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+) {
     let state = live.lock().await;
     (
         state.status.clone(),
         state.current_fingerprint.clone(),
         state.phase.clone(),
         state.last_error.clone(),
+        state.progress_at_ms,
     )
 }
 
@@ -555,6 +790,15 @@ fn bounded_text(text: &str) -> String {
 /// Update the in-memory runner state. Memory-only by design: telemetry must
 /// not block the repair/delivery hot path, so SQLite persistence is owned by
 /// the background heartbeat task and the explicit run writes.
+fn emit_webhook(event: &str, fingerprint: &str, repo: &str, detail: impl Into<String>) {
+    webhook::emit(webhook::WebhookEvent::new(
+        event,
+        Some(fingerprint.to_string()),
+        Some(repo.to_string()),
+        detail,
+    ));
+}
+
 async fn live_update(
     live: &SharedLive,
     status: &str,
@@ -567,6 +811,7 @@ async fn live_update(
     state.current_fingerprint = fp.map(str::to_string);
     state.phase = phase.map(str::to_string);
     state.last_error = error;
+    state.progress_at_ms = now_ms();
 }
 
 fn spawn_heartbeat(
@@ -579,7 +824,7 @@ fn spawn_heartbeat(
     tokio::spawn(async move {
         let mut logged_failure = false;
         loop {
-            let (status, fp, phase, error) = live_snapshot(&live).await;
+            let (status, fp, phase, error, progress_at) = live_snapshot(&live).await;
             let store = Arc::clone(&store);
             let runner_id = runner_id.clone();
             let config_json = config_json.clone();
@@ -595,6 +840,9 @@ fn spawn_heartbeat(
                         last_error: error,
                     },
                 );
+                if result.is_ok() {
+                    let _ = store.set_runner_progress(&runner_id, progress_at);
+                }
                 // v0.2.x 回滚保护：旧控制台仍读全局 heartbeat 表。
                 let _ = store.heartbeat(now_ms());
                 result
@@ -618,6 +866,248 @@ fn spawn_heartbeat(
     })
 }
 
+/// Resolve the base branch from local refs. The runner only supports the
+/// repository's `main`/`master` checkout (docs/08).
+fn resolve_base(repo_dir: &Path) -> anyhow::Result<&'static str> {
+    if git_ops::branch_exists(repo_dir, "main")? {
+        Ok("main")
+    } else if git_ops::branch_exists(repo_dir, "master")? {
+        Ok("master")
+    } else {
+        bail!(
+            "repo {} has neither a `main` nor a `master` branch",
+            repo_dir.display()
+        )
+    }
+}
+
+/// Refresh the runner's base and recover a checkout left behind by an
+/// interrupted delivery. Fetch/reset failures are environment faults: the
+/// caller stands down and retries on the next poll instead of crashing.
+async fn preflight_repo(repo_dir: &Path) -> anyhow::Result<&'static str> {
+    let base = resolve_base(repo_dir)?;
+    let head = git_ops::current_branch(repo_dir)?;
+    if head != base {
+        if head.starts_with("agent/fix/") {
+            // The runner owns this checkout. The interrupted branch keeps its
+            // commit for forensics; only the working tree is reset.
+            git_ops::git(repo_dir, &["checkout", "-f", base])?;
+            eprintln!("preflight   : recovered checkout from {head} to {base}");
+        } else {
+            bail!(
+                "repo {} is on branch `{}` — runner only works from {base}; reset the checkout",
+                repo_dir.display(),
+                head
+            );
+        }
+    }
+
+    let has_origin = git_ops::git(repo_dir, &["remote", "get-url", "origin"]).is_ok();
+    if has_origin {
+        git_ops::fetch_base(repo_dir, base, Duration::from_secs(120)).await?;
+        git_ops::reset_to_base(repo_dir, base)?;
+    }
+
+    let dirty = git_ops::git(
+        repo_dir,
+        &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
+    )?;
+    if !dirty.trim().is_empty() {
+        eprintln!(
+            "preflight   : unclean working tree — auto-reset to {base}:\n{}",
+            dirty.trim()
+        );
+        if has_origin {
+            git_ops::reset_to_base(repo_dir, base)?;
+        } else {
+            git_ops::git(repo_dir, &["reset", "--hard", "HEAD"])?;
+        }
+        let _ = git_ops::git(repo_dir, &["clean", "-fd", "--", ":(exclude)nuwa.repo.json"]);
+        let still = git_ops::git(
+            repo_dir,
+            &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
+        )?;
+        if !still.trim().is_empty() {
+            bail!(
+                "repo {} working tree still unclean after auto-reset — manual intervention required:\n{}",
+                repo_dir.display(),
+                still.trim()
+            );
+        }
+    }
+    Ok(base)
+}
+
+/// Remove per-fingerprint session directories whose latest run is older than
+/// the retention window. `_trusted` is runner configuration, never a session.
+fn cleanup_sessions(
+    root: &Path,
+    store: &shanhaijing::Store,
+    now: i64,
+    retention_days: u32,
+) -> anyhow::Result<usize> {
+    let cutoff = now - i64::from(retention_days) * 86_400_000;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error).with_context(|| format!("read {}", root.display())),
+    };
+    let issues = store.list_issues()?;
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('_') {
+            continue;
+        }
+        let latest = issues
+            .iter()
+            .find(|issue| issue::short_fingerprint(&issue.fingerprint) == name)
+            .map(|issue| {
+                store
+                    .latest_run(&issue.fingerprint)
+                    .ok()
+                    .flatten()
+                    .map(|run| run.started_at)
+                    .unwrap_or(issue.last_seen)
+            });
+        let keep = match latest {
+            Some(latest) => latest >= cutoff,
+            None => entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as i64 >= cutoff)
+                .unwrap_or(true),
+        };
+        if !keep {
+            std::fs::remove_dir_all(entry.path())
+                .with_context(|| format!("remove {}", entry.path().display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Remove `agent/fix/*` branches whose issue is already terminal. This keeps
+/// the deterministic branch namespace reusable after merge/reject/escalation
+/// and stops remote branches from accumulating forever.
+async fn cleanup_terminal_branches(
+    store: &shanhaijing::Store,
+    repo_dir: &Path,
+    push: bool,
+) -> anyhow::Result<usize> {
+    let listing = git_ops::git(
+        repo_dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/agent/fix/",
+        ],
+    )?;
+    if listing.trim().is_empty() {
+        return Ok(0);
+    }
+    let issues = store.list_issues()?;
+    let mut removed = 0usize;
+    for branch in listing.lines().map(str::trim).filter(|b| !b.is_empty()) {
+        let Some(short) = branch.strip_prefix("agent/fix/") else {
+            continue;
+        };
+        let Some(row) = issues
+            .iter()
+            .find(|row| issue::short_fingerprint(&row.fingerprint) == short)
+        else {
+            continue;
+        };
+        let terminal = matches!(
+            row.state.as_str(),
+            "merged" | "rejected" | "escalated" | "ignored"
+        );
+        // An escalated issue can still have an open PR after a manual state
+        // change; never delete that branch out from under the owner.
+        if !terminal || (row.state == "escalated" && row.pr_url.is_some()) {
+            continue;
+        }
+        git_ops::delete_local_branch(repo_dir, branch)?;
+        if push {
+            // Best effort: a stale remote branch is not a reason to fail the
+            // startup path; the next claim precheck retries it.
+            if let Err(e) =
+                git_ops::delete_remote_branch(repo_dir, branch, Duration::from_secs(120)).await
+            {
+                eprintln!("cleanup     : could not delete remote {branch}: {e:#}");
+            }
+        }
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Delete the deterministic branch left by a previous delivery for this
+/// fingerprint. Remote deletion only matters when the runner pushes.
+async fn remove_stale_branch(repo_dir: &Path, fingerprint: &str, push: bool) -> anyhow::Result<bool> {
+    let branch = format!("agent/fix/{}", issue::short_fingerprint(fingerprint));
+    if !git_ops::branch_exists(repo_dir, &branch)? {
+        return Ok(false);
+    }
+    git_ops::delete_local_branch(repo_dir, &branch)?;
+    if push {
+        git_ops::delete_remote_branch(repo_dir, &branch, Duration::from_secs(120)).await?;
+    }
+    Ok(true)
+}
+
+fn context_excerpt(text: &str, max_chars: usize) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    first.chars().take(max_chars).collect()
+}
+
+/// Build the retry context injected into the next repair prompt: the last
+/// owner decision plus the last three run outcomes/root causes/errors.
+fn build_prior_context(
+    store: &shanhaijing::Store,
+    fingerprint: &str,
+    secrets: &secrets::Secrets,
+) -> String {
+    let mut out = String::new();
+    if let Ok(Some(event)) = store.latest_owner_event(fingerprint) {
+        let detail = secrets.redact(&event.detail);
+        if !detail.trim().is_empty() {
+            out.push_str("OWNER NOTE:\n- ");
+            out.push_str(detail.trim());
+            out.push('\n');
+        }
+    }
+    if let Ok(runs) = store.recent_runs(fingerprint, 3) {
+        let mut header = false;
+        for run in runs {
+            if !header {
+                out.push_str("\nPRIOR ATTEMPTS:\n");
+                header = true;
+            }
+            let outcome = run.outcome.as_deref().unwrap_or("open");
+            let ci = run.ci_verdict.as_deref().unwrap_or("-");
+            let cause = secrets.redact(run.root_cause.as_deref().unwrap_or(""));
+            let error = secrets.redact(run.error.as_deref().unwrap_or(""));
+            out.push_str(&format!(
+                "- started={} outcome={} ci={} root_cause={} error={}\n",
+                run.started_at,
+                outcome,
+                ci,
+                context_excerpt(&cause, 240),
+                context_excerpt(&error, 240),
+            ));
+        }
+    }
+    out.chars().take(4_096).collect()
+}
+
 /// One pickup attempt. `Ok(true)` = an issue was claimed and driven to a
 /// terminal state this pass; `Ok(false)` = nothing pickable.
 #[allow(clippy::too_many_arguments)]
@@ -632,13 +1122,24 @@ async fn work_once(
     create_pr: bool,
     daily_pr_limit: u64,
     max_tokens: u64,
+    daily_token_limit: u64,
+    monthly_token_limit: u64,
     ci_timeout_secs: u64,
     runner_id: &str,
     live: SharedLive,
+    secrets: &Arc<secrets::Secrets>,
 ) -> anyhow::Result<bool> {
     let now = now_ms();
     // 活性必须在任何早退之前可见：配额待定/预检失败都不是"进程死了"。
     store.heartbeat(now)?;
+    if let Some(remaining) = stand_down_remaining(&live, now).await {
+        let detail = format!(
+            "provider/environment stand-down for {}s",
+            remaining / 1_000
+        );
+        live_update(&live, "standing_down", None, None, Some(detail)).await;
+        return Ok(false);
+    }
 
     // ---- frequency gate: stand down when today's PR quota is spent ----
     // Checked BEFORE claiming so the issue stays `new` and is picked up
@@ -656,60 +1157,52 @@ async fn work_once(
         }
     }
 
-    // ---- repo preflight: a dirty or off-main checkout wastes a run ----
-    // These are environment faults (a previous run left the checkout behind),
-    // not issue faults — bail loudly instead of claiming and escalating.
-    let head = match deliver::git(repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
-        Ok(head) => head,
-        Err(e) => {
-            live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
-            return Err(e);
-        }
-    };
-    if head != "main" && head != "master" {
-        let message = format!(
-            "repo {} is on branch `{}` — runner only works from main/master; reset the checkout",
-            repo_dir.display(),
-            head
+    // ---- spend caps: failures consume tokens too ----
+    let day_start = now - now.rem_euclid(86_400_000);
+    let daily_spent = store.tokens_used_since(Some(&repo_config.repo), day_start)?;
+    if daily_spent >= daily_token_limit {
+        let detail = format!(
+            "daily token cap reached: {daily_spent}/{daily_token_limit} for {}",
+            repo_config.repo
         );
-        live_update(&live, "error", None, None, Some(message.clone())).await;
-        bail!("{message}");
+        println!("quota      : {detail} — standing down");
+        live_update(&live, "standing_down", None, None, Some(detail)).await;
+        return Ok(false);
     }
-    let dirty = match deliver::git(
-        repo_dir,
-        &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
-    ) {
-        Ok(dirty) => dirty,
-        Err(e) => {
-            live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
-            return Err(e);
-        }
-    };
-    if !dirty.trim().is_empty() {
-        // runner 独占此部署目录：残留半成品（上次修复/交付中断）由下一次
-        // 修复自动覆盖，自动 reset 是安全且正确的自愈；仅有 nuwa.repo.json
-        // 这类登记文件不受影响（已在 porcelain 中排除）。
-        eprintln!("preflight   : unclean working tree — auto-reset to origin/main:\n{}", dirty.trim());
-        let _ = deliver::git(repo_dir, &["reset", "--hard", "origin/main"]);
-        let _ = deliver::git(repo_dir, &["clean", "-fd", "--", ":(exclude)nuwa.repo.json"]);
-        let still = deliver::git(
-            repo_dir,
-            &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
-        )?;
-        if !still.trim().is_empty() {
-            let message = format!(
-                "repo {} working tree still unclean after auto-reset — manual intervention required:\n{}",
-                repo_dir.display(),
-                still.trim()
-            );
-            live_update(&live, "error", None, None, Some(message.clone())).await;
-            bail!("{message}");
-        }
+    let month_start = now - 30 * 86_400_000;
+    let monthly_spent = store.tokens_used_since(Some(&repo_config.repo), month_start)?;
+    if monthly_spent >= monthly_token_limit {
+        let detail = format!(
+            "monthly token cap reached: {monthly_spent}/{monthly_token_limit} for {}",
+            repo_config.repo
+        );
+        println!("quota      : {detail} — standing down");
+        live_update(&live, "standing_down", None, None, Some(detail)).await;
+        return Ok(false);
     }
 
+    // ---- repo preflight: refresh the base and recover a half-delivered checkout ----
+    // A previous delivery may have failed after `checkout -b` and left the
+    // runner on the agent branch. The runner owns this checkout, so a clean
+    // `agent/fix/*` branch is recovered automatically instead of crash-looping.
+    let base = match preflight_repo(repo_dir).await {
+        Ok(base) => base,
+        Err(e) => {
+            live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
+            eprintln!("preflight   : {e:#}");
+            // Environment fault, not an issue fault: stand down and retry next
+            // poll instead of exiting into a systemd restart loop.
+            return Ok(false);
+        }
+    };
+    println!("preflight   : base {base}");
+
     // ---- claim (atomic: N runners can never share an issue) ----
-    let Some(snapshot) =
-        store.claim_ready_issue(now, now + shanhaijing::DEFAULT_COOLDOWN_MS)?
+    let Some(snapshot) = store.claim_ready_issue_for_repo(
+        now,
+        now + shanhaijing::DEFAULT_COOLDOWN_MS,
+        &repo_config.repo,
+    )?
     else {
         println!("nothing ready for pickup");
         live_update(&live, "idle", None, None, None).await;
@@ -735,23 +1228,95 @@ async fn work_once(
             "runner",
         );
         println!("mismatch   : {} escalated (belongs to `{}`)", snapshot.fingerprint, snapshot.repo);
+        emit_webhook(
+            "escalated",
+            &snapshot.fingerprint,
+            &repo_config.repo,
+            "repo mismatch: issue escalated (ADR-004)",
+        );
         live_update(&live, "idle", None, None, Some(message)).await;
         return Ok(true);
     }
     let fp = snapshot.fingerprint.clone();
+
+    // ---- attempt cap: stop an automatic retry loop before spending a run ----
+    let max_attempts = u64::from(repo_config.max_attempts.max(1));
+    if snapshot.attempts >= max_attempts {
+        let detail = format!(
+            "attempt cap reached ({} >= {})",
+            snapshot.attempts, max_attempts
+        );
+        let _ = store.ignore_issue(&fp, &detail, "runner", now);
+        println!("ignored    : {fp} — {detail}");
+        emit_webhook("ignored", &fp, &repo_config.repo, detail.clone());
+        live_update(&live, "idle", None, None, Some(detail)).await;
+        return Ok(true);
+    }
+
+    // ---- stale branch precheck (before any LLM spend) ----
+    // A deterministic branch survives a merged/rejected delivery. If it is
+    // still present when the same fingerprint comes back, the old code only
+    // discovered that in `deliver` after burning a full repair run.
+    let stale_branch = format!("agent/fix/{}", issue::short_fingerprint(&fp));
+    if git_ops::branch_exists(repo_dir, &stale_branch)? {
+        let recorded_pr = store
+            .list_issues()?
+            .into_iter()
+            .find(|row| row.fingerprint == fp)
+            .and_then(|row| row.pr_url);
+        if recorded_pr.is_some() {
+            let message = format!(
+                "branch {stale_branch} exists and the issue has a recorded PR — refusing to delete it; manual review required"
+            );
+            let _ = store.set_state_as(
+                &fp,
+                shanhaijing::State::Escalated,
+                now,
+                Some(&message),
+                "runner",
+            );
+            println!("branch     : {message}");
+            emit_webhook("escalated", &fp, &repo_config.repo, message.clone());
+            live_update(&live, "idle", None, None, Some(message)).await;
+            return Ok(true);
+        }
+        if let Err(e) = remove_stale_branch(repo_dir, &fp, push).await {
+            let message = format!(
+                "stale branch {stale_branch} could not be removed: {e:#} — escalated before starting a repair"
+            );
+            let _ = store.set_state_as(
+                &fp,
+                shanhaijing::State::Escalated,
+                now,
+                Some(&message),
+                "runner",
+            );
+            println!("branch     : {message}");
+            emit_webhook("escalated", &fp, &repo_config.repo, message.clone());
+            live_update(&live, "idle", None, None, Some(message)).await;
+            return Ok(true);
+        }
+        println!("branch     : removed stale {stale_branch} before repair");
+    }
+
+    let prior_context = build_prior_context(store, &fp, secrets);
     // Build the issue before `start_run` so the deterministic session dir is
     // known for the first lifecycle write.
     let prob = issue::Issue {
         fingerprint: fp.clone(),
-        title: snapshot.title.clone(),
+        // The raw signal is external input; strip known secrets / token
+        // patterns before it enters the LLM context.
+        title: secrets.redact(&snapshot.title),
         language: snapshot.language.clone(),
         occurrences: snapshot.occurrences,
         severity: snapshot.severity.clone(),
         first_seen: String::new(),
         last_seen: String::new(),
-        stack_trace: snapshot.stack_sample.clone(),
+        stack_trace: secrets.redact(&snapshot.stack_sample),
         log_window: Vec::new(),
+        prior_context,
         failing_check: repo_config.failing_check.clone(),
+        reproduce_check: repo_config.reproduce_check.clone(),
         forbidden_paths: repo_config.forbidden_paths.clone(),
     };
     let _ = store.start_run(&shanhaijing::RunStart {
@@ -808,10 +1373,17 @@ async fn work_once(
     let guards = std::sync::Arc::new(guard::Guards::new(repo_config.forbidden_paths.clone()));
     let progress_store = Arc::clone(store);
     let progress_run = run_id.clone();
+    let progress_live = Arc::clone(&live);
     let progress: Option<Arc<dyn Fn(repair::RepairProgress) + Send + Sync>> =
         Some(Arc::new(move |p| {
             let store = Arc::clone(&progress_store);
             let run_id = progress_run.clone();
+            // Every completed turn is real progress: refresh the watchdog
+            // timestamp even though the independent heartbeat keeps ticking.
+            let live = Arc::clone(&progress_live);
+            tokio::spawn(async move {
+                live.lock().await.progress_at_ms = now_ms();
+            });
             // Fire-and-forget: progress is best-effort telemetry and must not
             // sit in the event drain that drives the repair loop.
             tokio::spawn(async move {
@@ -835,6 +1407,7 @@ async fn work_once(
         provider,
         max_turns,
         guards,
+        secrets: Arc::clone(secrets),
         notes: repo_config.notes.clone(),
         progress,
     };
@@ -853,23 +1426,107 @@ async fn work_once(
     let report = match repair::run(&job).await {
         Ok(r) => r,
         Err(e) => {
-            let detail = bounded_text(&format!("repair_failed: {e:#}"));
+            let class = classify_failure(&e);
+            let detail = bounded_text(&secrets.redact(&format!("repair_failed: {e:#}")));
+            let outcome = match class {
+                FailureClass::ProviderTransient => "provider_transient",
+                FailureClass::ProviderConfig => "provider_config",
+                FailureClass::Environment => "environment",
+                FailureClass::Issue => "repair_failed",
+            };
             let _ = store.finish_run(
                 &run_id,
                 &shanhaijing::RunFinish {
                     finished_at: now_ms(),
-                    outcome: "repair_failed".into(),
+                    outcome: outcome.into(),
                     ci_verdict: None,
                     error: Some(detail.clone()),
                 },
             );
-            live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
-            store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
-            bail!("repair failed — issue escalated: {e:#}");
+            match class {
+                FailureClass::ProviderTransient => {
+                    // The issue is not at fault: release it for a later retry
+                    // without consuming an attempt, and stand down after a
+                    // short streak so a provider outage does not burn the queue.
+                    let _ = store.release_issue(
+                        &fp,
+                        &format!("provider transient: {e:#}"),
+                        now + 5 * 60_000,
+                        now,
+                    );
+                    let standing = mark_provider_failure(&live, now).await;
+                    if standing {
+                        emit_webhook(
+                            "provider_stand_down",
+                            &fp,
+                            &repo_config.repo,
+                            "provider transient failures reached 3; standing down for 15 minutes",
+                        );
+                    }
+                    live_update(
+                        &live,
+                        if standing { "standing_down" } else { "idle" },
+                        None,
+                        None,
+                        Some(detail),
+                    )
+                    .await;
+                    return Ok(false);
+                }
+                FailureClass::ProviderConfig => {
+                    let _ = store.set_state_as(
+                        &fp,
+                        shanhaijing::State::Escalated,
+                        now_ms(),
+                        Some(detail.as_str()),
+                        "runner",
+                    );
+                    emit_webhook(
+                        "escalated",
+                        &fp,
+                        &repo_config.repo,
+                        "provider configuration failure; issue escalated",
+                    );
+                    emit_webhook(
+                        "provider_stand_down",
+                        &fp,
+                        &repo_config.repo,
+                        "provider configuration failure; standing down for 15 minutes",
+                    );
+                    mark_stand_down(&live, now + 15 * 60_000).await;
+                    live_update(&live, "standing_down", None, None, Some(detail)).await;
+                    return Ok(false);
+                }
+                FailureClass::Environment => {
+                    let _ = store.release_issue(
+                        &fp,
+                        &format!("environment failure: {e:#}"),
+                        now + 5 * 60_000,
+                        now,
+                    );
+                    live_update(&live, "error", Some(&fp), None, Some(detail)).await;
+                    return Ok(false);
+                }
+                FailureClass::Issue => {
+                    live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
+                    let _ = store.increment_attempts(&fp);
+                    store.set_state_as(
+                        &fp,
+                        shanhaijing::State::Escalated,
+                        now_ms(),
+                        Some(detail.as_str()),
+                        "runner",
+                    )?;
+                    emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
+                    bail!("repair failed — issue escalated: {e:#}");
+                }
+            }
         }
     };
-    let cause = report
-        .root_cause_text
+    reset_provider_health(&live).await;
+    let _ = secrets.redact_session_dir(Path::new(&report.session_dir));
+    let redacted_root_cause = secrets.redact(&report.root_cause_text);
+    let cause = redacted_root_cause
         .lines()
         .find(|l| l.trim_start().starts_with("ROOT CAUSE"))
         .unwrap_or("(no ROOT CAUSE line)");
@@ -887,7 +1544,7 @@ async fn work_once(
             turns: Some(i64::from(report.turns)),
             tokens_uncached: Some(report.uncached_tokens as i64),
             tokens_cached: Some(report.cached_tokens as i64),
-            root_cause: Some(report.root_cause_text.clone()),
+            root_cause: Some(redacted_root_cause.clone()),
             session_dir: Some(report.session_dir.clone()),
             ..Default::default()
         },
@@ -899,7 +1556,9 @@ async fn work_once(
     // is the spend ceiling — an over-budget run never reaches delivery.
     let spent = report.uncached_tokens + report.cached_tokens;
     if spent > max_tokens {
-        let detail = bounded_text(&format!("budget_exceeded: {spent} > {max_tokens}"));
+        let detail = bounded_text(&secrets.redact(&format!(
+            "budget_exceeded: {spent} > {max_tokens}"
+        )));
         let _ = store.finish_run(
             &run_id,
             &shanhaijing::RunFinish {
@@ -910,10 +1569,14 @@ async fn work_once(
             },
         );
         live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
+        let _ = store.increment_attempts(&fp);
         store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
+        emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
         bail!("{detail} — issue escalated");
     }
-    println!("tokens     : {spent} (cap {max_tokens})");
+    println!(
+        "tokens     : {spent} (per-issue cap {max_tokens}, daily cap {daily_token_limit}, monthly cap {monthly_token_limit})"
+    );
 
     // ---- deliver ----
     live_update(&live, "working", Some(&fp), Some("deliver"), None).await;
@@ -926,6 +1589,11 @@ async fn work_once(
         },
     )
     .await;
+    let draft = repo_config.draft_first_n > 0
+        && store.merged_pr_count(&repo_config.repo)? < u64::from(repo_config.draft_first_n);
+    let public_base_url = std::env::var("NUWA_PUBLIC_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     let delivered = match deliver::deliver(
         &job.repo,
         &job.issue,
@@ -933,12 +1601,15 @@ async fn work_once(
         push,
         create_pr,
         &job.sessions_dir,
+        secrets,
+        public_base_url.as_deref(),
+        draft,
     )
     .await
     {
         Ok(d) => d,
         Err(e) => {
-            let detail = bounded_text(&format!("delivery_failed: {e:#}"));
+            let detail = bounded_text(&secrets.redact(&format!("delivery_failed: {e:#}")));
             let _ = store.finish_run(
                 &run_id,
                 &shanhaijing::RunFinish {
@@ -949,11 +1620,21 @@ async fn work_once(
                 },
             );
             live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
+            let _ = store.increment_attempts(&fp);
             store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
+            emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
             bail!("delivery failed — issue escalated: {e:#}");
         }
     };
 
+    println!(
+        "risk       : files={} +{} -{} tests={} ci={}",
+        delivered.risk.files.len(),
+        delivered.risk.added,
+        delivered.risk.removed,
+        delivered.risk.touches_tests,
+        delivered.risk.touches_ci
+    );
     let pr_opened_at = delivered.pr_url.as_ref().map(|_| now_ms());
     // 交付证据同样必须在 run 结束前落库（阻塞池执行，不占用异步 worker）。
     persist_run(
@@ -981,7 +1662,9 @@ async fn work_once(
         Some(delivered.pr_url.as_deref().unwrap_or("branch pushed, no PR")),
         "runner",
     ) {
-        let detail = bounded_text(&format!("delivery_failed: state update: {e:#}"));
+        let detail = bounded_text(&secrets.redact(&format!(
+            "delivery_failed: state update: {e:#}"
+        )));
         let _ = store.finish_run(
             &run_id,
             &shanhaijing::RunFinish {
@@ -992,11 +1675,12 @@ async fn work_once(
             },
         );
         live_update(&live, "error", Some(&fp), None, Some(detail)).await;
+        let _ = store.increment_attempts(&fp);
         return Err(e.into());
     }
     if let Some(url) = &delivered.pr_url {
         if let Err(e) = store.set_pr(&fp, url, now_ms()) {
-            let detail = bounded_text(&format!("delivery_failed: set_pr: {e:#}"));
+            let detail = bounded_text(&secrets.redact(&format!("delivery_failed: set_pr: {e:#}")));
             let _ = store.finish_run(
                 &run_id,
                 &shanhaijing::RunFinish {
@@ -1006,9 +1690,12 @@ async fn work_once(
                     error: Some(detail.clone()),
                 },
             );
-            live_update(&live, "error", Some(&fp), None, Some(detail)).await;
+            live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
+            emit_webhook("escalated", &fp, &repo_config.repo, detail);
+            let _ = store.increment_attempts(&fp);
             return Err(e.into());
         }
+        emit_webhook("pr_opened", &fp, &repo_config.repo, url.clone());
     }
 
     if !create_pr {
@@ -1034,11 +1721,9 @@ async fn work_once(
     // ---- CI 闸门消费（docs/03 末段）：红 → 自动关 PR + rejected；绿/超时 → 留给人工合并 ----
     live_update(&live, "working", Some(&fp), Some("ci"), None).await;
     if let (Some(slug), Some(number)) = (&delivered.slug, delivered.pr_number) {
-        let token = match std::env::var("NUWA_GITHUB_TOKEN")
-            .or_else(|_| std::env::var("GITHUB_TOKEN"))
-        {
-            Ok(token) => token,
-            Err(_) => {
+        let token = match secrets.github_token.clone() {
+            Some(token) => token,
+            None => {
                 // PR 已开出；缺令牌不是交付失败，只是 CI 闸门不可用。仍要
                 // 关闭 run，否则它会永远停在 open 状态。
                 let detail = bounded_text("NUWA_GITHUB_TOKEN not set — cannot poll CI checks");
@@ -1108,6 +1793,7 @@ async fn work_once(
                         },
                     );
                     live_update(&live, "error", Some(&fp), None, Some(detail)).await;
+                    let _ = store.increment_attempts(&fp);
                     return Err(e);
                 }
                 let _ = store.update_run(
@@ -1134,6 +1820,7 @@ async fn work_once(
                     "ci_red",
                     &format!("head {} — PR #{number} closed", &delivered.commit[..12.min(delivered.commit.len())]),
                 );
+                let _ = store.increment_attempts(&fp);
                 store.set_state_as(
                     &fp,
                     shanhaijing::State::Rejected,
@@ -1141,6 +1828,12 @@ async fn work_once(
                     Some(&format!("ci_red: CI red — PR #{number} closed, back to owner")),
                     "runner",
                 )?;
+                emit_webhook(
+                    "ci_red",
+                    &fp,
+                    &repo_config.repo,
+                    format!("PR #{number} closed after CI failure"),
+                );
                 // Trends bucket producer: the state change alone is not a
                 // merge/rejection signal (docs/09 §9.2).
                 let _ = ci::journal_terminal(
@@ -1331,6 +2024,8 @@ fn run_status(args: Vec<String>) -> anyhow::Result<()> {
 
 async fn run_fix() -> anyhow::Result<()> {
     let cli = parse_args(std::env::args().skip(2).collect())?;
+    webhook::init_from_env();
+    let secrets = Arc::new(secrets::Secrets::load_and_scrub_env());
     let prob = issue::Issue::load(&cli.issue_path).context("load issue")?;
 
     if !cli.repo.join(".git").exists() {
@@ -1363,10 +2058,12 @@ async fn run_fix() -> anyhow::Result<()> {
         provider: cli.provider,
         max_turns: cli.max_turns,
         guards: guards.clone(),
+        secrets: Arc::clone(&secrets),
         notes: String::new(),
         progress: None,
     };
     let report = repair::run(&job).await.context("repair run")?;
+    let _ = secrets.redact_session_dir(Path::new(&report.session_dir));
 
     println!(
         "\nrun       : {}\nturns     : {}\ntokens    : {} (cached {})",
@@ -1391,14 +2088,20 @@ async fn run_fix() -> anyhow::Result<()> {
         cli.push,
         cli.create_pr,
         &cli.sessions_dir,
+        &secrets,
+        None,
+        false,
     )
     .await?;
     println!(
-        "\nbranch    : {}\nbase      : {}\ncommit    : {}\npr        : {}",
+        "\nbranch    : {}\nbase      : {}\ncommit    : {}\npr        : {}\nrisk      : files={} tests={} ci={}",
         delivered.branch,
         delivered.base,
         &delivered.commit[..12.min(delivered.commit.len())],
         delivered.pr_url.as_deref().unwrap_or("-"),
+        delivered.risk.files.len(),
+        delivered.risk.touches_tests,
+        delivered.risk.touches_ci,
     );
     Ok(())
 }
@@ -1409,6 +2112,30 @@ mod tests {
     use super::*;
     use crate::instructions::RepoInstructions;
     use crate::issue::FailingCheck;
+
+    #[test]
+    fn failure_classifier_separates_provider_from_issue_faults() {
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!("LLM provider returned 429 rate limit")),
+            FailureClass::ProviderTransient
+        );
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!("ANTHROPIC_API_KEY not set")),
+            FailureClass::ProviderConfig
+        );
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!("Command timed out after 300s")),
+            FailureClass::Issue
+        );
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!("verification gate failed")),
+            FailureClass::Issue
+        );
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!("repo working tree dirty")),
+            FailureClass::Environment
+        );
+    }
 
     #[test]
     fn relative_sessions_root_becomes_absolute() {
@@ -1501,9 +2228,16 @@ mod tests {
 
         let cfg = RepoInstructions {
             repo: "example.com/spike".into(),
-            failing_check: FailingCheck { command: "true".into(), target: None },
+            failing_check: FailingCheck {
+                command: "true".into(),
+                target: None,
+                timeout_secs: 600,
+            },
             forbidden_paths: Vec::new(),
             notes: String::new(),
+            reproduce_check: None,
+            max_attempts: 3,
+            draft_first_n: 0,
         };
         let worked = work_once(
             &store,
@@ -1516,9 +2250,12 @@ mod tests {
             true,
             1,
             1_000_000,
+            5_000_000,
+            50_000_000,
             600,
             "test:runner",
             Arc::new(tokio::sync::Mutex::new(RunnerLive::new())),
+            &Arc::new(secrets::Secrets::default()),
         )
         .await
         .expect("work_once");
@@ -1553,9 +2290,16 @@ mod tests {
 
         let cfg = RepoInstructions {
             repo: "example.com/spike".into(),
-            failing_check: FailingCheck { command: "true".into(), target: None },
+            failing_check: FailingCheck {
+                command: "true".into(),
+                target: None,
+                timeout_secs: 600,
+            },
             forbidden_paths: Vec::new(),
             notes: String::new(),
+            reproduce_check: None,
+            max_attempts: 3,
+            draft_first_n: 0,
         };
         let worked = work_once(
             &store,
@@ -1568,14 +2312,17 @@ mod tests {
             true,
             1,
             1_000_000,
+            5_000_000,
+            50_000_000,
             600,
             "test:runner",
             Arc::new(tokio::sync::Mutex::new(RunnerLive::new())),
+            &Arc::new(secrets::Secrets::default()),
         )
         .await
         .expect("work_once must not fail on a mismatched issue");
 
-        assert!(worked, "mismatch handled is a unit of work");
+        assert!(!worked, "a repo-filtered claim leaves another repo's issue alone");
         let fp = fp_of(&store, now);
         let row = store
             .list_issues()
@@ -1583,7 +2330,10 @@ mod tests {
             .into_iter()
             .find(|r| r.fingerprint == fp)
             .expect("issue");
-        assert_eq!(row.state, "escalated", "poison issue must be escalated");
+        assert_eq!(
+            row.state, "new",
+            "repo filtering must not consume or escalate another repo's issue"
+        );
     }
 
     /// Helper: the single issue's fingerprint in a fresh test store.
@@ -1614,6 +2364,200 @@ mod tests {
             .expect("git");
         assert!(out.status.success(), "git {:?} failed", args);
         String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn fixed_loop_check() -> String {
+        if cfg!(windows) {
+            "if exist fixed.marker (exit 0) else (exit 1)".to_string()
+        } else {
+            "test -f fixed.marker".to_string()
+        }
+    }
+
+    fn init_git_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).expect("repo");
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.name", "test"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.join("f.txt"), "one\n").expect("write");
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "init"]);
+    }
+
+    #[tokio::test]
+    async fn preflight_recovers_from_agent_branch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo);
+        git(&repo, &["checkout", "-b", "agent/fix/abc"]);
+
+        let base = preflight_repo(&repo).await.expect("preflight");
+        assert_eq!(base, "main");
+        assert_eq!(git_output(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "main");
+    }
+
+    #[tokio::test]
+    async fn preflight_fetches_remote_main() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let origin = dir.path().join("origin.git");
+        std::fs::create_dir_all(&origin).expect("origin");
+        git(&origin, &["init", "--bare", "-b", "main"]);
+
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        git(&work, &["clone", origin.to_str().expect("origin path"), "."]);
+        git(&work, &["checkout", "-b", "main"]);
+        git(&work, &["config", "user.name", "test"]);
+        git(&work, &["config", "user.email", "test@example.com"]);
+        std::fs::write(work.join("f.txt"), "one\n").expect("write");
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "init"]);
+        git(&work, &["push", "-u", "origin", "main"]);
+
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).expect("other");
+        git(&other, &["clone", origin.to_str().expect("origin path"), "."]);
+        git(&other, &["config", "user.name", "test"]);
+        git(&other, &["config", "user.email", "test@example.com"]);
+        std::fs::write(other.join("g.txt"), "two\n").expect("write");
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-m", "second"]);
+        git(&other, &["push", "origin", "main"]);
+
+        preflight_repo(&work).await.expect("preflight");
+        assert!(work.join("g.txt").exists(), "preflight must fetch origin/main");
+        assert_eq!(
+            git_output(&work, &["rev-parse", "HEAD"]).trim(),
+            git_output(&work, &["rev-parse", "origin/main"]).trim()
+        );
+    }
+
+    #[test]
+    fn session_cleanup_removes_expired_fingerprint_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("sessions");
+        std::fs::create_dir_all(root.join("_trusted")).expect("trusted");
+        let store = shanhaijing::Store::open(dir.path().join("s.db")).expect("open");
+        let now = now_ms();
+
+        let mut fps = Vec::new();
+        for (i, title) in ["old session", "new session"].iter().enumerate() {
+            let signal = shanhaijing::Signal {
+                repo: "example.com/spike".into(),
+                language: "go".into(),
+                title: (*title).into(),
+                severity: "high".into(),
+                message: None,
+                stack_trace: format!(
+                    "panic: {title}\ngoroutine 1 [running]:\nexample.com/spike.F{i}()\n\t/app/a.go:1 +0x1"
+                ),
+            };
+            store.report_signal(&signal, now).expect("report");
+            let fp = store
+                .list_issues()
+                .expect("issues")
+                .into_iter()
+                .find(|issue| issue.title == *title)
+                .expect("issue")
+                .fingerprint;
+            let short = issue::short_fingerprint(&fp);
+            std::fs::create_dir_all(root.join(&short)).expect("session dir");
+            store
+                .start_run(&shanhaijing::RunStart {
+                    id: format!("run-{i}"),
+                    fingerprint: fp.clone(),
+                    runner_id: "test:runner".into(),
+                    repo: "example.com/spike".into(),
+                    started_at: if i == 0 { now - 2 * 86_400_000 } else { now },
+                    provider: None,
+                    model: None,
+                })
+                .expect("start");
+            fps.push(short);
+        }
+
+        let removed = cleanup_sessions(&root, &store, now, 1).expect("cleanup");
+        assert_eq!(removed, 1);
+        assert!(!root.join(&fps[0]).exists(), "old session dir must be removed");
+        assert!(root.join(&fps[1]).exists(), "new session dir must remain");
+        assert!(root.join("_trusted").exists(), "trusted config must survive");
+    }
+
+    #[tokio::test]
+    async fn cleanup_terminal_branches_removes_only_terminal() {
+        use shanhaijing::State;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo);
+        let store = shanhaijing::Store::open(dir.path().join("s.db")).expect("open");
+        let now = now_ms();
+
+        let mut states = Vec::new();
+        for (i, target) in ["merged", "rejected", "escalated", "new"].iter().enumerate() {
+            let title = format!("cleanup {i}");
+            let signal = shanhaijing::Signal {
+                repo: "example.com/spike".into(),
+                language: "go".into(),
+                title: title.clone(),
+                severity: "high".into(),
+                message: None,
+                stack_trace: format!(
+                    "panic: cleanup {i}\ngoroutine 1 [running]:\nexample.com/spike.F{i}()\n\t/app/a.go:1 +0x1"
+                ),
+            };
+            store.report_signal(&signal, now).expect("report");
+            let fp = store
+                .list_issues()
+                .expect("issues")
+                .into_iter()
+                .find(|row| row.title == title)
+                .expect("issue")
+                .fingerprint;
+            match *target {
+                "merged" => {
+                    store.set_state(&fp, State::Triggered, now, None).expect("triggered");
+                    store.set_state(&fp, State::Fixing, now, None).expect("fixing");
+                    store.set_state(&fp, State::PrOpen, now, None).expect("pr_open");
+                    store.set_state(&fp, State::Merged, now, None).expect("merged");
+                }
+                "rejected" => {
+                    store.set_state(&fp, State::Triggered, now, None).expect("triggered");
+                    store.set_state(&fp, State::Fixing, now, None).expect("fixing");
+                    store.set_state(&fp, State::PrOpen, now, None).expect("pr_open");
+                    store.set_state(&fp, State::Rejected, now, None).expect("rejected");
+                }
+                "escalated" => {
+                    store.set_state(&fp, State::Triggered, now, None).expect("triggered");
+                    store.set_state(&fp, State::Escalated, now, None).expect("escalated");
+                }
+                _ => {}
+            }
+            let branch = format!("agent/fix/{}", issue::short_fingerprint(&fp));
+            git(&repo, &["branch", &branch]);
+            states.push((branch, *target));
+        }
+
+        let removed = cleanup_terminal_branches(&store, &repo, false)
+            .await
+            .expect("cleanup");
+        assert_eq!(removed, 3, "only terminal branches are removed");
+        for (branch, target) in states {
+            let exists = git_ops::branch_exists(&repo, &branch).expect("exists");
+            assert_eq!(exists, target == "new", "{branch} ({target})");
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_stale_branch_deletes_local_branch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo);
+        git(&repo, &["branch", "agent/fix/fp"]);
+        assert!(git_ops::branch_exists(&repo, "agent/fix/fp").expect("exists"));
+        let removed = remove_stale_branch(&repo, "fp", false).await.expect("remove");
+        assert!(removed);
+        assert!(!git_ops::branch_exists(&repo, "agent/fix/fp").expect("gone"));
     }
 
     // The harness calls `block_in_place`, which panics on the default
@@ -1657,9 +2601,16 @@ mod tests {
 
         let cfg = RepoInstructions {
             repo: "example.com/spike".into(),
-            failing_check: FailingCheck { command: "echo ok".into(), target: None },
+            failing_check: FailingCheck {
+                command: fixed_loop_check(),
+                target: None,
+                timeout_secs: 600,
+            },
             forbidden_paths: Vec::new(),
             notes: String::new(),
+            reproduce_check: None,
+            max_attempts: 3,
+            draft_first_n: 0,
         };
         let live: SharedLive = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
         let worked = work_once(
@@ -1673,9 +2624,12 @@ mod tests {
             false,
             5,
             1_000_000,
+            5_000_000,
+            50_000_000,
             600,
             "test:runner",
             Arc::clone(&live),
+            &Arc::new(secrets::Secrets::default()),
         )
         .await
         .expect("work");
@@ -1710,6 +2664,135 @@ mod tests {
         assert!(fixed.contains("i < len(xs)"));
     }
 
+    #[tokio::test]
+    async fn attempt_cap_ignores_before_repair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo);
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
+        let now = now_ms();
+        let signal = shanhaijing::Signal {
+            repo: "example.com/spike".into(),
+            language: "go".into(),
+            title: "panic in Average".into(),
+            severity: "high".into(),
+            message: None,
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+        };
+        store.report_signal(&signal, now).expect("report");
+        let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
+        for _ in 0..3 {
+            store.increment_attempts(&fp).expect("attempt");
+        }
+
+        let cfg = RepoInstructions {
+            repo: "example.com/spike".into(),
+            failing_check: FailingCheck {
+                command: "true".into(),
+                target: None,
+                timeout_secs: 600,
+            },
+            forbidden_paths: Vec::new(),
+            notes: String::new(),
+            reproduce_check: None,
+            max_attempts: 3,
+            draft_first_n: 0,
+        };
+        let worked = work_once(
+            &store,
+            &cfg,
+            &repo,
+            dir.path().join("sessions"),
+            repair::ProviderKind::Faux,
+            5,
+            false,
+            false,
+            5,
+            1_000_000,
+            5_000_000,
+            50_000_000,
+            600,
+            "test:runner",
+            Arc::new(tokio::sync::Mutex::new(RunnerLive::new())),
+            &Arc::new(secrets::Secrets::default()),
+        )
+        .await
+        .expect("work");
+        assert!(worked);
+        let row = store
+            .list_issues()
+            .expect("issues")
+            .into_iter()
+            .find(|row| row.fingerprint == fp)
+            .expect("issue");
+        assert_eq!(row.state, "ignored");
+        assert!(
+            store.latest_run(&fp).expect("latest").is_none(),
+            "attempt cap must stop before any repair run"
+        );
+    }
+
+    #[test]
+    fn prior_context_includes_owner_note_and_last_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = shanhaijing::Store::open(dir.path().join("s.db")).expect("open");
+        let now = now_ms();
+        let signal = shanhaijing::Signal {
+            repo: "example.com/spike".into(),
+            language: "go".into(),
+            title: "panic in Average".into(),
+            severity: "high".into(),
+            message: None,
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+        };
+        store.report_signal(&signal, now).expect("report");
+        let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
+        store
+            .start_run(&shanhaijing::RunStart {
+                id: "run-prior".into(),
+                fingerprint: fp.clone(),
+                runner_id: "test:runner".into(),
+                repo: "example.com/spike".into(),
+                started_at: now,
+                provider: Some("faux".into()),
+                model: Some("faux".into()),
+            })
+            .expect("start");
+        store
+            .update_run(
+                "run-prior",
+                &shanhaijing::RunUpdate {
+                    root_cause: Some("ROOT CAUSE: off-by-one loop".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("update");
+        store
+            .finish_run(
+                "run-prior",
+                &shanhaijing::RunFinish {
+                    finished_at: now + 1,
+                    outcome: "repair_failed".into(),
+                    ci_verdict: None,
+                    error: Some("verification gate failed".into()),
+                },
+            )
+            .expect("finish");
+        store
+            .ignore_issue(&fp, "not a bug", "owner", now + 2)
+            .expect("ignore");
+        store
+            .reopen_issue(&fp, now + 3, Some("retry after upstream deploy"))
+            .expect("reopen");
+
+        let context = build_prior_context(&store, &fp, &secrets::Secrets::default());
+        assert!(context.contains("OWNER NOTE"), "{context}");
+        assert!(context.contains("retry after upstream deploy"), "{context}");
+        assert!(context.contains("PRIOR ATTEMPTS"), "{context}");
+        assert!(context.contains("ROOT CAUSE: off-by-one loop"), "{context}");
+        assert!(context.contains("verification gate failed"), "{context}");
+    }
+
     // Process-level evidence: `run_work` itself must register the runner,
     // record the finished run, and reset a crashed in-flight run at startup.
     // The faux test above bypasses all of that by calling `work_once` directly.
@@ -1731,11 +2814,14 @@ mod tests {
              }\n",
         )
         .expect("calc");
-        std::fs::write(
-            repo.join("nuwa.repo.json"),
-            r#"{"repo":"example.com/spike","failing_check":{"command":"echo ok"},"forbidden_paths":[],"notes":""}"#,
-        )
-        .expect("instructions");
+        let instructions = serde_json::json!({
+            "repo": "example.com/spike",
+            "failing_check": { "command": fixed_loop_check() },
+            "forbidden_paths": [],
+            "notes": ""
+        });
+        std::fs::write(repo.join("nuwa.repo.json"), instructions.to_string())
+            .expect("instructions");
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["add", "."]);
         git(

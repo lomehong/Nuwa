@@ -770,7 +770,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 - 左侧 232px 导航：女娲标志 + 版本；总览、问题单、运行器、活动、设置；底部主题切换与退出。
 - 顶栏：页面标题/面包屑、⌘K 全局搜索、主题切换、会话菜单。
-- 健康条：serve、runner 在线/总数、队列待领、运行中、今日 PR 配额。异常项可点击跳转。
+- 健康条：serve、runner 在线/总数、队列待领、运行中、今日 PR 配额；「需处理 N」（attention 计数）置首、danger 色、链接 `?attention=1`，计数增长时向屏幕阅读器礼貌播报。异常项可点击跳转。
 - <1024px：导航收为抽屉 + 底部四项主导航；健康条横向滚动。
 - 全局状态：离线横幅（API 不可达）、401 自动跳登录、错误边界、toast、骨架屏。
 - 路由：`/` 即 SPA 控制台；旧书签 `/ui*` 308 到 `/`、`/issue/{fp}` 308 到 `/issues/{fp}`；`/settings` 直接由 SPA 提供。
@@ -809,21 +809,24 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 主列：
 
-- **时间线**：状态迁移、首次/回归、PR、CI、配置/重排事件；历史上报按小时聚合。
-- **证据面板**（Tabs）：
-  - 根因：最近 run 的 `root_cause`。
+- **时间线**：状态迁移、首次/回归、PR、CI、配置/重排事件；历史上报按小时聚合；连续 `reported` 事件客户端折叠为「共 N 次」；默认限高（约 5 条）可「展开全部」，避免长历史把证据挤出首屏。
+- **证据面板**：绑定**当前所选 run**（「第 N 次运行的证据」），与会话转录同源——选择历史 run 时证据跟随，杜绝"看 A 的会话、配 B 的证据"。字段：
+  - 根因：所选 run 的 `root_cause`。
   - 验证：命令 + 输出（折叠、等宽、复制）。
   - 改动：`change_stat`、branch、commit（复制）。
   - CI：`ci_verdict`、PR 链接、head sha。
-  - 会话：转录查看器；user/assistant/tool 分组；thinking 默认折叠；长输出截断可展开；分页。
+  - 会话：转录查看器；user/assistant/tool 分组；thinking 默认折叠；长输出截断可展开（注明全文在运行器会话文件）；分页含「首页 / 末页（最新）」；**所选 run 未完成时以 15s+退避轮询**，陪跑视图自动增长。
 - **堆栈样本**：等宽、复制、保留换行（React 文本节点，不用 `dangerouslySetInnerHTML`）。
 
 侧栏：
 
+- **本页内容**：主列五个区块的锚点导航（时间线/证据/堆栈/运行记录/会话转录）。
 - 最近 run 摘要：状态、耗时、tokens、turns、provider/model、runner。
 - 相似问题：同 title 的指纹列表与状态。
 - 原始元数据：完整指纹、state_changed_at、owner runner。
 - 无 run 时显示"等待 runner 领取"。
+
+头部「返回」链接走浏览器历史（`navigate(-1)`），保留来源列表的筛选与页码；直接深链进入时回落到 `/issues`。详情页头部标注刷新节奏（每 15 秒，隐藏暂停，聚焦即刷）。
 
 ### 10.6 运行器
 
@@ -881,7 +884,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 | `--border-strong` | `#303A50` | `#CBD3E1` |
 | `--text` | `#E9EEF7` | `#131A26` |
 | `--text-secondary` | `#A5B1C6` | `#4E5B70` |
-| `--text-muted` | `#6C7A92` | `#7A879B` |
+| `--text-muted` | `#7D8AA3` | `#5F6C82` |
 | `--accent` | `#7C9CFF` | `#3D5BD9` |
 | `--info` | `#62B6FF` | `#1F6FD0` |
 | `--success` | `#3DDC97` | `#0E8A5F` |
@@ -903,15 +906,15 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 | low | 青玉 `#52D3A8` | 轻微/噪音 |
 | unknown | 紫灰 `#A98BFF` | 未分级 |
 
-**状态**：new 青玉、triggered 金、fixing 天蓝、pr_open 紫、merged 绿、rejected 红、escalated 橙红。
+**状态**：new 青玉、triggered 金、fixing 天蓝、pr_open 紫、merged 绿、rejected 红、escalated 橙红、ignored 灰。浅色主题下 escalated 用红（`#B91C1C`）而非橙，与 high 赭橙石拉开色距——attention 卡会把两者并排渲染。
 
-- 严重度与状态都使用"图标/形状 + 文本 + 颜色"三通道；禁止只用颜色。
+- 严重度与状态都使用"图标/形状 + 文本 + 颜色"三通道；禁止只用颜色。StateBadge 为每个状态配专属图标（merged 用 GitMerge 等），使"已合并绿"与"CI 通过绿"在形状上分流。
 - 颜色对比度满足 WCAG AA（正文 ≥ 4.5:1，大字号/图形 ≥ 3:1）。
 
 ### 11.3 字体与排版
 
 - UI：自托管 Inter Variable（woff2）；中文回退 `"PingFang SC", "Microsoft YaHei", sans-serif`。
-- 数据/代码：`"JetBrains Mono", ui-monospace, monospace`；指纹、commit、token、时间数字使用。
+- 数据/代码：`"JetBrains Mono", ui-monospace, monospace`；栈尾含 CJK 回退（PingFang SC / Microsoft YaHei），避免等宽上下文里的中文（如"45 秒"、"未归属"）漂移到任意的系统字体；指纹、commit、token、时间数字使用。
 - 字号：12/13/14/16/20/24/32；行高 1.4–1.6；标题字重 600。
 - 数字 `font-variant-numeric: tabular-nums`，避免跳动。
 
@@ -919,7 +922,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 - 间距基线 4px；圆角 8px（卡片/输入）、12px（模态）；边框 1px。
 - 阴影仅在浮层使用；主界面靠边框与层级色区分。
-- 内容最大宽 1440px；桌面 12 列网格；卡片间距 16/24px。
+- 内容最大宽 1440px；布局用语义化自适应网格（2/3/6 列按断点），不引入固定 12 列系统；卡片间距 12px（gap-3）。
 - 组件清单：AppShell、HealthStrip、PipelineFunnel、AttentionCard、RunPhaseStepper、IssueTable、StateBadge、SeverityStone、Timeline、EvidencePanel、TranscriptViewer、RunnerCard、TrendChart、SettingsSection、SecretField、ConfirmDialog、Toast、EmptyState、Skeleton、ErrorState。
 - 不引入第三方组件库；组件以 props 明确状态，不隐藏副作用。
 
@@ -927,7 +930,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 - 120–180ms，`ease-out`；仅用于层级变化、toast、抽屉、阶段推进。
 - 不自动播放装饰动画；`prefers-reduced-motion: reduce` 时关闭位移与淡入。
-- 轮询更新不闪烁：数字变化用轻微高亮，不整块重绘。
+- 轮询更新不闪烁：数字变化用轻微高亮（`FlashOnChange` 组件，`nuwa-flash` 动画复用 `--motion-*` 令牌），不整块重绘；运行阶段推进（PhaseStepper）有颜色过渡。
 
 ### 11.6 无障碍
 
@@ -942,8 +945,8 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 | 断点 | 行为 |
 |---|---|
-| ≥1440 | 12 列；详情双列；侧栏固定 |
-| 1024–1439 | 12 列；详情双列；侧栏可折叠 |
+| ≥1440（`2xl`，经 `--breakpoint-2xl: 90rem` 覆写） | 详情双列；attention 三列 |
+| 1024–1439 | 详情双列；侧栏固定（232px） |
 | 768–1023 | 单列；导航抽屉；表格保留但隐藏次要列 |
 | <768 | 卡片列表；底部导航；健康条横向滚动；详情单列 |
 
@@ -954,12 +957,13 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
   - 标签页隐藏暂停轮询，重新可见立即刷新。
   - 写操作后 invalidate 相关 key；不手写全局缓存。
 - 轮询失败：指数退避（10s → 20s → 40s，上限 60s），恢复后重置；顶部离线横幅。
-- 全局搜索：⌘K / Ctrl+K 打开命令面板，输入标题/指纹，回车进入详情或列表筛选。
-- `/` 聚焦当前页搜索；Esc 关闭弹层/清除焦点。
+- 全局搜索：⌘K / Ctrl+K 打开命令面板，输入标题/指纹，**↑↓ 选择、Enter 打开**；结果尾部固定「在问题单中查看全部结果」出口（`/issues?q=`）；空查询时展示 4 条静态命令（需要你处理 / 卡单问题 / 运行器 / 配置审计）；底部标注快捷键。
+- `/` 聚焦当前页搜索/首个筛选框（问题单页与活动页；模态打开时让位）；Esc 关闭弹层/清除焦点。
 - 复制：指纹、commit、分支名、PR 链接；复制成功 toast。
-- 确认：reopen 不需确认（可逆）；requeue、重启 unit、force restart 必须确认并说明影响。
+- 确认：reopen 不需确认（可逆）；requeue、重启 unit、force restart 必须确认并说明影响；确认框动作 in-flight 时焦点保持在对话框内并播报「正在处理」。
 - 表单离开未保存：设置页提示确认。
 - 所有交互可用键盘完成。
+- 状态化 URL：问题单/活动筛选之外，总览趋势的 range 也写入 `?range=`（默认 14d 不落参）。
 
 ## 13 · 配置 schema 与治理
 

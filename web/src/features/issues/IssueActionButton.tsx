@@ -1,11 +1,18 @@
 import { clsx } from "clsx";
-import { RefreshCw, RotateCcw } from "lucide-react";
+import { EyeOff, RefreshCw, RotateCcw } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { Button, ConfirmDialog, useToast, type IssueState } from "../../components/ui";
+import { Button, ConfirmDialog, Input, useToast, type IssueState } from "../../components/ui";
 import { ApiError } from "../../lib/api";
 import { describeError } from "../../lib/errors";
-import { issueActionFor, useReopenIssue, useRequeueIssue } from "./actions";
+import {
+  canIgnore,
+  canReopen,
+  canRequeue,
+  useIgnoreIssue,
+  useReopenIssue,
+  useRequeueIssue,
+} from "./actions";
 import { shortFingerprint } from "./format";
 
 interface IssueActionButtonProps {
@@ -16,11 +23,25 @@ interface IssueActionButtonProps {
   className?: string;
 }
 
-/** How long a successful write keeps the button disabled while views refetch. */
+type OwnerDialog = "ignore" | "requeue" | null;
+
+/** How long a successful write keeps the buttons disabled while views refetch. */
 const COOLDOWN_MS = 3000;
 
-/** Error text plus any `fields` the server attached (e.g. a 409 state hint). */
+/**
+ * Error text plus any `fields` the server attached (e.g. a 409 state hint).
+ * The server's `invalid_state` body is English ("state is fixing, not …");
+ * map the known code to operator language while keeping the field detail,
+ * instead of leaking the raw message into the zh-CN UI.
+ */
 function actionErrorDescription(error: unknown): string {
+  if (error instanceof ApiError && error.code === "invalid_state") {
+    const base = "问题单状态已变化（可能已被其他操作处理），请刷新后重试";
+    const details = error.fields
+      ? Object.entries(error.fields).map(([field, detail]) => `${field}：${detail}`)
+      : [];
+    return details.length > 0 ? `${base}（${details.join("；")}）` : `${base}。`;
+  }
   const message = describeError(error);
   if (error instanceof ApiError && error.fields) {
     const details = Object.entries(error.fields).map(
@@ -34,11 +55,9 @@ function actionErrorDescription(error: unknown): string {
 }
 
 /**
- * State-aware owner action (docs/09 §8.5): reopen a rejected/escalated issue
- * without a confirmation, or requeue a stuck issue behind a destructive
- * confirmation. Placed in the detail header (§10.5), the issue list (§10.4)
- * and the overview attention queue (§10.3). Renders nothing when the state
- * allows neither.
+ * State-aware owner actions (docs/09 §8.5): reopen (with an optional review
+ * note), mute (ignore), or requeue a stuck run. Every dialog is explicit; the
+ * note is persisted and fed into the next repair prompt.
  */
 export function IssueActionButton({
   fingerprint,
@@ -47,28 +66,35 @@ export function IssueActionButton({
   size = "sm",
   className,
 }: IssueActionButtonProps) {
-  const action = issueActionFor({ state, stuck });
+  const showReopen = canReopen(state);
+  const showIgnore = canIgnore(state);
+  const showRequeue = canRequeue(state, stuck);
   const { toast } = useToast();
   const reopen = useReopenIssue(fingerprint);
+  const ignore = useIgnoreIssue(fingerprint);
   const requeue = useRequeueIssue(fingerprint);
-  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [dialog, setDialog] = useState<OwnerDialog>(null);
+  const [reason, setReason] = useState("");
   const [cooldown, setCooldown] = useState(false);
 
-  // A poll can drop `stuck` (the action disappears) and re-add it later; the
-  // stale open flag must not resurrect the confirmation for the new state.
+  // A poll can make an action disappear and reappear; never keep a stale
+  // dialog for a transition the server would now reject.
   useEffect(() => {
-    if (action !== "requeue") {
-      setConfirmOpen(false);
+    if (
+      (dialog === "ignore" && !showIgnore) ||
+      (dialog === "requeue" && !showRequeue)
+    ) {
+      setDialog(null);
+      setReason("");
     }
-  }, [action]);
+  }, [dialog, showIgnore, showRequeue]);
 
-  // A successful write latches a short cooldown so a double click cannot POST
-  // the same transition twice while the invalidated views catch up. Resetting
-  // on every identity change keeps it self-healing: if a poll never reports the
-  // new state (or the row is recycled for another issue), the button still
-  // comes back instead of staying disabled forever.
+  // Reset the latch and note on every identity change so a recycled row does
+  // not inherit the previous issue's pending dialog.
   useEffect(() => {
     setCooldown(false);
+    setDialog(null);
+    setReason("");
   }, [fingerprint, state, stuck]);
 
   useEffect(() => {
@@ -79,13 +105,13 @@ export function IssueActionButton({
     return () => window.clearTimeout(timer);
   }, [cooldown]);
 
-  if (!action) {
+  if (!showReopen && !showIgnore && !showRequeue) {
     return null;
   }
 
   const shortFp = shortFingerprint(fingerprint);
-  const actionLabel = action === "reopen" ? "重新打开" : "重排";
-  const actionName = `${actionLabel}：${shortFp}`;
+  const pending = reopen.isPending || ignore.isPending || requeue.isPending;
+  const disabled = cooldown || pending;
 
   const reportFailure = (title: string, error: unknown) => {
     toast({
@@ -95,64 +121,112 @@ export function IssueActionButton({
     });
   };
 
-  // A successful write disables the button (like `pending`) for a short
-  // cooldown until the invalidated views report the new state, so a double
-  // click cannot POST the same transition twice.
-  if (action === "reopen") {
-    return (
-      <Button
-        variant="secondary"
-        size={size}
-        className={clsx("whitespace-nowrap", className)}
-        pending={reopen.isPending}
-        disabled={cooldown}
-        aria-label={actionName}
-        onClick={() => {
-          reopen.mutate(undefined, {
-            onSuccess: () => {
-              setCooldown(true);
-              toast({
-                title: "已重新入队",
-                description: "问题单已回到 new，等待 runner 领取。",
-                variant: "success",
-              });
-            },
-            onError: (error) => reportFailure("重新打开失败", error),
-          });
-        }}
-      >
-        <RotateCcw aria-hidden="true" className="size-4" />
-        重新打开
-      </Button>
-    );
-  }
+  const close = () => {
+    setDialog(null);
+    setReason("");
+  };
 
   return (
     <>
-      <Button
-        variant="secondary"
-        size={size}
-        className={clsx("whitespace-nowrap", className)}
-        pending={requeue.isPending}
-        disabled={cooldown}
-        aria-label={actionName}
-        onClick={() => setConfirmOpen(true)}
-      >
-        <RefreshCw aria-hidden="true" className="size-4" />
-        重排
-      </Button>
+      <div className={clsx("flex flex-wrap items-center justify-end gap-1", className)}>
+        {showReopen ? (
+          <Button
+            variant="secondary"
+            size={size}
+            className="whitespace-nowrap"
+            pending={reopen.isPending}
+            disabled={cooldown}
+            aria-label={`重新打开：${shortFp}`}
+            onClick={() => {
+              reopen.mutate(undefined, {
+                onSuccess: () => {
+                  setCooldown(true);
+                  toast({
+                    title: "已重新入队",
+                    description: "问题单已回到 new，等待 runner 领取。",
+                    variant: "success",
+                  });
+                },
+                onError: (error) => reportFailure("重新打开失败", error),
+              });
+            }}
+          >
+            <RotateCcw aria-hidden="true" className="size-4" />
+            重新打开
+          </Button>
+        ) : null}
+        {showIgnore ? (
+          <Button
+            variant="secondary"
+            size={size}
+            className="whitespace-nowrap"
+            disabled={disabled}
+            aria-label={`忽略：${shortFp}`}
+            onClick={() => setDialog("ignore")}
+          >
+            <EyeOff aria-hidden="true" className="size-4" />
+            忽略
+          </Button>
+        ) : null}
+        {showRequeue ? (
+          <Button
+            variant="secondary"
+            size={size}
+            className="whitespace-nowrap"
+            disabled={disabled}
+            aria-label={`重排：${shortFp}`}
+            onClick={() => setDialog("requeue")}
+          >
+            <RefreshCw aria-hidden="true" className="size-4" />
+            重排
+          </Button>
+        ) : null}
+      </div>
+
       <ConfirmDialog
-        open={confirmOpen}
+        open={dialog === "ignore"}
+        title="忽略问题？"
+        description="忽略后同指纹报告只计数，不再自动修复；只有手动重新打开能恢复。"
+        confirmLabel="确认忽略"
+        danger
+        pending={ignore.isPending}
+        onCancel={close}
+        onConfirm={() => {
+          ignore.mutate(reason, {
+            onSuccess: () => {
+              close();
+              setCooldown(true);
+              toast({
+                title: "已忽略",
+                description: "同指纹报告将被计数，不再自动修复。",
+                variant: "success",
+              });
+            },
+            onError: (error) => reportFailure("忽略失败", error),
+          });
+        }}
+      >
+        <Input
+          label="忽略原因（可选）"
+          value={reason}
+          maxLength={2000}
+          placeholder="例如：预期行为 / 第三方噪音"
+          onChange={(event) => setReason(event.target.value)}
+        />
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={dialog === "requeue"}
         title="重排卡单问题？"
         description="仅当问题单处于卡单状态时有效。重排会清除归属并重新入队，可能重复执行同一问题的修复。"
         confirmLabel="确认重排"
         danger
         pending={requeue.isPending}
-        onCancel={() => setConfirmOpen(false)}
+        onCancel={close}
         onConfirm={() => {
           requeue.mutate(undefined, {
             onSuccess: () => {
-              setConfirmOpen(false);
+              close();
               setCooldown(true);
               toast({
                 title: "已重排",
@@ -161,8 +235,7 @@ export function IssueActionButton({
               });
             },
             onError: (error) => {
-              // Close first: the toast region is inert while the modal is open.
-              setConfirmOpen(false);
+              close();
               reportFailure("重排失败", error);
             },
           });

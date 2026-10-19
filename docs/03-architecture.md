@@ -37,22 +37,27 @@ flowchart TB
 ## 修复流水线（单问题单生命周期）
 
 ```
-问题单就绪 → 领取（预算闸：token 上限 + 每仓库每日 PR 上限）
+问题单就绪 → repo 过滤领取（闸门：每 issue/每日/每月 token 上限 + 每仓库每日 PR 上限 + attempt cap）
+  → fetch + reset 最新 origin/<base>（失败回滚预检）
   → runner 选型（按仓库技术栈）
   → clone 目标仓库（私有，deploy key）
-  → 读取仓库指令文件（构建/测试命令、代码规范、禁改路径）
-  → 定位与复现（结合上下文包）
+  → 读取权威指令文件（tracked: base commit；untracked: runner 私有副本；每轮校验防篡改）
+  → 定位与复现（结合上下文包 + 最近 3 次 run/owner note）
   → 修改（五色石：补丁 + 修改说明）
-  → 验证（跑仓库测试命令；不足则以"复现验证证据"强制要求）
-  → 开分支 agent/fix/<issue-fingerprint> → 直接开 PR（正文含问题单链接、根因摘要、改动清单、验证结果）
-  → CI 闸门：不过测试 → 自动关 PR，问题单回炉升级给所有者
+  → 验证（base 红 / 分支绿；reproduce_check 或 .nuwa/repro.sh；failing_check 回归门；diff glob 禁改终检）
+  → 开分支 agent/fix/<issue-fingerprint> → 直接开 PR（正文含 issue 链接、根因、风险画像、前序尝试、验证证据、堆栈）
+  → CI 闸门：不过测试 → 自动关 PR，问题单 rejected 并累计 attempt
+  → 合入/关闭由人工决定；serve 定期 reconcile pr_open，终态分支清理
+  → 状态变更通过窄范围 HMAC webhook 推给所有者
 ```
 
 ## 安全与护栏（自主开 PR 的前提，缺一不可）
 
-1. 分支命名空间隔离：`agent/fix/*`，永不碰 `main` 等保护分支
-2. 每仓库每日 PR 上限 + 每问题单 token 花费上限（接 rpi-harness budget 钩子）
-3. 合并闸门交给 CI：PR 必须过测试，人工合并
-4. 禁改路径清单：部署配置、密钥、迁移文件等直接拒绝修改
-5. 复现验证证据：无验证结果的补丁不允许提 PR
-6. 上下文包与日志上报全程脱敏（密钥/敏感数据不进 LLM 上下文）
+1. 分支命名空间隔离：`agent/fix/*`，永不碰 `main` 等保护分支；终态清理，失败回滚
+2. 预算：每问题单 token 上限 + 每仓库每日/滚动 30 天 token 上限（失败尝试也计入）+ 每仓库每日 PR 上限 + attempt cap
+3. 合并闸门交给 CI：PR 必须过测试，人工合并；serve 自动 reconcile pr_open
+4. 禁改路径：工具调用前否决 + 交付面对 diff 做 glob 终检；`nuwa.repo.json` 隐式禁改
+5. 复现验证证据：base 红 / 分支绿；配置 `reproduce_check` 或分支 `.nuwa/repro.sh`；base 绿且无复现则 escalate
+6. 密钥隔离：work 启动清秘、bash/验证子进程 env 白名单、PR/证据/转录脱敏
+7. 指令文件完整性：tracked 配置读 base commit，untracked 用 runner 私有副本，每轮校验恢复
+8. 挂死可观测：心跳（liveness）与 progress_at（真实进度）分离；15 分钟无进度触发 webhook

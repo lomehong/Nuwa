@@ -94,11 +94,22 @@ export function IssueDetailPage() {
 
   const latestRun = data.runs[0];
   const selectedRun = runId ? data.runs.find((run) => run.id === runId) : undefined;
+  // docs/09 §10.5 audit flow: the evidence card must describe the SAME run as
+  // the transcript below it, otherwise "which attempt produced this?" is
+  // silently answered by the wrong attempt.
+  const evidenceRun = selectedRun ?? latestRun;
+  const evidenceAttempt = evidenceRun
+    ? data.runs.findIndex((run) => run.id === evidenceRun.id) + 1
+    : 0;
   const transcriptLabel = runId
     ? selectedRun
       ? `当前会话：${shortRunId(runId)} · ${runPhaseLabel(selectedRun.phase)} · ${runOutcomeLabel(selectedRun.outcome)}`
       : `当前会话：${shortRunId(runId)}（不在最近 10 次运行中）`
     : "默认展示最近一次有会话的运行。";
+  // An unfinished run keeps appending transcript messages: poll so the "陪跑"
+  // view grows live; finished runs are static and stay cheap.
+  const transcriptPoll =
+    (selectedRun ?? latestRun)?.finished_at_ms === null ? 15_000 : null;
 
   return (
     <article aria-labelledby="issue-title" className="space-y-6">
@@ -111,10 +122,14 @@ export function IssueDetailPage() {
 
       <IssueHeader issue={data.issue} />
 
+      <p className="text-caption text-text-muted">
+        详情每 15 秒自动刷新，标签页隐藏时暂停；窗口重新聚焦时立即更新。
+      </p>
+
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] lg:items-start">
         <div className="min-w-0 space-y-6">
           <IssueTimeline items={data.timeline} />
-          <IssueEvidence run={latestRun} />
+          <IssueEvidence run={evidenceRun} attempt={evidenceAttempt} />
           <StackSample text={data.stack_sample} />
           <IssueRuns
             runs={data.runs}
@@ -132,6 +147,7 @@ export function IssueDetailPage() {
               runId={runId}
               page={page}
               runLabel={transcriptLabel}
+              pollMs={transcriptPoll}
               onPageChange={changeTranscriptPage}
               onClearRun={clearRun}
             />

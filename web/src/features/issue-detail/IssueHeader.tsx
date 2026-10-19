@@ -1,5 +1,6 @@
 import { ArrowLeft, Clock3 } from "lucide-react";
-import { Link } from "react-router-dom";
+import { type MouseEvent } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 
 import { SeverityStone, StateBadge } from "../../components/ui";
 import { CiVerdictBadge, StuckBadge } from "../issues/IssueBadges";
@@ -38,18 +39,33 @@ function MetaTime({ label, tsMs }: { label: string; tsMs: number }) {
  * offered only for the transitions the server accepts.
  */
 export function IssueHeader({ issue }: IssueHeaderProps) {
+  const navigate = useNavigate();
+  const location = useLocation();
   const title = issue.title || "（无标题）";
   const fingerprint = issue.fingerprint;
 
+  // Return to wherever the user came from (usually a filtered issue list), so
+  // an "escalated 逐条复核" flow keeps its filters and page. Direct deep links
+  // have no in-app history; they fall back to the plain list.
+  const handleBack = (event: MouseEvent<HTMLAnchorElement>) => {
+    event.preventDefault();
+    if (location.key !== "default") {
+      navigate(-1);
+    } else {
+      navigate("/issues");
+    }
+  };
+
   return (
     <header className="space-y-4">
-      <Link
-        to="/issues"
+      <a
+        href="/issues"
+        onClick={handleBack}
         className="inline-flex min-h-11 items-center gap-1.5 rounded-sm text-body-sm text-text-secondary transition-colors hover:text-accent pointer-fine:min-h-9"
       >
         <ArrowLeft aria-hidden="true" className="size-3.5" />
-        返回问题单列表
-      </Link>
+        返回
+      </a>
 
       <div className="flex flex-wrap items-start gap-x-3 gap-y-2">
         <SeverityStone severity={issue.severity} className="mt-1.5 shrink-0" />
@@ -71,7 +87,7 @@ export function IssueHeader({ issue }: IssueHeaderProps) {
         </div>
       </div>
 
-      <dl className="grid grid-cols-2 gap-x-4 gap-y-3 rounded-card border border-border bg-surface px-4 py-3 sm:grid-cols-3 lg:grid-cols-6">
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-3 rounded-card border border-border bg-surface px-4 py-3 sm:grid-cols-3 lg:grid-cols-7">
         <div className="min-w-0">
           <dt className="text-caption text-text-muted">仓库</dt>
           <dd
@@ -91,6 +107,12 @@ export function IssueHeader({ issue }: IssueHeaderProps) {
           <dt className="text-caption text-text-muted">出现次数</dt>
           <dd className="mt-0.5 font-mono text-caption tabular-nums text-text">
             {formatCount(issue.occurrences)}
+          </dd>
+        </div>
+        <div className="min-w-0">
+          <dt className="text-caption text-text-muted">修复尝试</dt>
+          <dd className="mt-0.5 font-mono text-caption tabular-nums text-text">
+            {formatCount(issue.attempts ?? 0)}
           </dd>
         </div>
         <MetaTime label="首次出现" tsMs={issue.first_seen_ms} />

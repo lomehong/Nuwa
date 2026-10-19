@@ -241,7 +241,32 @@ pub async fn reconcile_all(
         if row.state != "pr_open" {
             continue;
         }
-        let Some(url) = &row.pr_url else { continue };
+        let Some(url) = &row.pr_url else {
+            // A branch-only delivery (or a failed set_pr) used to leave the
+            // issue in pr_open forever: every reconcile skipped it and
+            // reopen/requeue reject pr_open. Surface it as rejected so the
+            // owner can inspect/reopen instead of the row going stale.
+            store
+                .set_state(
+                    &row.fingerprint,
+                    State::Rejected,
+                    now,
+                    Some("pr_open without PR URL — branch-only delivery"),
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
+            journal_terminal(
+                store,
+                &row.fingerprint,
+                &row.repo,
+                "system",
+                "rejected",
+                "pr_open without PR URL",
+                now,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            out.push(format!("rejected   : {} (no PR URL)", row.fingerprint));
+            continue;
+        };
         let Some((slug, number)) = parse_pr_url(url) else {
             out.push(format!("skip       : {} — unparsable PR url {url}", row.fingerprint));
             continue;
@@ -308,6 +333,42 @@ mod tests {
     use super::summarize_lines;
     use super::SyncError;
     use super::Verdict;
+
+    #[tokio::test]
+    async fn pr_open_without_url_is_rejected_instead_of_staying_stuck() {
+        use shanhaijing::{State, Store};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t = 1_000_000;
+        let signal = shanhaijing::Signal {
+            repo: "example.com/app".into(),
+            language: "go".into(),
+            title: "panic: no pr".into(),
+            severity: "high".into(),
+            message: None,
+            stack_trace: "panic: no pr\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/a.go:1 +0x1".into(),
+        };
+        let fp = match store.report_signal(&signal, t).expect("report") {
+            shanhaijing::ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("expected new, got {other:?}"),
+        };
+        store.set_state(&fp, State::Triggered, t, None).expect("triggered");
+        store.set_state(&fp, State::Fixing, t, None).expect("fixing");
+        store.set_state(&fp, State::PrOpen, t, None).expect("pr_open");
+
+        let lines = crate::ci::reconcile_all(&store, "unused-token", t + 1)
+            .await
+            .expect("reconcile");
+        assert!(lines.iter().any(|line| line.contains("no PR URL")), "{lines:?}");
+        let row = store
+            .list_issues()
+            .expect("issues")
+            .into_iter()
+            .find(|row| row.fingerprint == fp)
+            .expect("issue");
+        assert_eq!(row.state, "rejected");
+    }
 
     #[test]
     fn summarize_lines_counts_each_prefix_and_parses_skips() {

@@ -9,7 +9,10 @@ export interface EffectiveConfig {
   max_turns: number | null;
   max_tokens: number | null;
   failing_check: string | null;
+  reproduce_check?: string | null;
   forbidden_paths_count: number | null;
+  max_attempts?: number | null;
+  draft_first_n?: number | null;
 }
 
 export interface RunnerDto {
@@ -19,6 +22,7 @@ export interface RunnerDto {
   pid: number | null;
   started_at_ms: number;
   heartbeat_at_ms: number;
+  progress_at_ms?: number;
   status: string;
   offline: boolean;
   current_fingerprint: string | null;

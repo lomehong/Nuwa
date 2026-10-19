@@ -180,7 +180,7 @@ describe("IssueDetailPage", () => {
     expect(header).not.toBeNull();
     expect(within(header as HTMLElement).getByText("严重")).toBeInTheDocument();
     expect(within(header as HTMLElement).getByText("已升级")).toBeInTheDocument();
-    expect(within(header as HTMLElement).getByText("卡单")).toBeInTheDocument();
+    expect(within(header as HTMLElement).getByText("疑似卡单")).toBeInTheDocument();
     expect(within(header as HTMLElement).getByText("example.com/app")).toBeInTheDocument();
     expect(within(header as HTMLElement).getByText("go")).toBeInTheDocument();
     expect(within(header as HTMLElement).getByText("17")).toBeInTheDocument();

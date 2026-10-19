@@ -53,6 +53,8 @@ pub enum State {
     Merged,
     Rejected,
     Escalated,
+    /// Owner mute / attempt cap. Reports never auto-reopen it.
+    Ignored,
 }
 
 impl State {
@@ -65,6 +67,7 @@ impl State {
             State::Merged => "merged",
             State::Rejected => "rejected",
             State::Escalated => "escalated",
+            State::Ignored => "ignored",
         }
     }
 
@@ -77,12 +80,16 @@ impl State {
             "merged" => State::Merged,
             "rejected" => State::Rejected,
             "escalated" => State::Escalated,
+            "ignored" => State::Ignored,
             _ => return None,
         })
     }
 
     fn is_terminal(&self) -> bool {
-        matches!(self, State::Merged | State::Rejected | State::Escalated)
+        matches!(
+            self,
+            State::Merged | State::Rejected | State::Escalated | State::Ignored
+        )
     }
 }
 
@@ -103,9 +110,14 @@ pub fn can_transition(from: State, to: State) -> bool {
             | (PrOpen, Merged)
             | (PrOpen, Rejected)
             | (Rejected, Escalated)
+            | (New, Ignored)
+            | (Triggered, Ignored)
+            | (Escalated, Ignored)
+            | (Rejected, Ignored)
             | (Merged, New)
             | (Rejected, New)
             | (Escalated, New)
+            | (Ignored, New)
     )
 }
 
@@ -146,6 +158,8 @@ pub enum ReportOutcome {
     },
     /// Terminal-state issue reported again: regression, reopened as `new`.
     Regression { fingerprint: String, occurrences: u64 },
+    /// Owner-muted or attempt-capped; reports are counted but never reopen it.
+    Muted { fingerprint: String, occurrences: u64 },
 }
 
 /// A pickable issue handed to the runner pool.
@@ -157,6 +171,7 @@ pub struct IssueSnapshot {
     pub repo: String,
     pub severity: String,
     pub occurrences: u64,
+    pub attempts: u64,
     pub stack_sample: String,
 }
 
@@ -170,6 +185,7 @@ pub struct IssueRow {
     pub severity: String,
     pub state: String,
     pub occurrences: u64,
+    pub attempts: u64,
     pub pr_url: Option<String>,
     #[serde(rename = "first_seen_ms")]
     pub first_seen: i64,
@@ -254,6 +270,8 @@ pub struct RunnerRow {
     pub pid: Option<i64>,
     pub started_at: i64,
     pub heartbeat_at: i64,
+    /// Last real progress (phase change/turn), distinct from liveness.
+    pub progress_at: i64,
     pub status: String,
     pub current_fingerprint: Option<String>,
     pub phase: Option<String>,
@@ -392,11 +410,12 @@ const DAY_MS: i64 = 86_400_000;
 /// journal.
 const EVENT_LIST_CAP: u32 = 5_000;
 
-/// Priority ordering shared by the claim and observer queries:
-/// `severity_weight × occurrences`, then oldest sighting.
-const READY_ORDER: &str = "(CASE severity
-        WHEN 'critical' THEN 10 WHEN 'high' THEN 5 WHEN 'medium' THEN 2 ELSE 1 END)
-        * occurrences DESC,
+/// Priority ordering shared by the claim and observer queries: severity is
+/// lexicographically first, so "most severe" beats "noisiest"; occurrences
+/// and age only break ties inside a severity band.
+const READY_ORDER: &str = "CASE severity
+        WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+        occurrences DESC,
         last_seen ASC";
 
 /// Full [`IssueRow`] projection; keep aligned with [`Store::issue_from_row`].
@@ -406,7 +425,8 @@ const ISSUE_VIEW_SELECT: &str = "SELECT i.fingerprint, i.title, i.language, i.re
         i.owner_runner_id,
         (SELECT r.ci_verdict FROM runs r
          WHERE r.fingerprint = i.fingerprint
-         ORDER BY r.started_at DESC, r.id DESC LIMIT 1) AS ci_verdict
+         ORDER BY r.started_at DESC, r.id DESC LIMIT 1) AS ci_verdict,
+        i.attempts
  FROM issues i";
 
 /// Event projection shared by the feed/detail/timeline queries; legacy rows
@@ -488,6 +508,12 @@ impl Store {
         drop(conn);
 
         let state = State::parse(&state).ok_or(ShanError::UnknownState(state))?;
+        if state == State::Ignored {
+            return Ok(ReportOutcome::Muted {
+                fingerprint: fp,
+                occurrences,
+            });
+        }
         if state.is_terminal() && state != State::Escalated {
             self.set_state(&fp, State::New, now_ms, Some("regression: terminal issue reported again"))?;
             self.set_cooldown(&fp, 0)?;
@@ -514,7 +540,7 @@ impl Store {
     pub fn ready_issue(&self, now_ms: i64) -> ShanResult<Option<IssueSnapshot>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
-            "SELECT fingerprint, title, language, repo, severity, occurrences, stack_sample
+            "SELECT fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample
              FROM issues
              WHERE state = 'new' AND cooldown_until <= ?1
              ORDER BY {READY_ORDER}
@@ -531,7 +557,7 @@ impl Store {
     pub fn ready_issues(&self, now_ms: i64, limit: u32) -> ShanResult<Vec<IssueSnapshot>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
-            "SELECT fingerprint, title, language, repo, severity, occurrences, stack_sample
+            "SELECT fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample
              FROM issues
              WHERE state = 'new' AND cooldown_until <= ?1
              ORDER BY {READY_ORDER}
@@ -560,7 +586,8 @@ impl Store {
             repo: row.get(3)?,
             severity: row.get(4)?,
             occurrences: row.get(5)?,
-            stack_sample: row.get(6)?,
+            attempts: row.get(6)?,
+            stack_sample: row.get(7)?,
         })
     }
 
@@ -584,9 +611,53 @@ impl Store {
                          ORDER BY {READY_ORDER}
                          LIMIT 1
                      )
-                     RETURNING fingerprint, title, language, repo, severity, occurrences, stack_sample"
+                     RETURNING fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample"
                 ),
                 rusqlite::params![now_ms, cooldown_until_ms],
+                Self::snapshot_from_row,
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        drop(conn);
+        if let Some(snapshot) = &claimed {
+            self.record_event(
+                &snapshot.fingerprint,
+                now_ms,
+                Some(&snapshot.repo),
+                "runner",
+                "state_changed",
+                "claimed by runner",
+            )?;
+        }
+        Ok(claimed)
+    }
+
+    /// Repo-scoped atomic claim: a runner must never pick up another repo's
+    /// issue just because it shares a database. The unfiltered claim remains
+    /// for tests and tooling.
+    pub fn claim_ready_issue_for_repo(
+        &self,
+        now_ms: i64,
+        cooldown_until_ms: i64,
+        repo: &str,
+    ) -> ShanResult<Option<IssueSnapshot>> {
+        let conn = self.lock();
+        let claimed: Option<IssueSnapshot> = conn
+            .query_row(
+                &format!(
+                    "UPDATE issues SET state = 'triggered', cooldown_until = ?2, state_changed_at = ?1
+                     WHERE fingerprint = (
+                         SELECT fingerprint FROM issues
+                         WHERE state = 'new' AND cooldown_until <= ?1 AND repo = ?3
+                         ORDER BY {READY_ORDER}
+                         LIMIT 1
+                     )
+                     RETURNING fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample"
+                ),
+                rusqlite::params![now_ms, cooldown_until_ms, repo],
                 Self::snapshot_from_row,
             )
             .map(Some)
@@ -626,12 +697,13 @@ impl Store {
             return Ok(false);
         }
 
-        let owner_state: Option<(String, Option<String>, i64)> = match owner.as_deref() {
+        let owner_state: Option<(String, Option<String>, i64, i64)> = match owner.as_deref() {
             Some(id) => conn
                 .query_row(
-                    "SELECT status, current_fingerprint, heartbeat_at FROM runners WHERE id=?1",
+                    "SELECT status, current_fingerprint, heartbeat_at, progress_at
+                     FROM runners WHERE id=?1",
                     [id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map(Some)
                 .or_else(|e| match e {
@@ -642,12 +714,22 @@ impl Store {
         };
 
         let (owner_heartbeat, healthy_owner) = match &owner_state {
-            Some((status, current, heartbeat)) => (
-                Some(*heartbeat),
-                status == "working"
-                    && current.as_deref() == Some(fingerprint)
-                    && now_ms - *heartbeat <= stuck_after_ms,
-            ),
+            Some((status, current, heartbeat, progress)) => {
+                // Progress is the real liveness signal only while this runner
+                // is actively working this issue. Idle/other-owner heartbeats
+                // are still the meaningful timestamp for an abandoned issue.
+                let working =
+                    status == "working" && current.as_deref() == Some(fingerprint);
+                let last = if working && *progress > 0 {
+                    *progress
+                } else {
+                    *heartbeat
+                };
+                (
+                    Some(last),
+                    working && now_ms - last <= stuck_after_ms,
+                )
+            }
             None => (None, false),
         };
         if healthy_owner {
@@ -712,9 +794,11 @@ impl Store {
         let revived: Vec<(String, String)> = {
             let conn = self.lock();
             let mut stmt = conn.prepare(
-                "SELECT fingerprint, repo FROM issues WHERE state IN ('triggered','fixing')",
+                "SELECT fingerprint, repo FROM issues
+                 WHERE state IN ('triggered','fixing')
+                   AND (owner_runner_id = ?1 OR owner_runner_id IS NULL)",
             )?;
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let rows = stmt.query_map([runner_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut count = 0;
@@ -723,8 +807,9 @@ impl Store {
                 let conn = self.lock();
                 conn.execute(
                     "UPDATE issues SET state='new', cooldown_until=0, owner_runner_id=NULL,
-                        state_changed_at=?2 WHERE fingerprint=?1 AND state IN ('triggered','fixing')",
-                    rusqlite::params![fp, now_ms],
+                        state_changed_at=?2 WHERE fingerprint=?1 AND state IN ('triggered','fixing')
+                        AND (owner_runner_id = ?3 OR owner_runner_id IS NULL)",
+                    rusqlite::params![fp, now_ms, runner_id],
                 )?;
             }
             self.record_event(&fp, now_ms, Some(&repo), runner_id, "requeued",
@@ -734,8 +819,15 @@ impl Store {
         Ok(count)
     }
 
-    /// Reopen an `escalated`/`rejected` issue as `new` (owner decision).
-    pub fn reopen_issue(&self, fingerprint: &str, now_ms: i64) -> ShanResult<()> {
+    /// Reopen an `escalated`/`rejected`/`ignored` issue as `new` (owner
+    /// decision). The owner's reason is journaled and an explicit reopen
+    /// resets the attempt counter — the cap only protects automatic loops.
+    pub fn reopen_issue(
+        &self,
+        fingerprint: &str,
+        now_ms: i64,
+        reason: Option<&str>,
+    ) -> ShanResult<()> {
         let conn = self.lock();
         let (state, repo): (String, String) = conn
             .query_row(
@@ -750,23 +842,135 @@ impl Store {
                 other => ShanError::Db(other),
             })?;
         let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state))?;
-        if !matches!(from, State::Escalated | State::Rejected) {
+        if !matches!(from, State::Escalated | State::Rejected | State::Ignored) {
             return Err(ShanError::InvalidTransition { from, to: State::New });
         }
         conn.execute(
             "UPDATE issues SET state='new', cooldown_until=0, owner_runner_id=NULL,
-                state_changed_at=?2 WHERE fingerprint=?1",
+                attempts=0, state_changed_at=?2 WHERE fingerprint=?1",
             rusqlite::params![fingerprint, now_ms],
         )?;
         drop(conn);
+        let reason = reason.map(str::trim).filter(|reason| !reason.is_empty());
+        let detail = match reason {
+            Some(reason) => format!("reopened by owner: {}", reason.chars().take(2_000).collect::<String>()),
+            None => "reopened by owner".to_string(),
+        };
         self.record_event(
             fingerprint,
             now_ms,
             Some(&repo),
             "owner",
             "state_changed",
-            "reopened by owner",
+            &detail,
         )
+    }
+
+    /// Internal retry: put a `triggered`/`fixing` issue back to `new` with a
+    /// short cooldown. Used for transient provider/environment failures; the
+    /// attempt counter is intentionally not touched.
+    pub fn release_issue(
+        &self,
+        fingerprint: &str,
+        reason: &str,
+        cooldown_until_ms: i64,
+        now_ms: i64,
+    ) -> ShanResult<()> {
+        let conn = self.lock();
+        let (state, repo): (String, String) = conn
+            .query_row(
+                "SELECT state, repo FROM issues WHERE fingerprint=?1",
+                [fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    ShanError::UnknownIssue(fingerprint.to_string())
+                }
+                other => ShanError::Db(other),
+            })?;
+        let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state))?;
+        if !matches!(from, State::Triggered | State::Fixing) {
+            return Err(ShanError::InvalidTransition { from, to: State::New });
+        }
+        conn.execute(
+            "UPDATE issues SET state='new', cooldown_until=?2, owner_runner_id=NULL,
+                state_changed_at=?3 WHERE fingerprint=?1",
+            rusqlite::params![fingerprint, cooldown_until_ms, now_ms],
+        )?;
+        drop(conn);
+        self.record_event(
+            fingerprint,
+            now_ms,
+            Some(&repo),
+            "runner",
+            "requeued",
+            reason,
+        )
+    }
+
+    /// Owner mute or attempt-cap: `ignored` is terminal and reports never
+    /// auto-reopen it. The reason is journaled and visible to future prompts.
+    pub fn ignore_issue(
+        &self,
+        fingerprint: &str,
+        reason: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> ShanResult<()> {
+        let reason = reason.trim();
+        let detail = if reason.is_empty() {
+            "ignored".to_string()
+        } else {
+            format!("ignored: {}", reason.chars().take(2_000).collect::<String>())
+        };
+        self.set_state_as(
+            fingerprint,
+            State::Ignored,
+            now_ms,
+            Some(&detail),
+            actor,
+        )?;
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE issues SET owner_runner_id=NULL WHERE fingerprint=?1",
+            [fingerprint],
+        )?;
+        Ok(())
+    }
+
+    /// Increment the issue-level attempt counter and return the new value.
+    /// Provider outages and environment faults intentionally do not call this.
+    pub fn increment_attempts(&self, fingerprint: &str) -> ShanResult<u64> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE issues SET attempts = attempts + 1 WHERE fingerprint = ?1",
+            [fingerprint],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownIssue(fingerprint.to_string()));
+        }
+        let attempts = conn.query_row(
+            "SELECT attempts FROM issues WHERE fingerprint = ?1",
+            [fingerprint],
+            |row| row.get(0),
+        )?;
+        Ok(attempts)
+    }
+
+    pub fn attempts_for(&self, fingerprint: &str) -> ShanResult<u64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT attempts FROM issues WHERE fingerprint = ?1",
+            [fingerprint],
+            |row| row.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                ShanError::UnknownIssue(fingerprint.to_string())
+            }
+            other => ShanError::Db(other),
+        })
     }
 
     /// Validate + apply a state transition, journaling the event as `system`.
@@ -869,6 +1073,40 @@ impl Store {
     /// per-repo daily PR limit (ADR-003 频控). Counts distinct PR URLs across
     /// the run ledger and legacy issue rows so retries of the same PR never
     /// consume quota twice.
+    /// Tokens spent by runs for one repo (or all repos) since `since_ms`.
+    /// Failed attempts count: this is a spend cap, not a PR quota.
+    pub fn tokens_used_since(&self, repo: Option<&str>, since_ms: i64) -> ShanResult<u64> {
+        let conn = self.lock();
+        let total: i64 = match repo {
+            Some(repo) => conn.query_row(
+                "SELECT COALESCE(SUM(tokens_uncached + tokens_cached), 0)
+                 FROM runs WHERE repo = ?1 AND started_at >= ?2",
+                rusqlite::params![repo, since_ms],
+                |row| row.get(0),
+            )?,
+            None => conn.query_row(
+                "SELECT COALESCE(SUM(tokens_uncached + tokens_cached), 0)
+                 FROM runs WHERE started_at >= ?1",
+                [since_ms],
+                |row| row.get(0),
+            )?,
+        };
+        Ok(total.max(0) as u64)
+    }
+
+    /// Number of merged issues for a repo. Used by `draft_first_n` to keep the
+    /// first PRs in a new repository as drafts without changing ADR-003's
+    /// default for established repos.
+    pub fn merged_pr_count(&self, repo: &str) -> ShanResult<u64> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM issues WHERE repo = ?1 AND state = 'merged'",
+            [repo],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
     pub fn prs_opened_since(&self, repo: &str, since_ms: i64) -> ShanResult<u64> {
         let conn = self.lock();
         let count: u64 = conn.query_row(
@@ -1211,7 +1449,7 @@ impl Store {
     pub fn get(&self, fingerprint: &str) -> ShanResult<Option<IssueSnapshot>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT fingerprint, title, language, repo, severity, occurrences, stack_sample
+            "SELECT fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample
              FROM issues WHERE fingerprint = ?1",
         )?;
         let mut rows = stmt.query([fingerprint])?;
@@ -1282,6 +1520,7 @@ impl Store {
             state_changed_at: row.get(10)?,
             owner_runner_id: row.get(11)?,
             ci_verdict: row.get(12)?,
+            attempts: row.get(13)?,
         })
     }
 
@@ -1405,8 +1644,8 @@ impl Store {
         conn.execute(
             "INSERT INTO runners(id, repo, host, pid, started_at, heartbeat_at, status,
                                  current_fingerprint, phase, provider, model, daily_pr_limit,
-                                 repo_path, service_unit, config_json, last_error)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,?9,?10,?11,?12,?13,NULL)
+                                 repo_path, service_unit, config_json, last_error, progress_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,?9,?10,?11,?12,?13,NULL,?5)
              ON CONFLICT(id) DO UPDATE SET
                 repo=excluded.repo, host=excluded.host, pid=excluded.pid,
                 started_at=excluded.started_at, heartbeat_at=excluded.heartbeat_at,
@@ -1414,7 +1653,7 @@ impl Store {
                 provider=excluded.provider, model=excluded.model,
                 daily_pr_limit=excluded.daily_pr_limit, repo_path=excluded.repo_path,
                 service_unit=excluded.service_unit, config_json=excluded.config_json,
-                last_error=NULL",
+                last_error=NULL, progress_at=excluded.progress_at",
             rusqlite::params![
                 r.id, r.repo, r.host, r.pid, r.started_at, r.heartbeat_at, r.status,
                 r.provider, r.model, r.daily_pr_limit, r.repo_path, r.service_unit, r.config_json,
@@ -1440,12 +1679,25 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the last real progress timestamp separately from liveness.
+    pub fn set_runner_progress(&self, id: &str, progress_at: i64) -> ShanResult<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE runners SET progress_at=?2 WHERE id=?1",
+            rusqlite::params![id, progress_at],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownRunner(id.to_string()));
+        }
+        Ok(())
+    }
+
     pub fn list_runners(&self) -> ShanResult<Vec<RunnerRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, repo, host, pid, started_at, heartbeat_at, status,
                     current_fingerprint, phase, provider, model, daily_pr_limit,
-                    repo_path, service_unit, config_json, last_error
+                    repo_path, service_unit, config_json, last_error, progress_at
              FROM runners ORDER BY heartbeat_at DESC, id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1456,6 +1708,7 @@ impl Store {
                 pid: row.get(3)?,
                 started_at: row.get(4)?,
                 heartbeat_at: row.get(5)?,
+                progress_at: row.get(16)?,
                 status: row.get(6)?,
                 current_fingerprint: row.get(7)?,
                 phase: row.get(8)?,
@@ -1680,6 +1933,32 @@ impl Store {
         let mut rows = stmt.query([fingerprint])?;
         match rows.next()? {
             Some(row) => Ok(Some(Self::run_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Newest runs for one fingerprint, used to build the next prompt's
+    /// `PRIOR ATTEMPTS` section.
+    pub fn recent_runs(&self, fingerprint: &str, limit: u32) -> ShanResult<Vec<RunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs
+             WHERE fingerprint=?1 ORDER BY started_at DESC, id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![fingerprint, limit], Self::run_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Newest owner-authored event (reopen/ignore reason) for one issue.
+    pub fn latest_owner_event(&self, fingerprint: &str) -> ShanResult<Option<EventRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{EVENT_SELECT} WHERE e.fingerprint = ?1 AND e.actor = 'owner'
+             ORDER BY e.id DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query([fingerprint])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::event_from_row(row)?)),
             None => Ok(None),
         }
     }
@@ -2571,9 +2850,9 @@ mod tests {
         store.set_state(&fp, State::Triggered, t, None).expect("t");
         store.set_state(&fp, State::Fixing, t, None).expect("f");
         store.set_state(&fp, State::Escalated, t, None).expect("e");
-        store.reopen_issue(&fp, t + 1).expect("reopen");
+        store.reopen_issue(&fp, t + 1, None).expect("reopen");
         assert!(store.ready_issue(t + 2).expect("ready").is_some());
-        assert!(store.reopen_issue(&fp, t + 3).is_err(), "new is not reopenable");
+        assert!(store.reopen_issue(&fp, t + 3, None).is_err(), "new is not reopenable");
     }
 
     #[test]
@@ -3887,6 +4166,19 @@ mod repo_tests {
         (dir, store)
     }
 
+    fn signal_for(title: &str, symbol: &str, severity: &str) -> Signal {
+        Signal {
+            repo: "example.com/spike-target".into(),
+            language: "go".into(),
+            title: title.into(),
+            severity: severity.into(),
+            message: None,
+            stack_trace: format!(
+                "panic: {title}\ngoroutine 1 [running]:\nexample.com/spike-target.{symbol}()\n\t/app/a.go:1 +0x1"
+            ),
+        }
+    }
+
     #[test]
     fn repos_list_in_case_insensitive_name_order() {
         let (_dir, store) = store();
@@ -3992,5 +4284,69 @@ mod repo_tests {
         }
         let store = Store::open(&path).expect("reopen");
         assert_eq!(store.list_repos().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn ignore_mutes_reports_and_reopen_resets_attempts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t = 1_000_000;
+        let signal = signal_for("panic in Average", "Average", "high");
+        let fp = match store.report_signal(&signal, t).expect("report") {
+            ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("expected new, got {other:?}"),
+        };
+
+        store
+            .ignore_issue(&fp, "not a bug — expected upstream", "owner", t + 1)
+            .expect("ignore");
+        let row = store
+            .list_issues()
+            .expect("issues")
+            .into_iter()
+            .find(|row| row.fingerprint == fp)
+            .expect("issue");
+        assert_eq!(row.state, "ignored");
+
+        let muted = store.report_signal(&signal, t + 2).expect("report");
+        assert!(
+            matches!(muted, ReportOutcome::Muted { .. }),
+            "ignored reports must not reopen: {muted:?}"
+        );
+
+        assert_eq!(store.increment_attempts(&fp).expect("attempt"), 1);
+        store
+            .reopen_issue(&fp, t + 3, Some("retry after upstream deploy"))
+            .expect("reopen");
+        assert_eq!(store.attempts_for(&fp).expect("attempts"), 0);
+        let event = store.latest_event(&fp).expect("event").expect("event");
+        assert!(event.detail.contains("retry after upstream deploy"));
+    }
+
+    #[test]
+    fn severity_dominates_occurrences_in_ready_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let t = 1_000_000;
+
+        let medium = signal_for("medium noise", "MediumNoise", "medium");
+        let medium_fp = match store.report_signal(&medium, t).expect("medium") {
+            ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("expected new, got {other:?}"),
+        };
+        for i in 0..6 {
+            store.report_signal(&medium, t + i).expect("medium repeat");
+        }
+
+        let critical = signal_for("critical bug", "CriticalBug", "critical");
+        let critical_fp = match store.report_signal(&critical, t).expect("critical") {
+            ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("expected new, got {other:?}"),
+        };
+
+        let picked = store.ready_issue(t).expect("ready").expect("issue");
+        assert_eq!(picked.fingerprint, critical_fp);
+        assert_ne!(picked.fingerprint, medium_fp);
+        assert_eq!(picked.attempts, 0);
     }
 }

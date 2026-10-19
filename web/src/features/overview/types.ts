@@ -102,7 +102,12 @@ export interface TrendTotals {
   merged: number;
   rejected: number;
   tokens: number;
+  ci_green?: number;
+  ci_red?: number;
   median_time_to_pr_secs: number | null;
+  false_positive_rate?: number | null;
+  review_latency_p50_secs?: number | null;
+  ci_red_rate?: number | null;
 }
 
 export interface TrendsResponse {

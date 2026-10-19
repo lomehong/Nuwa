@@ -47,6 +47,20 @@ export function formatDuration(ms: number): string {
   return `${days} 天 ${hours % 24} 小时`;
 }
 
+export function formatPercent(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "—";
+  }
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+export function formatSeconds(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "—";
+  }
+  return formatDuration(value * 1_000);
+}
+
 /** Relative age for attention cards and events: 刚刚 / 5 分钟前 / 3 天前. */
 export function formatAge(tsMs: number, now: number = Date.now()): string {
   const diff = isValidTimestamp(tsMs) ? Math.max(0, now - tsMs) : 0;
