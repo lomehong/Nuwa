@@ -678,13 +678,25 @@ async fn work_once(
         }
     };
     if !dirty.trim().is_empty() {
-        let message = format!(
-            "repo {} has an unclean working tree — reset before running:\n{}",
-            repo_dir.display(),
-            dirty.trim()
-        );
-        live_update(&live, "error", None, None, Some(message.clone())).await;
-        bail!("{message}");
+        // runner 独占此部署目录：残留半成品（上次修复/交付中断）由下一次
+        // 修复自动覆盖，自动 reset 是安全且正确的自愈；仅有 nuwa.repo.json
+        // 这类登记文件不受影响（已在 porcelain 中排除）。
+        eprintln!("preflight   : unclean working tree — auto-reset to origin/main:\n{}", dirty.trim());
+        let _ = deliver::git(repo_dir, &["reset", "--hard", "origin/main"]);
+        let _ = deliver::git(repo_dir, &["clean", "-fd", "--", ":(exclude)nuwa.repo.json"]);
+        let still = deliver::git(
+            repo_dir,
+            &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
+        )?;
+        if !still.trim().is_empty() {
+            let message = format!(
+                "repo {} working tree still unclean after auto-reset — manual intervention required:\n{}",
+                repo_dir.display(),
+                still.trim()
+            );
+            live_update(&live, "error", None, None, Some(message.clone())).await;
+            bail!("{message}");
+        }
     }
 
     // ---- claim (atomic: N runners can never share an issue) ----
