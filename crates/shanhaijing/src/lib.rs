@@ -703,6 +703,37 @@ impl Store {
         )
     }
 
+    /// Revive every issue stuck in a claimed-but-unfinished state (`triggered`
+    /// or `fixing`). Called once at runner startup: a crash/restart orphans the
+    /// previous process's in-flight repairs, and the claim path only picks up
+    /// `new` — without this a crash mid-repair would strand the issue forever.
+    /// Returns how many issues were revived.
+    pub fn revive_orphaned_fixing(&self, now_ms: i64, runner_id: &str) -> ShanResult<usize> {
+        let revived: Vec<(String, String)> = {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT fingerprint, repo FROM issues WHERE state IN ('triggered','fixing')",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut count = 0;
+        for (fp, repo) in revived {
+            {
+                let conn = self.lock();
+                conn.execute(
+                    "UPDATE issues SET state='new', cooldown_until=0, owner_runner_id=NULL,
+                        state_changed_at=?2 WHERE fingerprint=?1 AND state IN ('triggered','fixing')",
+                    rusqlite::params![fp, now_ms],
+                )?;
+            }
+            self.record_event(&fp, now_ms, Some(&repo), runner_id, "requeued",
+                "orphaned repair revived at runner startup")?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Reopen an `escalated`/`rejected` issue as `new` (owner decision).
     pub fn reopen_issue(&self, fingerprint: &str, now_ms: i64) -> ShanResult<()> {
         let conn = self.lock();
@@ -2406,6 +2437,50 @@ mod tests {
             .expect("issue")
             .fingerprint;
         assert!(!store.stuck(&fp, now + 100_000, 300_000).expect("stuck"));
+    }
+
+    /// 崩溃重启自愈：fixing 且 owner_runner_id 非空的单在 runner 启动时批量
+    /// 回 new（清冷却），claim 才能重领；revive 后再次 claim 不再复活别的单。
+    #[test]
+    fn revive_orphaned_fixing_requeues_all() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let now = 1_000_000;
+        // 两张单都会被第一轮 claim 变成 fixing（各自 cooldown 不同 fp）。
+        store.report_signal(&signal(), now).expect("report");
+        let fp1 = store
+            .claim_ready_issue(now, now + 10_000)
+            .expect("claim")
+            .expect("issue")
+            .fingerprint;
+        store
+            .report_signal(&issue_signal("second panic", "Second"), now + 1000)
+            .expect("report");
+        let fp2 = store
+            .claim_ready_issue(now + 1000, now + 11_000)
+            .expect("claim2")
+            .expect("issue2")
+            .fingerprint;
+        assert_ne!(fp1, fp2);
+
+        // 重启自愈：全部 fixing 回 new。
+        let revived = store
+            .revive_orphaned_fixing(now + 60_000, "host:repo")
+            .expect("revive");
+        assert_eq!(revived, 2);
+
+        // 复活后的单可被重新 claim（cooldown 已清）。
+        let again = store
+            .claim_ready_issue(now + 61_000, now + 71_000)
+            .expect("reclaim")
+            .expect("reclaimed");
+        assert_eq!(again.fingerprint, fp1);
+
+        // 已是 new 的单不再被 revive（幂等）。
+        let revived2 = store
+            .revive_orphaned_fixing(now + 62_000, "host:repo")
+            .expect("revive2");
+        assert_eq!(revived2, 1);
     }
 
     #[test]

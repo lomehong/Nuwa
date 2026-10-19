@@ -394,6 +394,14 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     );
     live_update(&live, "starting", None, None, None).await;
 
+    // 自愈：上一次进程崩溃/被杀留下的 `fixing` 单已无活着的 owner，claim 只领
+    // `new`——不复活就永远卡死。启动时批量回 `new` 并清冷却，让本轮循环自然重领。
+    match store.revive_orphaned_fixing(now, &runner_id) {
+        Ok(0) => {}
+        Ok(n) => println!("revive      : {n} orphaned fixing issue(s) requeued at startup"),
+        Err(e) => eprintln!("warning : revive orphaned fixing failed: {e}"),
+    }
+
     let result: anyhow::Result<()> = async {
         loop {
             let worked = work_once(
@@ -710,14 +718,25 @@ async fn work_once(
     let run_id = uuid::Uuid::new_v4().to_string();
     let (provider_name, model_name) = provider_meta(&provider);
     if snapshot.repo != repo_config.repo {
+        // 毒单隔离：异 repo 的单若 bail 会让 runner crash-loop 在同一张单上
+        // （claim 只看 new/cooldown，永远先领到它）。escalated 交给所有者
+        // 处置，runner 继续下一轮（ADR-004 边界 + 2026-10-19 部署实战）。
         let message = format!(
-            "repo mismatch: issue `{}` belongs to `{}`, instructions are for `{}` — refusing (ADR-004)",
+            "repo mismatch: issue `{}` belongs to `{}`, instructions are for `{}` — escalated (ADR-004)",
             snapshot.fingerprint,
             snapshot.repo,
             repo_config.repo
         );
-        live_update(&live, "error", Some(&snapshot.fingerprint), None, Some(message.clone())).await;
-        bail!("{message}");
+        let _ = store.set_state_as(
+            &snapshot.fingerprint,
+            shanhaijing::State::Escalated,
+            now,
+            Some(&message),
+            "runner",
+        );
+        println!("mismatch   : {} escalated (belongs to `{}`)", snapshot.fingerprint, snapshot.repo);
+        live_update(&live, "idle", None, None, Some(message)).await;
+        return Ok(true);
     }
     let fp = snapshot.fingerprint.clone();
     // Build the issue before `start_run` so the deterministic session dir is
@@ -1507,6 +1526,75 @@ mod tests {
         assert!(!worked, "quota must stand down");
         let hb = store.last_heartbeat().expect("heartbeat").expect("some heartbeat");
         assert!((now_ms() - hb).abs() < 5_000, "heartbeat must be fresh");
+    }
+
+    /// 异 repo 毒单：work_once 不 crash、不消耗 PR 配额，单被 escalated，
+    /// runner 返回"工作过"以继续下一轮（2026-10-19 部署实战：spike 遗留单
+    /// 曾让 runner crash-loop 在同一张单上）。
+    #[tokio::test]
+    async fn repo_mismatch_isolates_poison_issue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
+        let now = now_ms();
+        let signal = shanhaijing::Signal {
+            repo: "example.com/other-repo".into(),
+            language: "go".into(),
+            title: "panic: boom".into(),
+            severity: "high".into(),
+            message: None,
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/other.F()\n\t/app/a.go:1 +0x1".into(),
+        };
+        store.report_signal(&signal, now).expect("report");
+
+        // preflight 要求一个干净的 main checkout（claim 之前检查）。
+        git(repo_dir.path(), &["init", "-q", "-b", "main"]);
+        git(repo_dir.path(), &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-q", "-m", "init"]);
+
+        let cfg = RepoInstructions {
+            repo: "example.com/spike".into(),
+            failing_check: FailingCheck { command: "true".into(), target: None },
+            forbidden_paths: Vec::new(),
+            notes: String::new(),
+        };
+        let worked = work_once(
+            &store,
+            &cfg,
+            repo_dir.path(),
+            dir.path().join("sessions"),
+            repair::ProviderKind::Faux,
+            30,
+            false,
+            true,
+            1,
+            1_000_000,
+            600,
+            "test:runner",
+            Arc::new(tokio::sync::Mutex::new(RunnerLive::new())),
+        )
+        .await
+        .expect("work_once must not fail on a mismatched issue");
+
+        assert!(worked, "mismatch handled is a unit of work");
+        let fp = fp_of(&store, now);
+        let row = store
+            .list_issues()
+            .expect("rows")
+            .into_iter()
+            .find(|r| r.fingerprint == fp)
+            .expect("issue");
+        assert_eq!(row.state, "escalated", "poison issue must be escalated");
+    }
+
+    /// Helper: the single issue's fingerprint in a fresh test store.
+    fn fp_of(store: &shanhaijing::Store, _now: i64) -> String {
+        store
+            .list_issues()
+            .expect("rows")
+            .first()
+            .expect("an issue exists")
+            .fingerprint
+            .clone()
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {

@@ -100,7 +100,16 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         create_read_tool(&ctx, None),
         create_edit_tool(&ctx),
         create_write_tool(&ctx),
-        create_bash_tool(&ctx, None),
+        // 模型忘传 timeout 时（如 go test 等 stdin / 交互 prompt）命令会挂死
+        // 整个 run——300s 兜底，模型显式传的超时仍然优先（Q6，2026-10-19
+        // mindloop 实战：go test 挂死 50 分钟无事件）。
+        create_bash_tool(
+            &ctx,
+            Some(rpi_tools::BashToolOptions {
+                default_timeout: Some(300.0),
+                ..Default::default()
+            }),
+        ),
         create_grep_tool(&ctx, None),
         create_find_tool(&ctx, None),
         create_ls_tool(&ctx, None),
@@ -229,6 +238,14 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         models: providers,
         agent_emitter: Some(emitter),
         before_tool_call: Some(crate::guard::before_tool_hook(Arc::clone(&job.guards))),
+        // LLM 请求快速失败：单请求 120s（正常首 chunk 秒级）、至多重试 1 次。
+        // 挂死的 provider 流不再拖住整个 run 数十分钟——失败会走验证门/
+        // escalate 路径，由下一轮 claim 自然重试（Q6，2026-10-19）。
+        stream_options: rpi_harness::types::AgentHarnessStreamOptions {
+            timeout: Some(std::time::Duration::from_secs(120)),
+            max_retries: Some(1),
+            ..Default::default()
+        },
         ..AgentHarnessOptions::default()
     };
     let harness = Arc::new(AgentHarness::create(options).await.context("harness create")?);
