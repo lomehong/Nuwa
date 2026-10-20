@@ -10,9 +10,8 @@ import type { IssueDetailResponse, RunDto } from "../features/issue-detail/types
 import type { IssueListItem, IssueListResponse } from "../features/issues/types";
 import type { ProjectSummary } from "../features/projects/types";
 import type { RunnerDto, RunnerListResponse } from "../features/runners/types";
+import type { RepoDto, RepoListResponse } from "../features/projects/registry";
 import type {
-  RepoDto,
-  RepoListResponse,
   SettingDto,
   SettingsResponse,
   SystemResponse,

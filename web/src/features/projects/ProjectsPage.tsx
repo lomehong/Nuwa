@@ -33,19 +33,31 @@ function Cell({ value, tone }: { value: number; tone?: "danger" | "muted" }) {
   );
 }
 
-function ProjectName({ project }: { project: ProjectSummary }) {
+function ProjectName({
+  project,
+  linked = true,
+}: {
+  project: ProjectSummary;
+  /** False inside a link: a link may not nest another link. */
+  linked?: boolean;
+}) {
+  const label = projectLabel(project.name, project.repo);
   return (
     <div className="min-w-0">
       <div className="flex items-center gap-2">
         {project.worst_severity ? (
           <SeverityStone severity={project.worst_severity} hideLabel className="size-3.5" />
         ) : null}
-        <Link
-          to={`/projects/${encodeURIComponent(project.repo)}`}
-          className="truncate text-body-sm font-medium text-text transition-colors hover:text-accent"
-        >
-          {projectLabel(project.name, project.repo)}
-        </Link>
+        {linked ? (
+          <Link
+            to={`/projects/${encodeURIComponent(project.repo)}`}
+            className="truncate text-body-sm font-medium text-text transition-colors hover:text-accent"
+          >
+            {label}
+          </Link>
+        ) : (
+          <span className="truncate text-body-sm font-medium text-text">{label}</span>
+        )}
         {!project.registered ? (
           <span className="shrink-0 text-caption text-text-muted">未登记</span>
         ) : null}
@@ -170,7 +182,7 @@ export function ProjectsPage() {
                   className="nameplate flex min-h-11 items-center gap-3 rounded-card border border-border bg-surface px-3 py-2"
                 >
                   <span className="min-w-0 flex-1">
-                    <ProjectName project={project} />
+                    <ProjectName project={project} linked={false} />
                   </span>
                   <span className="flex shrink-0 items-center gap-3">
                     {project.attention > 0 ? (

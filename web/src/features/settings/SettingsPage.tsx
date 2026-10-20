@@ -31,15 +31,18 @@ import { SyncButton } from "../actions/SyncButton";
 import { issueDetailPath } from "../issues/format";
 import { formatDateTime, formatDuration, isoDateTime, shortFingerprint } from "../overview/format";
 import { PanelError } from "../overview/PanelChrome";
-import { runnerIsOffline } from "../runners/format";
-import { useRunnersQuery } from "../runners/queries";
-import type { RunnerDto } from "../runners/types";
-import { RepoFormDialog, type RepoFormPrefill } from "./RepoFormDialog";
-import { RestartDialog } from "./RestartDialog";
-import { SettingField } from "./SettingField";
+import { RepoFormDialog, type RepoFormPrefill } from "../projects/RepoFormDialog";
 import {
   useDeleteRepoMutation,
   useReposQuery,
+  type RepoDto,
+} from "../projects/registry";
+import { runnerIsOffline } from "../runners/format";
+import { useRunnersQuery } from "../runners/queries";
+import type { RunnerDto } from "../runners/types";
+import { RestartDialog } from "./RestartDialog";
+import { SettingField } from "./SettingField";
+import {
   useSaveSettingsMutation,
   useSettingsQuery,
   useSystemQuery,
@@ -48,7 +51,6 @@ import {
 import {
   isPlainValue,
   type DiffDto,
-  type RepoDto,
   type SettingDto,
   type SettingGroup,
   type SettingsResponse,

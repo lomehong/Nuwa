@@ -7,8 +7,8 @@ import { Button, Input, useToast } from "../../components/ui";
 import { ApiError } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { useModalBehavior } from "../../lib/modal";
-import { useCreateRepoMutation, useUpdateRepoMutation } from "./queries";
-import type { RepoDto } from "./types";
+import { useCreateRepoMutation, useUpdateRepoMutation } from "./registry";
+import type { RepoDto } from "./registry";
 
 export type RepoFormMode = "create" | "edit";
 
@@ -21,10 +21,19 @@ export interface RepoFormPrefill {
 export interface RepoFormDialogProps {
   open: boolean;
   mode: RepoFormMode;
+  /** Overrides the heading when the host page has its own wording. */
+  title?: string;
+  /** Overrides the submit button label when the host page has its own wording. */
+  submitLabel?: string;
   /** Edit target; its identity is path-owned and never editable. */
   target?: RepoDto | null;
   /** Create prefill, e.g. from a runner-only group. */
   prefill?: RepoFormPrefill | null;
+  /**
+   * Lock the identity even in create mode — the project already exists
+   * (it reported signals), so its id must not be typed over.
+   */
+  lockIdentity?: boolean;
   onClose: () => void;
 }
 
@@ -115,14 +124,18 @@ export function validateRepoForm(
 export function RepoFormDialog({
   open,
   mode,
+  title,
+  submitLabel,
   target = null,
   prefill = null,
+  lockIdentity = false,
   onClose,
 }: RepoFormDialogProps) {
   const create = useCreateRepoMutation();
   const update = useUpdateRepoMutation();
   const { toast } = useToast();
   const editing = mode === "edit";
+  const identityLocked = editing || lockIdentity;
   const pending = create.isPending || update.isPending;
 
   const [repo, setRepo] = useState(target?.repo ?? prefill?.repo ?? "");
@@ -191,12 +204,12 @@ export function RepoFormDialog({
       url: url.trim(),
       description: description.trim(),
     };
-    const nextErrors = validateRepoForm(values, editing);
+    const nextErrors = validateRepoForm(values, identityLocked);
     if (Object.keys(nextErrors).length > 0) {
       setErrors(nextErrors);
       return;
     }
-    const identity = editing && target ? target.repo : values.repo;
+    const identity = identityLocked && target ? target.repo : values.repo;
     const onSuccess = () => {
       toast({
         title: editing ? "仓库已更新" : "仓库已添加",
@@ -259,7 +272,7 @@ export function RepoFormDialog({
       >
         <div className="flex items-start justify-between gap-4">
           <h2 id={titleId} className="text-heading-sm font-semibold">
-            {editing ? "编辑仓库" : "添加仓库"}
+            {title ?? (editing ? "编辑仓库" : "添加仓库")}
           </h2>
           <button
             type="button"
@@ -290,11 +303,11 @@ export function RepoFormDialog({
             }}
           />
 
-          {editing ? (
+          {identityLocked ? (
             <div className="flex w-full flex-col gap-1.5">
               <p className="text-caption font-medium text-text-secondary">仓库标识</p>
               <p className="rounded-card border border-border bg-raised px-3 py-2 font-mono text-body-sm break-all text-text">
-                {target?.repo ?? ""}
+                {target?.repo ?? repo}
               </p>
               <p className="text-caption text-text-secondary">
                 用于匹配问题单与 runner，例如 example.com/app；登记后不可修改。
@@ -372,7 +385,7 @@ export function RepoFormDialog({
               取消
             </Button>
             <Button type="submit" pending={pending}>
-              {editing ? "保存" : "添加"}
+              {submitLabel ?? (editing ? "保存" : "添加")}
             </Button>
           </div>
         </form>

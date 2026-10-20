@@ -148,36 +148,3 @@ export interface RestartConflictBody {
   active_runs: ActiveRunSummary[];
 }
 
-/**
- * A console-registered repository (`crates/nuwa/src/api/repos.rs`).
- *
- * Only the display identity lives here. Repository content (`failing_check`,
- * `forbidden_paths`, `notes`) stays in the target repo's `nuwa.repo.json` and
- * is never part of this API.
- */
-export interface RepoDto {
-  repo: string;
-  name: string;
-  url: string;
-  description: string;
-  created_at_ms: number;
-  updated_at_ms: number;
-}
-
-export interface RepoListResponse {
-  data: RepoDto[];
-}
-
-export interface RepoResponse {
-  data: RepoDto;
-}
-
-export interface CreateRepoRequest {
-  repo: string;
-  name: string;
-  url: string;
-  description: string;
-}
-
-/** The identity is path-owned and immutable, so it never travels in the body. */
-export type UpdateRepoRequest = Omit<CreateRepoRequest, "repo">;

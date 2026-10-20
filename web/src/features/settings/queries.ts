@@ -13,9 +13,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch } from "../../lib/api";
 import { invalidateSettingsViews } from "../../lib/queryInvalidation";
 import type {
-  CreateRepoRequest,
-  RepoListResponse,
-  RepoResponse,
   RestartServicesRequest,
   SaveSettingsResponse,
   SettingsResponse,
@@ -23,15 +20,12 @@ import type {
   SystemResponse,
   TestSettingsRequest,
   TestSettingsResponse,
-  UpdateRepoRequest,
 } from "./types";
 
 export const SYSTEM_STALE_MS = 30_000;
-export const REPOS_STALE_MS = 30_000;
 
 export const settingsQueryKey = ["settings"] as const;
 export const systemQueryKey = ["system"] as const;
-export const reposQueryKey = ["repos"] as const;
 
 export function useSettingsQuery() {
   return useQuery({
@@ -88,62 +82,5 @@ export function useRestartServicesMutation() {
         method: "POST",
         body: JSON.stringify({ force: request.force ?? false }),
       }),
-  });
-}
-
-/**
- * The path segment for one registry entry. Axum's `{repo}` matches a single
- * segment, while identities contain `/`, so percent-encoding is mandatory.
- */
-export function repoApiPath(repo: string): string {
-  return `/repos/${encodeURIComponent(repo)}`;
-}
-
-/** `GET /repos` — the registry is small and changes rarely (docs/09 §8.7). */
-export function useReposQuery() {
-  return useQuery({
-    queryKey: reposQueryKey,
-    queryFn: ({ signal }) => apiFetch<RepoListResponse>("/repos", { signal }),
-    staleTime: REPOS_STALE_MS,
-    refetchOnWindowFocus: true,
-  });
-}
-
-export function useCreateRepoMutation() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (request: CreateRepoRequest) =>
-      apiFetch<RepoResponse>("/repos", {
-        method: "POST",
-        body: JSON.stringify(request),
-      }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: reposQueryKey });
-    },
-  });
-}
-
-export function useUpdateRepoMutation() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: ({ repo, ...fields }: UpdateRepoRequest & { repo: string }) =>
-      apiFetch<RepoResponse>(repoApiPath(repo), {
-        method: "PUT",
-        body: JSON.stringify(fields),
-      }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: reposQueryKey });
-    },
-  });
-}
-
-export function useDeleteRepoMutation() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (repo: string) =>
-      apiFetch<void>(repoApiPath(repo), { method: "DELETE" }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: reposQueryKey });
-    },
   });
 }

@@ -1,16 +1,21 @@
 import { clsx } from "clsx";
-import { ArrowLeft, ExternalLink, FolderTree } from "lucide-react";
+import { ArrowLeft, ExternalLink, FolderTree, Pencil } from "lucide-react";
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { Sparkline, type SparklineDatum } from "../../components/charts/Sparkline";
 import {
+  Button,
   Card,
   CardContent,
+  ConfirmDialog,
   EmptyState,
   SeverityStone,
   Skeleton,
   StateBadge,
+  useToast,
 } from "../../components/ui";
+import { describeError } from "../../lib/errors";
 import { eventKindLabel } from "../../lib/eventKinds";
 import { DEFAULT_EVENT_FILTERS } from "../events/filters";
 import { useEventsQuery } from "../events/queries";
@@ -19,8 +24,10 @@ import { DEFAULT_ISSUE_FILTERS } from "../issues/types";
 import { formatAge, formatNumber, formatPercent, formatSeconds, formatTokens } from "../overview/format";
 import { useOverviewQuery, useTrendsQuery } from "../overview/queries";
 import { useRunnersQuery } from "../runners/queries";
-import { formatLastSignal, projectLabel } from "./format";
+import { formatLastSignal, projectLabel, projectShortName } from "./format";
 import { useProjectsQuery } from "./queries";
+import { RepoFormDialog } from "./RepoFormDialog";
+import { useDeleteRepoMutation, useReposQuery } from "./registry";
 
 function LedgerStat({
   label,
@@ -69,8 +76,15 @@ export function ProjectPage() {
     repo: decoded,
     range: "7d",
   });
+  const repos = useReposQuery();
+  const removeRepo = useDeleteRepoMutation();
+  const { toast } = useToast();
+  const [editOpen, setEditOpen] = useState(false);
+  const [registerOpen, setRegisterOpen] = useState(false);
+  const [unregisterOpen, setUnregisterOpen] = useState(false);
 
   const project = projects.data?.data.find((entry) => entry.repo === decoded);
+  const registration = repos.data?.data.find((entry) => entry.repo === decoded) ?? null;
 
   if (projects.isPending) {
     return (
@@ -100,12 +114,45 @@ export function ProjectPage() {
   const projectRunners = (runners.data?.data ?? []).filter(
     (runner) => runner.repo === project.repo,
   );
+  // The target repo's own content (`nuwa.repo.json`) reaches the console only
+  // through a runner's effective config, and it is read-only by design.
+  const targetConfig = projectRunners.find(
+    (runner) =>
+      runner.effective.failing_check !== null ||
+      runner.effective.reproduce_check !== null ||
+      runner.effective.forbidden_paths_count !== null,
+  )?.effective ?? null;
   const attention = overview.data?.attention ?? [];
   const totals = trends.data?.totals;
   const buckets = trends.data?.buckets ?? [];
 
   const sparkline = (metric: "reports" | "new_issues" | "prs_opened"): SparklineDatum[] =>
     buckets.map((bucket) => ({ label: bucket.day, value: bucket[metric] }));
+
+  /** Unregistering only drops the console row; runners and the repo are untouched. */
+  function handleUnregister() {
+    if (!registration) {
+      return;
+    }
+    removeRepo.mutate(registration.repo, {
+      onSuccess: () => {
+        setUnregisterOpen(false);
+        toast({
+          title: "已取消登记",
+          description: `${registration.name}（${registration.repo}）`,
+          variant: "success",
+        });
+      },
+      onError: (error) => {
+        setUnregisterOpen(false);
+        toast({
+          title: "取消登记失败",
+          description: describeError(error),
+          variant: "danger",
+        });
+      },
+    });
+  }
 
   return (
     <section className="space-y-5">
@@ -150,11 +197,42 @@ export function ProjectPage() {
               <p className="mt-1 text-body-sm text-text-secondary">{project.description}</p>
             ) : null}
           </div>
-          <div className="text-right">
-            <p className="text-caption text-text-muted">最近信号</p>
-            <p className="text-body-sm text-text-secondary">
-              {formatLastSignal(project.last_signal_ms)}
-            </p>
+          <div className="flex shrink-0 flex-col items-end gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {registration ? (
+                <>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setEditOpen(true)}
+                  >
+                    <Pencil aria-hidden="true" className="size-3.5" />
+                    编辑登记
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setUnregisterOpen(true)}
+                  >
+                    取消登记
+                  </Button>
+                </>
+              ) : repos.isPending ? null : (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setRegisterOpen(true)}
+                >
+                  登记此项目
+                </Button>
+              )}
+            </div>
+            <div className="text-right">
+              <p className="text-caption text-text-muted">最近信号</p>
+              <p className="text-body-sm text-text-secondary">
+                {formatLastSignal(project.last_signal_ms)}
+              </p>
+            </div>
           </div>
         </div>
       </header>
@@ -300,6 +378,58 @@ export function ProjectPage() {
         <div className="space-y-5">
           <Card>
             <CardContent className="p-4">
+              <header className="mb-2 flex items-center justify-between gap-2">
+                <h3 className="text-heading-sm font-semibold text-text">仓库内容</h3>
+                <span className="rounded-card border border-border px-1.5 py-0.5 text-caption text-text-muted">
+                  只读
+                </span>
+              </header>
+              {targetConfig ? (
+                <dl className="space-y-2">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <dt className="shrink-0 text-caption text-text-muted">验证命令</dt>
+                    <dd
+                      className="min-w-0 truncate text-right font-mono text-caption text-text"
+                      title={targetConfig.failing_check ?? undefined}
+                    >
+                      {targetConfig.failing_check ?? "—"}
+                    </dd>
+                  </div>
+                  <div className="flex items-baseline justify-between gap-2">
+                    <dt className="shrink-0 text-caption text-text-muted">复现命令</dt>
+                    <dd
+                      className="min-w-0 truncate text-right font-mono text-caption text-text"
+                      title={targetConfig.reproduce_check ?? undefined}
+                    >
+                      {targetConfig.reproduce_check ?? "—"}
+                    </dd>
+                  </div>
+                  <div className="flex items-baseline justify-between gap-2">
+                    <dt className="text-caption text-text-muted">禁改路径</dt>
+                    <dd className="ledger__num text-body-sm text-text">
+                      {targetConfig.forbidden_paths_count ?? 0} 条
+                    </dd>
+                  </div>
+                  <div className="flex items-baseline justify-between gap-2">
+                    <dt className="text-caption text-text-muted">最大尝试</dt>
+                    <dd className="ledger__num text-body-sm text-text">
+                      {targetConfig.max_attempts ?? "—"}
+                    </dd>
+                  </div>
+                </dl>
+              ) : (
+                <p className="py-3 text-body-sm text-text-muted">
+                  还没有 runner 上报这个项目的仓库配置。
+                </p>
+              )}
+              <p className="mt-3 text-caption text-text-muted">
+                来自目标仓的 nuwa.repo.json，控制台不提供编辑。
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardContent className="p-4">
               <h3 className="mb-2 text-heading-sm font-semibold text-text">运行器</h3>
               {projectRunners.length === 0 ? (
                 <p className="py-3 text-body-sm text-text-muted">
@@ -384,6 +514,45 @@ export function ProjectPage() {
           </Card>
         </div>
       </div>
+
+      <RepoFormDialog
+        open={editOpen}
+        mode="edit"
+        title="编辑项目登记"
+        target={registration}
+        onClose={() => setEditOpen(false)}
+      />
+
+      <RepoFormDialog
+        open={registerOpen}
+        mode="create"
+        title="登记此项目"
+        submitLabel="登记"
+        prefill={{ repo: project.repo, name: projectShortName(project.repo) }}
+        lockIdentity
+        onClose={() => setRegisterOpen(false)}
+      />
+
+      <ConfirmDialog
+        open={unregisterOpen}
+        title="取消这个项目的登记？"
+        description={
+          registration
+            ? `将从控制台移除 ${registration.name}（${registration.repo}）的登记。这不会停止 runner，也不会修改目标仓库的 nuwa.repo.json；仓库内容（failing_check、forbidden_paths、notes）保持不变。`
+            : undefined
+        }
+        confirmLabel="确认取消登记"
+        cancelLabel="保留"
+        danger
+        pending={removeRepo.isPending}
+        cancelDisabled={removeRepo.isPending}
+        onConfirm={handleUnregister}
+        onCancel={() => {
+          if (!removeRepo.isPending) {
+            setUnregisterOpen(false);
+          }
+        }}
+      />
     </section>
   );
 }
