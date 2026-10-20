@@ -21,19 +21,6 @@ jobs:
       - name: tests
         run: cargo test --workspace
 
-  go:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: sdk/qingniao-go/go.mod
-      - name: vet + tests
-        working-directory: sdk/qingniao-go
-        run: |
-          go vet ./...
-          go test ./...
-
   web:
     runs-on: ubuntu-latest
     defaults:

@@ -32,10 +32,16 @@
 
 ## 1 · 现场装采集 SDK（青鸟）
 
-Go 系统（`sdk/qingniao-go`）：
+Go 系统（青鸟公共模块，**已发布**）：
+
+```bash
+go get github.com/lomehong/qingniao-go@v0.1.0
+```
+
+SDK 演进流：qingniao-go 仓改动 → 打 `vX.Y.Z` tag → 目标仓 `go get -u github.com/lomehong/qingniao-go`。服务器/CI 经公共 module proxy 零配置拉取；本机联调未发布的 SDK 改动时用 `go work`（work 文件不进 git）。
 
 ```go
-import "example.com/nuwa/qingniao"
+import "github.com/lomehong/qingniao-go"
 
 // panic 采集（进程仍会崩，青鸟只负责报信）：
 qingniao.Capture(sink, qingniao.Meta{Repo: "example.com/your-repo", Service: "api"}, run)
@@ -43,8 +49,6 @@ qingniao.Capture(sink, qingniao.Meta{Repo: "example.com/your-repo", Service: "ap
 // 手动上报非 panic 错误：
 qingniao.Report(sink, qingniao.Meta{Repo: "…"}, "healthcheck failed", err)
 ```
-
-SDK 目前是仓库内模块（`module example.com/nuwa/qingniao`），尚未发布到公共 module。目标仓用 `replace example.com/nuwa/qingniao => /path/to/nuwa/sdk/qingniao-go`，或像 mindloop 一样把 `qingniao` 源码复制进 `internal/qingniao`；不要直接 `go get`。
 
 sink 二选一：`FileSink{Path}`（JSONL，落盘后 `nuwa ingest`）或 `HTTPSink{Endpoint}`（POST 到 ingest 服务端）。`HTTPSink` 默认每次尝试 3s 超时、最多 2 次重试；可设置 `FallbackFile`，全部失败时把信封追加到本地 JSONL，避免崩溃进程丢信号。
 信封 schema = `qingniao/v1`，是 ingest Signal 的超集；新增字段不破坏旧服务端。

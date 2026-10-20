@@ -15,7 +15,7 @@ Nuwa = 自愈式修复 agent：运行时问题信号 → 山海经问题单（SQ
 | `crates/rpi-{telemetry,ai,agent,tools,harness}` | **vendored**，源自 bigfish1913/pi-rust @ 0.3.24（tag `vendored/pi-rust-0.3.24`） |
 | `crates/nuwa` | 自建主 bin：`ingest` / `work` / `fix` / `reopen` |
 | `crates/shanhaijing` | 自建问题单库（指纹/状态机/冷却） |
-| `sdk/qingniao-go` | 自建 Go 采集 SDK（`qingniao/v1` 信封 = ingest Signal 超集） |
+| `sdk/qingniao-go` | （已迁出）青鸟 Go 采集 SDK 独立为公开仓 [lomehong/qingniao-go](https://github.com/lomehong/qingniao-go)，接入目标仓用 `go get github.com/lomehong/qingniao-go@vX.Y.Z` |
 | `docs/` | 设计、ADR（04）、进度快照与陷阱（07 §D）、接入手册（08） |
 | `.upstream/` | 上游完整 clone，cherry-pick 参考；gitignored，永不提交 |
 | `spike/` | 现场实验区：toy 仓库、信号样例、session 转录；gitignored |
@@ -26,7 +26,7 @@ Nuwa = 自愈式修复 agent：运行时问题信号 → 山海经问题单（SQ
 ```bash
 cargo clippy --workspace --all-targets   # 自建 crate 必须零 warning
 cargo test --workspace                   # 上游 1662 测试是安全网
-go test ./...                            # 在 sdk/qingniao-go 下
+# 青鸟 Go SDK 的测试在独立仓 github.com/lomehong/qingniao-go（已迁出）
 cd web && npm ci && npm run typecheck && npm run lint && npm test && npm run build
 ```
 
