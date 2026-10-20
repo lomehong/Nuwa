@@ -8,6 +8,8 @@ import { EventsPage } from "../features/events/EventsPage";
 import { IssuesPage } from "../features/issues/IssuesPage";
 import { LoginPage } from "../features/login/LoginPage";
 import { OverviewPage } from "../features/overview/OverviewPage";
+import { ProjectPage } from "../features/projects/ProjectPage";
+import { ProjectsPage } from "../features/projects/ProjectsPage";
 import { RunnersPage } from "../features/runners/RunnersPage";
 import { useAuth } from "../lib/auth";
 import { AppShell } from "./AppShell";
@@ -73,6 +75,8 @@ export function AppRoutes() {
       <Route element={<RequireAuth />}>
         <Route element={<AppShell />}>
           <Route index element={<OverviewPage />} />
+          <Route path="projects" element={<ProjectsPage />} />
+          <Route path="projects/:repo" element={<ProjectPage />} />
           <Route path="issues" element={<IssuesPage />} />
           <Route path="issues/:fp" element={<LazyRoute><IssueDetailPage /></LazyRoute>} />
           <Route path="runners" element={<RunnersPage />} />

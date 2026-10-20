@@ -8,6 +8,7 @@ import type {
 } from "../features/overview/types";
 import type { IssueDetailResponse, RunDto } from "../features/issue-detail/types";
 import type { IssueListItem, IssueListResponse } from "../features/issues/types";
+import type { ProjectSummary } from "../features/projects/types";
 import type { RunnerDto, RunnerListResponse } from "../features/runners/types";
 import type {
   RepoDto,
@@ -267,12 +268,58 @@ export function mockRunners(runners: RunnerDto[] = [makeRunner()]) {
   return http.get("/api/v1/runners", () => HttpResponse.json(body));
 }
 
+/** One project rollup row. */
+export function makeProject(overrides: Partial<ProjectSummary> = {}): ProjectSummary {
+  return {
+    repo: "example.com/app",
+    name: null,
+    url: null,
+    description: null,
+    registered: false,
+    states: {
+      new: 0,
+      triggered: 0,
+      fixing: 0,
+      pr_open: 0,
+      merged: 0,
+      rejected: 0,
+      escalated: 0,
+      ignored: 0,
+    },
+    attention: 0,
+    worst_severity: null,
+    queued: 0,
+    running: 0,
+    pr_open: 0,
+    escalated: 0,
+    ignored: 0,
+    merged: 0,
+    rejected: 0,
+    runners: 0,
+    runners_online: 0,
+    prs_today: 0,
+    pr_limit: 0,
+    ci_green: 0,
+    ci_red: 0,
+    reports_24h: 0,
+    tokens_24h: 0,
+    last_signal_ms: 1_700_000_000_000,
+    last_delivery_ms: null,
+    last_pr_url: null,
+    ...overrides,
+  };
+}
+
+export function mockProjects(projects: ProjectSummary[] = []) {
+  return http.get("/api/v1/projects", () => HttpResponse.json({ data: projects }));
+}
+
 /**
  * The overview route now reads three endpoints. Most shell/router tests only
  * care that the page renders, so register all of them together.
  */
 export function mockOverviewResources(overrides: Partial<OverviewResponse> = {}) {
-  return [mockOverview(overrides), mockTrends(), mockEvents()];
+  return [mockOverview(overrides), mockTrends(), mockEvents(), mockProjects()];
 }
 
 function settingSpec(overrides: Partial<SettingDto> = {}): SettingDto {

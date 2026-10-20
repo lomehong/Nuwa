@@ -58,6 +58,8 @@ npm run build    # typecheck + vite build → web/dist
 
 Vite 代理使用 `changeOrigin: false` 保留 Host/Origin，否则浏览器写请求会被同源校验拒绝。未配置 `NUWA_UI_TOKEN` 时控制台进入本地模式；配置后首次访问会跳转 `/login` 用 UI 令牌换取 HttpOnly 会话。
 
+控制台以**项目**为信息主轴：左栏是项目铭牌栏（每个仓库一行，带最严重未闭环的严重度标记与待处理数），`/projects` 是跨项目分诊台账，`/projects/:repo` 是单个项目的工位（队列、运行中、配额、CI、交付质量、趋势）。详见 [docs/09-web-console-design.md](docs/09-web-console-design.md) §21。
+
 ## 当前状态（2026-10-20）
 
 | 能力 | 状态 |

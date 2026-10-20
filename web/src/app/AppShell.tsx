@@ -2,6 +2,7 @@ import { clsx } from "clsx";
 import {
   Activity,
   Cpu,
+  FolderTree,
   Gem,
   LayoutDashboard,
   ListTodo,
@@ -13,7 +14,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 
@@ -21,6 +22,9 @@ import { OfflineBanner } from "../components/OfflineBanner";
 import { ThemeToggle } from "../components/ThemeToggle";
 import { Badge, Button, Skeleton, useToast } from "../components/ui";
 import { useOverviewQuery } from "../features/overview/queries";
+import { ProjectRail } from "../features/projects/ProjectRail";
+import { projectLabel } from "../features/projects/format";
+import { useProjectsQuery } from "../features/projects/queries";
 import { ApiError } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { useModalBehavior } from "../lib/modal";
@@ -41,8 +45,16 @@ const NAV_ITEMS: readonly NavItem[] = [
   { label: "设置", icon: Settings, to: "/settings" },
 ];
 
-/** Bottom navigation keeps the four primary destinations (docs/09 §10.1). */
-const MOBILE_NAV_ITEMS = NAV_ITEMS.slice(0, 4);
+/**
+ * Bottom navigation on small screens. The project ledger replaces the
+ * activity feed here: a project is the axis the operator thinks in.
+ */
+const MOBILE_NAV_ITEMS: readonly NavItem[] = [
+  { label: "总览", icon: LayoutDashboard, to: "/", end: true },
+  { label: "问题单", icon: ListTodo, to: "/issues" },
+  { label: "项目", icon: FolderTree, to: "/projects" },
+  { label: "运行器", icon: Cpu, to: "/runners" },
+];
 
 const DRAWER_ID = "nav-drawer";
 
@@ -54,6 +66,22 @@ interface PageMeta {
 function pageMeta(pathname: string): PageMeta {
   if (pathname === "/") {
     return { title: "总览", breadcrumb: null };
+  }
+  if (pathname === "/projects" || pathname === "/projects/") {
+    return { title: "项目台账", breadcrumb: null };
+  }
+  if (pathname.startsWith("/projects/")) {
+    const raw = pathname.slice("/projects/".length);
+    if (!raw) {
+      return { title: "项目台账", breadcrumb: null };
+    }
+    let repo = raw;
+    try {
+      repo = decodeURIComponent(raw);
+    } catch {
+      // Keep the raw path segment when it is not valid percent-encoding.
+    }
+    return { title: "项目", breadcrumb: repo };
   }
   if (pathname === "/issues" || pathname === "/issues/") {
     return { title: "问题单", breadcrumb: null };
@@ -82,16 +110,6 @@ function pageMeta(pathname: string): PageMeta {
   }
   return { title: "Nuwa 控制台", breadcrumb: null };
 }
-
-const PILL_CLASS =
-  "inline-flex min-h-7 shrink-0 items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 text-caption whitespace-nowrap text-text-secondary";
-const PILL_LINK_CLASS = clsx(
-  PILL_CLASS,
-  "transition-colors hover:border-border-strong hover:text-text",
-  // Interactive pills reach the 44px touch target on coarse pointers only;
-  // plain status pills stay compact at 28px.
-  "pointer-coarse:min-h-11",
-);
 
 function StatusDot({ tone }: { tone: "success" | "warning" | "danger" }) {
   return (
@@ -202,30 +220,84 @@ function AttentionAnnounce({ count }: { count: number }) {
   );
 }
 
+/** One reading in the status line: a muted label and a mono value. */
+function StatusFigure({
+  to,
+  label,
+  value,
+  tone,
+  title,
+}: {
+  to?: string;
+  label: string;
+  value: string | number;
+  tone?: "danger";
+  title?: string;
+}) {
+  const body = (
+    <>
+      <span className="text-caption text-text-muted">{label}</span>
+      <span
+        className={clsx(
+          "ledger__num text-body-sm",
+          tone === "danger" ? "text-danger" : "text-text",
+        )}
+      >
+        {value}
+      </span>
+    </>
+  );
+  if (!to) {
+    return (
+      <span className="flex items-baseline gap-1.5" title={title}>
+        {body}
+      </span>
+    );
+  }
+  return (
+    <Link
+      to={to}
+      title={title}
+      className="flex items-baseline gap-1.5 transition-colors hover:text-accent"
+    >
+      {body}
+    </Link>
+  );
+}
+
+function StatusDivider() {
+  return <span aria-hidden="true" className="h-3.5 w-px shrink-0 bg-border" />;
+}
+
 /**
- * Compact health strip fed by `/overview` (docs/09 §10.1). It shares the
- * overview query (and key) with the page: the 10s poll pauses while the tab is
- * hidden and refreshes immediately on focus. Runner and issue counts link to
- * their pages.
+ * Global status line (docs/09 §10.1). It reads the numbers of the current
+ * scope — the project in view, or every project — as one ledger line
+ * (label · number · rule · label · number) instead of a row of identical
+ * pills, and it follows the project the operator is looking at.
  */
-export function HealthStrip() {
-  const overview = useOverviewQuery();
+export function HealthStrip({ scope }: { scope: string | null }) {
+  const overview = useOverviewQuery(scope);
+  const projects = useProjectsQuery();
+  const project = scope
+    ? projects.data?.data.find((entry) => entry.repo === scope)
+    : undefined;
+  const scopeName = scope ? projectLabel(project?.name ?? null, scope) : null;
+  const repoQuery = scope ? `&repo=${encodeURIComponent(scope)}` : "";
 
   let content: ReactNode;
   if (overview.isPending) {
     content = (
-      <div role="status" aria-busy="true" className="flex items-center gap-2">
-        <span className="sr-only">正在加载系统健康</span>
-        <Skeleton rounded="full" className="h-7 w-24" />
-        <Skeleton rounded="full" className="h-7 w-20" />
-        <Skeleton rounded="full" className="h-7 w-16" />
-        <Skeleton rounded="full" className="h-7 w-20" />
+      <div role="status" aria-busy="true" className="flex items-center gap-3">
+        <span className="sr-only">正在加载系统状态</span>
+        <Skeleton className="h-4 w-32" />
+        <Skeleton className="h-4 w-24" />
+        <Skeleton className="h-4 w-24" />
       </div>
     );
   } else if (!overview.data) {
     content = (
       <div className="flex items-center gap-2">
-        <span className={PILL_CLASS}>
+        <span className="flex items-center gap-1.5 text-body-sm text-danger">
           <StatusDot tone="danger" />
           serve 不可达
         </span>
@@ -244,74 +316,78 @@ export function HealthStrip() {
     } = overview.data;
     content = (
       <>
-        {/* The needs-attention count is the strip's most important signal — it
-            is the only "the system is calling you" cue visible from every page
-            (docs/09 §10.1). It leads the strip and links to the filtered list. */}
-        {attention.length > 0 ? (
+        {scopeName ? (
           <Link
-            to="/issues?attention=1"
-            className={clsx(PILL_LINK_CLASS, "border-danger/50 bg-danger/10 font-medium text-text")}
-            title={`需要你处理的事项：${attention.length} 项，点击查看列表`}
+            to={`/projects/${encodeURIComponent(scope ?? "")}`}
+            className="text-body-sm font-medium text-text transition-colors hover:text-accent"
+            title={scope ?? undefined}
           >
-            <StatusDot tone="danger" />
-            <span>需处理</span>
-            <span className="font-mono tabular-nums">{attention.length}</span>
+            {scopeName}
+          </Link>
+        ) : (
+          <span className="text-body-sm font-medium text-text">全部项目</span>
+        )}
+        {scope ? (
+          <Link
+            to="/"
+            className="text-caption text-text-muted transition-colors hover:text-accent"
+          >
+            取消限定
           </Link>
         ) : null}
-        <span className={PILL_CLASS} title="控制台 API 可达">
+        <StatusDivider />
+        <StatusFigure
+          to={`/issues?attention=1${repoQuery}`}
+          label="需处理"
+          value={attention.length}
+          tone={attention.length > 0 ? "danger" : undefined}
+          title={`需要你处理的事项：${attention.length} 项`}
+        />
+        <StatusDivider />
+        <StatusFigure
+          to={`/issues?state=new${repoQuery}`}
+          label="队列"
+          value={queue.ready_count}
+        />
+        <StatusDivider />
+        <StatusFigure
+          to={`/issues?state=triggered,fixing${repoQuery}`}
+          label="运行中"
+          value={activeRuns.length}
+        />
+        <StatusDivider />
+        <StatusFigure
+          to="/runners"
+          label="在线"
+          value={`${health.runners_online}/${health.runners_total}`}
+        />
+        <StatusDivider />
+        <StatusFigure
+          label="今日 PR"
+          value={health.prs_today}
+          title="今日打开的 PR（按仓库配额统计）"
+        />
+        {health.standing_down > 0 ? (
+          <>
+            <StatusDivider />
+            <StatusFigure
+              to="/runners"
+              label="配额待命"
+              value={health.standing_down}
+              tone="danger"
+            />
+          </>
+        ) : null}
+        <StatusDivider />
+        <span className="flex items-center gap-1.5 text-body-sm text-text-secondary">
           <StatusDot tone="success" />
           serve 正常
         </span>
-        <Link
-          to="/runners"
-          className={PILL_LINK_CLASS}
-          title={`运行器在线 ${health.runners_online}/${health.runners_total}`}
-        >
-          <Cpu aria-hidden="true" className="size-3.5 text-text-muted" />
-          <span className="sr-only">运行器</span>
-          <span>在线</span>
-          <span className="font-mono tabular-nums">
-            {health.runners_online}/{health.runners_total}
-          </span>
-        </Link>
-        <Link
-          to="/issues?state=new"
-          className={PILL_LINK_CLASS}
-          title="查看待领取的问题单"
-        >
-          <ListTodo aria-hidden="true" className="size-3.5 text-text-muted" />
-          <span>队列</span>
-          <span className="font-mono tabular-nums">{queue.ready_count}</span>
-        </Link>
-        <Link
-          to="/issues?state=triggered,fixing"
-          className={PILL_LINK_CLASS}
-          title="查看运行中的问题单"
-        >
-          <Activity aria-hidden="true" className="size-3.5 text-text-muted" />
-          <span>运行中</span>
-          <span className="font-mono tabular-nums">{activeRuns.length}</span>
-        </Link>
-        <span className={PILL_CLASS} title="今日打开的 PR（按仓库配额统计）">
-          <span>今日 PR</span>
-          <span className="font-mono tabular-nums">{health.prs_today}</span>
-        </span>
-        {health.standing_down > 0 ? (
-          <Link
-            to="/runners"
-            className={PILL_LINK_CLASS}
-            title="查看配额待命的运行器"
-          >
-            <StatusDot tone="warning" />
-            <span>配额待命</span>
-            <span className="font-mono tabular-nums">{health.standing_down}</span>
-          </Link>
-        ) : null}
         {overview.isError || overview.isRefetchError ? (
           <button
             type="button"
             onClick={() => void overview.refetch()}
-            className={clsx(PILL_LINK_CLASS, "cursor-pointer")}
+            className="flex items-center gap-1.5 text-body-sm text-danger"
           >
             <StatusDot tone="danger" />
             更新失败 · 重试
@@ -322,8 +398,8 @@ export function HealthStrip() {
   }
 
   return (
-    <section aria-label="全局健康条" className="border-b border-border bg-bg">
-      <div className="mx-auto flex w-full max-w-page items-center gap-2 overflow-x-auto px-4 py-2 sm:px-6 lg:px-8">
+    <section aria-label="全局状态" className="border-b border-border bg-bg">
+      <div className="mx-auto flex w-full max-w-page items-center gap-3 overflow-x-auto px-4 py-2 sm:px-6 lg:px-8">
         {overview.data ? <AttentionAnnounce count={overview.data.attention.length} /> : null}
         {content}
       </div>
@@ -343,6 +419,23 @@ export function AppShell() {
   const { toast } = useToast();
   const location = useLocation();
   const { title, breadcrumb } = pageMeta(location.pathname);
+  const projects = useProjectsQuery();
+  /**
+   * The project the operator is looking at: the project page's route
+   * parameter, or the `?repo=` scope of a list page. Every global reading
+   * follows it.
+   */
+  const scope = useMemo(() => {
+    if (location.pathname.startsWith("/projects/")) {
+      const raw = location.pathname.slice("/projects/".length);
+      try {
+        return decodeURIComponent(raw);
+      } catch {
+        return raw;
+      }
+    }
+    return new URLSearchParams(location.search).get("repo");
+  }, [location.pathname, location.search]);
   const [loggingOut, setLoggingOut] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -491,8 +584,22 @@ export function AppShell() {
           <ShellBrand />
         </div>
 
-        <nav aria-label="主导航" className="flex-1 overflow-y-auto px-3 py-4">
-          <SidebarNavList />
+        <nav aria-label="主导航" className="flex flex-1 flex-col overflow-hidden px-3 py-4">
+          <div className="flex min-h-0 flex-1 flex-col">
+            <Link
+              to="/projects"
+              className="flex min-h-9 items-center gap-1.5 px-2 pb-1 text-caption font-medium text-text-muted transition-colors hover:text-text"
+            >
+              <FolderTree aria-hidden="true" className="size-3.5" />
+              项目
+            </Link>
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <ProjectRail projects={projects.data?.data ?? []} activeRepo={scope} />
+            </div>
+          </div>
+          <div className="mt-4 border-t border-border pt-3">
+            <SidebarNavList />
+          </div>
         </nav>
 
         <SidebarFooter localMode={localMode} />
@@ -589,7 +696,7 @@ export function AppShell() {
 
         <OfflineBanner />
 
-        <HealthStrip />
+        <HealthStrip scope={scope} />
 
         <main
           id="main-content"
@@ -636,8 +743,26 @@ export function AppShell() {
                   </button>
                 </div>
 
-                <nav aria-label="抽屉主导航" className="flex-1 overflow-y-auto px-3 py-4">
-                  <SidebarNavList onNavigate={closeDrawer} />
+                <nav aria-label="抽屉主导航" className="flex flex-1 flex-col overflow-hidden px-3 py-4">
+                  <div className="flex min-h-0 flex-1 flex-col">
+                    <Link
+                      to="/projects"
+                      onClick={closeDrawer}
+                      className="flex min-h-9 items-center gap-1.5 px-2 pb-1 text-caption font-medium text-text-muted transition-colors hover:text-text"
+                    >
+                      <FolderTree aria-hidden="true" className="size-3.5" />
+                      项目
+                    </Link>
+                    <div className="min-h-0 flex-1 overflow-y-auto">
+                      <ProjectRail
+                        projects={projects.data?.data ?? []}
+                        activeRepo={scope}
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-4 border-t border-border pt-3">
+                    <SidebarNavList onNavigate={closeDrawer} />
+                  </div>
                 </nav>
 
                 <SidebarFooter localMode={localMode} />

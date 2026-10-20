@@ -2,6 +2,7 @@ import { RefreshCw } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 
 import { Button, Skeleton } from "../../components/ui";
+import { ProjectTriage } from "../projects/ProjectTriage";
 import { ActiveRuns } from "./ActiveRuns";
 import { AttentionQueue } from "./AttentionQueue";
 import { HealthPanel } from "./HealthPanel";
@@ -67,12 +68,14 @@ export function OverviewPage() {
       <header>
         <h2 className="text-title font-semibold text-text">总览</h2>
         <p className="mt-1 text-body-sm text-text-secondary">
-          需要你处理的事项、正在发生的运行、系统健康与可按 7/14/30/90 天切换的趋势。
+          按项目分诊：哪个项目在恶化、队列里压着多少、谁在跑。
         </p>
         <p className="mt-1 text-caption text-text-muted">
           核心数据每 10 秒自动刷新，趋势每 60 秒、最近活动每 30 秒；窗口重新聚焦时立即更新。
         </p>
       </header>
+
+      <ProjectTriage />
 
       {overview.data ? (
         <>

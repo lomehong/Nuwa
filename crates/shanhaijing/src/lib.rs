@@ -2004,6 +2004,33 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Runs started since `since_ms`, newest first. The project rollup reads
+    /// them to compute per-repo delivery and CI counters.
+    pub fn runs_since(&self, since_ms: i64) -> ShanResult<Vec<RunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs
+             WHERE started_at >= ?1 ORDER BY started_at DESC, id DESC"
+        ))?;
+        let rows = stmt.query_map([since_ms], Self::run_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Signal counts per repo for the given UTC day and later. The project
+    /// rollup sums the last two days to get a 24h report count.
+    pub fn signal_counts_since_day(&self, day: &str) -> ShanResult<BTreeMap<String, u64>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT repo, SUM(count) FROM signal_daily WHERE day >= ?1 GROUP BY repo",
+        )?;
+        let rows = stmt.query_map([day], |row| {
+            let repo: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((repo, count.max(0) as u64))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Runs still in flight, newest first — the overview's active-run strip.
     pub fn active_runs(&self) -> ShanResult<Vec<RunRow>> {
         let conn = self.lock();

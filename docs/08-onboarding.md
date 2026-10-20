@@ -38,6 +38,9 @@ Go 系统（青鸟公共模块，**v0.2 五挂点**，行为规范见 qingniao-g
 go get github.com/lomehong/qingniao-go@v0.2.0
 ```
 
+> v0.2.1 补丁（兜底落盘 / 关闭不 panic / 客户端 panic 指纹）已在 SDK 仓落地，
+> **待打 tag 并 push 后**把上面这行换成 `@v0.2.1`。
+
 SDK 演进流：qingniao-go 仓改动 → 打 `vX.Y.Z` tag → 目标仓 `go get -u github.com/lomehong/qingniao-go`。服务器/CI 经公共 module proxy 零配置拉取；本机联调未发布的 SDK 改动时用 `go work`（work 文件不进 git）。
 
 ```go
@@ -72,7 +75,11 @@ if corrupt { q.Fatal("config corrupt", err) }
 投递语义（SPEC §2/§3/§6）：panic/Fatal 走**同步**通道（进程将死，上报必须在死前完成）；
 其余走**有界异步队列**（默认 256，满丢最旧），绝不阻塞主流程。同指纹节流窗口默认
 60s（服务端聚合是第二道，不是替代）。`Redact` 钩子做源头脱敏；`FallbackFile`/
-`Stats()` 保证信号可审计。
+`Stats()` 保证信号可审计。v0.2.1 起：零配置 sink 自带兜底文件（端点缺失直接落盘，
+投递失败也落盘 `<缓存目录>/qingniao/fallback.jsonl`），投递失败但已落盘时 `Send`
+返回哨兵 `ErrFallbackWritten`（`errors.Is` 判断，**信号没丢但没送达**），
+`Stats()` 的 `Reported`/`Fallback`/`Dropped` 三者语义互斥；关闭与并发上报不再 panic。
+panic 信封带客户端指纹（与服务端 Go 栈算法逐字一致，两侧 golden 互钉；服务端当前自算）。
 信封 schema = `qingniao/v1`，是 ingest Signal 的超集；新增字段不破坏旧服务端。
 
 非 Go 系统不需要 SDK，直接 POST 同一个信封：

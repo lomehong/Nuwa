@@ -15,6 +15,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { Input, SeverityStone, Skeleton, StateBadge } from "../components/ui";
 import { normalizeSearchQuery } from "../features/issues/filters";
 import { issueDetailPath, shortFingerprint } from "../features/issues/format";
+import { useProjectsQuery } from "../features/projects/queries";
 import {
   MAX_SEARCH_QUERY_CHARS,
   type IssueListItem,
@@ -48,6 +49,11 @@ export function paletteListPath(term: string): string {
 
 /** Zero-query shortcuts (docs/09 §12 static commands). */
 const QUICK_COMMANDS: readonly { label: string; hint: string; to: string }[] = [
+  {
+    label: "项目台账",
+    hint: "按项目查看队列、运行器与交付质量",
+    to: "/projects",
+  },
   {
     label: "需要你处理",
     hint: "升级 / 卡单 / 被拒 / CI 超时",
@@ -97,6 +103,7 @@ export interface CommandPaletteProps {
  */
 export function CommandPalette({ open, onClose, returnFocusRef }: CommandPaletteProps) {
   const navigate = useNavigate();
+  const projects = useProjectsQuery();
   const panelRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const [text, setText] = useState("");
@@ -145,6 +152,20 @@ export function CommandPalette({ open, onClose, returnFocusRef }: CommandPalette
   // the matches plus a "view all" exit. Enter navigates to the highlighted
   // entry's `to`; clicks go through the rendered control.
   const issues = search.data?.data ?? [];
+  // Projects match by name or identity and lead the results: the operator
+  // usually thinks in projects, not fingerprints.
+  const projectMatches = (projects.data?.data ?? [])
+    .filter((project) => {
+      const term = debounced.toLowerCase();
+      if (!term) {
+        return false;
+      }
+      return (
+        project.repo.toLowerCase().includes(term) ||
+        (project.name ?? "").toLowerCase().includes(term)
+      );
+    })
+    .slice(0, 3);
   const entries: PaletteEntry[] =
     debounced.length === 0
       ? QUICK_COMMANDS.map((command) => ({
@@ -163,6 +184,23 @@ export function CommandPalette({ open, onClose, returnFocusRef }: CommandPalette
           ),
         }))
       : [
+          ...projectMatches.map((project) => ({
+            key: `project-${project.repo}`,
+            optionId: `palette-option-project-${project.repo}`,
+            to: `/projects/${encodeURIComponent(project.repo)}`,
+            render: ({ onResultClick }: EntryHandlers) => (
+              <Link
+                to={`/projects/${encodeURIComponent(project.repo)}`}
+                onClick={onResultClick}
+                className="flex min-h-11 flex-col justify-center gap-0.5 px-2.5 py-2"
+              >
+                <span className="text-body font-medium text-text">
+                  {project.name ?? project.repo}
+                </span>
+                <span className="font-mono text-caption text-text-muted">{project.repo}</span>
+              </Link>
+            ),
+          })),
           ...issues.map((issue) => ({
             key: issue.fingerprint,
             optionId: `palette-option-issue-${issue.fingerprint}`,

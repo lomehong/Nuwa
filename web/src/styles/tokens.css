@@ -116,7 +116,9 @@
   --text: #e9eef7;
   --text-secondary: #a5b1c6;
   --text-muted: #7d8aa3;
-  --accent: #7c9cff;
+  /* 窑火 (kiln ember): Nuwa smelts stones to patch the sky — the accent is
+     the heat of the kiln, not a generic dashboard blue. */
+  --accent: #ff9a52;
   --info: #62b6ff;
   --success: #3ddc97;
   --warning: #f2b84b;
@@ -160,7 +162,7 @@
   --text: #131a26;
   --text-secondary: #4e5b70;
   --text-muted: #5f6c82;
-  --accent: #3d5bd9;
+  --accent: #b8470c;
   --info: #1f6fd0;
   --success: #0e8a5f;
   --warning: #9a6700;
@@ -194,6 +196,32 @@
 }
 
 @layer components {
+  /* 石场台账 (project ledger): hairline rows, mono numerals, no card chrome.
+     The console reads like a ledger of workbenches, not a stack of cards. */
+  .ledger {
+    border-top: 1px solid var(--border);
+  }
+
+  .ledger__row {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .ledger__num {
+    font-family: var(--font-family-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+
+  /* 项目铭牌 (project nameplate): the rail row. The active project gets a
+     single ember rule on its left edge. */
+  .nameplate {
+    position: relative;
+  }
+
+  .nameplate--active {
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+
   /* Severity: shape/icon + text + colour (never colour alone). */
   .severity-stone {
     display: inline-flex;

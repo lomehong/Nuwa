@@ -180,25 +180,21 @@ export function HealthPanel({ health, ci }: HealthPanelProps) {
       }
     >
       <div className="space-y-3">
-        <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
+        <ul className="ledger grid grid-cols-2 gap-px overflow-hidden rounded-card border border-border bg-border sm:grid-cols-3 xl:grid-cols-6">
           {tiles.map((tile) => {
             const Icon = tile.icon;
             return (
-              <li
-                key={tile.key}
-                className="rounded-card border border-border bg-surface p-3"
-                data-runner-tile={tile.key}
-              >
+              <li key={tile.key} className="bg-surface px-3 py-2" data-runner-tile={tile.key}>
                 <div className="flex items-center justify-between gap-2">
                   <span className="inline-flex min-w-0 items-center gap-1.5 text-caption text-text-secondary">
                     <Icon aria-hidden="true" className={`size-3.5 shrink-0 ${tile.iconClass}`} />
                     <span className="truncate">{tile.label}</span>
                   </span>
-                  <span className="shrink-0 font-mono text-heading-sm font-semibold tabular-nums text-text">
+                  <span className="ledger__num shrink-0 text-body-sm font-medium text-text">
                     {tile.value}
                   </span>
                 </div>
-                <p className="mt-1 text-caption text-text-muted">
+                <p className="mt-0.5 truncate text-caption text-text-muted">
                   {tile.hint}
                   <span className="sr-only">
                     {tile.needsAttention ? "，需要关注" : ""}

@@ -311,4 +311,26 @@ mod tests {
         assert_eq!(class, "SOME ERROR N happened");
         assert!(frames.is_empty());
     }
+
+    /// The client-side Go panic fingerprint (青鸟 SDK `panicFingerprint`) must
+    /// equal the server-side one, otherwise the same panic aggregates under two
+    /// different keys depending on who computed it. The SDK pins the same
+    /// constant, so a divergence breaks one of the two test suites.
+    #[test]
+    fn go_panic_fingerprint_matches_the_sdk_golden() {
+        let trace = "panic: runtime error: index out of range [3] with length 3
+
+goroutine 1 [running]:
+example.com/spike-target.Average(...)
+	/app/calc.go:17 +0x8c
+example.com/spike-target.main()
+	/app/calc.go:25 +0x58
+created by testing.(*T).Run in goroutine 1
+	C:/Program Files/Go/src/testing/testing.go:1851 +0x3f6";
+        let message = "runtime error: index out of range [3] with length 3";
+        assert_eq!(
+            compute("go", Some(message), trace),
+            "20d8a3f3347cf11e192a405cd3434789"
+        );
+    }
 }

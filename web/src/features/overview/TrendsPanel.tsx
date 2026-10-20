@@ -16,7 +16,7 @@ import type { TrendBucket, TrendTotals, TrendsRange, TrendsResponse } from "./ty
 interface TrendMetric {
   key: keyof Pick<
     TrendBucket,
-    "reports" | "new_issues" | "prs_opened" | "merged" | "rejected" | "tokens"
+    "reports" | "new_issues" | "prs_opened" | "tokens"
   >;
   label: string;
   format: (value: number) => string;
@@ -26,8 +26,6 @@ const TREND_METRICS: readonly TrendMetric[] = [
   { key: "reports", label: "上报", format: formatNumber },
   { key: "new_issues", label: "新单", format: formatNumber },
   { key: "prs_opened", label: "打开 PR", format: formatNumber },
-  { key: "merged", label: "合并", format: formatNumber },
-  { key: "rejected", label: "拒绝", format: formatNumber },
   { key: "tokens", label: "tokens", format: formatTokens },
 ];
 

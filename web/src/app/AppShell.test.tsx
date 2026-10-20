@@ -5,12 +5,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { THEME_STORAGE_KEY } from "../lib/theme";
 import {
   makeOverview,
+  makeProject,
   mockIssues,
   mockMe,
+  mockOverview,
   mockOverviewResources,
+  mockProjects,
   mockRunners,
   mockSettings,
   mockSystem,
+  mockTrends,
+  mockEvents,
   server,
 } from "../test/msw";
 import { renderApp } from "../test/render";
@@ -148,7 +153,7 @@ describe("AppShell", () => {
     expect(screen.getByRole("heading", { level: 2, name: "活动" })).toBeInTheDocument();
   });
 
-  it("renders the health strip from /overview", async () => {
+  it("renders the status line from /overview", async () => {
     signedIn({
       queue: { ready_count: 3, next: [] },
       active_runs: [
@@ -178,35 +183,44 @@ describe("AppShell", () => {
 
     renderApp("/");
 
-    const region = await screen.findByRole("region", { name: "全局健康条" });
+    const region = await screen.findByRole("region", { name: "全局状态" });
     expect(await within(region).findByText("serve 正常")).toBeInTheDocument();
     expect(within(region).getByText("在线")).toBeInTheDocument();
     expect(within(region).getByText("1/2")).toBeInTheDocument();
+    expect(within(region).getByText("全部项目")).toBeInTheDocument();
     expect(
       within(region).getByRole("link", { name: /^队列\s*3$/ }),
     ).toHaveAttribute("href", "/issues?state=new");
     expect(
-      within(region).getByRole("link", { name: /^队列\s*3$/ }),
-    ).toHaveClass("pointer-coarse:min-h-11");
-    expect(
       within(region).getByRole("link", { name: /^运行中\s*1$/ }),
     ).toHaveAttribute("href", "/issues?state=triggered,fixing");
-    expect(
-      within(region).getByRole("link", { name: /^运行中\s*1$/ }),
-    ).toHaveClass("pointer-coarse:min-h-11");
     expect(within(region).getByText("今日 PR").parentElement).toHaveTextContent("今日 PR2");
     expect(within(region).getByText("配额待命").parentElement).toHaveTextContent("配额待命1");
-    expect(within(region).getByRole("link", { name: /^运行器\s*在线\s*1\/2$/ })).toHaveAttribute(
+    expect(within(region).getByRole("link", { name: /^在线\s*1\/2$/ })).toHaveAttribute(
       "href",
       "/runners",
-    );
-    expect(within(region).getByRole("link", { name: /^运行器\s*在线\s*1\/2$/ })).toHaveClass(
-      "pointer-coarse:min-h-11",
     );
     expect(within(region).getByRole("link", { name: /^配额待命\s*1$/ })).toHaveAttribute(
       "href",
       "/runners",
     );
+  });
+
+  it("scopes the status line to the project in view", async () => {
+    server.use(
+      mockMe(),
+      mockOverview(),
+      mockTrends(),
+      mockEvents(),
+      mockIssues(),
+      mockRunners(),
+      mockProjects([makeProject({ repo: "example.com/app", name: "App" })]),
+    );
+    renderApp("/projects/example.com%2Fapp");
+
+    const region = await screen.findByRole("region", { name: "全局状态" });
+    expect(await within(region).findByText("App")).toBeInTheDocument();
+    expect(within(region).getByText("取消限定")).toHaveAttribute("href", "/");
   });
 
   it("logs out through the API and returns to the login page", async () => {
@@ -277,9 +291,9 @@ describe("AppShell", () => {
       "href",
       "/runners",
     );
-    expect(within(mobileNav).getByRole("link", { name: "活动" })).toHaveAttribute(
+    expect(within(mobileNav).getByRole("link", { name: "项目" })).toHaveAttribute(
       "href",
-      "/events",
+      "/projects",
     );
     expect(container.querySelector("[style]")).toBeNull();
   });
@@ -508,6 +522,7 @@ describe("AppShell", () => {
       http.get("/api/v1/overview", unreachable),
       http.get("/api/v1/metrics/trends", unreachable),
       http.get("/api/v1/events", unreachable),
+      http.get("/api/v1/projects", unreachable),
     );
 
     renderApp("/");

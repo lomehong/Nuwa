@@ -4,6 +4,7 @@ pub mod common;
 pub mod events;
 pub mod issues;
 pub mod overview;
+pub mod projects;
 pub mod repos;
 pub mod runners;
 pub mod settings;
@@ -122,6 +123,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route("/overview", get(overview::overview))
+        .route("/projects", get(projects::projects))
         .route("/issues", get(issues::list))
         .route("/issues/{fp}", get(issues::detail))
         .route("/issues/{fp}/transcript", get(transcript::transcript))

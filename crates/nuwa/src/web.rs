@@ -52,14 +52,25 @@ pub async fn serve(method: Method, uri: Uri) -> Response {
         return static_response(path, asset.data, &method);
     }
     // Missing files (anything with a dot or under `assets/`) are real 404s.
-    // Only extensionless paths are client-side routes.
-    if looks_like_file(raw) {
+    // Only extensionless paths are client-side routes — except the project
+    // workbench, whose project id is a repository identity like
+    // `example.com/acme/worker` and therefore contains dots.
+    if looks_like_file(raw) && !is_client_route(raw) {
         return not_found(&method);
     }
     match Assets::get("index.html") {
         Some(index) => static_response("index.html", index.data, &method),
         None => placeholder(&method),
     }
+}
+
+/// Client routes whose path segments legitimately contain dots.
+const CLIENT_ROUTE_PREFIXES: &[&str] = &["projects/"];
+
+fn is_client_route(path: &str) -> bool {
+    CLIENT_ROUTE_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
 }
 
 fn looks_like_file(path: &str) -> bool {
@@ -175,6 +186,15 @@ mod tests {
     #[tokio::test]
     async fn extensionless_spa_routes_fall_back_to_index_or_placeholder() {
         for path in ["/issues/abc", "/settings/github", "/issues/"] {
+            assert_index_shell(serve_request(Method::GET, path).await).await;
+        }
+    }
+
+    /// A project id is a repository identity (`example.com/acme/worker`), so
+    /// the workbench route carries dots and must still reach the SPA shell.
+    #[tokio::test]
+    async fn project_routes_with_dotted_ids_fall_back_to_index_or_placeholder() {
+        for path in ["/projects/example.com%2Facme%2Fworker", "/projects/"] {
             assert_index_shell(serve_request(Method::GET, path).await).await;
         }
     }
