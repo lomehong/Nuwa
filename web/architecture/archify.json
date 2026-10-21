@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Nuwa · 自愈式修复 Agent 架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "nuwa-architecture.html",
+    "viewBox": [1140, 580],
+    "views": [
+      { "id": "collect", "label": "采集上报", "focus": ["sites", "qingniao", "ingest", "shanhaijing"], "note": "现场信号 → 脱敏上下文包 → 问题单入库" },
+      { "id": "repair", "label": "修复流水线", "focus": ["shanhaijing", "yinglong", "runner", "verify", "github"], "note": "问题单 → 补丁 → 验证门 → PR 主路径" },
+      { "id": "feedback", "label": "反馈回路", "focus": ["github", "yinglong", "sites"], "note": "CI 失败累计 attempt；环境特定 bug 下发现场验证脚本" }
+    ]
+  },
+  "components": [
+    { "id": "web", "type": "frontend", "label": "Web 控制台", "sublabel": "nuwa serve 内嵌 SPA", "pos": [880, 30], "size": [200, 60] },
+    { "id": "sites", "type": "external", "label": "各系统现场", "sublabel": "Go / Java / Rust 运行时", "pos": [40, 150], "size": [170, 80] },
+    { "id": "qingniao", "type": "backend", "label": "青鸟采集 SDK", "sublabel": "qingniao-go · 指纹化 · 脱敏", "tag": "无 LLM · 无 shell", "pos": [310, 150], "size": [190, 84] },
+    { "id": "ingest", "type": "backend", "label": "nuwa ingest", "sublabel": "信号接入", "pos": [600, 150], "size": [150, 70] },
+    { "id": "shanhaijing", "type": "database", "label": "山海经问题单库", "sublabel": "SQLite · 指纹去重 / 冷却 / 状态机", "pos": [880, 150], "size": [200, 84] },
+    { "id": "github", "type": "cloud", "label": "GitHub 目标仓库", "sublabel": "agent/fix/* · REST API 开 PR", "tag": "CI 闸门 · 人工合并", "pos": [40, 400], "size": [180, 84] },
+    { "id": "verify", "type": "security", "label": "独立验证门", "sublabel": "base 红 / 分支绿 · 禁改终检", "pos": [320, 400], "size": [170, 84] },
+    { "id": "runner", "type": "backend", "label": "rpi-harness 运行器", "sublabel": "vendored rpi-* · 定位 / 复现 / 修改", "tag": "clone 目标仓 · deploy key", "pos": [600, 400], "size": [190, 84] },
+    { "id": "yinglong", "type": "backend", "label": "nuwa work · 应龙", "sublabel": "领单 · 预算闸门 · 调度", "pos": [880, 400], "size": [200, 84] }
+  ],
+  "boundaries": [
+    { "kind": "security-group", "label": "五件套护栏 · ADR-003", "wraps": ["yinglong", "runner", "verify"] }
+  ],
+  "connections": [
+    { "id": "signal-capture", "from": "sites", "to": "qingniao", "label": "运行时问题信号" },
+    { "id": "context-upload", "from": "qingniao", "to": "ingest", "label": "上报上下文包" },
+    { "id": "dedup-store", "from": "ingest", "to": "shanhaijing", "label": "指纹去重入库" },
+    { "id": "console-view", "from": "web", "to": "shanhaijing", "label": "问题单视图", "labelDy": 24 },
+    { "id": "claim-issue", "from": "shanhaijing", "to": "yinglong", "label": "领取问题单", "labelDy": 24 },
+    { "id": "select-runner", "from": "yinglong", "to": "runner", "label": "按技术栈调度" },
+    { "id": "patch-gate", "from": "runner", "to": "verify", "label": "五色石补丁" },
+    { "id": "open-pr", "from": "verify", "to": "github", "label": "开 PR" },
+    { "id": "pr-rejected", "from": "github", "to": "yinglong", "label": "CI 不过 → rejected · attempt+1", "variant": "dashed", "fromSide": "bottom", "toSide": "bottom", "via": [[130, 520], [980, 520]] },
+    { "id": "site-probe", "from": "github", "to": "sites", "label": "环境特定 bug：下发预定义验证脚本", "variant": "dashed", "fromSide": "top", "toSide": "bottom" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "现场 · 只采集", "items": ["青鸟 SDK 内嵌各系统进程：采集 → 指纹化 → 上下文包脱敏上报", "无 LLM、无 shell 执行面；Go 版已独立为公开仓 lomehong/qingniao-go", "环境特定 bug 只下发预定义验证脚本，回报 pass/fail"] },
+    { "dot": "emerald", "title": "服务端 · 单二进制", "items": ["nuwa serve 内嵌 Web 控制台 SPA；子命令 ingest / work / fix / reopen", "山海经（SQLite）：指纹去重、冷却窗口、优先级、状态机", "应龙（nuwa work）领单，按目标仓技术栈调度 vendored rpi-harness"] },
+    { "dot": "rose", "title": "护栏 · 自主开 PR 前提（ADR-003）", "items": ["agent/fix/* 分支命名空间隔离，永不触碰保护分支", "每 issue / 每仓库 token、PR、attempt 预算上限，失败尝试也计入", "禁改路径双重否决 + 交付面 glob 终检；密钥只从环境变量读取"] }
+  ]
+}

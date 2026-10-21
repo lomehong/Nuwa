@@ -85,6 +85,10 @@ describe("AppShell", () => {
       "href",
       "/settings",
     );
+    expect(within(nav).getByRole("link", { name: "架构图" })).toHaveAttribute(
+      "href",
+      "/architecture",
+    );
     expect(within(nav).queryByText("Soon")).not.toBeInTheDocument();
   });
 
@@ -94,6 +98,7 @@ describe("AppShell", () => {
     ["/runners", "运行器"],
     ["/events", "活动"],
     ["/settings", "设置"],
+    ["/architecture", "架构图"],
   ] as const)("sets the document title on %s", async (route, title) => {
     server.use(
       mockMe(),
@@ -336,6 +341,26 @@ describe("AppShell", () => {
     expect(screen.queryByRole("button", { name: "退出登录" })).not.toBeInTheDocument();
   });
 
+  it("drops the session footer note outside local mode", async () => {
+    signedIn();
+    renderApp("/");
+
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+    expect(screen.queryByText("会话由 HttpOnly Cookie 保护")).not.toBeInTheDocument();
+  });
+
+  it("navigates to the architecture page from the sidebar", async () => {
+    signedIn();
+    renderApp("/");
+    await screen.findByRole("heading", { level: 1, name: "总览" });
+
+    const nav = screen.getByRole("navigation", { name: "主导航" });
+    fireEvent.click(within(nav).getByRole("link", { name: "架构图" }));
+
+    await screen.findByRole("heading", { level: 1, name: "架构图" });
+    expect(screen.getByTitle("Nuwa 架构图")).toHaveAttribute("src", "/architecture.html");
+  });
+
   it("moves focus to <main> from the skip link", async () => {
     signedIn();
     renderApp("/");
@@ -366,7 +391,7 @@ describe("AppShell", () => {
     expect(document.querySelector("[style]")).toBeNull();
 
     // Tab from the last focusable element wraps to the first (close).
-    within(drawer).getByRole("link", { name: "设置" }).focus();
+    within(drawer).getByRole("link", { name: "架构图" }).focus();
     fireEvent.keyDown(drawer, { key: "Tab" });
     expect(close).toHaveFocus();
 

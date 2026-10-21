@@ -4,6 +4,7 @@ import { Navigate, Outlet, useLocation, type RouteObject } from "react-router-do
 import { AuthErrorState } from "../components/AuthErrorState";
 import { AuthLoading } from "../components/AuthLoading";
 import { Skeleton } from "../components/ui";
+import { ArchitecturePage } from "../features/architecture/ArchitecturePage";
 import { EventsPage } from "../features/events/EventsPage";
 import { IssuesPage } from "../features/issues/IssuesPage";
 import { LoginPage } from "../features/login/LoginPage";
@@ -97,6 +98,7 @@ export const appRoutes: RouteObject[] = [
           },
           { path: "runners", element: <RunnersPage /> },
           { path: "events", element: <EventsPage /> },
+          { path: "architecture", element: <ArchitecturePage /> },
           {
             path: "settings",
             element: (

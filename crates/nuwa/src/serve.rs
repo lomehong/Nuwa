@@ -20,6 +20,32 @@ use crate::{now_ms, parse_signals, report_one, Shared};
 /// style.
 const CSP_STRICT: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
+/// The embedded architecture diagram (`web/public/architecture.html`) is a
+/// self-contained archify artifact — inline script/style by construction — and
+/// the console frames it inside `/architecture`. This policy applies only to
+/// that one build-owned file (same-origin framing + the inline content it
+/// ships); every other route keeps the strict no-frame CSP above.
+const CSP_ARCHITECTURE: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'";
+
+/// Only this path may be framed by the console and only it ships inline
+/// content; see `CSP_ARCHITECTURE`.
+const ARCHITECTURE_PAGE_PATH: &str = "/architecture.html";
+
+/// Frame + content policy for a request path, as `(X-Frame-Options, CSP)`.
+fn frame_policy_for(path: &str) -> (HeaderValue, HeaderValue) {
+    if path == ARCHITECTURE_PAGE_PATH {
+        (
+            HeaderValue::from_static("SAMEORIGIN"),
+            HeaderValue::from_static(CSP_ARCHITECTURE),
+        )
+    } else {
+        (
+            HeaderValue::from_static("DENY"),
+            HeaderValue::from_static(CSP_STRICT),
+        )
+    }
+}
+
 /// Session TTL bounds and default from docs/09 (`NUWA_SESSION_TTL_SECS`).
 const SESSION_TTL_DEFAULT_SECS: i64 = 86_400;
 const SESSION_TTL_MIN_SECS: i64 = 300;
@@ -143,12 +169,15 @@ fn is_safe_fingerprint(fp: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
 }
 
-/// Response hardening for every route. All responses use the strict CSP.
+/// Response hardening for every route. Responses use the strict CSP; the
+/// embedded architecture diagram alone is served frameable (see
+/// `frame_policy_for`).
 pub async fn security_headers(req: Request, next: Next) -> Response {
     let path = req.uri().path();
     // API payloads (session state, M2b read data) must never be cached. Static
     // responses keep the cache policy their handler set.
     let api = path == "/api" || path.starts_with("/api/");
+    let (frame_options, csp) = frame_policy_for(path);
     let mut res = next.run(req).await;
     let h = res.headers_mut();
     h.insert(
@@ -159,15 +188,12 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::X_FRAME_OPTIONS, frame_options);
     h.insert(
         HeaderName::from_static("permissions-policy"),
         HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
-    h.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CSP_STRICT),
-    );
+    h.insert(header::CONTENT_SECURITY_POLICY, csp);
     if api {
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
@@ -732,6 +758,62 @@ mod tests {
             assert!(!csp.contains("unsafe-inline"), "{uri}: {csp}");
             assert_eq!(header_str(&response, header::X_FRAME_OPTIONS), "DENY", "{uri}");
         }
+    }
+
+    /// End-to-end through the real middleware stack: the console must be able
+    /// to frame `/architecture.html` (same-origin) with the artifact's inline
+    /// content enabled, while the SPA shell keeps the strict no-frame policy.
+    #[tokio::test]
+    async fn architecture_page_is_served_frameable_and_the_shell_stays_strict() {
+        let (_dir, app) = test_app();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/architecture.html")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        // Common hardening still applies; only the frame/CSP pair is relaxed
+        // (assert_common_security_headers pins XFO=DENY, which is the point
+        // being excepted here).
+        assert_eq!(
+            header_str(&response, header::X_CONTENT_TYPE_OPTIONS),
+            "nosniff"
+        );
+        assert_eq!(header_str(&response, header::REFERRER_POLICY), "no-referrer");
+        assert_eq!(
+            header_str(
+                &response,
+                header::HeaderName::from_static("permissions-policy")
+            ),
+            "camera=(), microphone=(), geolocation=()"
+        );
+        assert_eq!(
+            header_str(&response, header::X_FRAME_OPTIONS),
+            "SAMEORIGIN"
+        );
+        let csp = header_str(&response, header::CONTENT_SECURITY_POLICY);
+        assert!(csp.contains("frame-ancestors 'self'"), "{csp}");
+        assert!(csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(header_str(&response, header::X_FRAME_OPTIONS), "DENY");
+        let csp = header_str(&response, header::CONTENT_SECURITY_POLICY);
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
     }
 
     #[tokio::test]
@@ -2968,5 +3050,36 @@ mod tests {
             invalid["error"]["fields"]["range"].is_string(),
             "invalid range must name the field: {invalid}"
         );
+    }
+
+    /// The architecture diagram is the one document the console frames: it
+    /// alone gets same-origin framing plus the inline script/style its
+    /// self-contained artifact ships with.
+    #[test]
+    fn only_the_architecture_page_gets_the_frameable_inline_policy() {
+        let (xfo, csp) = frame_policy_for("/architecture.html");
+        assert_eq!(xfo, "SAMEORIGIN");
+        let csp = csp.to_str().expect("ascii header");
+        assert!(csp.contains("frame-ancestors 'self'"), "{csp}");
+        assert!(csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+        assert!(csp.contains("style-src 'self' 'unsafe-inline'"), "{csp}");
+        // Framing stays same-origin only: foreign sites still cannot embed it.
+        assert!(!csp.contains("frame-ancestors *"), "{csp}");
+    }
+
+    #[test]
+    fn every_other_route_keeps_the_strict_no_frame_policy() {
+        for path in [
+            "/",
+            "/architecture",
+            "/architecture.htmlx",
+            "/Architecture.html",
+            "/api/v1/overview",
+            "/settings",
+        ] {
+            let (xfo, csp) = frame_policy_for(path);
+            assert_eq!(xfo, "DENY", "{path}");
+            assert_eq!(csp, CSP_STRICT, "{path}");
+        }
     }
 }

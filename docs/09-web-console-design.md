@@ -772,12 +772,12 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 ### 10.1 全局外壳
 
-- 左侧 232px 导航：女娲标志 + 版本；总览、问题单、运行器、活动、设置；底部主题切换与退出。
+- 左侧 232px 导航：女娲标志 + 版本；总览、问题单、运行器、活动、设置、架构图；本地模式下底部显示"本地模式 · API 无鉴权"。
 - 顶栏：页面标题/面包屑、⌘K 全局搜索、主题切换、会话菜单。
 - 健康条：serve、runner 在线/总数、队列待领、运行中、今日 PR 配额；「需处理 N」（attention 计数）置首、danger 色、链接 `?attention=1`，计数增长时向屏幕阅读器礼貌播报。异常项可点击跳转。
 - <1024px：导航收为抽屉 + 底部四项主导航；健康条横向滚动。
 - 全局状态：离线横幅（API 不可达）、401 自动跳登录、错误边界、toast、骨架屏。
-- 路由：`/` 即 SPA 控制台；旧书签 `/ui*` 308 到 `/`、`/issue/{fp}` 308 到 `/issues/{fp}`；`/settings` 直接由 SPA 提供。
+- 路由：`/` 即 SPA 控制台；旧书签 `/ui*` 308 到 `/`、`/issue/{fp}` 308 到 `/issues/{fp}`；`/settings` 直接由 SPA 提供；`/architecture` 为架构图页（内嵌 `/architecture.html`，见 §10.10）。
 
 ### 10.2 登录页
 
@@ -874,6 +874,12 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - 401：跳登录并保留 return URL。
 - 离线：顶部横幅"无法连接 serve，数据可能过期"，自动重试。
 - 所有写操作：pending、成功 toast、失败字段错误/全局错误。
+
+### 10.10 架构图
+
+- 侧栏「架构图」（`/architecture`）以同源 iframe 内嵌自包含交互视图 `/architecture.html`：archify 生成的单文件产物（缩放 / 路径追踪 / 引导章节 / 明暗切换），随 `web/public/` 进 dist、由 `nuwa serve` 的 rust-embed 装载；源规范在 `web/architecture/archify.json`，改图用 archify 重新生成后覆盖。
+- CSP 例外仅此一路径：`serve.rs frame_policy_for` 对 `/architecture.html` 单独允许同源 frame（`X-Frame-Options: SAMEORIGIN`、`frame-ancestors 'self'`）与内联脚本/样式（单文件构建即内联）；其余路由保持 strict CSP + DENY，单元测试钉住。
+- 命令面板 ⌘K 有「架构图」快捷入口；<1024px 时经抽屉主导航到达（底部四项导航不变）。
 
 ## 11 · 视觉系统
 

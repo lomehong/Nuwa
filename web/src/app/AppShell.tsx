@@ -8,6 +8,7 @@ import {
   ListTodo,
   LogOut,
   Menu,
+  Network,
   RefreshCw,
   Search,
   Settings,
@@ -43,6 +44,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { label: "运行器", icon: Cpu, to: "/runners" },
   { label: "活动", icon: Activity, to: "/events" },
   { label: "设置", icon: Settings, to: "/settings" },
+  { label: "架构图", icon: Network, to: "/architecture" },
 ];
 
 /**
@@ -94,6 +96,9 @@ function pageMeta(pathname: string): PageMeta {
   }
   if (pathname === "/settings" || pathname === "/settings/") {
     return { title: "设置", breadcrumb: null };
+  }
+  if (pathname === "/architecture" || pathname === "/architecture/") {
+    return { title: "架构图", breadcrumb: null };
   }
   if (pathname.startsWith("/issues/")) {
     const raw = pathname.slice("/issues/".length);
@@ -183,13 +188,12 @@ function SidebarNavList({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 function SidebarFooter({ localMode }: { localMode: boolean }) {
+  if (!localMode) {
+    return null;
+  }
   return (
     <div className="border-t border-border px-5 py-4">
-      {localMode ? (
-        <p className="text-caption text-text-secondary">本地模式 · API 无鉴权</p>
-      ) : (
-        <p className="text-caption text-text-secondary">会话由 HttpOnly Cookie 保护</p>
-      )}
+      <p className="text-caption text-text-secondary">本地模式 · API 无鉴权</p>
     </div>
   );
 }

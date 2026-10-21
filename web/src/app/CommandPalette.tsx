@@ -66,6 +66,11 @@ const QUICK_COMMANDS: readonly { label: string; hint: string; to: string }[] = [
     hint: "设置变更与重启记录",
     to: "/events?kind=config_changed,config_migrated,restart_requested",
   },
+  {
+    label: "架构图",
+    hint: "采集 → 问题单 → 修复 → 交付 总览",
+    to: "/architecture",
+  },
 ];
 
 type ClickHandler = (event: MouseEvent<HTMLAnchorElement>) => void;

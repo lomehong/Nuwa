@@ -390,6 +390,22 @@ mod tests {
         assert!(frames.is_empty());
     }
 
+    #[test]
+    fn rust_panic_fingerprint_matches_the_sdk_golden() {
+        // Pinned together with qingniao-rust's
+        // `rust_panic_fingerprint_matches_the_server_golden`: the Rust SDK
+        // mirrors this parser, so a change on either side must update both.
+        let trace = "thread 'main' panicked at src/calc.rs:17:9:\n\
+                     index out of range: the len is 3 but the index is 3\n\
+                     stack backtrace:\n\
+                     0: app::run\n\
+                                 at src/calc.rs:17:9";
+        assert_eq!(
+            compute("example.com/app", "rust", None, trace),
+            "53188b455b43cc5d1e02760404ae3c36"
+        );
+    }
+
     /// The client-side Go panic fingerprint (青鸟 SDK `panicFingerprint`) must
     /// equal the server-side one, otherwise the same panic aggregates under two
     /// different keys depending on who computed it. The SDK pins the same

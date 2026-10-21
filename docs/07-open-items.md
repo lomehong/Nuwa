@@ -98,6 +98,7 @@
   - **构建契约**：㉖ Cargo.toml `rust-version` 1.79→1.88（对齐 image/time 锁定依赖的实际下限，旧声明根本编译不过）。
   - **自测证据**：Rust 全量 **1119 通过 / 0 失败 / 1 ignored**（排除文档已注明的 Windows 上游 `os_cancel_interrupts…`），较基线 +31 测试；自建 crate `clippy -D warnings` 零警告（顺带清掉新工具链在 auth/common/overview/serve/main 暴露的 6 处既有 `map_or`/`%` lint）；前端 **344 通过 / 47 文件**（+9），typecheck/lint/build 零错误。**未提交/未推送/未部署**。
   - **已知限制（未在本轮处理）**：同 runner-id 双活进程的启动租约（claim-owner 已挡住更常见的异 runner 抢占，但两个相同 id 的活进程仍会互相孤儿恢复——需进程级租约/心跳存活判定）；transcript 运行中窗口的实时脱敏（serve 进程不持有 work 的密钥值，只能在 run 结束后落盘脱敏）。
+- **控制台架构图页（2026-10-21）**：左侧菜单新增「架构图」（`/architecture`，置于「设置」之后），替换侧栏底部的「会话由 HttpOnly Cookie 保护」文案（本地模式提示保留）。页面以同源 iframe 内嵌 archify 生成的自包含交互图：产物 `web/public/architecture.html`（随 dist 经 rust-embed 装载），源规范 `web/architecture/archify.json`。配套：① serve 对该唯一路径放宽安全头——`frame_policy_for` 给 `/architecture.html` 单独发 `X-Frame-Options: SAMEORIGIN` + 允许内联与同源 frame 的 CSP（自包含单文件必须内联、控制台要内嵌），其余路由仍 strict + DENY，2 个单元测试钉住；② 命令面板 ⌘K 快捷入口。验证：前端 348/348（+3）、typecheck/lint/build 零错误；`clippy -p nuwa` 零警告，新增测试单独全绿（`git_ops` 管道时序测试在全量并行下偶发超时，单独复跑通过——既有 Windows 抖动，与本次无关）。
 - 下一步：验证门对 `internal/` 可复现性的盲区（本例 go test 无法触发 main 运行时 panic，靠 CI 深跑兜底——补充 `go vet`+`go build`+单测三角）→ 并发池/镜像矩阵（A-3）→ musl 静态构建 → 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 同 runner-id 启动租约。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
