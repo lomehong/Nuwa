@@ -133,3 +133,19 @@
   3. reopen 由 owner 显式执行，重置 attempts 并把 reason 写入事件，下一轮 prompt 作为 OWNER NOTE。
   4. 优先级改为 severity 字典序优先，occurrences 只做同级排序。
 - 被否决备选：复用 rejected + muted 标记（状态语义混淆）；无上限自动重试（成本不可控）；把 provider 故障计入 attempts（会让基础设施抖动消耗业务单）。
+
+## ADR-013 · 问题单身份按仓库限定（fingerprint 纳入 repo）
+
+- 状态：已接受（2026-10-21）
+- 背景：`fingerprint = sha256(lang|error_class|top3 frames)`，issues 表以 fingerprint 为主键。两个仓库若共享同一全限定符号路径与错误消息（fork、vendored 副本、同一服务两个登记身份），同栈信号会合并成一行：后报的仓库被去重、无法被自己的 runner 领取，且 ignored/escalated/attempts/stack_sample 互相污染。实测 A、B 两仓同栈 → B 永远 claim 不到。
+- 决策：把 **repo 作为 fingerprint 哈希的第一段输入**（`sha256(repo|lang|error_class|frames…)`）。fingerprint 仍是单一主键，URL/runs/events/schema 全不变，值变为按仓库限定。`claim_ready_issue_for_repo` 的 repo 过滤因此从“必需”变为“冗余但保留”。
+- 跨仓契约：青鸟 SDK 的 `panicFingerprint` 必须同步把 `Meta.Repo` 作为首段输入并重钉 golden 常量（shanhaijing 侧 golden 已更新为 `5cc9dae18baa7dac8582fda50dedec8d`，repo=`example.com/spike-target`）。**运行时不受影响**：服务端始终重算指纹、Signal 不携带客户端指纹，客户端指纹只用于其自身节流；SDK 未跟进前只是两端 golden 互验暂时失效，不影响聚合正确性。
+- 被否决备选：① 复合主键 `(repo, fingerprint)`——需迁移 + 改 `/issues/{fp}` URL 方案 + runs/events 归属 + web 路由，blast radius 过大；② 仅按 repo 过滤 claim 不改身份——问题单仍合并，状态/样本污染未解决。
+
+## ADR-014 · 授权对 vendored rpi-* 就地打补丁（突破 AGENTS.md 硬规则 1）
+
+- 状态：已接受（2026-10-21，所有者明确授权）
+- 背景：全仓审查发现 5 个真实缺陷位于 vendored 的 `crates/rpi-*`，其中 os_env 大输出管道阻塞在正常运行即可触发（Q6 同类挂死）。AGENTS.md 硬规则 1 要求 vendored 保持原样、走上游 cherry-pick。
+- 决策：所有者授权**就地修补**这 5 处（os_env 并发驱动 stdout/stderr、settle 关键持久化失败传播、agent_harness 预算耗尽明确 outcome、compaction 继承 stream options、read 有预算流式读取）。每处改动加 `// Nuwa 本地补丁(2026-10-21): <原因>` 注释，保持公开签名稳定，带回归测试。
+- 约束：① 仅限这 5 处真实 bug，不借机重构/美化 vendored；② 与 upstream 对账时这些本地补丁是已知差异，未来 cherry-pick 上游修复时须保留本地语义；③ docs/07 §D 记录补丁清单。
+- 被否决备选：全部走上游 PR（周期长，os_env 挂死在生产持续发生）；仅 Nuwa 层规避（bash 工具在 vendored 内，无法完全规避）。

@@ -161,7 +161,7 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap, jar: CookieJa
     // guard rejects empty), so reissue it.
     if jar
         .get(CSRF_COOKIE)
-        .map_or(true, |cookie| cookie.value().is_empty())
+        .is_none_or(|cookie| cookie.value().is_empty())
     {
         let secure = secure_cookie(&state, &headers);
         jar = jar.add(csrf_cookie(

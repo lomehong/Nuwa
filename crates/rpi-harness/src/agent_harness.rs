@@ -3664,6 +3664,9 @@ impl AgentHarness {
                                 None
                             },
                             custom_instructions: None,
+                            // Nuwa 本地补丁(2026-10-21): 摘要请求继承 harness pin 的
+                            // stream options（timeout/max_retries 等），不再退回默认。
+                            stream_options: Some(snap.stream_options.clone()),
                         };
                         match {
                             let _progress = crate::events::CompactionProgressGuard::new(
@@ -3794,6 +3797,9 @@ impl AgentHarness {
                 })
                 .collect(),
         ));
+        // Nuwa 本地补丁(2026-10-21): 把 run 的取消令牌交给 settle 观察者——关键
+        // 持久化(assistant 提交 / tool_started)失败时立即取消，赶在工具执行前中止。
+        settle_state.set_cancel_signal(signal.clone());
         let context_write_error = Arc::new(Mutex::new(None));
         let mut config = AgentLoopConfig {
             model: snap.model.clone(),
@@ -3814,6 +3820,9 @@ impl AgentHarness {
                     .cloned();
                 let compaction_signal = signal.clone();
                 let compaction_run_id = run_id.clone();
+                // Nuwa 本地补丁(2026-10-21): 循环中 compaction 的摘要请求也要继承
+                // harness pin 的 stream options（timeout/max_retries 等）。
+                let compaction_stream_options = snap.stream_options.clone();
                 if enabled && model.context_window > 0 && provider.is_some() {
                     let cut_for_hook = Arc::clone(&post_compaction_cut);
                     Some(Arc::new(move |ctx: ShouldStopAfterTurnContext<'_>| -> BoxFuture<'static, Option<rpi_agent::AgentLoopTurnUpdate>> {
@@ -3823,6 +3832,7 @@ impl AgentHarness {
                         let cut = Arc::clone(&cut_for_hook);
                         let compaction_signal = compaction_signal.clone();
                         let compaction_run_id = compaction_run_id.clone();
+                        let compaction_stream_options = compaction_stream_options.clone();
                         let context = ctx.context.clone();
                         let new_messages_len = ctx.new_messages.len();
                         Box::pin(async move {
@@ -3835,7 +3845,7 @@ impl AgentHarness {
                                 message: message.clone(), terminate: None,
                             })).collect();
                             let prep = match prepare_compaction(&entries, settings) { Ok(Some(p)) => p, _ => return None };
-                            let opts = CompactionLlmOptions { provider, model: model.clone(), api_key: None, signal: compaction_signal, thinking_level: None, retry: None, custom_instructions: None };
+                            let opts = CompactionLlmOptions { provider, model: model.clone(), api_key: None, signal: compaction_signal, thinking_level: None, retry: None, custom_instructions: None, stream_options: Some(compaction_stream_options) };
                             let result = match { let _progress = crate::events::CompactionProgressGuard::new(&harness.bus, &harness.lane, false); compact(&prep, &opts).await } { Ok(r) => r, Err(_) => return None };
                             // Mid-loop compaction fires because the turn pushed the
                             // context over the threshold.
@@ -4063,6 +4073,14 @@ impl AgentHarness {
             return Err(HarnessError::io(error));
         }
 
+        // Nuwa 本地补丁(2026-10-21): settle 的关键持久化(assistant 提交 /
+        // tool_started)失败必须终止 run 并把错误传播给调用方——"先持久化后执行"
+        // 是崩溃恢复的前提。失败已在 settle 侧取消 signal（工具不会再执行），这里
+        // 与上面的 `context_write_error` 用同一 error-capture 模式收尾返回。
+        if let Some(error) = settle_state.take_critical_error() {
+            return Err(HarnessError::io(error));
+        }
+
         // Persist new messages + derive outcome.
         let (_leaf_id, _final_entry_id, mut outcome, op_outcome, op_error) = match result {
             Ok(new_messages) => {
@@ -4096,6 +4114,34 @@ impl AgentHarness {
                     }
                 }
                 let outcome = Self::derive_outcome(&new_messages, leaf.clone(), final_id.clone());
+                // Nuwa 本地补丁(2026-10-21): 预算耗尽误报 Completed 修复。达到
+                // run budget 停止时，最后一条 assistant 往往还停在 `ToolUse`
+                // （工具刚跑完、循环被 should_stop_after_turn 掐断），derive_outcome
+                // 的兜底分支会把它判成 Completed。nuwa 侧(crates/nuwa/src/repair.rs)
+                // 把 Completed 当修复成功、Aborted 当失败 bail——预算耗尽意味着任务
+                // 可能未完成，绝不能上报 Completed。这里在 budget_stop 触发且最后
+                // 一条 assistant 不是正常完成(stop_reason != Stop)时，把 outcome
+                // 改写为 Aborted（复用既有 Aborted 语义，不新增 enum 变体，保持
+                // 公开类型稳定；nuwa 无需改动即可把预算耗尽识别为失败）。最后一条
+                // 已是 Stop 的正常完成不受影响。
+                let outcome = if budget_stop.is_some() {
+                    match outcome {
+                        HarnessRunOutcome::Completed {
+                            leaf_id,
+                            final_entry_id,
+                            final_message,
+                        } if final_message.stop_reason != StopReason::Stop => {
+                            HarnessRunOutcome::Aborted {
+                                leaf_id,
+                                final_entry_id,
+                                final_message,
+                            }
+                        }
+                        other => other,
+                    }
+                } else {
+                    outcome
+                };
                 // The run's messages are durable now, so its frames are no
                 // longer needed as progress. Retiring them here (rather than at
                 // each `MessageEnd`) is what keeps a *failed retry attempt*'s
@@ -4307,6 +4353,9 @@ impl AgentHarness {
                             None
                         },
                         custom_instructions: custom_instructions.clone(),
+                        // Nuwa 本地补丁(2026-10-21): 显式 /compact 的摘要请求同样
+                        // 继承 harness pin 的 stream options（timeout/max_retries 等）。
+                        stream_options: Some(snap.stream_options.clone()),
                     };
                     match {
                         let _progress = crate::events::CompactionProgressGuard::new(

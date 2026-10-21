@@ -971,11 +971,14 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
         .await
         .expect("the run must terminate, not spin");
 
-    // It terminated "Completed" (the loop's normal exit path) — which is exactly
-    // why the reason has to be recorded separately.
+    // Nuwa 本地补丁(2026-10-21): 预算耗尽不再误报 Completed。旧实现里 budget
+    // stop 走循环的正常退出路径、outcome 按最后一条 assistant 的 stop_reason
+    // 判成 Completed（本测试曾断言那个 bug）；nuwa 的 repair.rs 把 Completed
+    // 当成功、Aborted 当失败——预算耗尽且最后一条 assistant 还停在 ToolUse
+    // （工作未完成）时必须是 Aborted。runBudget 通知仍照常记录（见下）。
     assert!(
-        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
-        "expected a Completed outcome, got {:?}",
+        matches!(result.outcome, HarnessRunOutcome::Aborted { .. }),
+        "expected an Aborted outcome on budget exhaustion with pending tool use, got {:?}",
         result.outcome
     );
 

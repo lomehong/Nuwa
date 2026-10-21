@@ -418,6 +418,28 @@ const READY_ORDER: &str = "CASE severity
         occurrences DESC,
         last_seen ASC";
 
+/// Severity rank mirroring the `READY_ORDER` CASE band. Unknown spellings rank
+/// 0, so they never outweigh a recognized severity.
+fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "critical" => 4,
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+/// The more severe of two severity labels; on a tie the already-stored value
+/// wins, so a repeat report never churns the stored severity sideways.
+fn higher_severity(current: &str, incoming: &str) -> String {
+    if severity_rank(incoming) > severity_rank(current) {
+        incoming.to_string()
+    } else {
+        current.to_string()
+    }
+}
+
 /// Full [`IssueRow`] projection; keep aligned with [`Store::issue_from_row`].
 const ISSUE_VIEW_SELECT: &str = "SELECT i.fingerprint, i.title, i.language, i.repo, i.severity,
         i.state, i.occurrences, i.pr_url, i.first_seen, i.last_seen,
@@ -462,16 +484,17 @@ impl Store {
     /// activity feed).
     pub fn report_signal(&self, signal: &Signal, now_ms: i64) -> ShanResult<ReportOutcome> {
         let fp = fingerprint::compute(
+            &signal.repo,
             &signal.language,
             signal.message.as_deref(),
             &signal.stack_trace,
         );
         let conn = self.lock();
-        let existing: Option<(String, u64, i64)> = conn
+        let existing: Option<(String, u64, i64, String)> = conn
             .query_row(
-                "SELECT state, occurrences, cooldown_until FROM issues WHERE fingerprint = ?1",
+                "SELECT state, occurrences, cooldown_until, severity FROM issues WHERE fingerprint = ?1",
                 [&fp],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map(Some)
             .or_else(|e| match e {
@@ -479,7 +502,7 @@ impl Store {
                 other => Err(other),
             })?;
 
-        let Some((state, occurrences, cooldown_until)) = existing else {
+        let Some((state, occurrences, cooldown_until, current_severity)) = existing else {
             conn.execute(
                 "INSERT INTO issues(fingerprint, title, language, severity, state, occurrences, first_seen, last_seen, cooldown_until, repo, stack_sample)
                  VALUES (?1, ?2, ?3, ?4, 'new', 1, ?5, ?5, 0, ?6, ?7)",
@@ -499,9 +522,14 @@ impl Store {
             return Ok(ReportOutcome::NewIssue { fingerprint: fp });
         };
 
+        // A repeat report must never downgrade a confirmed severity: a `low`
+        // (or unspecified → `medium`) re-report of a `critical` bug would
+        // otherwise sink it in the claim order. Keep the higher of the two;
+        // downgrading is an explicit owner action, not a side effect of noise.
+        let severity = higher_severity(&current_severity, &signal.severity);
         conn.execute(
             "UPDATE issues SET occurrences = occurrences + 1, last_seen = ?2, stack_sample = ?3, severity = ?4 WHERE fingerprint = ?1",
-            rusqlite::params![fp, now_ms, signal.stack_trace, signal.severity],
+            rusqlite::params![fp, now_ms, signal.stack_trace, severity],
         )?;
         bump_signal_daily(&conn, &fp, &signal.repo, now_ms)?;
         let occurrences = occurrences + 1;
@@ -638,17 +666,25 @@ impl Store {
     /// Repo-scoped atomic claim: a runner must never pick up another repo's
     /// issue just because it shares a database. The unfiltered claim remains
     /// for tests and tooling.
+    ///
+    /// The claim stamps `owner_runner_id` in the same atomic statement. Without
+    /// this there is a window between the claim (state→triggered) and
+    /// `start_run` (which also sets the owner) during which the row has a NULL
+    /// owner; a second runner's startup `revive_orphaned_fixing` would treat
+    /// that live claim as an orphan and requeue it, letting two runners work
+    /// the same issue. Owning it at claim time closes the window.
     pub fn claim_ready_issue_for_repo(
         &self,
         now_ms: i64,
         cooldown_until_ms: i64,
         repo: &str,
+        runner_id: &str,
     ) -> ShanResult<Option<IssueSnapshot>> {
         let conn = self.lock();
         let claimed: Option<IssueSnapshot> = conn
             .query_row(
                 &format!(
-                    "UPDATE issues SET state = 'triggered', cooldown_until = ?2, state_changed_at = ?1
+                    "UPDATE issues SET state = 'triggered', cooldown_until = ?2, state_changed_at = ?1, owner_runner_id = ?4
                      WHERE fingerprint = (
                          SELECT fingerprint FROM issues
                          WHERE state = 'new' AND cooldown_until <= ?1 AND repo = ?3
@@ -657,7 +693,7 @@ impl Store {
                      )
                      RETURNING fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample"
                 ),
-                rusqlite::params![now_ms, cooldown_until_ms, repo],
+                rusqlite::params![now_ms, cooldown_until_ms, repo, runner_id],
                 Self::snapshot_from_row,
             )
             .map(Some)
@@ -1010,10 +1046,35 @@ impl Store {
         if !can_transition(from, to) {
             return Err(ShanError::InvalidTransition { from, to });
         }
-        conn.execute(
-            "UPDATE issues SET state = ?2, state_changed_at = ?3 WHERE fingerprint = ?1",
-            rusqlite::params![fingerprint, to.as_str(), now_ms],
+        // Compare-and-swap: the UPDATE only lands if the state is still the one
+        // we validated. Two processes (a runner and the owner, or two runners)
+        // can both SELECT the same `from` before either writes; without the
+        // `AND state = ?4` guard the transition check is merely advisory and
+        // both writes succeed, pushing the issue along an edge that
+        // `can_transition` would have rejected had either seen the other's
+        // change. SQLite serializes the two writes, so the loser matches 0 rows.
+        let changed = conn.execute(
+            "UPDATE issues SET state = ?2, state_changed_at = ?3 WHERE fingerprint = ?1 AND state = ?4",
+            rusqlite::params![fingerprint, to.as_str(), now_ms, from.as_str()],
         )?;
+        if changed == 0 {
+            // The state moved under us between the SELECT and the write. Report
+            // the actual current state so the caller sees the real conflict.
+            let current: String = conn
+                .query_row(
+                    "SELECT state FROM issues WHERE fingerprint = ?1",
+                    [fingerprint],
+                    |row| row.get(0),
+                )
+                .map_err(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => {
+                        ShanError::UnknownIssue(fingerprint.to_string())
+                    }
+                    other => ShanError::Db(other),
+                })?;
+            let current = State::parse(&current).ok_or_else(|| ShanError::UnknownState(current))?;
+            return Err(ShanError::InvalidTransition { from: current, to });
+        }
         if to == State::New {
             conn.execute(
                 "UPDATE issues SET owner_runner_id = NULL WHERE fingerprint = ?1",
@@ -2114,6 +2175,131 @@ mod tests {
         sig
     }
 
+    #[test]
+    fn cross_repo_same_stack_are_separate_issues() {
+        // Two repositories sharing a fully-qualified symbol and message (forks,
+        // vendored copies) are two bugs: each must get its own row and be
+        // claimable by its own runner. Before repo entered the fingerprint the
+        // second report deduped onto the first, so repo B could never be picked.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let a = signal();
+        let mut b = signal();
+        b.repo = "example.com/other".to_string();
+        store.report_signal(&a, 1).expect("a");
+        let outcome_b = store.report_signal(&b, 2).expect("b");
+        assert!(
+            matches!(outcome_b, ReportOutcome::NewIssue { .. }),
+            "a different repo's identical stack must be a new issue, got {outcome_b:?}"
+        );
+        let fp_a = fingerprint::compute(&a.repo, "go", None, &a.stack_trace);
+        let fp_b = fingerprint::compute(&b.repo, "go", None, &b.stack_trace);
+        assert_ne!(fp_a, fp_b);
+        // Each repo's runner can claim its own.
+        assert!(store
+            .claim_ready_issue_for_repo(3, 1_000, "example.com/spike-target", "r-a")
+            .expect("claim a")
+            .is_some());
+        assert!(store
+            .claim_ready_issue_for_repo(3, 1_000, "example.com/other", "r-b")
+            .expect("claim b")
+            .is_some());
+    }
+
+    #[test]
+    fn repeat_report_does_not_downgrade_severity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let mut critical = signal();
+        critical.severity = "critical".to_string();
+        store.report_signal(&critical, 1).expect("first");
+        // A noisy low-severity re-report of the same bug must not sink it.
+        let mut low = signal();
+        low.severity = "low".to_string();
+        store.report_signal(&low, 2).expect("repeat");
+        let fp = fingerprint::compute(&critical.repo, "go", None, &critical.stack_trace);
+        let row = store
+            .list_issues()
+            .expect("list")
+            .into_iter()
+            .find(|r| r.fingerprint == fp)
+            .expect("row");
+        assert_eq!(row.severity, "critical", "severity must keep the confirmed max");
+        assert_eq!(row.occurrences, 2);
+    }
+
+    #[test]
+    fn claim_stamps_owner_so_another_runner_cannot_revive_it() {
+        // The claim registers the owner atomically; a second runner's startup
+        // orphan-revive must not treat that live claim as an orphan and requeue
+        // it (which would let two runners work the same issue).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let claimed = store
+            .claim_ready_issue_for_repo(2, 1_000_000, "example.com/spike-target", "runner-a")
+            .expect("claim")
+            .expect("claimed");
+        let row = store
+            .list_issues()
+            .expect("list")
+            .into_iter()
+            .find(|r| r.fingerprint == claimed.fingerprint)
+            .expect("row");
+        assert_eq!(row.owner_runner_id.as_deref(), Some("runner-a"));
+        assert_eq!(row.state, "triggered");
+        // A different runner must not revive it; the owner's own restart would.
+        assert_eq!(
+            store.revive_orphaned_fixing(3, "runner-b").expect("revive b"),
+            0,
+            "another runner must not steal a live claim"
+        );
+        assert_eq!(
+            store.revive_orphaned_fixing(3, "runner-a").expect("revive a"),
+            1,
+            "the owner's restart revives its own orphaned claim"
+        );
+    }
+
+    #[test]
+    fn concurrent_same_transition_admits_exactly_one_writer() {
+        // Two processes racing the same triggered→fixing edge: the CAS guard
+        // (UPDATE … AND state = <validated from>) means exactly one writer
+        // lands; the loser sees the state already moved and is rejected rather
+        // than both "succeeding" past the transition check.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("race.db");
+        {
+            let store = Store::open(&path).expect("open");
+            store.report_signal(&signal(), 1).expect("report");
+            store
+                .claim_ready_issue_for_repo(2, 1_000_000, "example.com/spike-target", "r")
+                .expect("claim")
+                .expect("claimed");
+        }
+        let fp = fingerprint::compute("example.com/spike-target", "go", None, TRACE);
+        let results: Vec<bool> = (0..2)
+            .map(|i| {
+                let path = path.clone();
+                let fp = fp.clone();
+                std::thread::spawn(move || {
+                    let store = Store::open(&path).expect("open");
+                    store
+                        .set_state_as(&fp, State::Fixing, 3, None, &format!("r{i}"))
+                        .is_ok()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect();
+        assert_eq!(
+            results.iter().filter(|ok| **ok).count(),
+            1,
+            "exactly one writer may apply triggered→fixing, got {results:?}"
+        );
+    }
+
     /// Start a run and fill the evidence columns the trends buckets read.
     fn seed_run(
         store: &Store,
@@ -2318,10 +2504,10 @@ mod tests {
         b.repo = "other/repo".to_string();
         store.report_signal(&signal(), 1).expect("a");
         store.report_signal(&b, 2).expect("b");
-        let fp_a = fingerprint::compute("go", None, &signal().stack_trace);
+        let fp_a = fingerprint::compute(&signal().repo, "go", None, &signal().stack_trace);
         let mut c = signal();
         c.stack_trace = TRACE.replace("Average", "Load");
-        let fp_c = fingerprint::compute("go", None, &c.stack_trace);
+        let fp_c = fingerprint::compute(&c.repo, "go", None, &c.stack_trace);
         store.report_signal(&c, 3).expect("c");
 
         store.set_pr(&fp_a, "https://x/pr/1", 10).expect("pr1");
@@ -3269,7 +3455,7 @@ mod tests {
         let store = Store::open(dir.path().join("s.db")).expect("open");
         let low = Signal { severity: "low".into(), ..issue_signal("low", "Load") };
         let critical = Signal { severity: "critical".into(), ..issue_signal("critical", "Submit") };
-        let fp_low = fingerprint::compute("go", None, &low.stack_trace);
+        let fp_low = fingerprint::compute(&low.repo, "go", None, &low.stack_trace);
         store.report_signal(&low, 1).expect("low");
         store.report_signal(&low, 2).expect("low again");
         store.report_signal(&critical, 1).expect("critical");
@@ -3489,9 +3675,9 @@ mod tests {
         let sig_b = issue_signal("panic in Average", "Submit");
         let sig_d = issue_signal("panic in Average", "Load");
         let sig_c = issue_signal("panic in Load", "Enqueue");
-        let fp_a = fingerprint::compute("go", None, &sig_a.stack_trace);
-        let fp_b = fingerprint::compute("go", None, &sig_b.stack_trace);
-        let fp_d = fingerprint::compute("go", None, &sig_d.stack_trace);
+        let fp_a = fingerprint::compute(&sig_a.repo, "go", None, &sig_a.stack_trace);
+        let fp_b = fingerprint::compute(&sig_b.repo, "go", None, &sig_b.stack_trace);
+        let fp_d = fingerprint::compute(&sig_d.repo, "go", None, &sig_d.stack_trace);
         store.report_signal(&sig_a, 1).expect("a");
         store.report_signal(&sig_b, 2).expect("b");
         store.report_signal(&sig_d, 3).expect("d");
@@ -3550,8 +3736,8 @@ mod tests {
         let repo_b = "example.com/other";
         let sig_a = signal();
         let sig_b = issue_signal("panic in Submit", "Submit");
-        let fp_a = fingerprint::compute("go", None, &sig_a.stack_trace);
-        let fp_b = fingerprint::compute("go", None, &sig_b.stack_trace);
+        let fp_a = fingerprint::compute(&sig_a.repo, "go", None, &sig_a.stack_trace);
+        let fp_b = fingerprint::compute(&sig_b.repo, "go", None, &sig_b.stack_trace);
         // Both issues exist so the legacy NULL-repo event can resolve its repo
         // through the issue join; their `reported` events sit at ts=1, outside
         // every window below.
@@ -3758,8 +3944,8 @@ mod tests {
         let mut sig_d = issue_signal("panic in Enqueue", "Enqueue");
         sig_d.repo = repo_b.to_string();
         let sig_old = issue_signal("panic in Archive", "Archive");
-        let fp_a = fingerprint::compute("go", None, &sig_a.stack_trace);
-        let fp_c = fingerprint::compute("go", None, &sig_c.stack_trace);
+        let fp_a = fingerprint::compute(&sig_a.repo, "go", None, &sig_a.stack_trace);
+        let fp_c = fingerprint::compute(&sig_c.repo, "go", None, &sig_c.stack_trace);
 
         // Reports also create the issues that own them; the old issue and its
         // report fall outside the 3-day window.
@@ -3960,7 +4146,7 @@ mod tests {
         let url_dup = "https://github.com/acme/spike/pull/10";
 
         let sig = signal();
-        let fp = fingerprint::compute("go", None, &sig.stack_trace);
+        let fp = fingerprint::compute(&sig.repo, "go", None, &sig.stack_trace);
         store.report_signal(&sig, t_start).expect("report");
         // Pre-migration fallback: only the issue row carries the PR.
         store.set_pr(&fp, url_dup, t_pr).expect("set pr");
@@ -3989,7 +4175,7 @@ mod tests {
 
         // A legacy-only issue PR (no run) must still count.
         let sig_legacy = issue_signal("panic in Submit", "Submit");
-        let fp_legacy = fingerprint::compute("go", None, &sig_legacy.stack_trace);
+        let fp_legacy = fingerprint::compute(&sig_legacy.repo, "go", None, &sig_legacy.stack_trace);
         store
             .report_signal(&sig_legacy, t_start)
             .expect("legacy report");
@@ -4000,7 +4186,7 @@ mod tests {
         // Another repo's PR must not leak into the repo filter.
         let mut sig_other = issue_signal("panic in Load", "Load");
         sig_other.repo = other.to_string();
-        let fp_other = fingerprint::compute("go", None, &sig_other.stack_trace);
+        let fp_other = fingerprint::compute(&sig_other.repo, "go", None, &sig_other.stack_trace);
         store
             .report_signal(&sig_other, t_start)
             .expect("other report");

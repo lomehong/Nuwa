@@ -61,6 +61,16 @@ pub enum TrustSource {
     PrivateCopy,
 }
 
+/// What a per-loop [`TrustedInstructions::refresh`] changed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RefreshOutcome {
+    /// The authoritative bytes differed from the last load — the base moved.
+    pub config_changed: bool,
+    /// The working-tree file differed from the authoritative bytes and was
+    /// rewritten (tamper, or simply catching up to a moved base).
+    pub restored: bool,
+}
+
 /// An instruction file plus the bytes the runner trusts. The working-tree file
 /// is verified/restored against these bytes before every claim.
 #[derive(Debug, Clone)]
@@ -152,6 +162,30 @@ impl TrustedInstructions {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Re-read the authoritative instruction bytes and re-parse them, then
+    /// restore the working-tree file. Call once per work loop, *after* the
+    /// preflight fetch/reset: `origin/<base>` may have moved, and without this
+    /// the runner keeps executing the config it parsed at startup (a weakened or
+    /// changed `failing_check`/`forbidden_paths` on the new base would be
+    /// ignored). Returns what changed so the caller can log base moves and
+    /// tamper restores distinctly.
+    pub fn refresh(&mut self) -> anyhow::Result<RefreshOutcome> {
+        let expected = self.expected_bytes();
+        let config_changed = expected != self.bytes;
+        if config_changed {
+            // A malformed new base config must stop the runner, not silently
+            // keep the stale one: re-parse before adopting the bytes.
+            self.instructions = parse(&expected, &self.path)?;
+            self.sha256 = sha256_hex(&expected);
+            self.bytes = expected;
+        }
+        let restored = self.verify_and_restore()?;
+        Ok(RefreshOutcome {
+            config_changed,
+            restored,
+        })
     }
 
     pub fn source(&self) -> TrustSource {
@@ -288,6 +322,40 @@ mod tests {
         assert!(trusted.verify_and_restore().expect("restore"));
         let restored = std::fs::read_to_string(repo.join(INSTRUCTION_FILE)).expect("read");
         assert!(restored.contains("\"repo\":\"main\""));
+    }
+
+    #[test]
+    fn refresh_picks_up_a_moved_base_config() {
+        // The preflight fetch/reset can move `origin/<base>` after startup; the
+        // runner must re-read the trusted config each loop instead of executing
+        // the stale object it parsed at boot.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo, true);
+        let mut trusted = TrustedInstructions::load(
+            &repo,
+            &repo.join(INSTRUCTION_FILE),
+            "main",
+            &dir.path().join("trust"),
+        )
+        .expect("load");
+        assert_eq!(trusted.instructions.forbidden_paths, vec!["go.sum".to_string()]);
+
+        // The base moves: a new commit hardens the forbidden list.
+        std::fs::write(
+            repo.join(INSTRUCTION_FILE),
+            r#"{"repo":"main","failing_check":{"command":"echo ok"},"forbidden_paths":["go.sum","secrets/"]}"#,
+        )
+        .expect("write");
+        git(&repo, &["commit", "-am", "harden forbidden paths"]);
+
+        let outcome = trusted.refresh().expect("refresh");
+        assert!(outcome.config_changed, "a moved base must be detected");
+        assert_eq!(
+            trusted.instructions.forbidden_paths,
+            vec!["go.sum".to_string(), "secrets/".to_string()],
+            "the runner must execute the new base config, not the startup one"
+        );
     }
 
     #[test]

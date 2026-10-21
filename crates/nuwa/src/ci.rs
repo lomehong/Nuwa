@@ -7,6 +7,21 @@
 use anyhow::{bail, Context};
 use serde::Serialize;
 
+/// A bounded HTTP client for GitHub API calls.
+///
+/// Every GitHub request must carry a connect + response timeout: a connection
+/// that opens but never returns a body would otherwise block the serial runner
+/// forever, and the CI budget is only checked *after* a request completes, so
+/// an unbounded request defeats it. Shared by the CI gate, PR close and PR
+/// creation (deliver.rs).
+pub(crate) fn github_http_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("build GitHub HTTP client")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// All completed checks green (neutral/skipped count as non-blocking).
@@ -58,7 +73,7 @@ pub async fn wait_for_ci(
     timeout_secs: u64,
 ) -> anyhow::Result<Verdict> {
     let start = std::time::Instant::now();
-    let http = reqwest::Client::new();
+    let http = github_http_client()?;
     loop {
         let resp = http
             .get(format!(
@@ -101,7 +116,7 @@ pub async fn wait_for_ci(
 
 /// Close a PR (rejected path). Needs the same token's pulls:write.
 pub async fn close_pr(token: &str, slug: &str, number: u64) -> anyhow::Result<()> {
-    let resp = reqwest::Client::new()
+    let resp = github_http_client()?
         .patch(format!("https://api.github.com/repos/{slug}/pulls/{number}"))
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
@@ -135,7 +150,7 @@ pub fn parse_pr_url(url: &str) -> Option<(String, u64)> {
 
 /// PR 的合并态：merged / open / closed(未合并).
 pub async fn pr_merge_state(token: &str, slug: &str, number: u64) -> anyhow::Result<String> {
-    let resp = reqwest::Client::new()
+    let resp = github_http_client()?
         .get(format!("https://api.github.com/repos/{slug}/pulls/{number}"))
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")

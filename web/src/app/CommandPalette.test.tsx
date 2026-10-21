@@ -6,10 +6,17 @@ import type { IssueListItem } from "../features/issues/types";
 import {
   makeIssue,
   makeIssues,
+  makeProject,
+  mockEvents,
   mockIssueDetail,
+  mockIssues,
   mockMe,
+  mockOverview,
   mockOverviewResources,
+  mockProjects,
+  mockRunners,
   mockTranscript,
+  mockTrends,
   server,
 } from "../test/msw";
 import { renderApp } from "../test/render";
@@ -302,5 +309,54 @@ describe("CommandPalette", () => {
         screen.queryByRole("dialog", { name: "搜索问题单" }),
       ).not.toBeInTheDocument(),
     );
+  });
+
+  // WHY: a query that matches ONLY projects must still render the project rows.
+  // The old empty-state check looked at issues alone, so the project links were
+  // hidden (and Enter could activate an invisible row).
+  it("renders a clickable project row when only projects match", async () => {
+    const project = makeProject({
+      repo: "example.com/acme/ingest",
+      name: "Ingest Service",
+    });
+    server.use(
+      mockMe(),
+      mockOverview(),
+      mockTrends(),
+      mockEvents(),
+      mockProjects([project]),
+      mockRunners(),
+      mockIssues(),
+    );
+    renderApp("/");
+
+    const dialog = await openWithShortcut();
+    const input = within(dialog).getByRole("searchbox", { name: "搜索问题单" });
+    fireEvent.change(input, { target: { value: "ingest" } });
+
+    const projectLink = await within(dialog).findByRole(
+      "link",
+      { name: /Ingest Service/ },
+      { timeout: 3_000 },
+    );
+    expect(projectLink).toHaveAttribute(
+      "href",
+      "/projects/example.com%2Facme%2Fingest",
+    );
+    // The "no issues" empty body must not render while a project row is shown.
+    expect(
+      within(dialog).queryByText("没有匹配的问题单。"),
+    ).not.toBeInTheDocument();
+    expect(within(dialog).getByRole("status")).toHaveTextContent("找到 1 个项目");
+
+    fireEvent.click(projectLink);
+
+    expect(
+      await screen.findByRole(
+        "heading",
+        { level: 2, name: "Ingest Service" },
+        { timeout: 3_000 },
+      ),
+    ).toBeInTheDocument();
   });
 });

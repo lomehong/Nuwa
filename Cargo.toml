@@ -20,7 +20,10 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.79"
+# Honest MSRV: the locked dependency graph (image 0.25, time 0.3.55, sha2 0.11)
+# requires 1.88, so a declared 1.79 could never actually build the workspace.
+# CI compiles on stable; this is the documented floor for local toolchains.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/bigfish1913/pi-rust"
 homepage = "https://rpi.laofu.online/"

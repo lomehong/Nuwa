@@ -1,12 +1,14 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  makeIssue,
   makeRepo,
   makeRunner,
   makeSettings,
   mockIssueDetail,
+  mockIssues,
   mockMe,
   mockOverviewResources,
   mockRepos,
@@ -63,24 +65,6 @@ function toggleSection(name: string) {
 function shellNavLink(name: string) {
   const nav = screen.getByRole("navigation", { name: "主导航" });
   return within(nav).getByRole("link", { name });
-}
-
-/** Click a same-origin anchor that the real shell does not render. The extra
- * capture listener runs after the guard's and cancels jsdom's unimplemented
- * navigation, so the assertion only observes whether the guard opened. */
-function clickInjectedLink(href: string) {
-  const anchor = document.createElement("a");
-  anchor.href = href;
-  anchor.textContent = "当前地址";
-  const stopNavigation = (event: Event) => event.preventDefault();
-  document.addEventListener("click", stopNavigation, true);
-  document.body.append(anchor);
-  try {
-    fireEvent.click(anchor);
-  } finally {
-    document.removeEventListener("click", stopNavigation, true);
-    anchor.remove();
-  }
 }
 
 const LEAVE_DIALOG = "放弃未保存的更改？";
@@ -312,30 +296,107 @@ describe("SettingsPage", () => {
     expect(screen.getByLabelText("Poll interval")).toHaveValue(60);
   });
 
-  it("ignores a current-route link that differs only by a trailing slash", async () => {
+  it("ignores a same-route navigation that differs only by a trailing slash", async () => {
     signedIn();
-    renderApp("/settings");
+    const { router } = renderApp("/settings");
     fireEvent.change(await screen.findByLabelText("Poll interval"), {
       target: { value: "60" },
     });
 
-    clickInjectedLink("/settings/");
+    // A programmatic navigation to the same route must not trip the guard.
+    await act(async () => {
+      await router.navigate("/settings/");
+    });
 
     expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument();
     expect(within(saveBar()).getByText("1 项未保存")).toBeInTheDocument();
   });
 
-  it("ignores a current-route link whose query parameters are reordered", async () => {
+  it("ignores a same-route navigation whose query parameters are reordered", async () => {
     signedIn();
-    renderApp("/settings?a=1&b=2");
+    const { router } = renderApp("/settings?a=1&b=2");
     fireEvent.change(await screen.findByLabelText("Poll interval"), {
       target: { value: "60" },
     });
 
-    clickInjectedLink("/settings?b=2&a=1");
+    await act(async () => {
+      await router.navigate("/settings?b=2&a=1");
+    });
 
     expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument();
     expect(within(saveBar()).getByText("1 项未保存")).toBeInTheDocument();
+  });
+
+  // WHY: the command palette leaves the page through navigate() (a programmatic
+  // PUSH), which the old anchor-click guard could not see. The data-router
+  // blocker must intercept it and ask before dropping the drafts.
+  it("guards the command palette's programmatic navigation while dirty", async () => {
+    server.use(
+      mockMe(),
+      ...mockOverviewResources(),
+      mockSystem(),
+      mockSettings(),
+      mockIssues({
+        data: [makeIssue({ fingerprint: "fp-palette", title: "Palette target panic" })],
+      }),
+    );
+    renderApp("/settings");
+    fireEvent.change(await screen.findByLabelText("Poll interval"), {
+      target: { value: "60" },
+    });
+
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: "搜索问题单" });
+    const input = within(palette).getByRole("searchbox", { name: "搜索问题单" });
+    fireEvent.change(input, { target: { value: "panic" } });
+    await within(palette).findByRole("link", { name: /Palette target panic/ });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    // The palette closed and the leave guard opened instead of navigating away.
+    const dialog = await screen.findByRole("dialog", { name: LEAVE_DIALOG });
+    fireEvent.click(within(dialog).getByRole("button", { name: "留在本页" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument(),
+    );
+    expect(screen.getByRole("heading", { level: 2, name: "设置" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Poll interval")).toHaveValue(60);
+  });
+
+  // WHY: the browser back button (POP) also dropped drafts under the old guard.
+  // The blocker must intercept POP, and cancel must restore the settings page
+  // with its drafts while confirm completes the back navigation.
+  it("guards browser back (POP) while drafts are unsaved", async () => {
+    signedIn();
+    server.use(mockIssues());
+    const { router } = renderApp("/");
+    // Push settings onto the stack so there is a back target, then dirty it.
+    await act(async () => {
+      await router.navigate("/settings");
+    });
+    fireEvent.change(await screen.findByLabelText("Poll interval"), {
+      target: { value: "60" },
+    });
+
+    await act(async () => {
+      await router.navigate(-1);
+    });
+
+    const dialog = await screen.findByRole("dialog", { name: LEAVE_DIALOG });
+    fireEvent.click(within(dialog).getByRole("button", { name: "留在本页" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: LEAVE_DIALOG })).not.toBeInTheDocument(),
+    );
+    expect(screen.getByRole("heading", { level: 2, name: "设置" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Poll interval")).toHaveValue(60);
+
+    // Back again, then confirm: the POP completes and we land on the overview.
+    await act(async () => {
+      await router.navigate(-1);
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "放弃并离开" }));
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "总览" }),
+    ).toBeInTheDocument();
   });
 
   it("warns that a console token change ends the session on restart", async () => {

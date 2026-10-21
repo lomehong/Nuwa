@@ -404,7 +404,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         .map(Path::to_path_buf)
         .context("instructions path has no parent")?;
     let base = resolve_base(&repo_dir)?;
-    let trusted = instructions::TrustedInstructions::load(
+    let mut trusted = instructions::TrustedInstructions::load(
         &repo_dir,
         &instructions_path,
         base,
@@ -492,33 +492,42 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let mut cycles: u64 = 0;
     let result: anyhow::Result<()> = async {
         loop {
-            // Integrity check before any claim: an agent that bypassed the
-            // tool guard cannot persist a weakened failing_check/forbidden
-            // list across a restart.
-            match trusted.verify_and_restore() {
-                Ok(true) => {
-                    eprintln!(
-                        "preflight   : {} was modified — restored from the trusted source",
-                        trusted.path().display()
-                    );
-                    let _ = store.record_event(
-                        "__system__",
-                        now_ms(),
-                        Some(&repo_config.repo),
-                        "runner",
-                        "config_tampered",
-                        "nuwa.repo.json restored from trusted source",
-                    );
-                }
-                Ok(false) => {}
+            // Integrity + freshness check before any claim: re-read the
+            // authoritative config (the base may have moved since the preflight
+            // fetch) and restore the working file. An agent that bypassed the
+            // tool guard cannot persist a weakened failing_check/forbidden list
+            // across a restart, and a base move is adopted rather than running
+            // the stale startup config.
+            let refresh = match trusted.refresh() {
+                Ok(outcome) => outcome,
                 Err(e) => {
                     live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
                     return Err(e);
                 }
+            };
+            if refresh.config_changed {
+                eprintln!("preflight   : trusted instructions changed on base — reloaded");
+            }
+            // A restore that is not a base move means the working file was
+            // tampered with; journal it. (On a base move the file legitimately
+            // differs and is rewritten — that is not tampering.)
+            if refresh.restored && !refresh.config_changed {
+                eprintln!(
+                    "preflight   : {} was modified — restored from the trusted source",
+                    trusted.path().display()
+                );
+                let _ = store.record_event(
+                    "__system__",
+                    now_ms(),
+                    Some(&trusted.instructions.repo),
+                    "runner",
+                    "config_tampered",
+                    "nuwa.repo.json restored from trusted source",
+                );
             }
             let worked = work_once(
                 &store,
-                &repo_config,
+                &trusted.instructions,
                 &repo_dir,
                 sessions_dir.clone(),
                 provider.clone(),
@@ -543,7 +552,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
                 }
             }
             cycles += 1;
-            if cycles % 100 == 0 {
+            if cycles.is_multiple_of(100) {
                 if let Ok(n) = cleanup_sessions(&sessions_dir, &store, now_ms(), 365) {
                     if n > 0 {
                         println!("cleanup     : removed {n} expired session dir(s)");
@@ -1202,6 +1211,7 @@ async fn work_once(
         now,
         now + shanhaijing::DEFAULT_COOLDOWN_MS,
         &repo_config.repo,
+        runner_id,
     )?
     else {
         println!("nothing ready for pickup");
@@ -1399,7 +1409,11 @@ async fn work_once(
                 .await;
             });
         }));
-    let session_dir = sessions_dir.join(prob.short_fingerprint());
+    // Per-run session directory: must match repair.rs's layout so the stored
+    // `session_dir` resolves to this run's own JSONL, not a sibling retry's.
+    let session_dir = sessions_dir
+        .join(prob.short_fingerprint())
+        .join(&run_id);
     let job = repair::RepairJob {
         repo: repo_dir.to_path_buf(),
         issue: prob,
@@ -1410,6 +1424,7 @@ async fn work_once(
         secrets: Arc::clone(secrets),
         notes: repo_config.notes.clone(),
         progress,
+        run_id: Some(run_id.clone()),
     };
 
     live_update(&live, "working", Some(&fp), Some("repair"), None).await;
@@ -1426,6 +1441,11 @@ async fn work_once(
     let report = match repair::run(&job).await {
         Ok(r) => r,
         Err(e) => {
+            // Redact the partial transcript on the failure path too: the model
+            // may have echoed a credential before the run died, and serve reads
+            // this file live for the transcript view. The success path redacts
+            // after `report`; without this, a failed run's secrets persist.
+            let _ = secrets.redact_session_dir(&session_dir);
             let class = classify_failure(&e);
             let detail = bounded_text(&secrets.redact(&format!("repair_failed: {e:#}")));
             let outcome = match class {
@@ -2061,6 +2081,7 @@ async fn run_fix() -> anyhow::Result<()> {
         secrets: Arc::clone(&secrets),
         notes: String::new(),
         progress: None,
+        run_id: None,
     };
     let report = repair::run(&job).await.context("repair run")?;
     let _ = secrets.redact_session_dir(Path::new(&report.session_dir));

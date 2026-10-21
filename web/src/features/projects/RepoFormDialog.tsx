@@ -54,6 +54,22 @@ interface RepoFormValues {
   description: string;
 }
 
+/**
+ * The field values a dialog seeds from, derived once per render from the
+ * current target/prefill. `repo` is the identity the form is bound to.
+ */
+function seedValues(
+  target: RepoDto | null | undefined,
+  prefill: RepoFormPrefill | null | undefined,
+): RepoFormValues {
+  return {
+    repo: target?.repo ?? prefill?.repo ?? "",
+    name: target?.name ?? prefill?.name ?? "",
+    url: target?.url ?? "",
+    description: target?.description ?? "",
+  };
+}
+
 function charCount(value: string): number {
   return Array.from(value).length;
 }
@@ -138,12 +154,16 @@ export function RepoFormDialog({
   const identityLocked = editing || lockIdentity;
   const pending = create.isPending || update.isPending;
 
-  const [repo, setRepo] = useState(target?.repo ?? prefill?.repo ?? "");
-  const [name, setName] = useState(target?.name ?? prefill?.name ?? "");
-  const [url, setUrl] = useState(target?.url ?? "");
-  const [description, setDescription] = useState(target?.description ?? "");
+  const seed = seedValues(target, prefill);
+  const [repo, setRepo] = useState(seed.repo);
+  const [name, setName] = useState(seed.name);
+  const [url, setUrl] = useState(seed.url);
+  const [description, setDescription] = useState(seed.description);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [wasOpen, setWasOpen] = useState(open);
+  // The identity the visible fields were last seeded from. Used to detect that
+  // an already-open dialog has been re-pointed at a different project.
+  const [seededIdentity, setSeededIdentity] = useState(seed.repo);
 
   const dialogRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -153,16 +173,31 @@ export function RepoFormDialog({
   // Every open starts fresh from its target/prefill (same pattern as the
   // command palette): reset during render so a reopened dialog never flashes
   // the previous entry's values.
+  //
+  // WHY the identity branch: this dialog is reused across the same route, so a
+  // history navigation can swap `target` from project A to project B while
+  // `open` stays true. Resetting only on the open transition would leave A's
+  // name/url/description on screen but submit them against B's identity,
+  // writing A onto B. Re-seeding whenever `target?.repo`/`prefill?.repo` changes
+  // keeps the fields, the shown identity and the submit target bound to one
+  // project.
+  const seedFields = () => {
+    setSeededIdentity(seed.repo);
+    setRepo(seed.repo);
+    setName(seed.name);
+    setUrl(seed.url);
+    setDescription(seed.description);
+    setErrors({});
+  };
   if (open !== wasOpen) {
     setWasOpen(open);
     if (open) {
-      setRepo(target?.repo ?? prefill?.repo ?? "");
-      setName(target?.name ?? prefill?.name ?? "");
-      setUrl(target?.url ?? "");
-      setDescription(target?.description ?? "");
-      setErrors({});
+      seedFields();
     }
+  } else if (open && seed.repo !== seededIdentity) {
+    seedFields();
   }
+
 
   function close() {
     if (pending) {
@@ -209,7 +244,11 @@ export function RepoFormDialog({
       setErrors(nextErrors);
       return;
     }
-    const identity = identityLocked && target ? target.repo : values.repo;
+    // Capture the submit target from the seeded `repo` state, NOT from the
+    // `target` prop: the prop can be re-pointed at another project by a render
+    // between opening and submitting, while `repo` is the identity this form
+    // instance was seeded with and stays fixed for this one submission.
+    const identity = identityLocked ? repo : values.repo;
     const onSuccess = () => {
       toast({
         title: editing ? "仓库已更新" : "仓库已添加",
@@ -307,7 +346,7 @@ export function RepoFormDialog({
             <div className="flex w-full flex-col gap-1.5">
               <p className="text-caption font-medium text-text-secondary">仓库标识</p>
               <p className="rounded-card border border-border bg-raised px-3 py-2 font-mono text-body-sm break-all text-text">
-                {target?.repo ?? repo}
+                {repo}
               </p>
               <p className="text-caption text-text-secondary">
                 用于匹配问题单与 runner，例如 example.com/app；登记后不可修改。

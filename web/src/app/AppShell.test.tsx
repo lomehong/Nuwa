@@ -223,6 +223,35 @@ describe("AppShell", () => {
     expect(within(region).getByText("取消限定")).toHaveAttribute("href", "/");
   });
 
+  // WHY: the overview's `queue.ready_count` is the GLOBAL claim queue, so a
+  // project-scoped strip must read the project's own `queued` instead. Alpha has
+  // none while Beta (elsewhere) holds the whole global backlog; the scoped strip
+  // must show 0 for Alpha, never the global 7.
+  it("shows the project's own queue, not the global claim queue", async () => {
+    server.use(
+      mockMe(),
+      mockOverview({ queue: { ready_count: 7, next: [] } }),
+      mockTrends(),
+      mockEvents(),
+      mockIssues(),
+      mockRunners(),
+      mockProjects([
+        makeProject({ repo: "example.com/alpha", name: "Alpha", queued: 0 }),
+        makeProject({ repo: "example.com/beta", name: "Beta", queued: 7 }),
+      ]),
+    );
+    renderApp("/projects/example.com%2Falpha");
+
+    const region = await screen.findByRole("region", { name: "全局状态" });
+    expect(await within(region).findByText("Alpha")).toBeInTheDocument();
+    expect(
+      within(region).getByRole("link", { name: /^队列\s*0$/ }),
+    ).toHaveAttribute("href", "/issues?state=new&repo=example.com%2Falpha");
+    expect(
+      within(region).queryByRole("link", { name: /^队列\s*7$/ }),
+    ).not.toBeInTheDocument();
+  });
+
   it("logs out through the API and returns to the login page", async () => {
     signedIn();
     document.cookie = "nuwa_csrf=logout-token; path=/";

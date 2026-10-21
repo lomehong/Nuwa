@@ -134,7 +134,7 @@ fn build_overview(store: &Store, repo: Option<&str>, now: i64) -> ShanResult<Ove
     let issues: Vec<IssueRow> = store
         .list_issues()?
         .into_iter()
-        .filter(|issue| repo.map_or(true, |repo| issue.repo == repo))
+        .filter(|issue| repo.is_none_or(|repo| issue.repo == repo))
         .collect();
     let by_fingerprint: BTreeMap<&str, &IssueRow> = issues
         .iter()
@@ -270,7 +270,7 @@ fn build_health(
 ) -> ShanResult<Health> {
     let runners: Vec<&RunnerRow> = runners
         .iter()
-        .filter(|runner| repo.map_or(true, |repo| runner.repo == repo))
+        .filter(|runner| repo.is_none_or(|repo| runner.repo == repo))
         .collect();
     let mut health = Health {
         runners_total: runners.len(),

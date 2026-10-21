@@ -76,6 +76,8 @@ fn llm_options(provider: Arc<dyn Provider>, model: Model) -> CompactionLlmOption
         thinking_level: None,
         retry: None,
         custom_instructions: None,
+        // Nuwa 本地补丁(2026-10-21): 新增字段，None 保持旧默认行为。
+        stream_options: None,
     }
 }
 

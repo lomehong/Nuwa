@@ -1,5 +1,5 @@
 import { lazy, Suspense, type ReactNode } from "react";
-import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
+import { Navigate, Outlet, useLocation, type RouteObject } from "react-router-dom";
 
 import { AuthErrorState } from "../components/AuthErrorState";
 import { AuthLoading } from "../components/AuthLoading";
@@ -67,24 +67,47 @@ function RequireAuth() {
  * Route table (docs/09 §10): `/login`, `/` overview, `/issues` list and
  * `/issues/:fp` detail, the read-only `/runners` and `/events` pages, and the
  * schema-driven `/settings` editor. Unknown paths return to the overview.
+ *
+ * WHY a data-router config (`RouteObject[]`) instead of a `<Routes>` element:
+ * both the app (`createBrowserRouter`) and the tests (`createMemoryRouter`)
+ * build their router from this one table, and only a data router exposes
+ * `useBlocker` — which the settings leave guard needs to intercept PUSH,
+ * REPLACE and POP (browser back / command-palette `navigate()`) uniformly. A
+ * declarative `<Routes>` router cannot block POP or programmatic navigation.
  */
-export function AppRoutes() {
-  return (
-    <Routes>
-      <Route path="/login" element={<LoginPage />} />
-      <Route element={<RequireAuth />}>
-        <Route element={<AppShell />}>
-          <Route index element={<OverviewPage />} />
-          <Route path="projects" element={<ProjectsPage />} />
-          <Route path="projects/:repo" element={<ProjectPage />} />
-          <Route path="issues" element={<IssuesPage />} />
-          <Route path="issues/:fp" element={<LazyRoute><IssueDetailPage /></LazyRoute>} />
-          <Route path="runners" element={<RunnersPage />} />
-          <Route path="events" element={<EventsPage />} />
-          <Route path="settings" element={<LazyRoute><SettingsPage /></LazyRoute>} />
-        </Route>
-      </Route>
-      <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
-  );
-}
+export const appRoutes: RouteObject[] = [
+  { path: "/login", element: <LoginPage /> },
+  {
+    element: <RequireAuth />,
+    children: [
+      {
+        element: <AppShell />,
+        children: [
+          { index: true, element: <OverviewPage /> },
+          { path: "projects", element: <ProjectsPage /> },
+          { path: "projects/:repo", element: <ProjectPage /> },
+          { path: "issues", element: <IssuesPage /> },
+          {
+            path: "issues/:fp",
+            element: (
+              <LazyRoute>
+                <IssueDetailPage />
+              </LazyRoute>
+            ),
+          },
+          { path: "runners", element: <RunnersPage /> },
+          { path: "events", element: <EventsPage /> },
+          {
+            path: "settings",
+            element: (
+              <LazyRoute>
+                <SettingsPage />
+              </LazyRoute>
+            ),
+          },
+        ],
+      },
+    ],
+  },
+  { path: "*", element: <Navigate to="/" replace /> },
+];

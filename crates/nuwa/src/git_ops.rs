@@ -100,8 +100,34 @@ pub async fn run_process(
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    let out = stdout_task.await.unwrap_or_default();
-    let err = stderr_task.await.unwrap_or_default();
+    // Bound the pipe drain by the same deadline. A grandchild that inherited
+    // the stdout/stderr pipe (a daemon, a `&`-backgrounded process, a watcher)
+    // keeps the write end open after the direct child exits, so an unbounded
+    // `read_to_end` would hang the call forever even though the command itself
+    // finished. The timeout must cover the whole operation, not just the
+    // child's lifetime — otherwise `git`/check commands with a lingering
+    // descendant defeat the "hard timeout" contract.
+    let drain_budget = timeout
+        .saturating_sub(start.elapsed())
+        .max(Duration::from_millis(50));
+    let (out, err) = match tokio::time::timeout(drain_budget, async {
+        let o = stdout_task.await.unwrap_or_default();
+        let e = stderr_task.await.unwrap_or_default();
+        (o, e)
+    })
+    .await
+    {
+        Ok(pair) => pair,
+        Err(_) => {
+            // The pipe is still held open past the deadline. Kill the tree to
+            // release it and abandon the readers rather than wait; the detached
+            // tasks finish harmlessly once EOF arrives. Report a timeout: the
+            // overall operation exceeded its budget.
+            timed_out = true;
+            kill_tree(pid).await;
+            (Vec::new(), Vec::new())
+        }
+    };
     Ok(ProcessOutput {
         success: status.success(),
         stdout: String::from_utf8_lossy(&out).trim().to_string(),
@@ -354,6 +380,41 @@ mod tests {
         };
         assert!(!status.success());
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn run_process_deadline_covers_a_grandchild_holding_the_pipe() {
+        // A direct child that exits while a backgrounded grandchild keeps the
+        // inherited stdout pipe open must not hang the call past its deadline.
+        // Regression: the drain used to await EOF unbounded after the child
+        // exited, so a lingering descendant defeated the "hard timeout".
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        let (program, args): (&str, &[&str]) = ("sh", &["-c", "sleep 5 & echo done"]);
+        #[cfg(windows)]
+        let (program, args): (&str, &[&str]) = (
+            "cmd",
+            &["/C", "start /B ping -n 6 127.0.0.1 & echo done"],
+        );
+
+        let start = Instant::now();
+        let out = run_process(
+            program,
+            args,
+            dir.path(),
+            Duration::from_millis(300),
+            None,
+        )
+        .await
+        .expect("run_process");
+        let elapsed = start.elapsed();
+        // Bounded by the deadline plus kill/cleanup slack — never the ~5s the
+        // grandchild would otherwise hold the pipe open.
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "run_process waited {elapsed:?} for a pipe a grandchild held open"
+        );
+        assert!(out.timed_out, "exceeding the drain deadline is a timeout");
     }
 
     #[tokio::test]

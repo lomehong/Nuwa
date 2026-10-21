@@ -135,6 +135,23 @@ impl Secrets {
         let _ = take("NUWA_UI_TOKEN", &mut redact_values);
         let _ = take("NUWA_INGEST_TOKEN", &mut redact_values);
         let _ = take("NUWA_WEBHOOK_SECRET", &mut redact_values);
+        // Proxy URLs in the child-env allowlist may embed credentials
+        // (`http://user:password@host`). The build/test child legitimately needs
+        // the value, so it is not removed — but the password must never surface
+        // in a transcript, PR body or evidence. Capture it for redaction.
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "GOPROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            if let Some(value) = vars.get(key) {
+                redact_values.extend(url_passwords(value));
+            }
+        }
         redact_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         redact_values.dedup();
         Self {
@@ -257,6 +274,25 @@ fn secret_patterns() -> &'static [Regex] {
     })
 }
 
+/// Extract the password from any `scheme://user:password@host` userinfo in a
+/// proxy URL, so it can be redacted from persisted output. Values without
+/// userinfo (the common `http://host:port`) yield nothing.
+fn url_passwords(value: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"[a-zA-Z][a-zA-Z0-9+.\-]*://([^/@\s]+)@").expect("valid userinfo pattern")
+    });
+    re.captures_iter(value)
+        .filter_map(|cap| {
+            let userinfo = cap.get(1)?.as_str();
+            userinfo
+                .rsplit_once(':')
+                .map(|(_, password)| password.to_string())
+                .filter(|password| !password.is_empty())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +320,34 @@ mod tests {
         assert!(!vars.contains_key("NUWA_GITHUB_TOKEN"));
         assert!(!vars.contains_key("ZAI_API_KEY"));
         assert!(secrets.redact("token ghp_abcdefghijklmnopqrstuvwx1234").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn proxy_url_password_is_captured_and_redacted() {
+        // The child keeps a working proxy value, but an embedded password must
+        // never reach a transcript / PR body / evidence.
+        let mut vars = vars(&[("HTTPS_PROXY", "http://alice:supersecret@proxy.corp:8080")]);
+        let secrets = Secrets::from_vars(&mut vars);
+        // The proxy value itself is still allowed through to the child.
+        assert_eq!(vars.get("HTTPS_PROXY").map(String::as_str), Some("http://alice:supersecret@proxy.corp:8080"));
+        let redacted = secrets.redact("dialing http://alice:supersecret@proxy.corp:8080");
+        assert!(!redacted.contains("supersecret"), "{redacted}");
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn url_passwords_extracts_only_userinfo_passwords() {
+        assert_eq!(
+            url_passwords("http://user:pw123456@host:8080"),
+            vec!["pw123456".to_string()]
+        );
+        assert!(url_passwords("http://host:8080").is_empty());
+        assert!(url_passwords("https://corp.proxy:3128").is_empty());
+        // A comma-separated GOPROXY list yields each credential.
+        assert_eq!(
+            url_passwords("https://a:pw1234@x,http://b:pw5678@y"),
+            vec!["pw1234".to_string(), "pw5678".to_string()]
+        );
     }
 
     #[test]

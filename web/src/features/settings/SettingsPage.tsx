@@ -9,8 +9,8 @@ import {
   ShieldCheck,
   Trash2,
 } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Link, useLocation, useNavigate } from "react-router-dom";
+import { useEffect, useRef, useState, useCallback, type ReactNode } from "react";
+import { Link, useBlocker, type BlockerFunction } from "react-router-dom";
 
 import {
   Badge,
@@ -832,11 +832,8 @@ export function SettingsPage() {
   const testLlm = useTestSettingsMutation();
   const removeRepo = useDeleteRepoMutation();
   const { toast } = useToast();
-  const location = useLocation();
-  const navigate = useNavigate();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
-  const [pendingHref, setPendingHref] = useState<string | null>(null);
   const [restartOpen, setRestartOpen] = useState(false);
   const [repoDialog, setRepoDialog] = useState<RepoDialogState | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<RepoDto | null>(null);
@@ -874,69 +871,49 @@ export function SettingsPage() {
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
   }, []);
 
-  // In-app navigation guard: links are caught in the capture phase and
-  // default-prevented, so the router's own click handler bails out (it checks
-  // defaultPrevented) while other handlers, such as the drawer's close, still
-  // run. Same-origin plain left clicks only; new tabs, downloads, external,
-  // hash and same-location links pass.
-  useEffect(() => {
-    function handleLinkClick(event: MouseEvent) {
-      if (!dirtyRef.current || event.defaultPrevented || event.button !== 0) {
-        return;
+  // In-app navigation guard via the data router's blocker.
+  //
+  // WHY useBlocker instead of the old capture-phase click listener: a click
+  // listener only ever sees real clicks on `<a href>`, so two ways of leaving
+  // slipped through and silently dropped unsaved drafts — the command palette's
+  // `navigate()` (a programmatic PUSH) and the browser back/forward buttons
+  // (POP). `useBlocker` is the router's single choke point for PUSH, REPLACE and
+  // POP, so one guard now covers link clicks, the palette, and history
+  // navigation, and hands us `proceed()`/`reset()` to drive the same
+  // confirmation dialog the anchor guard used.
+  const shouldBlockNavigation = useCallback<BlockerFunction>(
+    ({ currentLocation, nextLocation }) => {
+      // Same-route moves never lose drafts, so never block them: a trailing
+      // slash (`/settings` vs `/settings/`), a reordered query (`?a=1&b=2` vs
+      // `?b=2&a=1`) or a hash-only jump (the section-nav anchors) all keep the
+      // page mounted. This mirrors the old guard's same-location passthrough.
+      if (
+        normalizePathname(currentLocation.pathname) ===
+          normalizePathname(nextLocation.pathname) &&
+        normalizeSearch(currentLocation.search) === normalizeSearch(nextLocation.search)
+      ) {
+        return false;
       }
-      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
-        return;
-      }
-      const target = event.target;
-      if (!(target instanceof Element)) {
-        return;
+      // Guards read dirty state through the ref so this callback stays stable
+      // and never re-registers on a per-keystroke draft change.
+      if (!dirtyRef.current) {
+        return false;
       }
       // Links inside a dialog this page owns (the restart dialog's active-run
-      // fingerprints) navigate normally: the page unmounts and takes the
-      // dialog with it. Guarding them would stack a second dialog on top of a
-      // modal one. The shell's navigation drawer is also `role="dialog"` but
-      // must still open the guard, so the exemption is explicit.
-      if (target.closest('[role="dialog"][data-allow-navigation]')) {
-        return;
+      // fingerprints) navigate normally: the page unmounts and takes the dialog
+      // with it, so guarding them would stack a second dialog on a modal one.
+      // The blocker only sees locations, not the clicked element, so detect the
+      // dialog's marker in the DOM — it is still mounted at block time. The
+      // shell's navigation drawer is also `role="dialog"` but must still open
+      // the guard, so the exemption stays explicit via `data-allow-navigation`.
+      if (document.querySelector('[role="dialog"][data-allow-navigation]')) {
+        return false;
       }
-      const anchor = target.closest<HTMLAnchorElement>("a[href]");
-      if (!anchor) {
-        return;
-      }
-      if (anchor.target && anchor.target !== "_self") {
-        return;
-      }
-      if (anchor.hasAttribute("download")) {
-        return;
-      }
-      const href = anchor.getAttribute("href");
-      if (!href || href.startsWith("#")) {
-        return;
-      }
-      let url: URL;
-      try {
-        url = new URL(anchor.href, window.location.href);
-      } catch {
-        return;
-      }
-      if (url.origin !== window.location.origin) {
-        return;
-      }
-      const samePathname =
-        normalizePathname(url.pathname) === normalizePathname(location.pathname);
-      const sameSearch = normalizeSearch(url.search) === normalizeSearch(location.search);
-      const sameHash = url.hash === location.hash;
-      if (samePathname && sameSearch && sameHash) {
-        return;
-      }
-      // No stopPropagation: the drawer's NavLink onClick still runs and closes
-      // the drawer while the guard dialog opens.
-      event.preventDefault();
-      setPendingHref(`${url.pathname}${url.search}${url.hash}`);
-    }
-    document.addEventListener("click", handleLinkClick, true);
-    return () => document.removeEventListener("click", handleLinkClick, true);
-  }, [location.pathname, location.search, location.hash]);
+      return true;
+    },
+    [],
+  );
+  const blocker = useBlocker(shouldBlockNavigation);
 
   function handleDraftChange(spec: SettingDto, raw: string) {
     setDrafts((current) => {
@@ -1530,20 +1507,24 @@ export function SettingsPage() {
       </div>
 
       <ConfirmDialog
-        open={pendingHref !== null}
+        open={blocker.state === "blocked"}
         title="放弃未保存的更改？"
         description={`离开后将丢失 ${dirtyCount} 项未保存的修改。`}
         confirmLabel="放弃并离开"
         cancelLabel="留在本页"
         danger
         onConfirm={() => {
-          const href = pendingHref;
-          setPendingHref(null);
-          if (href) {
-            navigate(href);
+          // Discard and continue the blocked navigation (PUSH/REPLACE/POP).
+          if (blocker.state === "blocked") {
+            blocker.proceed();
           }
         }}
-        onCancel={() => setPendingHref(null)}
+        onCancel={() => {
+          // Stay: cancel the blocked navigation and keep the drafts.
+          if (blocker.state === "blocked") {
+            blocker.reset();
+          }
+        }}
       />
 
       <RestartDialog

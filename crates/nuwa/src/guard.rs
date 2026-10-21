@@ -65,6 +65,16 @@ impl Guards {
                         ));
                     }
                 }
+                // A literal `git checkout` substring misses the same subcommand
+                // behind a global option (`git -C . checkout -b probe`,
+                // `git -c x=y reset`), which still moves branches / rewrites
+                // history. Scan tokens so the reserved-subcommand contract holds
+                // regardless of global flags.
+                if let Some(sub) = find_denied_git_subcommand(cmd) {
+                    return Err(format!(
+                        "guard: `git {sub}` is reserved for Nuwa's delivery step — the agent must not run it"
+                    ));
+                }
                 for f in &self.forbidden {
                     if cmd.contains(f.as_str()) {
                         return Err(format!("guard: command references forbidden path `{f}`"));
@@ -76,20 +86,34 @@ impl Guards {
     }
 
     fn check_path(&self, path: &str) -> Result<(), String> {
-        let windows_drive = path.len() >= 2 && path.as_bytes()[1] == b':';
-        if path.starts_with('/') || path.starts_with('\\') || windows_drive {
+        // Judge the path the tool will actually open, not the raw argument:
+        // rpi-tools strips a leading `@` and expands `~` to the home dir before
+        // resolving. Without mirroring that, `@/tmp/x` and `~/x` slip past the
+        // absolute-path check and escape the repository.
+        let normalized = normalize_guard_path(path);
+        if normalized.starts_with('~') {
+            return Err(
+                "guard: `~` (home-relative) paths are not allowed — edit inside the repository"
+                    .to_string(),
+            );
+        }
+        let windows_drive = normalized.len() >= 2 && normalized.as_bytes()[1] == b':';
+        if normalized.starts_with('/') || normalized.starts_with('\\') || windows_drive {
             return Err(
                 "guard: absolute paths are not allowed — edit inside the repository".to_string(),
             );
         }
-        let traverses_up = std::path::Path::new(path)
+        let traverses_up = std::path::Path::new(&normalized)
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir));
         if traverses_up {
             return Err("guard: path traversal (`..`) is not allowed".to_string());
         }
+        // Forbidden globs are written with `/`; a Windows-style `\` separator
+        // must not slip through (`.github\ci.yml` vs forbidden `.github/`).
+        let slashed = normalized.replace('\\', "/");
         for f in &self.forbidden {
-            if path.contains(f.as_str()) {
+            if slashed.contains(f.as_str()) {
                 return Err(format!(
                     "guard: `{path}` hits the forbidden-path list (`{f}`)"
                 ));
@@ -97,6 +121,66 @@ impl Guards {
         }
         Ok(())
     }
+}
+
+/// Mirror rpi-tools' `normalize_tool_path`: fold unicode spaces to ASCII and
+/// strip a single leading `@`, so the guard sees the same path the tool opens.
+fn normalize_guard_path(path: &str) -> String {
+    let trimmed: String = path
+        .chars()
+        .map(|c| if c.is_whitespace() && c != ' ' { ' ' } else { c })
+        .collect();
+    let trimmed = trimmed.trim_start();
+    trimmed.strip_prefix('@').unwrap_or(trimmed).to_string()
+}
+
+/// Git global options that consume the following token as their value.
+const GIT_GLOBAL_OPTS_WITH_VALUE: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+];
+
+/// Reserved git subcommands (the `git `-prefixed entries of [`DENIED_COMMANDS`]).
+const DENIED_GIT_SUBCOMMANDS: &[&str] = &[
+    "push", "checkout", "switch", "reset", "revert", "clean", "branch", "tag",
+];
+
+/// Find a reserved git subcommand even when global options sit between `git`
+/// and the subcommand. Returns the subcommand name, or `None`.
+fn find_denied_git_subcommand(cmd: &str) -> Option<&'static str> {
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "git" {
+            let mut j = i + 1;
+            while j < tokens.len() {
+                let token = tokens[j];
+                if GIT_GLOBAL_OPTS_WITH_VALUE.contains(&token) {
+                    j += 2; // skip the option and its value
+                    continue;
+                }
+                if token.starts_with('-') {
+                    j += 1; // a valueless global flag
+                    continue;
+                }
+                break;
+            }
+            if let Some(sub) = tokens.get(j) {
+                if let Some(matched) = DENIED_GIT_SUBCOMMANDS
+                    .iter()
+                    .find(|denied| *denied == sub)
+                {
+                    return Some(matched);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Build the harness hook. `Some(blocked)` prevents execution; the model gets
@@ -197,5 +281,48 @@ mod tests {
         assert!(guards()
             .check("bash", &json!({"command": "printf x > nuwa.repo.json"}))
             .is_err());
+    }
+
+    #[test]
+    fn at_prefixed_and_home_relative_paths_are_blocked() {
+        // rpi-tools strips a leading `@` and expands `~`; the guard must judge
+        // the resolved target, so both escape attempts are rejected.
+        assert!(guards()
+            .check("write", &json!({"path": "@/tmp/escape.go"}))
+            .is_err());
+        assert!(guards()
+            .check("write", &json!({"path": "~/escape.go"}))
+            .is_err());
+    }
+
+    #[test]
+    fn windows_separator_does_not_slip_past_forbidden_prefix() {
+        assert!(guards()
+            .check("write", &json!({"path": r".github\workflows\ci.yml"}))
+            .is_err());
+    }
+
+    #[test]
+    fn git_subcommand_behind_global_options_is_blocked() {
+        for cmd in [
+            "git -C . checkout -b probe",
+            "git -c user.email=a@b reset --hard HEAD~1",
+            "git --no-pager push origin main",
+        ] {
+            match guards().check("bash", &json!({"command": cmd})) {
+                Err(err) => assert!(err.contains("delivery step"), "{cmd}: {err}"),
+                Ok(()) => panic!("`{cmd}` must be blocked"),
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_git_read_commands_are_allowed() {
+        for cmd in ["git status", "git --no-pager log -1", "git diff"] {
+            assert!(
+                guards().check("bash", &json!({"command": cmd})).is_ok(),
+                "`{cmd}` is read-only and must pass"
+            );
+        }
     }
 }

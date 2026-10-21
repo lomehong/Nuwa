@@ -167,7 +167,7 @@ async fn create_pr_via_api(
     body: &str,
     draft: bool,
 ) -> anyhow::Result<(String, u64)> {
-    let resp = reqwest::Client::new()
+    let resp = crate::ci::github_http_client()?
         .post(format!("https://api.github.com/repos/{slug}/pulls"))
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")

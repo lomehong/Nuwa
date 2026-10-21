@@ -738,12 +738,24 @@ fn read_settings(
     })
 }
 
+/// Serializes the whole settings read-modify-write. Two concurrent PUTs that
+/// each read the old file and write back their own change would otherwise lose
+/// one update (last writer wins) and race on the temp file. A blocking mutex is
+/// fine here: `write_settings` already runs on the blocking pool.
+static SETTINGS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn write_settings(
     store: &Store,
     path: &Path,
     updates: &BTreeMap<String, Value>,
     now: i64,
 ) -> Result<PutSettingsResponse, ApiError> {
+    // Hold the lock across read → validate → backup → write → audit so the file
+    // is never a torn merge of two requests. A poisoned lock (a prior panic)
+    // must not wedge settings forever.
+    let _write_guard = SETTINGS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -854,6 +866,20 @@ fn validate_updates(
             fields.insert(
                 key.clone(),
                 "must not contain line breaks or control characters".to_string(),
+            );
+            continue;
+        }
+        // systemd `EnvironmentFile=` strips surrounding quotes and processes
+        // backslash escapes, while nuwa's own `parse_env` reads the value raw.
+        // A value containing `"` or `\` would therefore load differently at
+        // runtime than it validates/displays here — e.g. a UI token saved as
+        // `"alpha"` becomes `alpha` under systemd, locking the owner out. No
+        // legitimate value for these keys (tokens, URLs, numbers, identifiers,
+        // unit names) needs either character, so reject rather than corrupt.
+        if raw_text.contains('"') || raw_text.contains('\\') {
+            fields.insert(
+                key.clone(),
+                "must not contain quote or backslash characters".to_string(),
             );
             continue;
         }
@@ -1603,6 +1629,37 @@ mod tests {
                 .expect("events")
                 .is_empty(),
             "a rejected PUT must not journal any config event"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_rejects_quote_and_backslash_values_that_systemd_would_rewrite() {
+        // systemd EnvironmentFile strips surrounding quotes and unescapes
+        // backslashes; nuwa's parse_env reads raw. A token saved as `"alpha"`
+        // would load as `alpha` at runtime and lock the owner out, so reject.
+        let file = "NUWA_UI_TOKEN=good-token-1234\n";
+        let (_dir, app, _store, env_path) = test_app(Some(file));
+        let csrf = csrf_token(&app).await;
+
+        let response = put_json(
+            &app,
+            r#"{"values":{
+                "NUWA_UI_TOKEN":"\"quoted-token\"",
+                "NUWA_GITHUB_TOKEN":"back\\slash"
+            }}"#,
+            Some(&csrf),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value = json_body(response).await;
+        assert_eq!(value["error"]["code"], "validation_failed");
+        for key in ["NUWA_UI_TOKEN", "NUWA_GITHUB_TOKEN"] {
+            assert!(value["error"]["fields"][key].is_string(), "{key}: {value}");
+        }
+        assert_eq!(
+            std::fs::read(&env_path).expect("read env"),
+            file.as_bytes(),
+            "a rejected PUT must leave the file byte-identical"
         );
     }
 

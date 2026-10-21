@@ -177,6 +177,25 @@ pub trait FileSystem: Send + Sync {
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<u8>, FileError>;
 
+    /// Nuwa 本地补丁(2026-10-21): 有界范围读取 `[offset, offset+len)`（越过 EOF
+    /// 的部分截断，返回空表示 offset 已在 EOF 之后）。read 工具用它做流式分块
+    /// 扫描与图片大小上限检查，避免大文件被 `read_binary_file` 全量载入内存。
+    /// 默认实现基于全量读+切片（内存假环境本来就整体持有文件，语义等价）；
+    /// 真实 OS 环境（`OsExecutionEnv`）覆写为 open+seek+take 的真有界读取。
+    /// 新增的是带默认实现的 trait 方法，既有 `FileSystem` 实现无需改动。
+    async fn read_binary_file_range(
+        &self,
+        path: &str,
+        offset: u64,
+        len: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<u8>, FileError> {
+        let bytes = self.read_binary_file(path, cancel).await?;
+        let start = (offset as usize).min(bytes.len());
+        let end = start.saturating_add(len).min(bytes.len());
+        Ok(bytes[start..end].to_vec())
+    }
+
     /// Creates parent directories (recursive) automatically. Mirrors TS
     /// `writeFile`.
     async fn write_file(

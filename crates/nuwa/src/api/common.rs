@@ -76,7 +76,7 @@ pub(crate) fn parse_page_number(
         return default;
     };
     match raw.parse::<u64>() {
-        Ok(value) if value >= 1 && max.map_or(true, |max| value <= max) => value,
+        Ok(value) if value >= 1 && max.is_none_or(|max| value <= max) => value,
         Ok(_) => {
             let message = match max {
                 Some(max) => format!("must be between 1 and {max}"),

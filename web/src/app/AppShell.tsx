@@ -314,6 +314,14 @@ export function HealthStrip({ scope }: { scope: string | null }) {
       health,
       queue,
     } = overview.data;
+    // WHY: the server's `queue.ready_count` is the GLOBAL claim queue (see
+    // crates/nuwa/src/api/overview.rs build_queue: "claim queue is global"), so
+    // it ignores the repo filter. Under a project scope the figure links to
+    // `?state=new&repo=<scope>` (a project-only list), which let a global
+    // backlog masquerade as the project's own — a phantom backlog. Use the
+    // project's `queued` (its count of state=new issues, per projects.rs) so the
+    // number matches the list it links to; keep the global count for "全部项目".
+    const queueCount = scope ? (project?.queued ?? 0) : queue.ready_count;
     content = (
       <>
         {scopeName ? (
@@ -347,7 +355,7 @@ export function HealthStrip({ scope }: { scope: string | null }) {
         <StatusFigure
           to={`/issues?state=new${repoQuery}`}
           label="队列"
-          value={queue.ready_count}
+          value={queueCount}
         />
         <StatusDivider />
         <StatusFigure

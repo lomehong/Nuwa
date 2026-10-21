@@ -372,7 +372,18 @@ pub fn diff_summary(
     forbidden_paths: &[String],
 ) -> anyhow::Result<DiffSummary> {
     let mut summary = DiffSummary::default();
-    let status = git_ops::git(repo, &["status", "--porcelain=v1", "-z"])?;
+    // Raw bytes, never trimmed: porcelain `XY path` records carry a meaningful
+    // leading status column (` M` = modified-not-staged), and the shared `git()`
+    // helper trims, which would corrupt the first record (` M go.sum` → path
+    // `o.sum`) and silently miss a forbidden file. `--untracked-files=all`
+    // lists untracked files individually instead of folding a new directory to
+    // `dir/`, so a forbidden file inside it is matched the same way `git add -A`
+    // would stage it.
+    let status_bytes = git_ops::git_raw(
+        repo,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    let status = String::from_utf8_lossy(&status_bytes);
     let mut parts = status.split('\0').filter(|part| !part.is_empty());
     while let Some(entry) = parts.next() {
         if entry.len() < 4 {
@@ -669,6 +680,47 @@ mod tests {
         assert!(
             summary.forbidden_hits.iter().any(|hit| hit.contains("deploy.pem")),
             "{:?}",
+            summary.forbidden_hits
+        );
+    }
+
+    #[test]
+    fn forbidden_glob_matches_file_inside_a_new_untracked_directory() {
+        // Regression: porcelain folded a wholly-new directory to `cfg/`, so a
+        // forbidden `cfg/key.pem` inside it was never matched, yet `git add -A`
+        // staged it for delivery. `--untracked-files=all` lists the file itself.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        std::fs::create_dir(repo.join("cfg")).expect("mkdir");
+        std::fs::write(repo.join("cfg/key.pem"), "key\n").expect("write");
+        let summary = diff_summary(&repo, "main", &["*.pem".to_string()]).expect("diff");
+        assert!(
+            summary
+                .forbidden_hits
+                .iter()
+                .any(|hit| hit.contains("cfg/key.pem")),
+            "nested untracked forbidden file must be caught: {:?}",
+            summary.forbidden_hits
+        );
+    }
+
+    #[test]
+    fn forbidden_glob_matches_a_modified_tracked_file() {
+        // Regression: the shared `git()` helper trimmed porcelain output, so a
+        // ` M go.sum` record (leading status space) parsed as path `o.sum` and
+        // the forbidden `go.sum` was missed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(repo.join("go.sum"), "module hash\n").expect("write");
+        git(&repo, &["add", "go.sum"]);
+        git(&repo, &["commit", "-m", "add go.sum"]);
+        std::fs::write(repo.join("go.sum"), "module hash CHANGED\n").expect("rewrite");
+        let summary = diff_summary(&repo, "main", &["go.sum".to_string()]).expect("diff");
+        assert!(
+            summary.forbidden_hits.iter().any(|hit| hit.contains("go.sum")),
+            "a modified tracked forbidden file must be caught: {:?}",
             summary.forbidden_hits
         );
     }

@@ -171,6 +171,31 @@ describe("项目工位", () => {
 
     expect(await screen.findByText("找不到这个项目")).toBeInTheDocument();
   });
+
+  // WHY: `useParams` already decodes, so a second `decodeURIComponent` on an
+  // identity containing a literal `%` used to throw `URIError` and blank the
+  // page. The project workstation must render it verbatim.
+  it("renders a project whose identity contains a literal percent sign", async () => {
+    const percentRepo = "corp/50%done";
+    server.use(
+      mockMe(),
+      mockOverview(),
+      mockTrends(),
+      mockEvents(),
+      mockIssues(),
+      mockRunners(),
+      mockProjects([makeProject({ repo: percentRepo, name: "Half Done" })]),
+    );
+    renderApp(`/projects/${encodeURIComponent(percentRepo)}`);
+
+    // The percent-bearing identity resolves to the real project (no throw, no
+    // "not found"), and the mono caption shows the exact stored identity.
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "Half Done" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("找不到这个项目")).not.toBeInTheDocument();
+    expect(screen.getAllByText(percentRepo).length).toBeGreaterThan(0);
+  });
 });
 
 describe("项目登记编辑", () => {

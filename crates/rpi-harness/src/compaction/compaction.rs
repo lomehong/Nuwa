@@ -158,6 +158,12 @@ pub struct CompactionLlmOptions {
     pub thinking_level: Option<ThinkingLevel>,
     pub retry: Option<RetryPolicy>,
     pub custom_instructions: Option<String>,
+    /// Nuwa 本地补丁(2026-10-21): harness 钉住的 stream options（timeout /
+    /// max_retries 等）。摘要请求过去总是重建默认 `SimpleStreamOptions`，丢掉
+    /// 调用方 pin 的限制（nuwa pin 了 120s/1 次重试），compaction 请求会退回
+    /// provider 默认 600s 超时。`None` 保持旧默认行为（字段扩展用 Default 兜底，
+    /// 既有调用方不受影响）。
+    pub stream_options: Option<crate::types::AgentHarnessStreamOptions>,
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +607,13 @@ fn turn_prefix_max_tokens(reserve_tokens: i64, model_max_tokens: u64) -> u64 {
 /// only when the model reasons AND a non-`Off` level is set — mirrors TS).
 fn build_summary_options(opts: &CompactionLlmOptions, max_tokens: u64) -> SimpleStreamOptions {
     let mut o = SimpleStreamOptions::default();
+    // Nuwa 本地补丁(2026-10-21): 先合并调用方 pin 的 stream options
+    // (timeout/max_retries/max_retry_delay/headers 等)，摘要请求必须继承 harness
+    // 的限制而不是退回 provider 默认值；随后按原逻辑覆盖本函数负责的字段
+    // (api_key/signal/max_tokens/reasoning)，这些字段 merge_into 不会触碰。
+    if let Some(pinned) = &opts.stream_options {
+        o = pinned.merge_into(o);
+    }
     o.api_key = opts.api_key.clone();
     o.signal = opts.signal.clone();
     o.max_tokens = Some(max_tokens);

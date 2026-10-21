@@ -259,11 +259,16 @@ export function CommandPalette({ open, onClose, returnFocusRef }: CommandPalette
     !waitingForDebounce &&
     !search.isPending &&
     !search.isError;
+  // WHY: emptiness must count project matches too, otherwise a query that hits
+  // only projects would announce "no issues" while project rows are on screen.
+  const resultCount = projectMatches.length + issues.length;
   const announcement = !settled
     ? ""
-    : issues.length === 0
+    : resultCount === 0
       ? "没有匹配的问题单"
-      : `找到 ${issues.length} 条问题单`;
+      : issues.length === 0
+        ? `找到 ${projectMatches.length} 个项目`
+        : `找到 ${issues.length} 条问题单`;
 
   function activate(entry: PaletteEntry) {
     onClose();
@@ -361,7 +366,7 @@ export function CommandPalette({ open, onClose, returnFocusRef }: CommandPalette
         </button>
       </div>
     );
-  } else if (issues.length === 0) {
+  } else if (projectMatches.length + issues.length === 0) {
     body = (
       <div className="px-4 py-6">
         <p className="text-body-sm text-text-secondary">没有匹配的问题单。</p>

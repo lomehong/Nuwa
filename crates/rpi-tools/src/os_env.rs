@@ -478,6 +478,39 @@ impl FileSystem for OsExecutionEnv {
         read_cancellable(&abs, cancel).await
     }
 
+    /// Nuwa 本地补丁(2026-10-21): 真有界范围读取（open+seek+take），只把请求的
+    /// 字节段载入内存。read 工具靠它对大文件做流式分块扫描（默认实现会退化为
+    /// 全量读，正是被修的 OOM 形状）。错误映射与取消语义与 `read_binary_file`
+    /// 保持一致。
+    async fn read_binary_file_range(
+        &self,
+        path: &str,
+        offset: u64,
+        len: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<u8>, FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let abs = Self::resolve_path(&self.cwd, path);
+        let read = async {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let mut f = tokio::fs::File::open(&abs).await?;
+            f.seek(std::io::SeekFrom::Start(offset)).await?;
+            let mut buf = Vec::new();
+            f.take(len as u64).read_to_end(&mut buf).await?;
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        };
+        let res = match cancel {
+            Some(t) => tokio::select! {
+                r = read => r,
+                _ = t.cancelled() => {
+                    return Err(FileError::aborted().with_path(abs.to_string_lossy()))
+                }
+            },
+            None => read.await,
+        };
+        res.map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))
+    }
+
     async fn write_file(
         &self,
         path: &str,
@@ -1049,8 +1082,24 @@ impl Shell for OsExecutionEnv {
             // the inherited pipes, so reading to EOF waits for a process the
             // command no longer owns. No timeout rescues that: the timeout wraps
             // `child.wait()` and the child already exited successfully.
+            //
+            // Nuwa 本地补丁(2026-10-21): 旧实现先 `(&mut status_fut).await` 再 join 读流。
+            // 子进程输出超过管道缓冲(~64KB)时 write 阻塞 → 子进程不退出 → status_fut
+            // 不返回 → 读流永不推进，活锁直到超时（实测 256KiB 输出必然触发）。改为
+            // select! 并发驱动 status_fut 与 stdout/stderr 读流：子进程运行期间读取持续
+            // 推进，写端不会阻塞。子进程仍是 driver——status_fut 完成立即 break，随后
+            // 对残留 stdio 只给 EXIT_STDIO_GRACE_MS 排水预算，保持上面注释描述的
+            // "孙进程持有管道时不等 EOF" 语义不变。
             tokio::pin!(status_fut, stdout_task, stderr_task);
-            let status_res = (&mut status_fut).await;
+            let mut stdout_done = false;
+            let mut stderr_done = false;
+            let status_res = loop {
+                tokio::select! {
+                    _ = &mut stdout_task, if !stdout_done => { stdout_done = true; }
+                    _ = &mut stderr_task, if !stderr_done => { stderr_done = true; }
+                    status = &mut status_fut => break status,
+                }
+            };
             // Drain what is already in the pipe — a completed write is already in
             // the pipe buffer, so this is not a race — then stop, without waiting
             // for an EOF that may never come. A command whose own process is gone
@@ -1058,7 +1107,20 @@ impl Shell for OsExecutionEnv {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS),
                 async {
-                    let _ = tokio::join!(&mut stdout_task, &mut stderr_task);
+                    // Nuwa 本地补丁(2026-10-21): 只排水尚未读完的流（select 循环里
+                    // 已跑到 EOF 的 future 不能再被 poll）。
+                    tokio::join!(
+                        async {
+                            if !stdout_done {
+                                (&mut stdout_task).await;
+                            }
+                        },
+                        async {
+                            if !stderr_done {
+                                (&mut stderr_task).await;
+                            }
+                        },
+                    );
                 },
             )
             .await;

@@ -64,7 +64,7 @@ impl AppState {
     /// unset everywhere so a hand-built state cannot accept any login while
     /// the session middleware still demands a cookie.
     pub fn local_mode(&self) -> bool {
-        self.ui_token.as_deref().map_or(true, str::is_empty)
+        self.ui_token.as_deref().is_none_or(str::is_empty)
     }
 }
 

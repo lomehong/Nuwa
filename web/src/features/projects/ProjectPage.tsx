@@ -58,8 +58,12 @@ function LedgerStat({
  * the runner and PR quota look like, and how it has been trending.
  */
 export function ProjectPage() {
-  const { repo = "" } = useParams<{ repo: string }>();
-  const decoded = decodeURIComponent(repo);
+  // WHY: `useParams` already percent-decodes the path segment, so decoding a
+  // second time corrupts identities. A repo containing a literal `%` (e.g.
+  // `corp/50%done`) makes `decodeURIComponent` throw `URIError`, and `corp/a%20b`
+  // would be silently rewritten to a different identity `corp/a b`. Use the
+  // param verbatim.
+  const decoded = useParams<{ repo: string }>().repo ?? "";
   const projects = useProjectsQuery();
   const overview = useOverviewQuery(decoded);
   const trends = useTrendsQuery("14d", decoded);

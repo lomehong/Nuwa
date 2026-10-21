@@ -546,7 +546,11 @@ pub(crate) fn write_env_atomic(path: &std::path::Path, contents: &str) -> Result
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = path.with_extension("env.tmp");
+        // A unique temp name: two concurrent writers (or a migrate racing a
+        // PUT) must not share `nuwa.env.tmp`, where one could rename or delete
+        // the other's half-written file. The write lock in api/settings.rs
+        // serializes PUTs, but migrate-env is a separate entry point.
+        let tmp = path.with_extension(format!("env.{}.tmp", uuid::Uuid::new_v4().simple()));
         let write = (|| -> std::io::Result<()> {
             std::fs::write(&tmp, contents)?;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;

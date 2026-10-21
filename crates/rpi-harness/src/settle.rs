@@ -43,6 +43,8 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use rpi_agent::{AgentEmitter, AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, StopReason};
+// Nuwa 本地补丁(2026-10-21): 关键持久化失败需要立即取消整个 run，引入 run 的取消令牌。
+use tokio_util::sync::CancellationToken;
 
 use crate::agent_harness::AgentHarness;
 use crate::session::types::{
@@ -120,6 +122,15 @@ pub struct SettleState {
     /// A final assistant normally waits for run-end persistence. If a queued
     /// message continues this run, commit that assistant before the injection.
     uncommitted_assistant: Mutex<Option<(usize, usize, AssistantMessage)>>,
+    // Nuwa 本地补丁(2026-10-21): 关键持久化(assistant 提交 / tool_started)失败必须
+    // 终止 run——"先持久化后执行"是崩溃恢复的前提，只 warn 继续会让工具在没有任何
+    //  durable 记录的情况下裸跑。仿照 agent_harness 的 `context_write_error`
+    // error-capture 模式：这里记录失败并取消 run 令牌，由 run 循环在收尾处取出并
+    // 转成 `HarnessError::io` 返回，避免改动 `emit`/settle 的既有签名。
+    /// 关键持久化失败的捕获槽（首条错误生效）。
+    critical_error: Mutex<Option<String>>,
+    /// run 的取消令牌；关键持久化失败时取消，阻止后续工具继续执行。
+    cancel_signal: Mutex<Option<CancellationToken>>,
 }
 
 impl SettleState {
@@ -147,7 +158,37 @@ impl SettleState {
             reserved_results: Mutex::new(BTreeMap::new()),
             injected: Mutex::new(VecDeque::new()),
             uncommitted_assistant: Mutex::new(None),
+            // Nuwa 本地补丁(2026-10-21): 关键持久化失败捕获 + run 取消令牌（见字段注释）。
+            critical_error: Mutex::new(None),
+            cancel_signal: Mutex::new(None),
         }
+    }
+
+    /// Nuwa 本地补丁(2026-10-21): 注册 run 的取消令牌。新增 setter 而不是改
+    /// `SettleState::new` 的签名，保持公开 API 稳定（nuwa 侧依赖现有签名）。
+    pub fn set_cancel_signal(&self, signal: CancellationToken) {
+        *self.cancel_signal.lock().unwrap() = Some(signal);
+    }
+
+    /// Nuwa 本地补丁(2026-10-21): 记录一条关键持久化失败并取消 run。首条错误
+    /// 生效（后续错误只记日志）；取消令牌让 agent loop 在工具真正执行前中止
+    /// （`prepare_tool_call` 会检查 signal），run 循环收尾处通过
+    /// [`SettleState::take_critical_error`] 把失败转成 `HarnessError::io`。
+    fn fail_critical(&self, what: &str, error: &dyn std::fmt::Display) {
+        tracing::error!(%error, "{what} failed; aborting the run");
+        self.critical_error
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| format!("{what} failed: {error}"));
+        if let Some(signal) = self.cancel_signal.lock().unwrap().clone() {
+            signal.cancel();
+        }
+    }
+
+    /// Nuwa 本地补丁(2026-10-21): 取出（并清空）关键持久化失败信息，供 run
+    /// 循环在收尾处转成 `HarnessError` 返回。
+    pub(crate) fn take_critical_error(&self) -> Option<String> {
+        self.critical_error.lock().unwrap().take()
     }
 
     /// Register a message the run is about to inject, with the entry id its
@@ -301,7 +342,11 @@ impl SettlingEmitter {
             .prepare_commit(index, &entry_id, &self.harness)
             .await
         {
-            tracing::warn!(%error, "could not bind a settled assistant stream");
+            // Nuwa 本地补丁(2026-10-21): 流绑定失败会让下面的提交被跳过，等效于
+            // assistant 提交失败——这是关键持久化（tool_started 依赖该 entry），
+            // 必须终止 run，不能让工具在无持久化记录的情况下继续执行。
+            self.state
+                .fail_critical("settled assistant stream bind", &error);
             return;
         }
         match self.harness.append_provisioned(entry).await {
@@ -336,7 +381,12 @@ impl SettlingEmitter {
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, "could not commit a settled assistant message");
+                // Nuwa 本地补丁(2026-10-21): assistant 提交是关键持久化——它承载的
+                // tool call 马上要执行，提交失败意味着 tool_started 无处挂靠、崩溃后
+                // 无法恢复"哪个工具的副作用未知"。必须终止 run（旧行为 warn 后继续，
+                // 工具照常执行，破坏"先持久化后执行"契约）。
+                self.state
+                    .fail_critical("settled assistant message commit", &error);
             }
         }
     }
@@ -394,7 +444,11 @@ impl SettlingEmitter {
             replay,
         };
         if let Err(error) = self.harness.write_tool_started(record).await {
-            tracing::warn!(%error, tool_call_id, "could not record a tool_started frame");
+            // Nuwa 本地补丁(2026-10-21): tool_started 是关键持久化——它是崩溃后
+            // 判定"哪个工具的副作用未知"的唯一记录。写入失败时旧行为 warn 后照常
+            // 执行工具（裸跑）；现在必须取消 run 并让上层以错误终止。emit 在工具
+            // prepare/execute 之前被 await，此处取消可赶在副作用发生前中止。
+            self.state.fail_critical("tool_started record", &error);
         }
     }
 

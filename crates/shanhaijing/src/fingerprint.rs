@@ -19,8 +19,21 @@ pub fn parse(language: &str, stack: &str) -> (String, Vec<String>) {
     }
 }
 
-/// Fingerprint = SHA-256 over `lang|error_class|frame|frame|…`.
-pub fn compute(language: &str, message: Option<&str>, stack: &str) -> String {
+/// Fingerprint = SHA-256 over `repo|lang|error_class|frame|frame|…`.
+///
+/// The repo is part of the identity: two repositories that happen to share a
+/// fully-qualified symbol path and error message (forks, vendored copies) are
+/// still two separate bugs in two separate codebases, and must not collapse
+/// into one issue row that only one runner can claim. `fingerprint` stays the
+/// single primary key, so URLs/runs/events are unchanged — the value simply
+/// becomes repo-qualified.
+///
+/// Contract with the 青鸟 SDK: `panicFingerprint` must hash the same layout
+/// (`repo|lang|error_class|frames…`, repo first) so client-side throttling and
+/// server-side aggregation agree. The server always recomputes and ignores any
+/// client value, so a lagging SDK only affects its own throttle key, never
+/// aggregation correctness.
+pub fn compute(repo: &str, language: &str, message: Option<&str>, stack: &str) -> String {
     let (error_class, frames) = parse(language, stack);
     let error_class = match message {
         // An explicit headline (e.g. the first log line) wins when present.
@@ -28,6 +41,8 @@ pub fn compute(language: &str, message: Option<&str>, stack: &str) -> String {
         _ => error_class,
     };
     let mut hasher = Sha256::new();
+    hasher.update(repo.as_bytes());
+    hasher.update(b"|");
     hasher.update(language.as_bytes());
     hasher.update(b"|");
     hasher.update(error_class.as_bytes());
@@ -120,14 +135,44 @@ fn parse_go(stack: &str) -> (String, Vec<String>) {
             }
             // other indented lines (call args) are ignored
         } else if trimmed.contains('(') {
-            // `pkg.Func(args...)` → keep `pkg.Func` only.
-            pending_func = Some(trimmed.split('(').next().unwrap_or(trimmed).to_string());
+            // `pkg.Func(args...)` → keep `pkg.Func`; `pkg.(*Recv).Method(args)`
+            // → keep `pkg.(*Recv).Method` (a pointer receiver must not be
+            // truncated at its own paren, or Average and Median on the same
+            // type would collapse into one fingerprint).
+            pending_func = Some(go_func_symbol(trimmed).to_string());
         }
     }
     if error_class.is_empty() {
         error_class = parse_generic(stack).0;
     }
     (error_class, frames)
+}
+
+/// Strip a Go frame's trailing argument list, keeping the full function symbol.
+/// The argument list is the final balanced paren group; a pointer receiver's
+/// own parens are nested before it, so scanning back to the matching `(` of the
+/// terminal `)` preserves `pkg.(*Recv).Method`.
+fn go_func_symbol(line: &str) -> &str {
+    if !line.ends_with(')') {
+        // No argument list to strip (`pkg.Func` with no parens, or a frame that
+        // does not end in a call) — keep it whole.
+        return line;
+    }
+    let bytes = line.as_bytes();
+    let mut depth = 0usize;
+    for (i, &b) in bytes.iter().enumerate().rev() {
+        match b {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &line[..i];
+                }
+            }
+            _ => {}
+        }
+    }
+    line
 }
 
 fn is_go_noise(func: &str) -> bool {
@@ -248,22 +293,55 @@ mod tests {
         created by testing.(*T).Run in goroutine 1\n\
         \tC:/Program Files/Go/src/testing/testing.go:1851 +0x3f6";
 
+    /// The repo the SDK golden test pins; both sides must hash this same value.
+    const GOLDEN_REPO: &str = "example.com/spike-target";
+
     #[test]
     fn go_trace_is_normalized_and_stable() {
-        let a = compute("go", None, GO_TRACE);
+        let a = compute(GOLDEN_REPO, "go", None, GO_TRACE);
         // Same bug, different index/length/addresses/line drift.
         let drifted = GO_TRACE
             .replace("[3] with length 3", "[9] with length 9")
             .replace("calc.go:17", "calc.go:21")
             .replace("+0x8c", "+0x91");
-        let b = compute("go", None, &drifted);
+        let b = compute(GOLDEN_REPO, "go", None, &drifted);
         assert_eq!(a, b, "volatile parts must not change the fingerprint");
+    }
+
+    #[test]
+    fn different_repo_is_different_fingerprint() {
+        // The same stack in two repositories is two bugs, not one: a shared
+        // fingerprint would let repo A's issue swallow repo B's reports and
+        // leave B's runner with nothing to claim.
+        let a = compute("example.com/acme/a", "go", None, GO_TRACE);
+        let b = compute("example.com/acme/b", "go", None, GO_TRACE);
+        assert_ne!(a, b, "repo must be part of the issue identity");
+    }
+
+    #[test]
+    fn go_pointer_receiver_methods_are_distinct() {
+        // `pkg.(*Calc).Average` and `pkg.(*Calc).Median` must not collapse: the
+        // old `split('(')` truncated both to `pkg.`.
+        let avg = "panic: boom\n\ngoroutine 1 [running]:\n\
+            example.com/app.(*Calc).Average(0x1)\n\t/app/calc.go:17 +0x8c\n";
+        let med = "panic: boom\n\ngoroutine 1 [running]:\n\
+            example.com/app.(*Calc).Median(0x1)\n\t/app/calc.go:17 +0x8c\n";
+        assert_ne!(
+            compute(GOLDEN_REPO, "go", None, avg),
+            compute(GOLDEN_REPO, "go", None, med),
+            "distinct pointer-receiver methods must fingerprint differently"
+        );
+        let (_, frames) = parse("go", avg);
+        assert_eq!(frames[0], "example.com/app.(*Calc).Average@calc.go", "{frames:?}");
     }
 
     #[test]
     fn different_error_is_different_fingerprint() {
         let other = GO_TRACE.replace("index out of range", "nil pointer dereference");
-        assert_ne!(compute("go", None, GO_TRACE), compute("go", None, &other));
+        assert_ne!(
+            compute(GOLDEN_REPO, "go", None, GO_TRACE),
+            compute(GOLDEN_REPO, "go", None, &other)
+        );
     }
 
     #[test]
@@ -300,8 +378,8 @@ mod tests {
 
     #[test]
     fn explicit_message_wins_over_derived() {
-        let derived = compute("go", None, GO_TRACE);
-        let explicit = compute("go", Some("reporter crashed on window N"), GO_TRACE);
+        let derived = compute(GOLDEN_REPO, "go", None, GO_TRACE);
+        let explicit = compute(GOLDEN_REPO, "go", Some("reporter crashed on window N"), GO_TRACE);
         assert_ne!(derived, explicit);
     }
 
@@ -316,6 +394,9 @@ mod tests {
     /// equal the server-side one, otherwise the same panic aggregates under two
     /// different keys depending on who computed it. The SDK pins the same
     /// constant, so a divergence breaks one of the two test suites.
+    ///
+    /// The repo is now part of the identity (see [`compute`]); the SDK must hash
+    /// `repo|lang|error_class|frames…` with the same repo string to stay aligned.
     #[test]
     fn go_panic_fingerprint_matches_the_sdk_golden() {
         let trace = "panic: runtime error: index out of range [3] with length 3
@@ -329,8 +410,8 @@ created by testing.(*T).Run in goroutine 1
 	C:/Program Files/Go/src/testing/testing.go:1851 +0x3f6";
         let message = "runtime error: index out of range [3] with length 3";
         assert_eq!(
-            compute("go", Some(message), trace),
-            "20d8a3f3347cf11e192a405cd3434789"
+            compute(GOLDEN_REPO, "go", Some(message), trace),
+            "5cc9dae18baa7dac8582fda50dedec8d"
         );
     }
 }

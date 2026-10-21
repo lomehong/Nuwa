@@ -58,6 +58,12 @@ pub struct RepairJob {
     pub notes: String,
     /// Live progress sink, invoked on every completed turn that carries usage.
     pub progress: Option<Arc<dyn Fn(RepairProgress) + Send + Sync>>,
+    /// The work-loop run id. When present, the session lives in a per-run
+    /// subdirectory so two repairs of the same fingerprint never share one —
+    /// otherwise the transcript endpoint's "newest JSONL in the dir" resolves an
+    /// older run's request to the latest run's file (wrong evidence). `None`
+    /// for the one-shot `nuwa fix` path, which keeps the flat layout.
+    pub run_id: Option<String>,
 }
 
 /// Live progress snapshot handed to `RepairJob::progress` after each turn.
@@ -160,7 +166,16 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
     let harness_tools: Vec<HarnessTool> = tools.into_iter().map(HarnessTool::new).collect();
 
     // ---- durable session (crash-resumable) ----
-    let sessions_dir = job.sessions_dir.join(job.issue.short_fingerprint());
+    // Per-run subdirectory when the work loop supplies a run id, so retries of
+    // the same fingerprint do not pile their JSONL into one shared directory
+    // (the transcript endpoint resolves "newest JSONL in the run's dir").
+    let sessions_dir = match &job.run_id {
+        Some(run_id) => job
+            .sessions_dir
+            .join(job.issue.short_fingerprint())
+            .join(run_id),
+        None => job.sessions_dir.join(job.issue.short_fingerprint()),
+    };
     let sessions_dir = std::path::absolute(&sessions_dir)
         .with_context(|| format!("resolve {}", sessions_dir.display()))?;
     std::fs::create_dir_all(&sessions_dir)
@@ -461,6 +476,7 @@ mod tests {
             progress: Some(Arc::new(move |p| {
                 seen_cb.lock().expect("lock").push(p);
             })),
+            run_id: None,
         };
 
         let report = run(&job).await.expect("run");

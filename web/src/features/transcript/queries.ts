@@ -5,7 +5,7 @@
  * key so switching runs never flashes another run's messages.
  */
 
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 
 import { apiFetch } from "../../lib/api";
 import { backoffInterval } from "../../lib/polling";
@@ -61,8 +61,27 @@ export function useTranscriptQuery(
     refetchInterval: options?.refetchIntervalMs
       ? backoffInterval(options.refetchIntervalMs)
       : false,
-    // Keep the current page visible while the next one loads; the viewer
-    // focuses a page heading once the new data settles.
-    placeholderData: keepPreviousData,
+    // Keep the current page visible while the next page of the SAME run loads;
+    // the viewer focuses a page heading once the new data settles.
+    //
+    // WHY not `keepPreviousData`: it carries the previous result across ANY key
+    // change, so switching runs would keep showing run A's messages while the
+    // slower run B is still in flight — a cross-run leak. Only reuse the data
+    // when the fingerprint AND runId match (i.e. a page change within one run);
+    // a run switch starts empty so the viewer never flashes another run.
+    placeholderData: (previous, previousQuery) => {
+      if (!previousQuery) {
+        return undefined;
+      }
+      const [, prevFingerprint, prevRunId] = previousQuery.queryKey as readonly [
+        string,
+        string,
+        string | null,
+        number,
+      ];
+      return prevFingerprint === fingerprint && prevRunId === runId
+        ? previous
+        : undefined;
+    },
   });
 }
