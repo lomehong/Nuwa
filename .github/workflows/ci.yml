@@ -14,6 +14,17 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # rust-embed 在 release/CI 下编译期嵌入 web/dist——serve 的架构图页
+      # 测试断言嵌入产物可访问，因此 rust job 必须先产出前端（与
+      # release.yml 的构建前置一致）。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: build web console (embedded fixtures)
+        working-directory: web
+        run: npm ci && npm run build
       - name: clippy (self-owned crates — zero-warning bar)
         # --no-deps: the command-line -D would otherwise propagate into the
         # vendored workspace members and flag their known unwraps.
