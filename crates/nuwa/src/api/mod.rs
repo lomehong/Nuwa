@@ -1,13 +1,16 @@
 pub mod actions;
 pub mod auth;
+pub mod benchmarks;
 pub mod common;
 pub mod events;
 pub mod issues;
+pub mod memory;
 pub mod overview;
 pub mod projects;
 pub mod repos;
 pub mod runners;
 pub mod settings;
+pub mod skills;
 pub mod system;
 pub mod transcript;
 pub mod trends;
@@ -116,7 +119,7 @@ pub fn api_not_found() -> ApiError {
 
 /// `/api/v1` router: public login plus session/CSRF-protected routes.
 pub fn router(state: Arc<AppState>) -> axum::Router {
-    use axum::routing::{get, post, put};
+    use axum::routing::{get, patch, post, put};
 
     let public = axum::Router::new().route("/auth/login", post(auth::login));
     let protected = axum::Router::new()
@@ -124,6 +127,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/auth/me", get(auth::me))
         .route("/overview", get(overview::overview))
         .route("/projects", get(projects::projects))
+        .route("/projects/{repo}/skills", get(skills::project_skills))
+        .route("/projects/{repo}/memory", get(memory::list))
+        .route(
+            "/projects/{repo}/memory/{fp}",
+            patch(memory::update).delete(memory::delete),
+        )
         .route("/issues", get(issues::list))
         .route("/issues/{fp}", get(issues::detail))
         .route("/issues/{fp}/transcript", get(transcript::transcript))
@@ -141,6 +150,9 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/system", get(system::system))
         .route("/events", get(events::list))
         .route("/metrics/trends", get(trends::trends))
+        .route("/benchmarks", get(benchmarks::list))
+        .route("/benchmarks/scenarios", get(benchmarks::scenarios))
+        .route("/benchmarks/{id}", get(benchmarks::detail))
         .route_layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::session::require_session,

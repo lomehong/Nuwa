@@ -2,6 +2,7 @@ import { clsx } from "clsx";
 import {
   Activity,
   Cpu,
+  FlaskConical,
   FolderTree,
   Gem,
   LayoutDashboard,
@@ -43,6 +44,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { label: "问题单", icon: ListTodo, to: "/issues" },
   { label: "运行器", icon: Cpu, to: "/runners" },
   { label: "活动", icon: Activity, to: "/events" },
+  { label: "基准", icon: FlaskConical, to: "/benchmarks" },
   { label: "设置", icon: Settings, to: "/settings" },
   { label: "架构图", icon: Network, to: "/architecture" },
 ];
@@ -77,13 +79,33 @@ function pageMeta(pathname: string): PageMeta {
     if (!raw) {
       return { title: "项目台账", breadcrumb: null };
     }
-    let repo = raw;
+    const [encodedRepo, section] = raw.split("/");
+    let repo = encodedRepo;
     try {
-      repo = decodeURIComponent(raw);
+      repo = decodeURIComponent(encodedRepo);
     } catch {
       // Keep the raw path segment when it is not valid percent-encoding.
     }
+    if (section === "skills") {
+      return { title: "修复技能", breadcrumb: repo };
+    }
+    if (section === "memory") {
+      return { title: "修复记忆", breadcrumb: repo };
+    }
     return { title: "项目", breadcrumb: repo };
+  }
+  if (pathname === "/benchmarks" || pathname === "/benchmarks/") {
+    return { title: "修复基准", breadcrumb: null };
+  }
+  if (pathname.startsWith("/benchmarks/")) {
+    const raw = pathname.slice("/benchmarks/".length);
+    let id = raw;
+    try {
+      id = decodeURIComponent(raw);
+    } catch {
+      // Keep the raw segment when it is not valid percent-encoding.
+    }
+    return { title: "基准详情", breadcrumb: id || null };
   }
   if (pathname === "/issues" || pathname === "/issues/") {
     return { title: "问题单", breadcrumb: null };

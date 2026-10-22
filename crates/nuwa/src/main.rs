@@ -1,4 +1,5 @@
 mod api;
+mod benchmark;
 mod check;
 mod ci;
 mod deliver;
@@ -111,9 +112,10 @@ async fn main() -> anyhow::Result<()> {
         Some("reopen") => run_reopen(argv.collect()),
         Some("ignore") => run_ignore(argv.collect()),
         Some("check") => check::run(argv.collect()).await,
+        Some("benchmark") => benchmark::run(argv.collect()).await,
         Some("migrate-env") => run_migrate_env(argv.collect()),
         other => bail!(
-            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--runner-id <id>] [--service-unit <unit>] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp> [--reason <text>]   (owner reviewed an escalation)\n            nuwa ignore --db <path> --fingerprint <fp> [--reason <text>]   (owner mute / not a bug)\n            nuwa check --instructions <path> [--repo <path>] [--base main] [--json]   (preflight a repo config)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
+            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--runner-id <id>] [--service-unit <unit>] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp> [--reason <text>]   (owner reviewed an escalation)\n            nuwa ignore --db <path> --fingerprint <fp> [--reason <text>]   (owner mute / not a bug)\n            nuwa check --instructions <path> [--repo <path>] [--base main] [--json]   (preflight a repo config)\n            nuwa benchmark [run] [--db <path>] [--provider faux|zai|anthropic] [--model <id>] [--scenario <name,...>] [--max-turns N] [--json]   (repair benchmark; `benchmark list` prints scenarios)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
         ),
     }
 }
@@ -710,7 +712,7 @@ fn default_runner_id(repo: &str) -> String {
     sanitize_runner_id(&format!("{host}:{repo}"))
 }
 
-fn provider_meta(provider: &repair::ProviderKind) -> (String, String) {
+pub(crate) fn provider_meta(provider: &repair::ProviderKind) -> (String, String) {
     match provider {
         repair::ProviderKind::Faux => ("faux".into(), "faux".into()),
         repair::ProviderKind::Anthropic { model } => (
@@ -745,6 +747,7 @@ fn effective_config_json(
         "forbidden_paths_count": repo_config.forbidden_paths.len(),
         "max_attempts": repo_config.max_attempts,
         "draft_first_n": repo_config.draft_first_n,
+        "skills": repo_config.skills,
     })
     .to_string()
 }
@@ -1488,6 +1491,7 @@ async fn work_once(
         repo_config: Some(repo_config.clone()),
         secrets: Arc::clone(secrets),
         progress,
+        faux_script: None,
         run_id: Some(run_id.clone()),
     })?;
     let session_dir = prepared.session_dir().to_path_buf();
@@ -2284,7 +2288,7 @@ fn env_d(name: &str, default: &str) -> String {
 }
 
 /// 设置页驱动的 provider 默认值（CLI 显式 flag 优先）。
-fn env_provider_default() -> repair::ProviderKind {
+pub(crate) fn env_provider_default() -> repair::ProviderKind {
     match env_d("NUWA_PROVIDER", "anthropic").as_str() {
         "zai" => repair::ProviderKind::Zai {
             base_url: std::env::var("NUWA_BASE_URL").ok().filter(|s| !s.is_empty()),
@@ -2365,6 +2369,7 @@ async fn run_fix() -> anyhow::Result<()> {
         repo_config,
         secrets: Arc::clone(&secrets),
         progress: None,
+        faux_script: None,
         run_id: None,
     })?;
     let report = prepared.execute().await.context("repair run")?;

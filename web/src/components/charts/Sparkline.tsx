@@ -12,6 +12,8 @@ export interface SparklineProps {
   /** Metric name announced by assistive technology, e.g. "上报". */
   label: string;
   valueFormatter?: (value: number) => string;
+  /** Bucket unit in the accessible summary (benchmarks use 次). */
+  unit?: string;
   emptyLabel?: string;
   className?: string;
 }
@@ -34,6 +36,7 @@ export function Sparkline({
   data,
   label,
   valueFormatter = String,
+  unit = "天",
   emptyLabel = "暂无数据",
   className,
 }: SparklineProps) {
@@ -56,7 +59,7 @@ export function Sparkline({
   const peak = Math.max(...values);
   const peakIndex = values.indexOf(peak);
   const summary =
-    `${label}，最近 ${data.length} 天共 ${valueFormatter(total)}，` +
+    `${label}，最近 ${data.length} ${unit}共 ${valueFormatter(total)}，` +
     `峰值 ${valueFormatter(peak)}（${data[peakIndex]?.label ?? "—"}）`;
 
   return (

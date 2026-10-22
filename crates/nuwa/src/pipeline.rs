@@ -25,6 +25,8 @@ pub struct RepairRequest {
     pub repo_config: Option<RepoInstructions>,
     pub secrets: Arc<secrets::Secrets>,
     pub progress: Option<ProgressSink>,
+    /// benchmark 场景注入的确定性 faux 脚本；普通 runner 为 None。
+    pub faux_script: Option<rpi_ai::providers::faux::FauxScript>,
     /// 常驻 runner 的 run id；`None` 表示一次性 CLI（平铺会话目录）。
     pub run_id: Option<String>,
 }
@@ -100,6 +102,7 @@ pub fn prepare_repair(req: RepairRequest) -> anyhow::Result<PreparedRepair> {
         secrets: req.secrets,
         notes,
         progress: req.progress,
+        faux_script: req.faux_script,
         run_id: req.run_id,
     };
     Ok(PreparedRepair {
@@ -240,6 +243,7 @@ mod tests {
             repo_config: None,
             secrets: Arc::new(secrets::Secrets::default()),
             progress: None,
+            faux_script: None,
             run_id: Some("run-1".into()),
         };
         let prepared = prepare_repair(req).expect("prepare");

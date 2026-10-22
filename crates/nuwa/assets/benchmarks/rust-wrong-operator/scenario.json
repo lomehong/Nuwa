@@ -1,0 +1,18 @@
+{
+  "name": "rust-wrong-operator",
+  "title": "Rust 累加写成减法",
+  "description": "一个最小的 cargo 包把累加写成累减；修复应只改运算符与测试无关的代码。",
+  "language": "rust",
+  "failing_check": {
+    "command": "cargo test --quiet",
+    "timeout_secs": 300
+  },
+  "writes": [
+    {
+      "path": "src/lib.rs",
+      "content": "pub fn total(values: &[i32]) -> i32 {\n    let mut sum = 0;\n    for value in values {\n        sum += *value;\n    }\n    sum\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn sums_values() {\n        assert_eq!(total(&[1, 2, 3]), 6);\n    }\n}\n"
+    }
+  ],
+  "final": "ROOT CAUSE: total 的循环用了 -=，符号写反。\nCHANGE: 改为 +=。\nVERIFICATION: cargo test --quiet — pass.",
+  "expect_fixed": true
+}

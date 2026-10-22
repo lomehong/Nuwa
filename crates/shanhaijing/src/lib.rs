@@ -237,6 +237,105 @@ pub struct RepairMemoryRow {
     pub recorded_at: i64,
 }
 
+/// 控制台记忆列表行：内容 + 来源 + 所属问题单 + 是否停用。
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairMemoryView {
+    pub fingerprint: String,
+    /// 问题单标题；问题单已被清理时为空。
+    pub title: String,
+    pub state: String,
+    pub commit_sha: String,
+    pub pr_url: Option<String>,
+    pub root_cause: String,
+    pub change_stat: String,
+    pub files: i64,
+    pub recorded_at: i64,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkStart {
+    pub id: String,
+    pub started_at: i64,
+    pub provider: String,
+    pub model: Option<String>,
+    /// `faux`（确定性）或 `live`（真实 provider）。
+    pub mode: String,
+    pub scenarios: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkFinish {
+    pub finished_at: i64,
+    pub status: String,
+    pub repaired: i64,
+    pub claimed: i64,
+    pub false_positive: i64,
+    pub delivery_ok: i64,
+    pub turns: i64,
+    pub tokens_uncached: i64,
+    pub tokens_cached: i64,
+    pub duration_ms: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchmarkRunRow {
+    pub id: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub provider: String,
+    pub model: Option<String>,
+    pub mode: String,
+    pub status: String,
+    pub scenarios: i64,
+    pub repaired: i64,
+    pub claimed: i64,
+    pub false_positive: i64,
+    pub delivery_ok: i64,
+    pub turns: i64,
+    pub tokens_uncached: i64,
+    pub tokens_cached: i64,
+    pub duration_ms: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchmarkResultInput {
+    pub run_id: String,
+    pub scenario: String,
+    pub language: String,
+    pub expected_fixed: bool,
+    pub repaired: bool,
+    pub claimed_fixed: bool,
+    pub delivery_ok: bool,
+    pub turns: i64,
+    pub tokens_uncached: i64,
+    pub tokens_cached: i64,
+    pub duration_ms: i64,
+    pub root_cause: Option<String>,
+    pub final_report: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchmarkResultRow {
+    pub run_id: String,
+    pub scenario: String,
+    pub language: String,
+    pub expected_fixed: bool,
+    pub repaired: bool,
+    pub claimed_fixed: bool,
+    pub delivery_ok: bool,
+    pub turns: i64,
+    pub tokens_uncached: i64,
+    pub tokens_cached: i64,
+    pub duration_ms: i64,
+    pub root_cause: Option<String>,
+    pub final_report: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Filters for the console event feed. An empty `kinds` list means "every
 /// kind"; `from_ms`/`to_ms` are inclusive bounds on `events.ts`.
 #[derive(Debug, Clone, Default)]
@@ -1712,7 +1811,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT fingerprint, commit_sha, pr_url, root_cause, change_stat, files, recorded_at
              FROM repair_memory
-             WHERE repo = ?1 AND fingerprint != ?2
+             WHERE repo = ?1 AND fingerprint != ?2 AND disabled = 0
              ORDER BY recorded_at DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(
@@ -1730,6 +1829,246 @@ impl Store {
             },
         )?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 控制台记忆列表：来源、问题单标题/状态、停用标记，最新在前。
+    pub fn list_repair_memory(
+        &self,
+        repo: &str,
+        limit: u32,
+        offset: u32,
+    ) -> ShanResult<(Vec<RepairMemoryView>, u64)> {
+        let conn = self.lock();
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM repair_memory WHERE repo = ?1",
+            [repo],
+            |row| row.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT m.fingerprint, COALESCE(i.title, ''), COALESCE(i.state, ''),
+                    m.commit_sha, m.pr_url, m.root_cause, m.change_stat, m.files,
+                    m.recorded_at, m.disabled
+             FROM repair_memory m
+             LEFT JOIN issues i ON i.fingerprint = m.fingerprint
+             WHERE m.repo = ?1
+             ORDER BY m.recorded_at DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![repo, limit, offset], |row| {
+            Ok(RepairMemoryView {
+                fingerprint: row.get(0)?,
+                title: row.get(1)?,
+                state: row.get(2)?,
+                commit_sha: row.get(3)?,
+                pr_url: row.get(4)?,
+                root_cause: row.get(5)?,
+                change_stat: row.get(6)?,
+                files: row.get(7)?,
+                recorded_at: row.get(8)?,
+                disabled: row.get::<_, i64>(9)? != 0,
+            })
+        })?;
+        Ok((rows.collect::<Result<_, _>>()?, total as u64))
+    }
+
+    /// 停用/启用一条记忆。返回 false 表示该记忆不存在。
+    pub fn set_repair_memory_disabled(
+        &self,
+        repo: &str,
+        fingerprint: &str,
+        disabled: bool,
+    ) -> ShanResult<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE repair_memory SET disabled = ?3 WHERE repo = ?1 AND fingerprint = ?2",
+            rusqlite::params![repo, fingerprint, disabled as i64],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// 删除一条记忆。返回 false 表示该记忆不存在。
+    pub fn delete_repair_memory(&self, repo: &str, fingerprint: &str) -> ShanResult<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "DELETE FROM repair_memory WHERE repo = ?1 AND fingerprint = ?2",
+            rusqlite::params![repo, fingerprint],
+        )?;
+        Ok(changed > 0)
+    }
+
+    // ---- repair benchmark ----
+
+    pub fn start_benchmark_run(&self, start: &BenchmarkStart) -> ShanResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO benchmark_runs
+                (id, started_at, provider, model, mode, status, scenarios)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
+            rusqlite::params![
+                start.id,
+                start.started_at,
+                start.provider,
+                start.model,
+                start.mode,
+                start.scenarios as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_benchmark_result(&self, result: &BenchmarkResultInput) -> ShanResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO benchmark_results
+                (run_id, scenario, language, expected_fixed, repaired, claimed_fixed,
+                 delivery_ok, turns, tokens_uncached, tokens_cached, duration_ms,
+                 root_cause, final_report, error)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(run_id, scenario) DO UPDATE SET
+                language=excluded.language,
+                expected_fixed=excluded.expected_fixed,
+                repaired=excluded.repaired,
+                claimed_fixed=excluded.claimed_fixed,
+                delivery_ok=excluded.delivery_ok,
+                turns=excluded.turns,
+                tokens_uncached=excluded.tokens_uncached,
+                tokens_cached=excluded.tokens_cached,
+                duration_ms=excluded.duration_ms,
+                root_cause=excluded.root_cause,
+                final_report=excluded.final_report,
+                error=excluded.error",
+            rusqlite::params![
+                result.run_id,
+                result.scenario,
+                result.language,
+                result.expected_fixed as i64,
+                result.repaired as i64,
+                result.claimed_fixed as i64,
+                result.delivery_ok as i64,
+                result.turns,
+                result.tokens_uncached,
+                result.tokens_cached,
+                result.duration_ms,
+                result.root_cause,
+                result.final_report,
+                result.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_benchmark_run(&self, id: &str, finish: &BenchmarkFinish) -> ShanResult<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE benchmark_runs SET
+                finished_at = ?2,
+                status = ?3,
+                repaired = ?4,
+                claimed = ?5,
+                false_positive = ?6,
+                delivery_ok = ?7,
+                turns = ?8,
+                tokens_uncached = ?9,
+                tokens_cached = ?10,
+                duration_ms = ?11,
+                error = ?12
+             WHERE id = ?1",
+            rusqlite::params![
+                id,
+                finish.finished_at,
+                finish.status,
+                finish.repaired,
+                finish.claimed,
+                finish.false_positive,
+                finish.delivery_ok,
+                finish.turns,
+                finish.tokens_uncached,
+                finish.tokens_cached,
+                finish.duration_ms,
+                finish.error,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownRun(id.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn list_benchmark_runs(&self, limit: u32) -> ShanResult<Vec<BenchmarkRunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, started_at, finished_at, provider, model, mode, status,
+                    scenarios, repaired, claimed, false_positive, delivery_ok,
+                    turns, tokens_uncached, tokens_cached, duration_ms, error
+             FROM benchmark_runs ORDER BY started_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], Self::benchmark_run_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn get_benchmark_run(&self, id: &str) -> ShanResult<Option<BenchmarkRunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, started_at, finished_at, provider, model, mode, status,
+                    scenarios, repaired, claimed, false_positive, delivery_ok,
+                    turns, tokens_uncached, tokens_cached, duration_ms, error
+             FROM benchmark_runs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::benchmark_run_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn benchmark_results(&self, run_id: &str) -> ShanResult<Vec<BenchmarkResultRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT run_id, scenario, language, expected_fixed, repaired, claimed_fixed,
+                    delivery_ok, turns, tokens_uncached, tokens_cached, duration_ms,
+                    root_cause, final_report, error
+             FROM benchmark_results WHERE run_id = ?1 ORDER BY scenario",
+        )?;
+        let rows = stmt.query_map([run_id], |row| {
+            Ok(BenchmarkResultRow {
+                run_id: row.get(0)?,
+                scenario: row.get(1)?,
+                language: row.get(2)?,
+                expected_fixed: row.get::<_, i64>(3)? != 0,
+                repaired: row.get::<_, i64>(4)? != 0,
+                claimed_fixed: row.get::<_, i64>(5)? != 0,
+                delivery_ok: row.get::<_, i64>(6)? != 0,
+                turns: row.get(7)?,
+                tokens_uncached: row.get(8)?,
+                tokens_cached: row.get(9)?,
+                duration_ms: row.get(10)?,
+                root_cause: row.get(11)?,
+                final_report: row.get(12)?,
+                error: row.get(13)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn benchmark_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkRunRow> {
+        Ok(BenchmarkRunRow {
+            id: row.get(0)?,
+            started_at: row.get(1)?,
+            finished_at: row.get(2)?,
+            provider: row.get(3)?,
+            model: row.get(4)?,
+            mode: row.get(5)?,
+            status: row.get(6)?,
+            scenarios: row.get(7)?,
+            repaired: row.get(8)?,
+            claimed: row.get(9)?,
+            false_positive: row.get(10)?,
+            delivery_ok: row.get(11)?,
+            turns: row.get(12)?,
+            tokens_uncached: row.get(13)?,
+            tokens_cached: row.get(14)?,
+            duration_ms: row.get(15)?,
+            error: row.get(16)?,
+        })
     }
 
     /// Filtered lifecycle events, newest first (`ts DESC, id DESC`) — the
@@ -4731,5 +5070,133 @@ mod repo_tests {
             .expect("rows");
         assert_eq!(rows.len(), REPAIR_MEMORY_KEEP);
         assert_eq!(rows[0].fingerprint, format!("fp-{}", REPAIR_MEMORY_KEEP + 4));
+    }
+
+    #[test]
+    fn repair_memory_can_be_disabled_and_deleted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store
+            .record_repair_memory(&memory_entry("fp-a", 10))
+            .expect("a");
+        store
+            .record_repair_memory(&memory_entry("fp-b", 20))
+            .expect("b");
+
+        assert!(store
+            .set_repair_memory_disabled("example.com/spike-target", "fp-a", true)
+            .expect("disable"));
+        let rows = store
+            .recent_repair_memory("example.com/spike-target", "none", 10)
+            .expect("rows");
+        assert_eq!(rows.len(), 1, "disabled memory must not enter prior_context");
+        assert_eq!(rows[0].fingerprint, "fp-b");
+
+        let (listed, total) = store
+            .list_repair_memory("example.com/spike-target", 10, 0)
+            .expect("list");
+        assert_eq!(total, 2);
+        assert!(listed.iter().any(|row| row.fingerprint == "fp-a" && row.disabled));
+
+        assert!(store
+            .set_repair_memory_disabled("example.com/spike-target", "fp-a", false)
+            .expect("enable"));
+        assert!(store
+            .delete_repair_memory("example.com/spike-target", "fp-a")
+            .expect("delete"));
+        assert!(!store
+            .delete_repair_memory("example.com/spike-target", "missing")
+            .expect("missing"));
+        let (_, total) = store
+            .list_repair_memory("example.com/spike-target", 10, 0)
+            .expect("list");
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn benchmark_run_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store
+            .start_benchmark_run(&BenchmarkStart {
+                id: "bench-1".into(),
+                started_at: 1_000,
+                provider: "faux".into(),
+                model: Some("faux-1".into()),
+                mode: "faux".into(),
+                scenarios: 2,
+            })
+            .expect("start");
+        store
+            .insert_benchmark_result(&BenchmarkResultInput {
+                run_id: "bench-1".into(),
+                scenario: "go-off-by-one".into(),
+                language: "go".into(),
+                expected_fixed: true,
+                repaired: true,
+                claimed_fixed: true,
+                delivery_ok: true,
+                turns: 3,
+                tokens_uncached: 120,
+                tokens_cached: 30,
+                duration_ms: 900,
+                root_cause: Some("ROOT CAUSE: loop bound".into()),
+                final_report: Some("VERIFICATION: go test ./... ok".into()),
+                error: None,
+            })
+            .expect("result");
+        store
+            .insert_benchmark_result(&BenchmarkResultInput {
+                run_id: "bench-1".into(),
+                scenario: "node-noop-claim".into(),
+                language: "node".into(),
+                expected_fixed: false,
+                repaired: false,
+                claimed_fixed: true,
+                delivery_ok: false,
+                turns: 2,
+                tokens_uncached: 80,
+                tokens_cached: 0,
+                duration_ms: 400,
+                root_cause: None,
+                final_report: Some("VERIFICATION: claimed".into()),
+                error: Some("verification failed".into()),
+            })
+            .expect("result");
+        store
+            .finish_benchmark_run(
+                "bench-1",
+                &BenchmarkFinish {
+                    finished_at: 2_000,
+                    status: "completed".into(),
+                    repaired: 1,
+                    claimed: 2,
+                    false_positive: 1,
+                    delivery_ok: 1,
+                    turns: 5,
+                    tokens_uncached: 200,
+                    tokens_cached: 30,
+                    duration_ms: 1_300,
+                    error: None,
+                },
+            )
+            .expect("finish");
+
+        let runs = store.list_benchmark_runs(10).expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "completed");
+        assert_eq!(runs[0].false_positive, 1);
+        let detail = store
+            .get_benchmark_run("bench-1")
+            .expect("detail")
+            .expect("run");
+        assert_eq!(detail.claimed, 2);
+        let results = store.benchmark_results("bench-1").expect("results");
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|row| row.scenario == "go-off-by-one" && row.repaired));
+        assert!(results
+            .iter()
+            .any(|row| row.scenario == "node-noop-claim" && !row.repaired && row.claimed_fixed));
+        assert!(store.get_benchmark_run("missing").expect("missing").is_none());
     }
 }

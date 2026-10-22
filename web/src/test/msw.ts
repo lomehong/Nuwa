@@ -18,6 +18,15 @@ import type {
 } from "../features/settings/types";
 import type { TranscriptResponse } from "../features/transcript/types";
 import type { MeResponse } from "../lib/auth";
+import type { ProjectSkillsResponse, SkillDto } from "../features/skills/types";
+import type { MemoryDto, MemoryListResponse } from "../features/memory/types";
+import type {
+  BenchmarkDetailResponse,
+  BenchmarkResultDto,
+  BenchmarkRunDto,
+  BenchmarkRunsResponse,
+  ScenarioMeta,
+} from "../features/benchmarks/types";
 
 /** One MSW server per test file; handlers are registered with `server.use`. */
 export const server = setupServer();
@@ -498,4 +507,163 @@ export function makeRepo(overrides: Partial<RepoDto> = {}): RepoDto {
 export function mockRepos(repos: RepoDto[] = []) {
   const body: RepoListResponse = { data: repos };
   return http.get("/api/v1/repos", () => HttpResponse.json(body));
+}
+
+// ---- skills / memory / benchmarks (P1/P2 console surfaces) ----
+
+export function makeSkill(overrides: Partial<SkillDto> = {}): SkillDto {
+  return {
+    name: "rust-cargo",
+    version: 1,
+    description: "Rust 编译/测试失败路径",
+    languages: ["rust"],
+    matches: ["cargo"],
+    body: "# Rust 修复路径\n先读第一条 error。",
+    body_truncated: false,
+    source: "builtin",
+    origin: "builtin:rust-cargo.md",
+    effective: true,
+    overrides_builtin: false,
+    allowlisted: false,
+    ...overrides,
+  };
+}
+
+export function makeProjectSkills(
+  overrides: Partial<ProjectSkillsResponse> = {},
+): ProjectSkillsResponse {
+  return {
+    repo: "example.com/app",
+    selection_mode: "auto",
+    allowlist: [],
+    repo_path: "/srv/app",
+    skills: [makeSkill()],
+    warnings: [],
+    ...overrides,
+  };
+}
+
+/** Wildcard path: repo identities contain encoded slashes. */
+export function mockProjectSkills(body: ProjectSkillsResponse = makeProjectSkills()) {
+  return http.get(/\/api\/v1\/projects\/.*\/skills$/, () => HttpResponse.json(body));
+}
+
+export function makeMemory(overrides: Partial<MemoryDto> = {}): MemoryDto {
+  return {
+    fingerprint: "fp-memory",
+    title: "panic in Average",
+    state: "merged",
+    commit_sha: "0123456789abcdef",
+    pr_url: "https://github.com/acme/app/pull/9",
+    root_cause: "ROOT CAUSE: loop bound",
+    change_stat: "calc.go | 2 +-",
+    files: 1,
+    recorded_at_ms: 1_700_000_000_000,
+    disabled: false,
+    ...overrides,
+  };
+}
+
+export function makeMemoryList(overrides: Partial<MemoryListResponse> = {}): MemoryListResponse {
+  return {
+    data: [makeMemory()],
+    total: 1,
+    limit: 20,
+    offset: 0,
+    ...overrides,
+  };
+}
+
+export function mockProjectMemory(body: MemoryListResponse = makeMemoryList()) {
+  return http.get(/\/api\/v1\/projects\/.*\/memory(\?.*)?$/, () =>
+    HttpResponse.json(body),
+  );
+}
+
+export function makeScenario(overrides: Partial<ScenarioMeta> = {}): ScenarioMeta {
+  return {
+    name: "node-empty-average",
+    title: "Node 空数组平均值为 NaN",
+    description: "average([]) 返回 NaN；测试期望 0。",
+    language: "node",
+    failing_check: "node --test",
+    expect_fixed: true,
+    ...overrides,
+  };
+}
+
+export function makeBenchmarkRun(overrides: Partial<BenchmarkRunDto> = {}): BenchmarkRunDto {
+  return {
+    id: "bench-1",
+    started_at_ms: 1_700_000_000_000,
+    finished_at_ms: 1_700_000_004_000,
+    provider: "faux",
+    model: "faux",
+    mode: "faux",
+    status: "completed",
+    scenarios: 2,
+    repaired: 1,
+    claimed: 2,
+    false_positive: 1,
+    delivery_ok: 1,
+    turns: 4,
+    tokens_uncached: 200,
+    tokens_cached: 0,
+    duration_ms: 4_000,
+    error: null,
+    ...overrides,
+  };
+}
+
+export function makeBenchmarkResult(
+  overrides: Partial<BenchmarkResultDto> = {},
+): BenchmarkResultDto {
+  return {
+    scenario: "node-empty-average",
+    language: "node",
+    expected_fixed: true,
+    repaired: true,
+    claimed_fixed: true,
+    delivery_ok: true,
+    matches_expectation: true,
+    turns: 2,
+    tokens_uncached: 100,
+    tokens_cached: 0,
+    duration_ms: 900,
+    root_cause: "ROOT CAUSE: empty input",
+    final_report: "ROOT CAUSE: empty input\nVERIFICATION: node --test",
+    error: null,
+    ...overrides,
+  };
+}
+
+export function makeBenchmarks(
+  overrides: Partial<BenchmarkRunsResponse> = {},
+): BenchmarkRunsResponse {
+  return {
+    data: [makeBenchmarkRun()],
+    scenarios: [makeScenario()],
+    ...overrides,
+  };
+}
+
+export function mockBenchmarks(body: BenchmarkRunsResponse = makeBenchmarks()) {
+  return http.get("/api/v1/benchmarks", () => HttpResponse.json(body));
+}
+
+export function makeBenchmarkDetail(
+  overrides: Partial<BenchmarkDetailResponse> = {},
+): BenchmarkDetailResponse {
+  return {
+    run: makeBenchmarkRun(),
+    results: [makeBenchmarkResult()],
+    ...overrides,
+  };
+}
+
+export function mockBenchmarkDetail(
+  id: string,
+  body: BenchmarkDetailResponse = makeBenchmarkDetail(),
+) {
+  return http.get(`/api/v1/benchmarks/${encodeURIComponent(id)}`, () => HttpResponse.json(body));
 }

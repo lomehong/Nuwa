@@ -13,6 +13,7 @@ export interface EffectiveConfig {
   forbidden_paths_count: number | null;
   max_attempts?: number | null;
   draft_first_n?: number | null;
+  skills?: string[];
 }
 
 export interface RunnerDto {

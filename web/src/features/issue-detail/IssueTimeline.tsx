@@ -3,6 +3,7 @@ import { useState } from "react";
 
 import { Badge, Button, Card, CardContent, CardHeader, CardTitle } from "../../components/ui";
 import { decisionDetailLabel } from "../../lib/eventKinds";
+import { DecisionTraceDetails } from "../events/DecisionTraceDetails";
 import {
   actorLabel,
   eventKindLabel,
@@ -121,6 +122,9 @@ export function IssueTimeline({ items }: IssueTimelineProps) {
                           {(item.kind === "decision" ? decisionDetailLabel(item.detail) : item.detail) ||
                             "—"}
                         </p>
+                        {item.kind === "decision" ? (
+                          <DecisionTraceDetails detail={item.detail} />
+                        ) : null}
                         <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-text-muted">
                           {actor ? <span>操作者：{actor}</span> : <span>操作者：未记录</span>}
                           <span aria-hidden="true">·</span>

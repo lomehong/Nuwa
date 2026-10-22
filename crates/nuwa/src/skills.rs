@@ -15,6 +15,9 @@ use rust_embed::RustEmbed;
 use crate::issue::Issue;
 
 pub const REPO_SKILLS_DIR: &str = ".nuwa/skills";
+/// Repo skill files above this size are skipped: they cannot be injected
+/// (the prompt cap is far smaller) and reading them would only burn memory.
+const MAX_SKILL_FILE_BYTES: u64 = 256 * 1024;
 /// 单次注入的技能数上限。
 pub const MAX_SKILLS: usize = 3;
 const MAX_BODY_CHARS: usize = 3_000;
@@ -174,6 +177,20 @@ pub fn repo_skills(repo: &Path) -> (Vec<Skill>, Vec<String>) {
             .unwrap_or(&path)
             .display()
             .to_string();
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > MAX_SKILL_FILE_BYTES => {
+                warnings.push(format!(
+                    "{origin}: skill file is {} bytes (limit {MAX_SKILL_FILE_BYTES})",
+                    metadata.len()
+                ));
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warnings.push(format!("{origin}: {error}"));
+                continue;
+            }
+        }
         match std::fs::read_to_string(&path)
             .map_err(anyhow::Error::from)
             .and_then(|text| parse(&text, &origin))
@@ -417,6 +434,21 @@ mod tests {
         let selection = select(dir.path(), &issue("rust", "cargo test"), &[]);
         assert!(selection.used.contains(&"rust-cargo@9".to_string()));
         assert!(selection.section.contains("LOCAL BODY"));
+    }
+
+    #[test]
+    fn oversized_repo_skill_is_skipped_with_a_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = dir.path().join(REPO_SKILLS_DIR);
+        std::fs::create_dir_all(&skills_dir).expect("dir");
+        std::fs::write(
+            skills_dir.join("huge.md"),
+            "x".repeat((MAX_SKILL_FILE_BYTES + 1) as usize),
+        )
+        .expect("write");
+        let (loaded, warnings) = repo_skills(dir.path());
+        assert!(loaded.is_empty());
+        assert!(warnings.iter().any(|warning| warning.contains("limit")));
     }
 
     #[test]

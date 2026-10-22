@@ -332,7 +332,7 @@ CREATE TABLE IF NOT EXISTS signal_daily (
 | `repo` | TEXT | 事件所属仓库；配置/系统事件为空 |
 | `actor` | TEXT | `owner` / `runner` / `system`；历史事件为 NULL |
 
-新增事件 kind：`requeued`、`config_migrated`、`restart_requested`、`runner_started`、`runner_stopped`、`runner_error`、`decision`。保留既有：`reported`、`state_changed`、`pr_opened`、`ci_green`、`ci_red`、`ci_timeout`、`merged`、`config_changed`。
+新增事件 kind：`requeued`、`config_migrated`、`restart_requested`、`runner_started`、`runner_stopped`、`runner_error`、`decision`、`memory_updated`、`memory_deleted`。保留既有：`reported`、`state_changed`、`pr_opened`、`ci_green`、`ci_red`、`ci_timeout`、`merged`、`config_changed`。
 `decision` 是结构化决策 trace（ADR-015）：detail 为 `{stage, decision, reason, details}` JSON；活动页与问题时间线渲染为「stage · decision — reason」一行，原始 JSON 保留在 title 中。
 
 系统事件的合成指纹：配置变更/迁移用 `__config__`，重启请求用 `__system__`，runner 生命周期用 `__runner__:<runner_id>`。控制台遇到这些前缀时显示"系统"标签，不当作问题单链接。
@@ -773,7 +773,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 ### 10.1 全局外壳
 
-- 左侧 232px 导航：女娲标志 + 版本；总览、问题单、运行器、活动、设置、架构图；本地模式下底部显示"本地模式 · API 无鉴权"。
+- 左侧 232px 导航：女娲标志 + 版本；总览、问题单、运行器、活动、基准、设置、架构图；本地模式下底部显示"本地模式 · API 无鉴权"。
 - 顶栏：页面标题/面包屑、⌘K 全局搜索、主题切换、会话菜单。
 - 健康条：serve、runner 在线/总数、队列待领、运行中、今日 PR 配额；「需处理 N」（attention 计数）置首、danger 色、链接 `?attention=1`，计数增长时向屏幕阅读器礼貌播报。异常项可点击跳转。
 - <1024px：导航收为抽屉 + 底部四项主导航；健康条横向滚动。
@@ -881,6 +881,25 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - 侧栏「架构图」（`/architecture`）以同源 iframe 内嵌自包含交互视图 `/architecture.html`：archify 生成的单文件产物（缩放 / 路径追踪 / 引导章节 / 明暗切换），随 `web/public/` 进 dist、由 `nuwa serve` 的 rust-embed 装载；源规范在 `web/architecture/archify.json`，改图用 archify 重新生成后覆盖。
 - CSP 例外仅此一路径：`serve.rs frame_policy_for` 对 `/architecture.html` 单独允许同源 frame（`X-Frame-Options: SAMEORIGIN`、`frame-ancestors 'self'`）与内联脚本/样式（单文件构建即内联）；其余路由保持 strict CSP + DENY，单元测试钉住。
 - 命令面板 ⌘K 有「架构图」快捷入口；<1024px 时经抽屉主导航到达（底部四项导航不变）。
+
+### 10.11 项目修复技能
+
+- 路由 `/projects/:repo/skills`（项目工位「修复技能」卡进入）；数据来自 `GET /api/v1/projects/{repo}/skills`：内置技能 + 运行器 `repo_path` 下 `.nuwa/skills/*.md`。
+- 只读：控制台不编辑目标仓文件；同名仓库技能覆盖内置版本，界面同时展示生效定义、被覆盖的内置版本（可切换显示）、白名单与解析告警。
+- 每条技能展示 `name@version`、来源、语言/命中词、正文（`<details>`，20,000 字符上限提示）。`nuwa check` 是写入前的校验门。
+
+### 10.12 项目修复记忆
+
+- 路由 `/projects/:repo/memory`（项目工位「修复记忆」卡进入）；数据来自 `GET /api/v1/projects/{repo}/memory?limit=&offset=`，按 `recorded_at` 倒序，展示问题单标题/状态、根因、改动、commit/PR 与时间来源。
+- 所有者动作：`PATCH .../memory/{fp}` 停用/启用（停用后不再注入，但保留来源证据）；`DELETE .../memory/{fp}` 删除。两者均要求 CSRF，并写 `memory_updated`/`memory_deleted` owner 审计事件。
+- 记忆只由 runner 在“验证门绿 + CI 绿（或 branch-only 已推送）”后写入；每仓最多 50 条，注入最多最近 3 条并排除当前问题单。
+
+### 10.13 修复基准
+
+- 侧栏「基准」（`/benchmarks`）与 `/benchmarks/:id` 只读展示 `benchmark_runs`/`benchmark_results`；执行在 CLI/CI（`nuwa benchmark run`），serve 不启动模型循环。
+- 列表：最近通过率、误报率、交付门通过率、成本（tokens/turns/耗时）与通过率趋势；运行表可按模式/状态筛选；场景目录标注“应修复/负对照”。
+- 详情：逐场景展示 `repaired`、`claimed_fixed`、`delivery_ok`、与预期是否一致；误报单独标红，负对照被交付门拦截时给出“门禁正确拦截”说明；可跳转上一次运行做对比。
+- `decision` 事件的原始 JSON 在活动页与问题时间线可展开查看（技能选择、上下文预算、交付/CI 证据），并支持复制。
 
 ## 11 · 视觉系统
 

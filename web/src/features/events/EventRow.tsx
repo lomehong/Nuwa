@@ -10,6 +10,7 @@ import {
 import { actorLabel } from "../issue-detail/format";
 import { issueDetailPath } from "../issues/format";
 import { decisionDetailLabel } from "../../lib/eventKinds";
+import { DecisionTraceDetails } from "./DecisionTraceDetails";
 import {
   eventKindLabel,
   eventKindVariant,
@@ -69,12 +70,15 @@ function KindCell({ event }: { event: EventItem }) {
 function EventDetail({ detail, kind }: { detail: string; kind: string }) {
   const text = kind === "decision" ? decisionDetailLabel(detail) : detail;
   return (
-    <p
-      className="max-w-prose break-words font-mono text-body-sm text-text-secondary"
-      title={text || undefined}
-    >
-      {text || "—"}
-    </p>
+    <div>
+      <p
+        className="max-w-prose break-words font-mono text-body-sm text-text-secondary"
+        title={text || undefined}
+      >
+        {text || "—"}
+      </p>
+      {kind === "decision" ? <DecisionTraceDetails detail={detail} /> : null}
+    </div>
   );
 }
 

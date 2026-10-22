@@ -58,6 +58,8 @@ pub struct RepairJob {
     pub notes: String,
     /// Live progress sink, invoked on every completed turn that carries usage.
     pub progress: Option<Arc<dyn Fn(RepairProgress) + Send + Sync>>,
+    /// 基准场景提供的确定性脚本；`None` 时使用内置自证脚本。
+    pub faux_script: Option<FauxScript>,
     /// The work-loop run id. When present, the session lives in a per-run
     /// subdirectory so two repairs of the same fingerprint never share one —
     /// otherwise the transcript endpoint's "newest JSONL in the dir" resolves an
@@ -140,8 +142,37 @@ pub fn session_dir_for(
     }
 }
 
-pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
-    // Turn budget (rpi-harness RunBudget reads this per run). Token-level caps
+/// The offline smoke script: it does NOT prove LLM repair quality — that needs
+/// a real provider. It exercises tools, guards, persistence and delivery.
+fn default_faux_script() -> FauxScript {
+    FauxScript::new()
+        .with_tool_call(
+            "edit",
+            serde_json::json!({
+                "path": "calc.go",
+                "edits": [{
+                    "oldText": "for i := 0; i <= len(xs); i++ {",
+                    "newText": "for i := 0; i < len(xs); i++ {"
+                }]
+            }),
+        )
+        // The offline proof also leaves a marker so the delivery gate's
+        // red→green check is language- and shell-agnostic.
+        .with_tool_call(
+            "write",
+            serde_json::json!({
+                "path": "fixed.marker",
+                "content": "fixed\n"
+            }),
+        )
+        .with_text(
+            "ROOT CAUSE: Average iterated with i <= len(xs), indexing one past the last element — index out of range panic on every non-empty window.\n\
+             CHANGE: bounded the loop at i < len(xs) so the sum covers exactly the slice.\n\
+             VERIFICATION: go test ./... — all tests pass.",
+        )
+}
+
+pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn budget (rpi-harness RunBudget reads this per run). Token-level caps
     // land with the 运行器池 scheduler; the turn cap bounds runaway loops now.
     std::env::set_var("RPI_MAX_TURNS_PER_RUN", job.max_turns.to_string());
 
@@ -224,33 +255,9 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         ProviderKind::Faux => {
             // Deterministic offline proof of the pipeline: the scripted "model"
             // performs the real edit via the real edit tool, exercising tools,
-            // guards, session persistence and delivery. It does NOT prove LLM
-            // repair quality — that needs the anthropic path with a real key.
-            let script = FauxScript::new()
-                .with_tool_call(
-                    "edit",
-                    serde_json::json!({
-                        "path": "calc.go",
-                        "edits": [{
-                            "oldText": "for i := 0; i <= len(xs); i++ {",
-                            "newText": "for i := 0; i < len(xs); i++ {"
-                        }]
-                    }),
-                )
-                // The offline proof also leaves a marker so the delivery
-                // gate's red→green check is language- and shell-agnostic.
-                .with_tool_call(
-                    "write",
-                    serde_json::json!({
-                        "path": "fixed.marker",
-                        "content": "fixed\n"
-                    }),
-                )
-                .with_text(
-                    "ROOT CAUSE: Average iterated with i <= len(xs), indexing one past the last element — index out of range panic on every non-empty window.\n\
-                     CHANGE: bounded the loop at i < len(xs) so the sum covers exactly the slice.\n\
-                     VERIFICATION: go test ./... — all tests pass.",
-                );
+            // guards, session persistence and delivery. Benchmark scenarios
+            // inject their own script; the built-in one stays the smoke test.
+            let script = job.faux_script.clone().unwrap_or_else(default_faux_script);
             let provider = FauxProvider::new(script);
             let model = provider.default_model().clone();
             (model, vec![provider as Arc<dyn Provider>])
@@ -517,6 +524,7 @@ mod tests {
             progress: Some(Arc::new(move |p| {
                 seen_cb.lock().expect("lock").push(p);
             })),
+            faux_script: None,
             run_id: None,
         };
 

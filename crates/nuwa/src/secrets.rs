@@ -238,10 +238,24 @@ pub fn agent_env_allowlist() -> BTreeMap<String, String> {
 }
 
 fn build_allowlist(vars: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    // Windows environment names are case-insensitive, but `std::env::vars()`
+    // preserves the parent's spelling (Git Bash/MSYS exports `SYSTEMROOT`).
+    // An exact lookup for the canonical `SystemRoot` would silently drop it and
+    // break Windows children that need it (Node's test-runner children fail in
+    // crypto init). Match case-insensitively and emit the canonical spelling.
+    let normalized: BTreeMap<String, &String> = vars
+        .iter()
+        .map(|(key, value)| (key.to_ascii_lowercase(), value))
+        .collect();
+    let lookup = |key: &str| {
+        normalized
+            .get(&key.to_ascii_lowercase())
+            .map(|value| (*value).clone())
+    };
     let mut allow = BTreeMap::new();
     for key in SAFE_ENV {
-        if let Some(value) = vars.get(*key) {
-            allow.insert((*key).to_string(), value.clone());
+        if let Some(value) = lookup(key) {
+            allow.insert((*key).to_string(), value);
         }
     }
     if let Some(extra) = vars.get("NUWA_AGENT_ENV_ALLOW") {
@@ -249,8 +263,8 @@ fn build_allowlist(vars: &BTreeMap<String, String>) -> BTreeMap<String, String> 
             if KNOWN_SECRET_KEYS.contains(&key) {
                 continue;
             }
-            if let Some(value) = vars.get(key) {
-                allow.insert(key.to_string(), value.clone());
+            if let Some(value) = lookup(key) {
+                allow.insert(key.to_string(), value);
             }
         }
     }
@@ -378,6 +392,21 @@ mod tests {
         assert_eq!(allow.get("MY_BUILD_FLAG").map(String::as_str), Some("1"));
         assert!(!allow.contains_key("ZAI_API_KEY"));
         assert!(!allow.contains_key("SSH_AUTH_SOCK"));
+    }
+
+    #[test]
+    fn allowlist_matches_windows_env_names_case_insensitively() {
+        // Git Bash exports `SYSTEMROOT`; Windows children still need the value.
+        let vars = vars(&[
+            ("SYSTEMROOT", r"C:\Windows"),
+            ("path", r"C:\bin"),
+            ("NUWA_AGENT_ENV_ALLOW", "custom_flag"),
+            ("CUSTOM_FLAG", "1"),
+        ]);
+        let allow = build_allowlist(&vars);
+        assert_eq!(allow.get("SystemRoot").map(String::as_str), Some(r"C:\Windows"));
+        assert_eq!(allow.get("PATH").map(String::as_str), Some(r"C:\bin"));
+        assert_eq!(allow.get("custom_flag").map(String::as_str), Some("1"));
     }
 
     #[test]

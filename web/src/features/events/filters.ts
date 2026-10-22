@@ -23,6 +23,8 @@ export const EVENT_KINDS = [
   "ci_red",
   "ci_timeout",
   "decision",
+  "memory_updated",
+  "memory_deleted",
   "config_changed",
   "config_migrated",
   "restart_requested",

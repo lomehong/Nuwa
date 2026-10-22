@@ -64,6 +64,9 @@ pub struct EffectiveConfig {
     pub max_attempts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft_first_n: Option<u64>,
+    /// `nuwa.repo.json` 的 skills 白名单；空数组 = 自动选择。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 /// `GET /api/v1/runners` — every registered runner, newest heartbeat first.
@@ -136,7 +139,7 @@ fn runner_dto(runner: &RunnerRow, now: i64, prs_today: u64) -> RunnerDto {
     }
 }
 
-fn effective_config(config_json: &str) -> EffectiveConfig {
+pub(crate) fn effective_config(config_json: &str) -> EffectiveConfig {
     let Ok(config) = serde_json::from_str::<serde_json::Value>(config_json) else {
         return EffectiveConfig::default();
     };
@@ -157,6 +160,17 @@ fn effective_config(config_json: &str) -> EffectiveConfig {
         forbidden_paths_count: number("forbidden_paths_count"),
         max_attempts: number("max_attempts"),
         draft_first_n: number("draft_first_n"),
+        skills: config
+            .get("skills")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

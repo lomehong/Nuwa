@@ -53,6 +53,7 @@ MODULE_RULES: dict[str, set[str]] = {
     },
     "check": {"api", "serve", "web"},
     "pipeline": {"api", "serve", "web", "check"},
+    "benchmark": {"api", "serve", "web"},
     "skills": {
         "api", "serve", "deliver", "repair", "verify", "guard", "instructions",
         "check", "web", "session", "settings",

@@ -1,0 +1,18 @@
+{
+  "name": "node-empty-average",
+  "title": "Node 空数组平均值为 NaN",
+  "description": "average([]) 返回 NaN；测试期望 0。修复需要显式处理空输入。",
+  "language": "node",
+  "failing_check": {
+    "command": "node --test",
+    "timeout_secs": 120
+  },
+  "writes": [
+    {
+      "path": "calc.mjs",
+      "content": "export function average(values) {\n  if (values.length === 0) {\n    return 0;\n  }\n  return values.reduce((sum, value) => sum + value, 0) / values.length;\n}\n"
+    }
+  ],
+  "final": "ROOT CAUSE: average 对空数组除以 0。\nCHANGE: 空输入返回 0。\nVERIFICATION: node --test — pass.",
+  "expect_fixed": true
+}

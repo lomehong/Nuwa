@@ -282,6 +282,28 @@ cd web && NUWA_E2E_BASE_URL=http://127.0.0.1:7404 NUWA_E2E_TOKEN=dummy npm run t
 - `GET /api/v1/system`：`version/build_commit/started_at_ms/uptime_secs/db_path/db_size_bytes/local_mode/services[{unit,active}]`。systemd 不可用或 `systemctl is-active` 无输出时 `active="n/a"`，不算错误；本地模式会在页面显示无鉴权警告。
 - `GET /api/v1/issues/{fp}/transcript?run_id=&page=1&page_size=20`：省略 `run_id` 时取该指纹**最近一次有 `session_dir` 的 run**；指定不属于该指纹的 run → 404 `run not found`；未知单 → 404 `issue not found`。只解析 `kind=entry,type=message`，映射 user / assistant（thinking、text、tool_call）/ tool_result；其它记录（header/record/model_change/custom）忽略。单个块（text/thinking/tool_result/序列化后的 tool_call 参数）按 UTF-8 字节上限 16KB 截断并标 `truncated=true`；**超限 tool_call 的 `arguments` 会从 JSON 对象变成字符串预览 `<truncated: N bytes>`**（前端需同时处理 object 与 string 两种类型），避免单个调用占满页面。文件只读末尾 2MB（更早内容丢弃并标 `meta.truncated=true`），按消息分页：`page_size` 默认 **20**、最大 **100**（100 是上限不是默认值），越界或非数字 422；无 run/无会话返回 `data:[]`、`meta.empty=true`。转录路径由 DB 的 run 行派生（必须是绝对路径且不含 `..`），从不接受客户端路径；`work --sessions` 建议传绝对路径，否则失败/中断的 run 可能没有可读转录。
 
+## 修复基准（可选）
+
+固定种子场景验证“修复流水线 + 验证门 + 交付门”是否退化：
+
+```bash
+nuwa benchmark list                       # 内置场景目录
+nuwa benchmark run --provider faux        # 确定性流水线基准（不需要 API key）
+nuwa benchmark run --provider zai --model glm-5.3-flash   # 真实模型质量基准
+nuwa benchmark run --provider faux --scenario node-empty-average,go-off-by-one --json
+```
+
+- `faux` 只证明流水线与门禁，不证明模型修复质量；`live` 才衡量模型，比较时固定 provider/model/场景集。
+- 每次运行写 `benchmark_runs` / `benchmark_results`；控制台 `/benchmarks` 看趋势、误报与逐场景证据。
+- 负对照（`expect_fixed=false`）必须保持“未修复”，否则说明门禁退化。
+- 基准在独立 CLI 进程运行；serve 不启动模型循环。
+
+## 控制台里的技能与记忆
+
+- `/projects/<repo>/skills`：内置技能 + 目标仓 `.nuwa/skills/*.md` 的只读目录，展示来源、版本、覆盖关系与解析告警；控制台不编辑目标仓文件。
+- `/projects/<repo>/memory`：验证门 + CI 证明过的修复记忆；可停用（保留来源、不再注入）或删除，操作写 owner 审计事件。
+- 记忆由 runner 自动写入，模型自述不会进入记忆；每仓最多 50 条。
+
 ## 问题单状态机（运维视角）
 
 ```

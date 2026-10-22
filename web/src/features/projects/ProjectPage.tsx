@@ -1,5 +1,13 @@
 import { clsx } from "clsx";
-import { ArrowLeft, ExternalLink, FolderTree, Pencil } from "lucide-react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  BookOpen,
+  BrainCircuit,
+  ExternalLink,
+  FolderTree,
+  Pencil,
+} from "lucide-react";
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
@@ -258,6 +266,50 @@ export function ProjectPage() {
         />
         <LedgerStat label="上报 24h" value={formatNumber(project.reports_24h)} />
         <LedgerStat label="tokens 24h" value={formatTokens(project.tokens_24h)} />
+      </div>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Card>
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4">
+            <div className="min-w-0">
+              <h3 className="flex items-center gap-1.5 text-heading-sm font-semibold text-text">
+                <BookOpen aria-hidden="true" className="size-4 text-accent" />
+                修复技能
+              </h3>
+              <p className="mt-1 text-body-sm text-text-secondary">
+                内置技能与目标仓 <span className="font-mono">.nuwa/skills</span> 的只读目录、
+                覆盖关系与解析告警。
+              </p>
+            </div>
+            <Link
+              to={`/projects/${encodeURIComponent(project.repo)}/skills`}
+              className="inline-flex min-h-11 items-center gap-1 text-body-sm font-medium text-accent transition-colors hover:underline"
+            >
+              查看技能
+              <ArrowRight aria-hidden="true" className="size-4" />
+            </Link>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4">
+            <div className="min-w-0">
+              <h3 className="flex items-center gap-1.5 text-heading-sm font-semibold text-text">
+                <BrainCircuit aria-hidden="true" className="size-4 text-accent" />
+                修复记忆
+              </h3>
+              <p className="mt-1 text-body-sm text-text-secondary">
+                验证门 + CI 证明过的同仓修复；可查看来源、停用或删除，决定下一轮是否参考。
+              </p>
+            </div>
+            <Link
+              to={`/projects/${encodeURIComponent(project.repo)}/memory`}
+              className="inline-flex min-h-11 items-center gap-1 text-body-sm font-medium text-accent transition-colors hover:underline"
+            >
+              查看记忆
+              <ArrowRight aria-hidden="true" className="size-4" />
+            </Link>
+          </CardContent>
+        </Card>
       </div>
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_20rem]">

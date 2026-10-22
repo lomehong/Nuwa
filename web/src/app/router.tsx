@@ -27,6 +27,26 @@ const SettingsPage = lazy(() =>
     default: module.SettingsPage,
   })),
 );
+const ProjectSkillsPage = lazy(() =>
+  import("../features/skills/ProjectSkillsPage").then((module) => ({
+    default: module.ProjectSkillsPage,
+  })),
+);
+const ProjectMemoryPage = lazy(() =>
+  import("../features/memory/ProjectMemoryPage").then((module) => ({
+    default: module.ProjectMemoryPage,
+  })),
+);
+const BenchmarksPage = lazy(() =>
+  import("../features/benchmarks/BenchmarksPage").then((module) => ({
+    default: module.BenchmarksPage,
+  })),
+);
+const BenchmarkDetailPage = lazy(() =>
+  import("../features/benchmarks/BenchmarkDetailPage").then((module) => ({
+    default: module.BenchmarkDetailPage,
+  })),
+);
 
 function RouteFallback() {
   return (
@@ -87,6 +107,22 @@ export const appRoutes: RouteObject[] = [
           { index: true, element: <OverviewPage /> },
           { path: "projects", element: <ProjectsPage /> },
           { path: "projects/:repo", element: <ProjectPage /> },
+          {
+            path: "projects/:repo/skills",
+            element: (
+              <LazyRoute>
+                <ProjectSkillsPage />
+              </LazyRoute>
+            ),
+          },
+          {
+            path: "projects/:repo/memory",
+            element: (
+              <LazyRoute>
+                <ProjectMemoryPage />
+              </LazyRoute>
+            ),
+          },
           { path: "issues", element: <IssuesPage /> },
           {
             path: "issues/:fp",
@@ -98,6 +134,22 @@ export const appRoutes: RouteObject[] = [
           },
           { path: "runners", element: <RunnersPage /> },
           { path: "events", element: <EventsPage /> },
+          {
+            path: "benchmarks",
+            element: (
+              <LazyRoute>
+                <BenchmarksPage />
+              </LazyRoute>
+            ),
+          },
+          {
+            path: "benchmarks/:id",
+            element: (
+              <LazyRoute>
+                <BenchmarkDetailPage />
+              </LazyRoute>
+            ),
+          },
           { path: "architecture", element: <ArchitecturePage /> },
           {
             path: "settings",

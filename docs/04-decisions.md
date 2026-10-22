@@ -163,3 +163,17 @@
   6. 上下文预算：runs 表记录 `compactions/context_window/messages`，repair 报告同一组数字；压缩次数来自 harness 的 CompactionProgress 事件（vendored `events.rs` 补类型化订阅实现，属 ADR-014 授权范围）。
 - 已知盲区（诚实记录）：harness 未对外暴露逐条消息淘汰、压缩摘要长度与“当前上下文 token 占用”；`estimate_context_tokens` 也不对调用方开放。因此控制台只承诺“压缩发生了几次、模型窗口多大、结束时多少条消息”，不承诺实时上下文占用百分比。
 - 被否决备选：两条入口各写一套（漂移已经发生）；把技能选择交给模型（不确定、不可回放）；把全部历史修复注入提示（污染上下文且无来源）；无条件合并基线（会把未验证的树推给 PR）。
+
+## ADR-016 · 修复基准：执行在 CLI/CI，控制台只读结果，指标必须包含误报
+
+- 状态：已接受（2026-10-23）
+- 背景：技能、记忆、决策 trace、上下文预算都让修复过程可审计，但仍没有可比较的质量数字——“改完之后到底修得更好还是更差”无法回答。只看通过率又会自欺：模型声称修好、检查仍红的情况必须被单列。
+- 决策：
+  1. **固定场景内嵌**：`assets/benchmarks/<scenario>/` 含 `scenario.json` 与种子仓文件；场景声明 `failing_check`、预期是否应修复、确定性 faux 写入与最终消息。内置 4 个正场景 + 1 个负对照（只写说明但声称修好）。
+  2. **执行面与展示面分离**：`nuwa benchmark run` 在独立进程运行（`faux` 默认，`live` 需真实 provider 密钥）；serve 不启动模型循环，控制台只读结果。原因：provider 密钥、全局 turn 预算环境变量、进程隔离都不适合放在 HTTP 服务里。
+  3. **指标**：逐场景记录 `repaired`、`claimed_fixed`、`delivery_ok`、turns/tokens/耗时；误报定义为 `claimed_fixed && !repaired`。基准必须报告误报率与负对照结果，不能只报通过率。
+  4. **隔离**：每个场景复制到独立临时 git 仓；Windows 场景可覆盖启动器命令；Rust fixture 自带 `target-dir`，避免开发机的全局 cargo 配置污染基线。基准不触碰用户仓库。
+  5. **持久化与展示**：结果写 `benchmark_runs`/`benchmark_results`（schema v6）；控制台 `/benchmarks` 展示趋势、运行表、场景目录与逐场景证据，`/benchmarks/:id` 显示误报、预期偏差与门禁拦截。
+  6. **顺带修复**：基准首次运行暴露 Windows 子进程环境白名单按大小写精确查找 `SystemRoot` 的缺陷（Git Bash 导出 `SYSTEMROOT` 时被丢弃，Node 测试子进程在 crypto 初始化崩溃）；白名单改为大小写不敏感并回填规范键名。
+- 已知边界：内置场景只有 5 个，覆盖四类工具链的典型失败与一个负对照；它证明“流水线与门禁不退化”，不能替代真实仓库的多样化故障。`live` 结果受模型随机性与成本影响，比较时应固定 provider/model/场景集。
+- 被否决备选：控制台按钮直接跑基准（密钥/进程/预算边界不清）；只报通过率（无法发现误报）；接入外部基准服务（超出单所有者部署边界）；把 faux 结果当模型质量（faux 只证明流水线，不证明 LLM）。

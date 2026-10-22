@@ -29,6 +29,8 @@ const EVENT_KIND_LABELS: Record<string, string> = {
   runner_error: "运行器异常",
   sync: "对账",
   decision: "决策",
+  memory_updated: "记忆更新",
+  memory_deleted: "记忆删除",
 };
 
 export function eventKindLabel(kind: string): string {
@@ -56,6 +58,8 @@ const EVENT_KIND_VARIANTS: Record<string, BadgeVariant> = {
   runner_error: "danger",
   sync: "neutral",
   decision: "info",
+  memory_updated: "info",
+  memory_deleted: "warning",
 };
 
 export function eventKindVariant(kind: string): BadgeVariant {
@@ -64,22 +68,42 @@ export function eventKindVariant(kind: string): BadgeVariant {
 
 /**
  * `decision` events carry structured JSON (`stage`/`decision`/`reason`).
- * Render that as one readable line; anything malformed falls back to the raw
- * detail so a trace is never hidden by a parser failure.
+ * Anything malformed returns null so callers can fall back to the raw detail.
  */
-export function decisionDetailLabel(detail: string): string {
+export interface DecisionTracePayload {
+  stage: string;
+  decision: string;
+  reason: string;
+  details?: unknown;
+}
+
+export function parseDecision(detail: string): DecisionTracePayload | null {
   try {
     const parsed = JSON.parse(detail) as {
       stage?: unknown;
       decision?: unknown;
       reason?: unknown;
+      details?: unknown;
     };
     if (typeof parsed.stage !== "string" || typeof parsed.decision !== "string") {
-      return detail;
+      return null;
     }
-    const reason = typeof parsed.reason === "string" && parsed.reason ? ` — ${parsed.reason}` : "";
-    return `${parsed.stage} · ${parsed.decision}${reason}`;
+    return {
+      stage: parsed.stage,
+      decision: parsed.decision,
+      reason: typeof parsed.reason === "string" ? parsed.reason : "",
+      details: parsed.details,
+    };
   } catch {
+    return null;
+  }
+}
+
+/** Render a trace as one readable line; malformed detail stays raw. */
+export function decisionDetailLabel(detail: string): string {
+  const parsed = parseDecision(detail);
+  if (!parsed) {
     return detail;
   }
+  return `${parsed.stage} · ${parsed.decision}${parsed.reason ? ` — ${parsed.reason}` : ""}`;
 }

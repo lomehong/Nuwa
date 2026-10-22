@@ -249,6 +249,16 @@ pub fn validate_forbidden_paths(paths: &[String]) -> anyhow::Result<()> {
     compile_forbidden(paths).map(|_| ())
 }
 
+/// Run one check against the current working tree (benchmark scoring).
+pub(crate) async fn check_working_tree(
+    repo: &Path,
+    check: &FailingCheck,
+    secrets: &Secrets,
+) -> anyhow::Result<CheckOutput> {
+    let env = crate::secrets::agent_env_allowlist();
+    run_check(repo, check, &env, secrets).await
+}
+
 async fn run_check(
     dir: &Path,
     check: &FailingCheck,

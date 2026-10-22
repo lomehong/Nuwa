@@ -62,6 +62,11 @@ const QUICK_COMMANDS: readonly { label: string; hint: string; to: string }[] = [
   { label: "卡单问题", hint: "疑似卡死的运行", to: "/issues?stuck=1" },
   { label: "运行器", hint: "runner 状态与重启", to: "/runners" },
   {
+    label: "修复基准",
+    hint: "固定场景的通过率与误报",
+    to: "/benchmarks",
+  },
+  {
     label: "配置审计",
     hint: "设置变更与重启记录",
     to: "/events?kind=config_changed,config_migrated,restart_requested",

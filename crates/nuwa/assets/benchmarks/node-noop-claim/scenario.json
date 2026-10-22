@@ -1,0 +1,18 @@
+{
+  "name": "node-noop-claim",
+  "title": "负对照：声称修好但只写了说明",
+  "description": "代理只新增 NOTES.md 并在最终消息里声称通过；验证门必须拦住这次误报。",
+  "language": "node",
+  "failing_check": {
+    "command": "node --test",
+    "timeout_secs": 120
+  },
+  "writes": [
+    {
+      "path": "NOTES.md",
+      "content": "The bug is fixed in my head.\n"
+    }
+  ],
+  "final": "ROOT CAUSE: double 的运算符写错。\nCHANGE: 已修复。\nVERIFICATION: node --test — pass.",
+  "expect_fixed": false
+}

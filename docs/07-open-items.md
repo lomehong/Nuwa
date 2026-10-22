@@ -109,7 +109,14 @@
   - **P1-7 修复记忆（带来源）**：shanhaijing schema v4 新增 `repair_memory` 表（repo+fingerprint 主键，commit/PR/时间来源）；只在验证门绿 + CI 绿（或 branch-only 已推送）后 upsert，同指纹保留最新、每仓 50 条；`build_prior_context` 在 OWNER NOTE/PRIOR ATTEMPTS 后注入同仓其他问题单的已验证修复，排除当前指纹。迁移与存储测试 3 个、上下文注入断言 1 组。
   - **P1-8 上下文预算可见**：`RepairReport.context` 报告模型窗口/自动压缩次数/最终消息数；runs 表新增 `compactions/context_window/messages`（schema v5），`/api/v1/issues/{fp}` 透出，运行记录卡显示「窗口/压缩/消息」。压缩计数来自 harness `CompactionProgress` 事件；逐条消息淘汰与实时占用 harness 未暴露，按 ADR-015 诚实记录为盲区。
   - **验证证据**：Rust 全量 **1138 通过 / 0 失败 / 1 ignored**（4 个 Windows 时序用例按文档排除：上游 `os_cancel_interrupts…`、`git_ops` 孙进程管道、`rpi-tools` 两个 stdout/超时断言——单独复跑均通过）；自建 crate `clippy -D warnings` 零警告；前端 **350 通过 / 48 文件**，typecheck/lint/build 零错误；`check-arch.py`（16 模块/6 crate/2 条债）与 `check-vendored.py`（14 文件）通过。新增单测覆盖 pipeline 3、skills 8、trace 1、delivery 远端 tip 2、记忆 2、迁移 v4/v5 2。
-- 下一步：验证门对 `internal/` 可复现性的盲区（本例 go test 无法触发 main 运行时 panic，靠 CI 深跑兜底——补充 `go vet`+`go build`+单测三角）→ 并发池/镜像矩阵（A-3）→ musl 静态构建 → 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 同 runner-id 启动租约。
+- **技能/记忆完整 UI + 修复基准（2026-10-23，未提交/未推送）**：ADR-016 记录基准取舍。
+  - **技能目录**：`GET /api/v1/projects/{repo}/skills` 汇总内置与仓库 `.nuwa/skills/*.md`（来源/版本/覆盖关系/白名单/解析告警）；项目工位新增「修复技能」入口与 `/projects/:repo/skills` 页（搜索、来源/语言筛选、生效定义切换、正文展开）；runner 心跳的 effective config 增加 `skills`；`decision` 事件在活动页/问题时间线可展开原始 JSON 并复制。
+  - **修复记忆**：schema v6 给 `repair_memory` 增加 `disabled`；新增列表/停用/删除 API（CSRF + owner 审计 `memory_updated`/`memory_deleted`）；`/projects/:repo/memory` 页展示来源、问题单状态、根因/改动、分页与筛选，支持停用/启用与确认删除；注入查询排除停用记忆。
+  - **修复基准**：5 个内嵌场景（Go/Rust/Node/Python 正场景 + Node 负对照），场景自带 faux 脚本与预期；`nuwa benchmark run [--provider faux|zai|anthropic] [--scenario ...] [--json]` 在独立进程复制临时 git 仓、跑修复→检查→交付门，记录 repaired/claimed/false_positive/delivery/turns/tokens/duration；schema v6 新增 `benchmark_runs`/`benchmark_results`；控制台 `/benchmarks`（通过率/误报率/交付率/趋势/运行表/场景目录）与详情页（逐场景证据、预期偏差、门禁拦截说明、与上次对比）。
+  - **基准暴露并修复的真实缺陷**：Windows 子进程环境白名单按大小写精确查找 `SystemRoot`，Git Bash 导出 `SYSTEMROOT` 时被丢弃，导致 Node 测试子进程在 crypto 初始化崩溃（139/134）；改为大小写不敏感并回填规范键名。Rust 场景固定 `target-dir`，避免开发机全局 cargo 配置污染基准。
+  - **已知边界**：内置场景只有 5 个，证明流水线/门禁不退化，不等同于真实仓库的多样故障；`live` 结果受模型随机性与成本影响，比较须固定 provider/model/场景集；控制台不触发基准运行（密钥与进程边界留在 CLI/CI）。
+  - **验证证据**：Rust 全量 **1153 通过 / 0 失败 / 1 ignored**（4 个 Windows 时序用例按文档排除、单独复跑通过；新增技能体积上限用例单独通过，当前共 1154）；自建 crate `clippy -D warnings` 零警告；前端 **360 通过 / 52 文件**，typecheck/lint/build 零错误；`check-arch.py`（17 模块）与 `check-vendored.py`（14 文件）通过；真实 `nuwa serve` + Headless Chrome 走查技能/记忆/基准/决策详情，0 console error。
+- 下一步：验证门对 `internal/` 可复现性的盲区（本例 go test 无法触发 main 运行时 panic，靠 CI 深跑兜底——补充 `go vet`+`go build`+单测三角）→ 并发池/镜像矩阵（A-3）→ musl 静态构建 → 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 同 runner-id 启动租约 → 基准场景扩充（真实仓库故障与 live 基线）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 

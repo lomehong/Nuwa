@@ -27,6 +27,8 @@ const CASES: readonly [kind: string, label: string, variant: BadgeVariant][] = [
   ["runner_error", "运行器异常", "danger"],
   ["sync", "对账", "neutral"],
   ["decision", "决策", "info"],
+  ["memory_updated", "记忆更新", "info"],
+  ["memory_deleted", "记忆删除", "warning"],
   ["pr_merged", "PR 已合并", "success"],
   ["pr_closed", "PR 已关闭", "danger"],
 ];

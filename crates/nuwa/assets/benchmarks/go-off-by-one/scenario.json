@@ -1,0 +1,18 @@
+{
+  "name": "go-off-by-one",
+  "title": "Go 平均数循环越界 + 空切片除零",
+  "description": "Average 的循环边界多走一格，空输入直接 panic；修复需要收紧边界并处理空切片。",
+  "language": "go",
+  "failing_check": {
+    "command": "go test ./...",
+    "timeout_secs": 180
+  },
+  "writes": [
+    {
+      "path": "calc.go",
+      "content": "package calc\n\n// Average returns the arithmetic mean of xs.\nfunc Average(xs []int) float64 {\n\tif len(xs) == 0 {\n\t\treturn 0\n\t}\n\tsum := 0\n\tfor i := 0; i < len(xs); i++ {\n\t\tsum += xs[i]\n\t}\n\treturn float64(sum) / float64(len(xs))\n}\n"
+    }
+  ],
+  "final": "ROOT CAUSE: Average 用 i <= len(xs) 遍历并在空切片上除零。\nCHANGE: 边界改为 i < len(xs)，空切片返回 0。\nVERIFICATION: go test ./... — pass.",
+  "expect_fixed": true
+}
