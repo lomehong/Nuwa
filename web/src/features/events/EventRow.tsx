@@ -9,6 +9,7 @@ import {
 } from "../../components/ui";
 import { actorLabel } from "../issue-detail/format";
 import { issueDetailPath } from "../issues/format";
+import { decisionDetailLabel } from "../../lib/eventKinds";
 import {
   eventKindLabel,
   eventKindVariant,
@@ -65,13 +66,14 @@ function KindCell({ event }: { event: EventItem }) {
   );
 }
 
-function EventDetail({ detail }: { detail: string }) {
+function EventDetail({ detail, kind }: { detail: string; kind: string }) {
+  const text = kind === "decision" ? decisionDetailLabel(detail) : detail;
   return (
     <p
       className="max-w-prose break-words font-mono text-body-sm text-text-secondary"
-      title={detail || undefined}
+      title={text || undefined}
     >
-      {detail || "—"}
+      {text || "—"}
     </p>
   );
 }
@@ -121,7 +123,7 @@ export function EventRow({ event }: { event: EventItem }) {
         <EventFingerprint fingerprint={event.fingerprint} />
       </TableCell>
       <TableCell className="max-w-[28rem] align-top">
-        <EventDetail detail={event.detail} />
+        <EventDetail detail={event.detail} kind={event.kind} />
       </TableCell>
       <TableCell className="align-top">
         <Repo repo={event.repo} />
@@ -144,7 +146,7 @@ export function EventCard({ event }: { event: EventItem }) {
             <EventTime event={event} className="ml-auto text-right" />
           </div>
           <EventFingerprint fingerprint={event.fingerprint} />
-          <EventDetail detail={event.detail} />
+          <EventDetail detail={event.detail} kind={event.kind} />
           <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-caption">
             <div className="min-w-0">
               <dt className="text-text-muted">仓库</dt>

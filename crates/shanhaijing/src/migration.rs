@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::ShanResult;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub fn apply(conn: &mut Connection) -> ShanResult<()> {
     conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
@@ -29,9 +29,23 @@ pub fn apply(conn: &mut Connection) -> ShanResult<()> {
         tx.commit()?;
         version = 2;
     }
-    if version < SCHEMA_VERSION {
+    if version < 3 {
         let tx = conn.transaction()?;
         migrate_v3(&tx)?;
+        tx.pragma_update(None, "user_version", 3)?;
+        tx.commit()?;
+        version = 3;
+    }
+    if version < 4 {
+        let tx = conn.transaction()?;
+        migrate_v4(&tx)?;
+        tx.pragma_update(None, "user_version", 4)?;
+        tx.commit()?;
+        version = 4;
+    }
+    if version < SCHEMA_VERSION {
+        let tx = conn.transaction()?;
+        migrate_v5(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
     }
@@ -148,6 +162,36 @@ fn migrate_v3(conn: &Connection) -> ShanResult<()> {
     Ok(())
 }
 
+/// v4：已验证修复记忆。来源（commit/PR/时间）与内容同表保存，注入时随内容
+/// 一起展示；同一 (repo, fingerprint) 只保留最新一次。
+fn migrate_v4(conn: &Connection) -> ShanResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS repair_memory (
+            repo        TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            commit_sha  TEXT NOT NULL,
+            pr_url      TEXT,
+            root_cause  TEXT NOT NULL,
+            change_stat TEXT NOT NULL DEFAULT '',
+            files       INTEGER NOT NULL DEFAULT 0,
+            recorded_at INTEGER NOT NULL,
+            PRIMARY KEY (repo, fingerprint)
+        );
+        CREATE INDEX IF NOT EXISTS idx_repair_memory_repo
+            ON repair_memory(repo, recorded_at DESC);",
+    )?;
+    Ok(())
+}
+
+/// v5：上下文预算可见。压缩次数、模型窗口与会话消息数随 run 落库——这是
+/// 「为什么这次修复烧了这么多 token」的直接证据。
+fn migrate_v5(conn: &Connection) -> ShanResult<()> {
+    add_column_if_missing(conn, "runs", "compactions", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "runs", "context_window", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "runs", "messages", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -224,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_is_v3() {
+    fn fresh_database_is_current() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fresh.db");
         let _store = Store::open(&path).expect("open");
@@ -232,8 +276,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3);
-        for table in ["issues", "events", "runners", "runs", "signal_daily", "repos"] {
+        assert_eq!(version, 5);
+        for table in ["issues", "events", "runners", "runs", "signal_daily", "repos", "repair_memory"] {
             assert!(table_exists(&conn, table), "missing {table}");
         }
         for (table, column) in [
@@ -245,6 +289,9 @@ mod tests {
             ("events", "actor"),
             ("repos", "created_at"),
             ("repos", "updated_at"),
+            ("runs", "compactions"),
+            ("runs", "context_window"),
+            ("runs", "messages"),
         ] {
             assert!(column_exists(&conn, table, column), "missing {table}.{column}");
         }
@@ -263,7 +310,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3, "v0 must run v1, v2 and v3");
+        assert_eq!(version, 5, "v0 must run v1 through v5");
         assert!(table_exists(&conn, "repos"));
         let (state_changed_at, owner): (i64, Option<String>) = conn
             .query_row(
@@ -292,12 +339,12 @@ mod tests {
             migrate_v1(&conn).expect("v1 migration");
             conn.pragma_update(None, "user_version", 1).expect("version");
         }
-        let _store = Store::open(&path).expect("migrate v2/v3");
+        let _store = Store::open(&path).expect("migrate v2/v3/v4/v5");
         let conn = Connection::open(&path).expect("reopen");
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 5);
         assert!(table_exists(&conn, "repos"));
         assert!(column_exists(&conn, "issues", "attempts"));
         // v1 data survives the upgrade.
@@ -310,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_database_to_v3() {
+    fn migrates_v2_database_to_current() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("v2.db");
         {
@@ -320,12 +367,12 @@ mod tests {
             migrate_v2(&conn).expect("v2");
             conn.pragma_update(None, "user_version", 2).expect("version");
         }
-        let _store = Store::open(&path).expect("migrate v3");
+        let _store = Store::open(&path).expect("migrate v3/v4/v5");
         let conn = Connection::open(&path).expect("reopen");
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 5);
         assert!(column_exists(&conn, "issues", "attempts"));
         assert!(column_exists(&conn, "runners", "progress_at"));
         let title: String = conn
@@ -334,6 +381,58 @@ mod tests {
             })
             .expect("issue title");
         assert_eq!(title, "t");
+    }
+
+    #[test]
+    fn migrates_v3_database_to_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v3.db");
+        {
+            let conn = Connection::open(&path).expect("open");
+            v0_schema(&conn);
+            migrate_v1(&conn).expect("v1");
+            migrate_v2(&conn).expect("v2");
+            migrate_v3(&conn).expect("v3");
+            conn.pragma_update(None, "user_version", 3).expect("version");
+        }
+        let _store = Store::open(&path).expect("migrate v4/v5");
+        let conn = Connection::open(&path).expect("reopen");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 5);
+        assert!(table_exists(&conn, "repair_memory"));
+        let title: String = conn
+            .query_row("SELECT title FROM issues WHERE fingerprint='fp1'", [], |row| {
+                row.get(0)
+            })
+            .expect("issue title");
+        assert_eq!(title, "t");
+    }
+
+    #[test]
+    fn migrates_v4_database_to_v5() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v4.db");
+        {
+            let conn = Connection::open(&path).expect("open");
+            v0_schema(&conn);
+            migrate_v1(&conn).expect("v1");
+            migrate_v2(&conn).expect("v2");
+            migrate_v3(&conn).expect("v3");
+            migrate_v4(&conn).expect("v4");
+            conn.pragma_update(None, "user_version", 4).expect("version");
+        }
+        let _store = Store::open(&path).expect("migrate v5");
+        let conn = Connection::open(&path).expect("reopen");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 5);
+        for column in ["compactions", "context_window", "messages"] {
+            assert!(column_exists(&conn, "runs", column), "missing runs.{column}");
+        }
+        assert!(table_exists(&conn, "repair_memory"));
     }
 
     #[test]
@@ -346,7 +445,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 5);
     }
 
     #[test]

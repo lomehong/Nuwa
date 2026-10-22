@@ -154,6 +154,71 @@ fn normalize_slug(rest: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+/// Push with transient-network retries; on exhaustion the delivery guard
+/// restores the base checkout and drops the local branch.
+async fn push_with_retry(repo: &Path, branch: &str) -> anyhow::Result<()> {
+    let mut last = anyhow::anyhow!("unreachable");
+    for attempt in 1..=3 {
+        match git_ops::push_branch(repo, branch, std::time::Duration::from_secs(120)).await {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+        if attempt < 3 {
+            eprintln!("push retry {attempt}/3 (transient network error), waiting 5s…");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    }
+    Err(last.context(format!("push failed for branch {branch}")))
+}
+
+/// Remote tip of `refs/heads/<branch>`; `None` when the branch is absent.
+fn remote_branch_tip(repo: &Path, branch: &str) -> anyhow::Result<Option<String>> {
+    let out = git(
+        repo,
+        &[
+            "ls-remote",
+            "--heads",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_string))
+}
+
+/// 交付证据必须对应远端真实存在的那个提交。ls-remote 失败或指向别的 SHA
+/// 都按失败处理——"推上去了"不是证据，"推到这一步"才是。
+async fn assert_pushed_commit(repo: &Path, branch: &str, expected: &str) -> anyhow::Result<()> {
+    let mut last = String::from("(no remote branch)");
+    for attempt in 1..=3 {
+        match remote_branch_tip(repo, branch) {
+            Ok(Some(tip)) if tip == expected => return Ok(()),
+            Ok(Some(tip)) => last = tip,
+            Ok(None) => last = String::from("(no remote branch)"),
+            Err(e) => last = format!("(ls-remote failed: {e:#})"),
+        }
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+    bail!("pushed branch {branch} does not point at the verified commit {expected}: {last}");
+}
+
+/// 尽力刷新 PR 基线；返回远端基线 tip。网络失败只降级告警——此时修复
+/// 分支已经推送成功，把交付整单打回得不偿失。
+fn fetch_base_tip(repo: &Path, base: &str) -> Option<String> {
+    match git(repo, &["fetch", "--quiet", "origin", base]) {
+        Ok(_) => git(repo, &["rev-parse", "--verify", &format!("origin/{base}")]).ok(),
+        Err(e) => {
+            eprintln!("deliver   : base refresh skipped: {e:#}");
+            None
+        }
+    }
+}
+
 /// Create the PR through the GitHub REST API. Per ADR-004 the server holds
 /// minimal credentials: one fine-grained token with `pulls:write` scoped to
 /// the registered repos — no interactive `gh` login, no CLI dependency.
@@ -255,6 +320,8 @@ async fn deliver_inner(
         bail!("agent made no changes — refusing to open an empty PR");
     }
     let base = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let base_oid = git(repo, &["rev-parse", "--verify", &base])
+        .with_context(|| format!("resolve delivery base {base}"))?;
     let branch = format!("agent/fix/{}", issue.short_fingerprint());
     if git(repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).is_ok() {
         bail!("branch {branch} already exists — this fingerprint already has work in flight; refusing a duplicate PR");
@@ -266,15 +333,15 @@ async fn deliver_inner(
 
     // ---- 2. independent verification gate (base red / branch green) ----
     println!("deliver   : verification gate `{}`…", issue.failing_check.command);
-    let evidence = crate::verify::verify(repo, issue, &base, secrets).await?;
+    let mut evidence = crate::verify::verify(repo, issue, &base, secrets).await?;
     let check_command = secrets.redact(&issue.failing_check.command);
-    let evidence_detail = secrets.redact(&evidence.detail(issue));
+    let mut evidence_detail = secrets.redact(&evidence.detail(issue));
     let evidence_path = sessions_dir
         .join(issue.short_fingerprint())
         .join("verification.txt");
     std::fs::create_dir_all(evidence_path.parent().with_context(|| "evidence dir")?)?;
     std::fs::write(&evidence_path, &evidence_detail).context("write evidence")?;
-    let verification_detail = truncate_evidence(&evidence_detail, 16_000);
+    let mut verification_detail = truncate_evidence(&evidence_detail, 16_000);
 
     // ---- 3. branch + commit ----
     git(repo, &["checkout", "-b", &branch])?;
@@ -313,39 +380,71 @@ async fn deliver_inner(
     if fail_point == Some(FailPoint::AfterCommit) {
         anyhow::bail!("test fail point: after commit");
     }
-    let commit = git(repo, &["rev-parse", "HEAD"])?;
+    let mut commit = git(repo, &["rev-parse", "HEAD"])?;
     let stat = git(repo, &["diff", "--stat", &format!("{base}...HEAD")])?;
-    let change_stat = truncate_evidence(&stat, 4_000);
+    let mut change_stat = truncate_evidence(&stat, 4_000);
 
     // ---- 4. push + PR ----
     let mut pr_url = None;
     let mut slug_out = None;
     let mut pr_number = None;
     if push {
-        // GitHub connectivity from CN networks flakes — retry transient resets.
-        let mut push_result = Err(anyhow::anyhow!("unreachable"));
-        for attempt in 1..=3 {
-            push_result = git_ops::push_branch(
-                repo,
-                &branch,
-                std::time::Duration::from_secs(120),
-            )
-            .await;
-            if push_result.is_ok() {
-                break;
-            }
-            if attempt < 3 {
-                eprintln!(
-                    "push retry {attempt}/3 (transient network error), waiting 5s…"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        push_with_retry(repo, &branch).await?;
+
+        // 基线在验证之后移动时，PR 会落后于 base（GitHub 也可能因此不开
+        // 检查）。只合并一次：合并树重新过红绿验证，再把新 tip 推上去；
+        // 冲突则中止交付、交人工 rebase——绝不把未验证的树提成 PR。
+        if create_pr && base != "HEAD" {
+            if let Some(tip) = fetch_base_tip(repo, &base) {
+                let contains_base =
+                    git(repo, &["merge-base", "--is-ancestor", &tip, &commit]).is_ok();
+                if tip != base_oid && !contains_base {
+                    println!(
+                        "deliver   : base {base} moved after verification — merging once and re-verifying"
+                    );
+                    let merge_msg = format!(
+                        "chore: merge origin/{base} before delivery\n\nNuwa re-verifies the merged tree."
+                    );
+                    if let Err(e) = git(
+                        repo,
+                        &[
+                            "-c",
+                            "user.name=nuwa[bot]",
+                            "-c",
+                            "user.email=nuwa@local",
+                            "merge",
+                            "--no-edit",
+                            "-m",
+                            &merge_msg,
+                            &format!("origin/{base}"),
+                        ],
+                    ) {
+                        let _ = git(repo, &["merge", "--abort"]);
+                        bail!(
+                            "base {base} moved and merging it conflicted — delivery aborted, manual rebase required: {e:#}"
+                        );
+                    }
+                    let merged = git(repo, &["rev-parse", "HEAD"])?;
+                    evidence = match crate::verify::verify(repo, issue, &base, secrets).await {
+                        Ok(evidence) => evidence,
+                        Err(e) => {
+                            let _ = git(repo, &["reset", "--hard", &commit]);
+                            bail!("base moved; the merged tree failed re-verification: {e:#}");
+                        }
+                    };
+                    evidence_detail = secrets.redact(&evidence.detail(issue));
+                    std::fs::write(&evidence_path, &evidence_detail)
+                        .context("write merged evidence")?;
+                    verification_detail = truncate_evidence(&evidence_detail, 16_000);
+                    let stat = git(repo, &["diff", "--stat", &format!("{base}...HEAD")])?;
+                    change_stat = truncate_evidence(&stat, 4_000);
+                    commit = merged;
+                    push_with_retry(repo, &branch).await?;
+                }
             }
         }
-        // Push exhausted its retries: the guard restores the base checkout and
-        // removes the local branch before the error escapes.
-        if let Err(e) = push_result {
-            return Err(e.context(format!("push failed for branch {branch}")));
-        }
+        // 交付证据钉在远端真实 tip 上，而不是"推送命令返回成功"。
+        assert_pushed_commit(repo, &branch, &commit).await?;
         if create_pr {
             let origin = git(repo, &["remote", "get-url", "origin"])
                 .context("read origin remote (PR creation needs a GitHub remote)")?;
@@ -538,6 +637,7 @@ mod tests {
             uncached_tokens: 0,
             cached_tokens: 0,
             session_dir: dir.join("sessions").display().to_string(),
+            context: Default::default(),
         }
     }
 
@@ -654,6 +754,52 @@ mod tests {
         assert!(out.ends_with('…'));
         assert_eq!(out.chars().count(), 101);
         assert_eq!(truncate_evidence("short", 100), "short");
+    }
+
+    #[tokio::test]
+    async fn pushed_commit_must_match_the_remote_tip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let origin = dir.path().join("origin.git");
+        git(dir.path(), &["init", "--bare", origin.to_str().expect("utf8")]);
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().expect("utf8")],
+        );
+        git(&repo, &["checkout", "-b", "agent/fix/fp-delivery"]);
+        std::fs::write(repo.join("fix.go"), "package main\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "fix"]);
+        let tip = git_output(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        git(&repo, &["push", "origin", "agent/fix/fp-delivery"]);
+
+        assert_pushed_commit(&repo, "agent/fix/fp-delivery", &tip)
+            .await
+            .expect("remote tip equals the verified commit");
+        assert!(
+            assert_pushed_commit(&repo, "agent/fix/fp-delivery", "0".repeat(40).as_str())
+                .await
+                .is_err(),
+            "a different SHA must fail post-delivery verification"
+        );
+    }
+
+    #[test]
+    fn missing_remote_branch_has_no_tip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let origin = dir.path().join("origin.git");
+        git(dir.path(), &["init", "--bare", origin.to_str().expect("utf8")]);
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().expect("utf8")],
+        );
+        assert_eq!(
+            remote_branch_tip(&repo, "agent/fix/none").expect("ls-remote"),
+            None
+        );
     }
 
     #[test]

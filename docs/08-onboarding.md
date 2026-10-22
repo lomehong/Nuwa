@@ -111,6 +111,7 @@ curl -sS -X POST "$NUWA_INGEST_URL/ingest" \
   "forbidden_paths": [".github/", "deploy/", "*.pem", "go.mod", "go.sum"],
   "max_attempts": 3,
   "draft_first_n": 0,
+  "skills": ["rust-cargo"],
   "notes": "给修复 runner 的自由文本说明（规范、禁区原因、注意事项）"
 }
 ```
@@ -121,6 +122,31 @@ curl -sS -X POST "$NUWA_INGEST_URL/ingest" \
 - `forbidden_paths` 在工具调用前做子串否决（拦截诚实错误），并在交付面对 `git diff --name-status` 做 glob 终检（权威；`*.pem` 现在真的能匹配嵌套文件）
 - `max_attempts`：problem-level 失败累计到阈值后自动 `ignored`，避免自动重试循环
 - `draft_first_n`：该仓前 N 个 PR 以 draft 打开；0 保持 ADR-003 的非 draft 默认
+- `skills` 可选：限定注入哪些修复技能（名字见下），留空则按问题语言与失败命令自动选择，最多 3 个
+
+### 修复技能（可选）
+
+内置技能随二进制分发（`rust-cargo` / `node-toolchain` / `go-test` / `python-pytest`），按问题单的 `language` 与 `failing_check.command` 确定性选择后追加到 runner 系统提示，单段总长有上限。仓库可放自己的技能覆盖或补充：
+
+```
+<repo>/.nuwa/skills/<name>.md
+```
+
+```markdown
+---
+name: rust-cargo
+version: 2
+description: 本仓 Rust 修复路径
+languages: rust
+matches: cargo, nextest
+---
+
+# 正文（Markdown，最多 3000 字符进入提示）
+```
+
+- 同名仓库技能覆盖内置版本；`version` 必须是 ≥1 的整数，会随 `name@version` 记录到决策 trace
+- frontmatter 只接受 `name/version/description/languages/matches`，未知键报错；`nuwa check` 会把坏技能文件升级为 error，运行时则跳过并告警
+- 技能是排查建议，不改变护栏：禁改路径、验证门、分支命名空间仍然强制
 
 接入前先跑预检（不消耗 LLM、不创建分支）：
 
@@ -129,7 +155,7 @@ nuwa check --instructions /path/to/your-repo/nuwa.repo.json
 nuwa check --instructions /path/to/repo/nuwa.repo.json --json
 ```
 
-预检会校验 JSON、repo 身份、glob、`max_attempts`，并在干净 base worktree 上探测 `failing_check`/`reproduce_check`。`failing_check` 在 base 上已是绿色会给出 warning（需要复现脚本），`reproduce_check` 在 base 上绿色则是 error。退出码非 0 表示配置不可用。
+预检会校验 JSON、repo 身份、glob、`max_attempts`、`skills` 点名与 `.nuwa/skills/*.md` 的 frontmatter，并在干净 base worktree 上探测 `failing_check`/`reproduce_check`。`failing_check` 在 base 上已是绿色会给出 warning（需要复现脚本），`reproduce_check` 在 base 上绿色则是 error。退出码非 0 表示配置不可用。
 
 ## 3 · 启动 runner（应龙）
 

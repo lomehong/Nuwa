@@ -39,6 +39,9 @@ pub struct RepoInstructions {
     /// Free-text repo-specific guidance appended to the runner system prompt.
     #[serde(default)]
     pub notes: String,
+    /// 允许注入的修复技能名（内置或 `.nuwa/skills`）；空 = 按语言/命令自动选择。
+    #[serde(default)]
+    pub skills: Vec<String>,
     /// Optional command that must fail on the base and pass on the branch.
     #[serde(default)]
     pub reproduce_check: Option<FailingCheck>,
@@ -52,6 +55,18 @@ pub struct RepoInstructions {
     pub draft_first_n: u32,
 }
 
+
+/// 读取工作区里的 `nuwa.repo.json`（不建立受信副本，供一次性 `nuwa fix` 使用）。
+/// 常驻 runner 走 [`TrustedInstructions::load`]，两者共享同一套解析与校验。
+pub fn load_working_tree(repo_dir: &Path) -> anyhow::Result<Option<RepoInstructions>> {
+    let path = repo_dir.join(INSTRUCTION_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read instructions {}", path.display()))?;
+    parse(&bytes, &path).map(Some)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustSource {

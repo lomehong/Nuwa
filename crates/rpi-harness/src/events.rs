@@ -198,6 +198,18 @@ impl HarnessEventOf for RunEndEvent {
     }
 }
 
+// Nuwa 本地补丁(2026-10-22): 补 CompactionProgressEvent 的 HarnessEventOf，
+// 否则公开事件无法用类型化 on() 订阅（nuwa 统计压缩次数需要）。
+impl HarnessEventOf for CompactionProgressEvent {
+    const TYPE_TAG: &'static str = "compaction_progress";
+    fn downcast(event: &HarnessEvent) -> Option<&Self> {
+        match event {
+            HarnessEvent::CompactionProgress(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 /// Erased direct listener stored per type tag. `Arc` so `emit` can clone it
 /// out of the mutex and invoke with the lock dropped (reentrancy-safe).
 type DirectListener = Arc<dyn Fn(&HarnessEvent) + Send + Sync>;

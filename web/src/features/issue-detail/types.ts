@@ -39,6 +39,10 @@ export interface RunDto {
   turns: number;
   tokens_uncached: number;
   tokens_cached: number;
+  /** 上下文预算：自动压缩次数、模型窗口、run 结束时的消息数。 */
+  compactions: number;
+  context_window: number;
+  messages: number;
   provider: string | null;
   model: string | null;
   root_cause: string | null;

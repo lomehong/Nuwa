@@ -23,6 +23,9 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+/// 每仓库保留的修复记忆条数。
+pub const REPAIR_MEMORY_KEEP: usize = 50;
+
 /// A raw collector report. One signal per incident batch; dedup happens here,
 /// never at the collector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +212,31 @@ pub struct EventRow {
     pub actor: Option<String>,
 }
 
+/// 一条已验证的修复记忆。来源（提交/PR/时间）必须随记忆一起保存：
+/// 没有来源的"经验"无法被复核，也就不能进入下一次修复的上下文。
+#[derive(Debug, Clone)]
+pub struct RepairMemoryEntry {
+    pub repo: String,
+    pub fingerprint: String,
+    pub commit_sha: String,
+    pub pr_url: Option<String>,
+    pub root_cause: String,
+    pub change_stat: String,
+    pub files: i64,
+    pub recorded_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairMemoryRow {
+    pub fingerprint: String,
+    pub commit_sha: String,
+    pub pr_url: Option<String>,
+    pub root_cause: String,
+    pub change_stat: String,
+    pub files: i64,
+    pub recorded_at: i64,
+}
+
 /// Filters for the console event feed. An empty `kinds` list means "every
 /// kind"; `from_ms`/`to_ms` are inclusive bounds on `events.ts`.
 #[derive(Debug, Clone, Default)]
@@ -314,6 +342,9 @@ pub struct RunUpdate {
     pub turns: Option<i64>,
     pub tokens_uncached: Option<i64>,
     pub tokens_cached: Option<i64>,
+    pub compactions: Option<i64>,
+    pub context_window: Option<i64>,
+    pub messages: Option<i64>,
     pub harness_run_id: Option<String>,
     pub root_cause: Option<String>,
     pub verification_ok: Option<bool>,
@@ -351,6 +382,12 @@ pub struct RunRow {
     pub turns: i64,
     pub tokens_uncached: i64,
     pub tokens_cached: i64,
+    /// 自动压缩次数（harness CompactionProgress，manual=false）。
+    pub compactions: i64,
+    /// 模型上下文窗口（token）；0 = 未知。
+    pub context_window: i64,
+    /// run 结束时会话里的消息数。
+    pub messages: i64,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub root_cause: Option<String>,
@@ -462,7 +499,8 @@ const EVENT_SELECT: &str = "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), CO
 const RUN_COLUMNS: &str = "id, harness_run_id, fingerprint, runner_id, repo, started_at, finished_at,
         phase, outcome, ci_verdict, turns, tokens_uncached, tokens_cached, provider,
         model, root_cause, change_stat, branch, commit_sha, pr_url, pr_opened_at,
-        verification_ok, verification_detail, session_dir, error";
+        verification_ok, verification_detail, session_dir, error, compactions,
+        context_window, messages";
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> ShanResult<Self> {
@@ -1627,6 +1665,73 @@ impl Store {
         })
     }
 
+    /// 记录一条已验证的修复。同一 (repo, fingerprint) 只保留最新一次，
+    /// 每仓库最多 [`REPAIR_MEMORY_KEEP`] 条——记忆是参考，不是账本。
+    pub fn record_repair_memory(&self, entry: &RepairMemoryEntry) -> ShanResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO repair_memory
+                (repo, fingerprint, commit_sha, pr_url, root_cause, change_stat, files, recorded_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(repo, fingerprint) DO UPDATE SET
+                commit_sha=excluded.commit_sha,
+                pr_url=excluded.pr_url,
+                root_cause=excluded.root_cause,
+                change_stat=excluded.change_stat,
+                files=excluded.files,
+                recorded_at=excluded.recorded_at",
+            rusqlite::params![
+                entry.repo,
+                entry.fingerprint,
+                entry.commit_sha,
+                entry.pr_url,
+                entry.root_cause,
+                entry.change_stat,
+                entry.files,
+                entry.recorded_at,
+            ],
+        )?;
+        conn.execute(
+            "DELETE FROM repair_memory WHERE repo = ?1 AND fingerprint NOT IN (
+                SELECT fingerprint FROM repair_memory WHERE repo = ?1
+                ORDER BY recorded_at DESC LIMIT ?2
+             )",
+            rusqlite::params![entry.repo, REPAIR_MEMORY_KEEP as i64],
+        )?;
+        Ok(())
+    }
+
+    /// 同仓库其他问题单的已验证修复，最新在前。
+    pub fn recent_repair_memory(
+        &self,
+        repo: &str,
+        exclude_fingerprint: &str,
+        limit: u32,
+    ) -> ShanResult<Vec<RepairMemoryRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT fingerprint, commit_sha, pr_url, root_cause, change_stat, files, recorded_at
+             FROM repair_memory
+             WHERE repo = ?1 AND fingerprint != ?2
+             ORDER BY recorded_at DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![repo, exclude_fingerprint, limit],
+            |row| {
+                Ok(RepairMemoryRow {
+                    fingerprint: row.get(0)?,
+                    commit_sha: row.get(1)?,
+                    pr_url: row.get(2)?,
+                    root_cause: row.get(3)?,
+                    change_stat: row.get(4)?,
+                    files: row.get(5)?,
+                    recorded_at: row.get(6)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Filtered lifecycle events, newest first (`ts DESC, id DESC`) — the
     /// console event feed. `limit` is capped at 5000.
     pub fn list_events(&self, query: &EventQuery, limit: u32) -> ShanResult<Vec<EventRow>> {
@@ -1916,12 +2021,16 @@ impl Store {
                 pr_opened_at = COALESCE(?14, pr_opened_at),
                 ci_verdict = COALESCE(?15, ci_verdict),
                 session_dir = COALESCE(?16, session_dir),
-                error = COALESCE(?17, error)
+                error = COALESCE(?17, error),
+                compactions = COALESCE(?18, compactions),
+                context_window = COALESCE(?19, context_window),
+                messages = COALESCE(?20, messages)
              WHERE id = ?1 AND finished_at IS NULL",
             rusqlite::params![
                 id, u.phase, u.turns, u.tokens_uncached, u.tokens_cached, u.harness_run_id,
                 u.root_cause, u.verification_ok, u.verification_detail, u.change_stat, u.branch,
                 u.commit_sha, u.pr_url, u.pr_opened_at, u.ci_verdict, u.session_dir, u.error,
+                u.compactions, u.context_window, u.messages,
             ],
         )?;
         if changed == 0 {
@@ -1982,6 +2091,9 @@ impl Store {
             verification_detail: row.get(22)?,
             session_dir: row.get(23)?,
             error: row.get(24)?,
+            compactions: row.get(25)?,
+            context_window: row.get(26)?,
+            messages: row.get(27)?,
         })
     }
 
@@ -4561,5 +4673,63 @@ mod repo_tests {
         assert_eq!(picked.fingerprint, critical_fp);
         assert_ne!(picked.fingerprint, medium_fp);
         assert_eq!(picked.attempts, 0);
+    }
+
+    fn memory_entry(fingerprint: &str, recorded_at: i64) -> RepairMemoryEntry {
+        RepairMemoryEntry {
+            repo: "example.com/spike-target".to_string(),
+            fingerprint: fingerprint.to_string(),
+            commit_sha: format!("sha-{fingerprint}"),
+            pr_url: Some(format!("https://github.com/acme/app/pull/{recorded_at}")),
+            root_cause: "ROOT CAUSE: fixed".to_string(),
+            change_stat: "1 file changed".to_string(),
+            files: 1,
+            recorded_at,
+        }
+    }
+
+    #[test]
+    fn repair_memory_keeps_latest_per_fingerprint_with_provenance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        store
+            .record_repair_memory(&memory_entry("fp-a", 10))
+            .expect("first");
+        let mut newer = memory_entry("fp-a", 20);
+        newer.commit_sha = "sha-a-2".to_string();
+        store.record_repair_memory(&newer).expect("upsert");
+        store
+            .record_repair_memory(&memory_entry("fp-b", 30))
+            .expect("second");
+
+        let rows = store
+            .recent_repair_memory("example.com/spike-target", "fp-b", 3)
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fingerprint, "fp-a");
+        assert_eq!(rows[0].commit_sha, "sha-a-2", "upsert keeps the newest evidence");
+        assert!(rows[0].pr_url.is_some());
+        assert!(rows[0].root_cause.contains("ROOT CAUSE"));
+
+        let other_repo = store
+            .recent_repair_memory("example.com/other", "fp-b", 3)
+            .expect("rows");
+        assert!(other_repo.is_empty(), "memory never crosses repositories");
+    }
+
+    #[test]
+    fn repair_memory_is_pruned_per_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        for index in 0..(REPAIR_MEMORY_KEEP as i64 + 5) {
+            store
+                .record_repair_memory(&memory_entry(&format!("fp-{index}"), index))
+                .expect("record");
+        }
+        let rows = store
+            .recent_repair_memory("example.com/spike-target", "none", 1_000)
+            .expect("rows");
+        assert_eq!(rows.len(), REPAIR_MEMORY_KEEP);
+        assert_eq!(rows[0].fingerprint, format!("fp-{}", REPAIR_MEMORY_KEEP + 4));
     }
 }

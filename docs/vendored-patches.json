@@ -1,0 +1,63 @@
+{
+  "baseline": "vendored/pi-rust-0.3.24",
+  "baseline_commit": "3446a821df48d32f81e35c64776365bca09873c7",
+  "adr": "docs/04-decisions.md#adr-014--授权对-vendored-rpi--就地打补丁突破-agentsmd-硬规则-1",
+  "files": [
+    {
+      "path": "crates/rpi-harness/src/agent_harness.rs",
+      "reason": "预算耗尽不再误报 Completed（返回 Aborted）；compaction 摘要请求继承调用方 pin 的 stream options"
+    },
+    {
+      "path": "crates/rpi-harness/src/compaction/compaction.rs",
+      "reason": "摘要请求合并并继承调用方的 timeout/max_retries"
+    },
+    {
+      "path": "crates/rpi-harness/src/settle.rs",
+      "reason": "assistant 提交 / tool_started 等关键持久化失败时取消整个 run，不再继续执行工具"
+    },
+    {
+      "path": "crates/rpi-harness/src/events.rs",
+      "reason": "补 CompactionProgressEvent 的 HarnessEventOf 实现：事件会 emit 但此前无法用类型化 on() 订阅，nuwa 无法统计压缩次数"
+    },
+    {
+      "path": "crates/rpi-harness/tests/compaction_split_turn.rs",
+      "reason": "适配 CompactionLlmOptions 新增字段（None 保持旧默认）"
+    },
+    {
+      "path": "crates/rpi-harness/tests/compaction_stream_options.rs",
+      "reason": "新增回归测试：摘要请求继承 stream options"
+    },
+    {
+      "path": "crates/rpi-harness/tests/compaction_summary.rs",
+      "reason": "适配 CompactionLlmOptions 新增字段"
+    },
+    {
+      "path": "crates/rpi-harness/tests/harness_run_e2e.rs",
+      "reason": "预算耗尽断言从 Completed 改为 Aborted"
+    },
+    {
+      "path": "crates/rpi-harness/tests/run_budget_outcome.rs",
+      "reason": "新增回归测试：预算耗尽 outcome 语义"
+    },
+    {
+      "path": "crates/rpi-harness/tests/settle_critical_persistence.rs",
+      "reason": "新增回归测试：关键持久化失败终止 run"
+    },
+    {
+      "path": "crates/rpi-tools/src/env.rs",
+      "reason": "FileSystem 增加有界范围读取契约 read_binary_file_range"
+    },
+    {
+      "path": "crates/rpi-tools/src/os_env.rs",
+      "reason": "并发驱动 stdout/stderr 与进程等待，修复大输出管道阻塞；实现有界范围读取"
+    },
+    {
+      "path": "crates/rpi-tools/src/tools/read.rs",
+      "reason": "流式有预算读取与图片输入上限，避免大文件全量载入"
+    },
+    {
+      "path": "crates/rpi-tools/tests/os_env_large_output.rs",
+      "reason": "新增回归测试：大输出不在管道上活锁"
+    }
+  ]
+}

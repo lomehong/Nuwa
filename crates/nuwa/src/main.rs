@@ -6,11 +6,14 @@ mod git_ops;
 mod guard;
 mod instructions;
 mod issue;
+mod pipeline;
 mod repair;
 mod secrets;
 mod serve;
 mod session;
 mod settings;
+mod skills;
+mod trace;
 mod verify;
 mod web;
 mod webhook;
@@ -1078,9 +1081,11 @@ fn context_excerpt(text: &str, max_chars: usize) -> String {
 }
 
 /// Build the retry context injected into the next repair prompt: the last
-/// owner decision plus the last three run outcomes/root causes/errors.
+/// owner decision, the last three run outcomes/root causes, and verified
+/// fixes from other issues in the same repo (with provenance).
 fn build_prior_context(
     store: &shanhaijing::Store,
+    repo: &str,
     fingerprint: &str,
     secrets: &secrets::Secrets,
 ) -> String {
@@ -1114,7 +1119,49 @@ fn build_prior_context(
             ));
         }
     }
+    if let Ok(memories) = store.recent_repair_memory(repo, fingerprint, 3) {
+        if !memories.is_empty() {
+            out.push_str(
+                "\nVERIFIED FIXES IN THIS REPO (other issues; reference only, re-verify against current code):\n",
+            );
+        }
+        for memory in memories {
+            let cause = secrets.redact(&memory.root_cause);
+            // Provenance first: a memory without a commit/PR cannot be checked.
+            let source = memory
+                .pr_url
+                .clone()
+                .unwrap_or_else(|| format!("commit {}", &memory.commit_sha[..12.min(memory.commit_sha.len())]));
+            out.push_str(&format!(
+                "- {} — root_cause={} change={}\n",
+                source,
+                context_excerpt(&cause, 200),
+                context_excerpt(memory.change_stat.trim(), 120),
+            ));
+        }
+    }
     out.chars().take(4_096).collect()
+}
+
+/// 只有通过独立验证门（以及 CI 绿灯或明确的 branch-only 成功）的修复才进入
+/// 记忆；来源随内容一起保存。
+fn remember_verified_fix(
+    store: &shanhaijing::Store,
+    repo: &str,
+    fingerprint: &str,
+    delivered: &deliver::DeliverReport,
+    root_cause: &str,
+) {
+    let _ = store.record_repair_memory(&shanhaijing::RepairMemoryEntry {
+        repo: repo.to_string(),
+        fingerprint: fingerprint.to_string(),
+        commit_sha: delivered.commit.clone(),
+        pr_url: delivered.pr_url.clone(),
+        root_cause: root_cause.to_string(),
+        change_stat: delivered.change_stat.clone(),
+        files: delivered.risk.files.len() as i64,
+        recorded_at: now_ms(),
+    });
 }
 
 /// One pickup attempt. `Ok(true)` = an issue was claimed and driven to a
@@ -1244,6 +1291,20 @@ async fn work_once(
             &repo_config.repo,
             "repo mismatch: issue escalated (ADR-004)",
         );
+        trace::record(
+            store,
+            &snapshot.fingerprint,
+            &repo_config.repo,
+            trace::Decision {
+                stage: "claim",
+                decision: "escalated",
+                reason: "issue repo does not match this runner's instructions",
+                details: serde_json::json!({
+                    "issue_repo": snapshot.repo,
+                    "runner_repo": repo_config.repo,
+                }),
+            },
+        );
         live_update(&live, "idle", None, None, Some(message)).await;
         return Ok(true);
     }
@@ -1257,6 +1318,20 @@ async fn work_once(
             snapshot.attempts, max_attempts
         );
         let _ = store.ignore_issue(&fp, &detail, "runner", now);
+        trace::record(
+            store,
+            &fp,
+            &repo_config.repo,
+            trace::Decision {
+                stage: "claim",
+                decision: "ignored",
+                reason: "attempt cap reached",
+                details: serde_json::json!({
+                    "attempts": snapshot.attempts,
+                    "max_attempts": max_attempts,
+                }),
+            },
+        );
         println!("ignored    : {fp} — {detail}");
         emit_webhook("ignored", &fp, &repo_config.repo, detail.clone());
         live_update(&live, "idle", None, None, Some(detail)).await;
@@ -1285,6 +1360,17 @@ async fn work_once(
                 Some(&message),
                 "runner",
             );
+            trace::record(
+                store,
+                &fp,
+                &repo_config.repo,
+                trace::Decision {
+                    stage: "preflight",
+                    decision: "escalated",
+                    reason: "stale branch has a recorded PR; refusing to delete it",
+                    details: serde_json::json!({"branch": stale_branch, "pr_url": recorded_pr}),
+                },
+            );
             println!("branch     : {message}");
             emit_webhook("escalated", &fp, &repo_config.repo, message.clone());
             live_update(&live, "idle", None, None, Some(message)).await;
@@ -1301,6 +1387,17 @@ async fn work_once(
                 Some(&message),
                 "runner",
             );
+            trace::record(
+                store,
+                &fp,
+                &repo_config.repo,
+                trace::Decision {
+                    stage: "preflight",
+                    decision: "escalated",
+                    reason: "stale branch removal failed",
+                    details: serde_json::json!({"branch": stale_branch, "error": secrets.redact(&format!("{e:#}"))}),
+                },
+            );
             println!("branch     : {message}");
             emit_webhook("escalated", &fp, &repo_config.repo, message.clone());
             live_update(&live, "idle", None, None, Some(message)).await;
@@ -1309,26 +1406,10 @@ async fn work_once(
         println!("branch     : removed stale {stale_branch} before repair");
     }
 
-    let prior_context = build_prior_context(store, &fp, secrets);
-    // Build the issue before `start_run` so the deterministic session dir is
-    // known for the first lifecycle write.
-    let prob = issue::Issue {
-        fingerprint: fp.clone(),
-        // The raw signal is external input; strip known secrets / token
-        // patterns before it enters the LLM context.
-        title: secrets.redact(&snapshot.title),
-        language: snapshot.language.clone(),
-        occurrences: snapshot.occurrences,
-        severity: snapshot.severity.clone(),
-        first_seen: String::new(),
-        last_seen: String::new(),
-        stack_trace: secrets.redact(&snapshot.stack_sample),
-        log_window: Vec::new(),
-        prior_context,
-        failing_check: repo_config.failing_check.clone(),
-        reproduce_check: repo_config.reproduce_check.clone(),
-        forbidden_paths: repo_config.forbidden_paths.clone(),
-    };
+    let prior_context = build_prior_context(store, &repo_config.repo, &fp, secrets);
+    // 问题单在 `start_run` 之前构建：确定性会话目录要在第一次生命周期写入时
+    // 就已知。
+    let prob = pipeline::issue_from_snapshot(&snapshot, repo_config, prior_context, secrets);
     let _ = store.start_run(&shanhaijing::RunStart {
         id: run_id.clone(),
         fingerprint: fp.clone(),
@@ -1339,6 +1420,7 @@ async fn work_once(
         model: Some(model_name.clone()),
     });
     live_update(&live, "working", Some(&fp), Some("claim"), None).await;
+    let provider_label = pipeline::provider_label(&provider);
     println!(
         "claimed    : {} [{}] {} — {}x\nrepo       : {}\nprovider   : {}",
         fp,
@@ -1346,17 +1428,7 @@ async fn work_once(
         snapshot.title,
         snapshot.occurrences,
         repo_dir.display(),
-        match &provider {
-            repair::ProviderKind::Faux => "faux".to_string(),
-            repair::ProviderKind::Anthropic { model } => match model {
-                Some(m) => format!("anthropic:{m}"),
-                None => "anthropic:<catalog default>".to_string(),
-            },
-            repair::ProviderKind::Zai { model, .. } => match model {
-                Some(m) => format!("zai:{m}"),
-                None => "zai:glm-5.3-flash".to_string(),
-            },
-        },
+        provider_label,
     );
     if let Err(e) = store.set_state_as(
         &fp,
@@ -1380,52 +1452,61 @@ async fn work_once(
     }
 
     // ---- repair ----
-    let guards = std::sync::Arc::new(guard::Guards::new(repo_config.forbidden_paths.clone()));
     let progress_store = Arc::clone(store);
     let progress_run = run_id.clone();
     let progress_live = Arc::clone(&live);
-    let progress: Option<Arc<dyn Fn(repair::RepairProgress) + Send + Sync>> =
-        Some(Arc::new(move |p| {
-            let store = Arc::clone(&progress_store);
-            let run_id = progress_run.clone();
-            // Every completed turn is real progress: refresh the watchdog
-            // timestamp even though the independent heartbeat keeps ticking.
-            let live = Arc::clone(&progress_live);
-            tokio::spawn(async move {
-                live.lock().await.progress_at_ms = now_ms();
-            });
-            // Fire-and-forget: progress is best-effort telemetry and must not
-            // sit in the event drain that drives the repair loop.
-            tokio::spawn(async move {
-                let update = shanhaijing::RunUpdate {
-                    turns: Some(i64::from(p.turns)),
-                    tokens_uncached: Some(p.uncached_tokens as i64),
-                    tokens_cached: Some(p.cached_tokens as i64),
-                    ..Default::default()
-                };
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = store.update_run(&run_id, &update);
-                })
-                .await;
-            });
-        }));
-    // Per-run session directory: must match repair.rs's layout so the stored
-    // `session_dir` resolves to this run's own JSONL, not a sibling retry's.
-    let session_dir = sessions_dir
-        .join(prob.short_fingerprint())
-        .join(&run_id);
-    let job = repair::RepairJob {
+    let progress: Option<pipeline::ProgressSink> = Some(Arc::new(move |p| {
+        let store = Arc::clone(&progress_store);
+        let run_id = progress_run.clone();
+        // Every completed turn is real progress: refresh the watchdog
+        // timestamp even though the independent heartbeat keeps ticking.
+        let live = Arc::clone(&progress_live);
+        tokio::spawn(async move {
+            live.lock().await.progress_at_ms = now_ms();
+        });
+        // Fire-and-forget: progress is best-effort telemetry and must not
+        // sit in the event drain that drives the repair loop.
+        tokio::spawn(async move {
+            let update = shanhaijing::RunUpdate {
+                turns: Some(i64::from(p.turns)),
+                tokens_uncached: Some(p.uncached_tokens as i64),
+                tokens_cached: Some(p.cached_tokens as i64),
+                ..Default::default()
+            };
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = store.update_run(&run_id, &update);
+            })
+            .await;
+        });
+    }));
+    let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
         repo: repo_dir.to_path_buf(),
         issue: prob,
-        sessions_dir,
+        sessions_dir: sessions_dir.clone(),
         provider,
         max_turns,
-        guards,
+        repo_config: Some(repo_config.clone()),
         secrets: Arc::clone(secrets),
-        notes: repo_config.notes.clone(),
         progress,
         run_id: Some(run_id.clone()),
-    };
+    })?;
+    let session_dir = prepared.session_dir().to_path_buf();
+    trace::record(
+        store,
+        &fp,
+        &repo_config.repo,
+        trace::Decision {
+            stage: "repair",
+            decision: "started",
+            reason: "issue claimed; repository preflight passed",
+            details: serde_json::json!({
+                "provider": provider_label,
+                "max_turns": max_turns,
+                "skills": prepared.skills_used(),
+                "session_dir": session_dir.display().to_string(),
+            }),
+        },
+    );
 
     live_update(&live, "working", Some(&fp), Some("repair"), None).await;
     persist_run(
@@ -1438,14 +1519,9 @@ async fn work_once(
         },
     )
     .await;
-    let report = match repair::run(&job).await {
+    let report = match prepared.execute().await {
         Ok(r) => r,
         Err(e) => {
-            // Redact the partial transcript on the failure path too: the model
-            // may have echoed a credential before the run died, and serve reads
-            // this file live for the transcript view. The success path redacts
-            // after `report`; without this, a failed run's secrets persist.
-            let _ = secrets.redact_session_dir(&session_dir);
             let class = classify_failure(&e);
             let detail = bounded_text(&secrets.redact(&format!("repair_failed: {e:#}")));
             let outcome = match class {
@@ -1475,6 +1551,20 @@ async fn work_once(
                         now,
                     );
                     let standing = mark_provider_failure(&live, now).await;
+                    trace::record(
+                        store,
+                        &fp,
+                        &repo_config.repo,
+                        trace::Decision {
+                            stage: "repair",
+                            decision: "released",
+                            reason: "provider transient failure; issue is not at fault",
+                            details: serde_json::json!({
+                                "error": detail,
+                                "stand_down": standing,
+                            }),
+                        },
+                    );
                     if standing {
                         emit_webhook(
                             "provider_stand_down",
@@ -1513,6 +1603,17 @@ async fn work_once(
                         &repo_config.repo,
                         "provider configuration failure; standing down for 15 minutes",
                     );
+                    trace::record(
+                        store,
+                        &fp,
+                        &repo_config.repo,
+                        trace::Decision {
+                            stage: "repair",
+                            decision: "escalated",
+                            reason: "provider configuration failure",
+                            details: serde_json::json!({"error": detail}),
+                        },
+                    );
                     mark_stand_down(&live, now + 15 * 60_000).await;
                     live_update(&live, "standing_down", None, None, Some(detail)).await;
                     return Ok(false);
@@ -1523,6 +1624,17 @@ async fn work_once(
                         &format!("environment failure: {e:#}"),
                         now + 5 * 60_000,
                         now,
+                    );
+                    trace::record(
+                        store,
+                        &fp,
+                        &repo_config.repo,
+                        trace::Decision {
+                            stage: "repair",
+                            decision: "released",
+                            reason: "environment failure; not an issue fault",
+                            details: serde_json::json!({"error": detail}),
+                        },
                     );
                     live_update(&live, "error", Some(&fp), None, Some(detail)).await;
                     return Ok(false);
@@ -1538,19 +1650,53 @@ async fn work_once(
                         "runner",
                     )?;
                     emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
+                    trace::record(
+                        store,
+                        &fp,
+                        &repo_config.repo,
+                        trace::Decision {
+                            stage: "repair",
+                            decision: "escalated",
+                            reason: "repair failed on an issue-level fault",
+                            details: serde_json::json!({"error": detail}),
+                        },
+                    );
                     bail!("repair failed — issue escalated: {e:#}");
                 }
             }
         }
     };
     reset_provider_health(&live).await;
-    let _ = secrets.redact_session_dir(Path::new(&report.session_dir));
     let redacted_root_cause = secrets.redact(&report.root_cause_text);
     let cause = redacted_root_cause
         .lines()
         .find(|l| l.trim_start().starts_with("ROOT CAUSE"))
         .unwrap_or("(no ROOT CAUSE line)");
     println!("root cause : {cause}");
+    println!(
+        "context    : window {} tokens, {} auto-compaction(s), {} messages",
+        report.context.model_context_window, report.context.compactions, report.context.messages
+    );
+    trace::record(
+        store,
+        &fp,
+        &repo_config.repo,
+        trace::Decision {
+            stage: "repair",
+            decision: "completed",
+            reason: "harness returned a final report",
+            details: serde_json::json!({
+                "turns": report.turns,
+                "turns_cap": max_turns,
+                "tokens_uncached": report.uncached_tokens,
+                "tokens_cached": report.cached_tokens,
+                "token_cap": max_tokens,
+                "context_window": report.context.model_context_window,
+                "compactions": report.context.compactions,
+                "messages": report.context.messages,
+            }),
+        },
+    );
 
     // 事件排水在 prompt 返回时被 abort，尾部的 TurnEnd 可能缺失；以
     // RepairReport 的累计值/轮数为准覆盖进度回调的中间态。这不是尽力而为
@@ -1564,6 +1710,9 @@ async fn work_once(
             turns: Some(i64::from(report.turns)),
             tokens_uncached: Some(report.uncached_tokens as i64),
             tokens_cached: Some(report.cached_tokens as i64),
+            compactions: Some(i64::from(report.context.compactions)),
+            context_window: Some(report.context.model_context_window as i64),
+            messages: Some(report.context.messages as i64),
             root_cause: Some(redacted_root_cause.clone()),
             session_dir: Some(report.session_dir.clone()),
             ..Default::default()
@@ -1592,6 +1741,17 @@ async fn work_once(
         let _ = store.increment_attempts(&fp);
         store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
         emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
+        trace::record(
+            store,
+            &fp,
+            &repo_config.repo,
+            trace::Decision {
+                stage: "budget",
+                decision: "escalated",
+                reason: "per-issue token cap exceeded",
+                details: serde_json::json!({"spent_tokens": spent, "cap_tokens": max_tokens}),
+            },
+        );
         bail!("{detail} — issue escalated");
     }
     println!(
@@ -1614,17 +1774,17 @@ async fn work_once(
     let public_base_url = std::env::var("NUWA_PUBLIC_BASE_URL")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let delivered = match deliver::deliver(
-        &job.repo,
-        &job.issue,
-        &report,
+    let delivered = match pipeline::deliver(pipeline::DeliveryRequest {
+        repo: repo_dir,
+        issue: prepared.issue(),
+        report: &report,
+        sessions_dir: &sessions_dir,
         push,
         create_pr,
-        &job.sessions_dir,
-        secrets,
-        public_base_url.as_deref(),
+        public_base_url: public_base_url.as_deref(),
         draft,
-    )
+        secrets,
+    })
     .await
     {
         Ok(d) => d,
@@ -1643,6 +1803,17 @@ async fn work_once(
             let _ = store.increment_attempts(&fp);
             store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
             emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
+            trace::record(
+                store,
+                &fp,
+                &repo_config.repo,
+                trace::Decision {
+                    stage: "deliver",
+                    decision: "escalated",
+                    reason: "delivery failed",
+                    details: serde_json::json!({"error": detail}),
+                },
+            );
             bail!("delivery failed — issue escalated: {e:#}");
         }
     };
@@ -1717,8 +1888,49 @@ async fn work_once(
         }
         emit_webhook("pr_opened", &fp, &repo_config.repo, url.clone());
     }
+    trace::record(
+        store,
+        &fp,
+        &repo_config.repo,
+        trace::Decision {
+            stage: "deliver",
+            decision: if !push {
+                "delivered_local"
+            } else if delivered.pr_url.is_some() {
+                "pr_opened"
+            } else {
+                "branch_pushed"
+            },
+            reason: "verification gate green (base red, branch green)",
+            details: serde_json::json!({
+                "branch": delivered.branch,
+                "commit": delivered.commit,
+                "pr_url": delivered.pr_url,
+                "draft": draft,
+                "files": delivered.risk.files.len(),
+                "added": delivered.risk.added,
+                "removed": delivered.risk.removed,
+                "touches_tests": delivered.risk.touches_tests,
+                "touches_ci": delivered.risk.touches_ci,
+            }),
+        },
+    );
 
     if !create_pr {
+        trace::record(
+            store,
+            &fp,
+            &repo_config.repo,
+            trace::Decision {
+                stage: "deliver",
+                decision: "branch_only",
+                reason: "PR creation disabled for this runner",
+                details: serde_json::json!({"branch": delivered.branch, "commit": delivered.commit}),
+            },
+        );
+        if push {
+            remember_verified_fix(store, &repo_config.repo, &fp, &delivered, &redacted_root_cause);
+        }
         let _ = store.finish_run(
             &run_id,
             &shanhaijing::RunFinish {
@@ -1764,6 +1976,17 @@ async fn work_once(
                     },
                 );
                 live_update(&live, "idle", None, None, Some(detail.clone())).await;
+                trace::record(
+                    store,
+                    &fp,
+                    &repo_config.repo,
+                    trace::Decision {
+                        stage: "ci",
+                        decision: "unavailable",
+                        reason: "github token missing; checks cannot be polled",
+                        details: serde_json::json!({"pr": number}),
+                    },
+                );
                 return Err(anyhow::anyhow!(detail));
             }
         };
@@ -1798,6 +2021,28 @@ async fn work_once(
                     "runner",
                     "ci_green",
                     &format!("head {}", &delivered.commit[..12.min(delivered.commit.len())]),
+                );
+                trace::record(
+                    store,
+                    &fp,
+                    &repo_config.repo,
+                    trace::Decision {
+                        stage: "ci",
+                        decision: "ci_green",
+                        reason: "all checks passed; awaiting human merge",
+                        details: serde_json::json!({
+                            "pr": number,
+                            "slug": slug,
+                            "commit": delivered.commit,
+                        }),
+                    },
+                );
+                remember_verified_fix(
+                    store,
+                    &repo_config.repo,
+                    &fp,
+                    &delivered,
+                    &redacted_root_cause,
                 );
             }
             Ok(ci::Verdict::Failure) => {
@@ -1840,6 +2085,21 @@ async fn work_once(
                     "ci_red",
                     &format!("head {} — PR #{number} closed", &delivered.commit[..12.min(delivered.commit.len())]),
                 );
+                trace::record(
+                    store,
+                    &fp,
+                    &repo_config.repo,
+                    trace::Decision {
+                        stage: "ci",
+                        decision: "ci_red",
+                        reason: "CI failed; PR closed and issue rejected",
+                        details: serde_json::json!({
+                            "pr": number,
+                            "slug": slug,
+                            "commit": delivered.commit,
+                        }),
+                    },
+                );
                 let _ = store.increment_attempts(&fp);
                 store.set_state_as(
                     &fp,
@@ -1877,6 +2137,21 @@ async fn work_once(
             }
             Ok(ci::Verdict::TimedOut) => {
                 let _ = store.record_event(&fp, now_ms(), Some(&repo_config.repo), "runner", "ci_timeout", slug);
+                trace::record(
+                    store,
+                    &fp,
+                    &repo_config.repo,
+                    trace::Decision {
+                        stage: "ci",
+                        decision: "ci_timeout",
+                        reason: "checks unfinished inside the CI window; PR left open",
+                        details: serde_json::json!({
+                            "pr": number,
+                            "slug": slug,
+                            "timeout_secs": ci_timeout_secs,
+                        }),
+                    },
+                );
                 let _ = store.update_run(
                     &run_id,
                     &shanhaijing::RunUpdate {
@@ -1920,6 +2195,21 @@ async fn work_once(
                 println!(
                     "ci gate   : checks unavailable ({e:#}) — PR left open; \
                      grant the PAT Actions:Read-only + Contents:Read-only on this repo"
+                );
+                trace::record(
+                    store,
+                    &fp,
+                    &repo_config.repo,
+                    trace::Decision {
+                        stage: "ci",
+                        decision: "unavailable",
+                        reason: "checks could not be read; PR left open for humans",
+                        details: serde_json::json!({
+                            "pr": number,
+                            "slug": slug,
+                            "error": secrets.redact(&format!("{e:#}")),
+                        }),
+                    },
                 );
             }
         }
@@ -2046,7 +2336,11 @@ async fn run_fix() -> anyhow::Result<()> {
     let cli = parse_args(std::env::args().skip(2).collect())?;
     webhook::init_from_env();
     let secrets = Arc::new(secrets::Secrets::load_and_scrub_env());
-    let prob = issue::Issue::load(&cli.issue_path).context("load issue")?;
+    // 文件里的问题单是外部输入：与常驻 runner 一样先脱敏。
+    let prob = pipeline::redact_issue(
+        issue::Issue::load(&cli.issue_path).context("load issue")?,
+        &secrets,
+    );
 
     if !cli.repo.join(".git").exists() {
         bail!("{} is not a git repository", cli.repo.display());
@@ -2056,39 +2350,34 @@ async fn run_fix() -> anyhow::Result<()> {
         "== Nuwa fix run ==\nissue     : {}\nrepo      : {}\nprovider  : {}\nmax turns : {}",
         prob.fingerprint,
         cli.repo.display(),
-        match &cli.provider {
-            repair::ProviderKind::Faux => "faux".to_string(),
-            repair::ProviderKind::Anthropic { model } => match model {
-                Some(m) => format!("anthropic:{m}"),
-                None => "anthropic:<catalog default>".to_string(),
-            },
-            repair::ProviderKind::Zai { model, .. } => match model {
-                Some(m) => format!("zai:{m}"),
-                None => "zai:glm-5.3-flash".to_string(),
-            },
-        },
+        pipeline::provider_label(&cli.provider),
         cli.max_turns,
     );
 
-    let guards = std::sync::Arc::new(guard::Guards::new(prob.forbidden_paths.clone()));
-    let job = repair::RepairJob {
+    // 工作区若有仓库指令，其 notes 与技能白名单与常驻 runner 走同一条注入路径。
+    let repo_config = instructions::load_working_tree(&cli.repo)?;
+    let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
         repo: cli.repo.clone(),
         issue: prob.clone(),
         sessions_dir: cli.sessions_dir.clone(),
         provider: cli.provider,
         max_turns: cli.max_turns,
-        guards: guards.clone(),
+        repo_config,
         secrets: Arc::clone(&secrets),
-        notes: String::new(),
         progress: None,
         run_id: None,
-    };
-    let report = repair::run(&job).await.context("repair run")?;
-    let _ = secrets.redact_session_dir(Path::new(&report.session_dir));
+    })?;
+    let report = prepared.execute().await.context("repair run")?;
 
     println!(
-        "\nrun       : {}\nturns     : {}\ntokens    : {} (cached {})",
-        report.run_id, report.turns, report.uncached_tokens, report.cached_tokens
+        "\nrun       : {}\nturns     : {}\ntokens    : {} (cached {})\ncontext   : window {} tokens, {} auto-compaction(s), {} messages",
+        report.run_id,
+        report.turns,
+        report.uncached_tokens,
+        report.cached_tokens,
+        report.context.model_context_window,
+        report.context.compactions,
+        report.context.messages,
     );
     let cause = report
         .root_cause_text
@@ -2102,17 +2391,17 @@ async fn run_fix() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let delivered = deliver::deliver(
-        &cli.repo,
-        &prob,
-        &report,
-        cli.push,
-        cli.create_pr,
-        &cli.sessions_dir,
-        &secrets,
-        None,
-        false,
-    )
+    let delivered = pipeline::deliver(pipeline::DeliveryRequest {
+        repo: &cli.repo,
+        issue: &prob,
+        report: &report,
+        sessions_dir: &cli.sessions_dir,
+        push: cli.push,
+        create_pr: cli.create_pr,
+        public_base_url: None,
+        draft: false,
+        secrets: &secrets,
+    })
     .await?;
     println!(
         "\nbranch    : {}\nbase      : {}\ncommit    : {}\npr        : {}\nrisk      : files={} tests={} ci={}",
@@ -2256,6 +2545,7 @@ mod tests {
             },
             forbidden_paths: Vec::new(),
             notes: String::new(),
+            skills: Vec::new(),
             reproduce_check: None,
             max_attempts: 3,
             draft_first_n: 0,
@@ -2318,6 +2608,7 @@ mod tests {
             },
             forbidden_paths: Vec::new(),
             notes: String::new(),
+            skills: Vec::new(),
             reproduce_check: None,
             max_attempts: 3,
             draft_first_n: 0,
@@ -2629,6 +2920,7 @@ mod tests {
             },
             forbidden_paths: Vec::new(),
             notes: String::new(),
+            skills: Vec::new(),
             reproduce_check: None,
             max_attempts: 3,
             draft_first_n: 0,
@@ -2715,6 +3007,7 @@ mod tests {
             },
             forbidden_paths: Vec::new(),
             notes: String::new(),
+            skills: Vec::new(),
             reproduce_check: None,
             max_attempts: 3,
             draft_first_n: 0,
@@ -2806,11 +3099,47 @@ mod tests {
             .reopen_issue(&fp, now + 3, Some("retry after upstream deploy"))
             .expect("reopen");
 
-        let context = build_prior_context(&store, &fp, &secrets::Secrets::default());
+        store
+            .record_repair_memory(&shanhaijing::RepairMemoryEntry {
+                repo: "example.com/spike".into(),
+                fingerprint: "other-fp".into(),
+                commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                pr_url: Some("https://github.com/acme/spike/pull/7".into()),
+                root_cause: "ROOT CAUSE: nil map guard".into(),
+                change_stat: " calc.go | 2 +-".into(),
+                files: 1,
+                recorded_at: now,
+            })
+            .expect("memory");
+        store
+            .record_repair_memory(&shanhaijing::RepairMemoryEntry {
+                repo: "example.com/spike".into(),
+                fingerprint: fp.clone(),
+                commit_sha: "feedface".into(),
+                pr_url: None,
+                root_cause: "ROOT CAUSE: current issue memory must be excluded".into(),
+                change_stat: String::new(),
+                files: 1,
+                recorded_at: now,
+            })
+            .expect("current memory");
+
+        let context = build_prior_context(
+            &store,
+            "example.com/spike",
+            &fp,
+            &secrets::Secrets::default(),
+        );
         assert!(context.contains("OWNER NOTE"), "{context}");
         assert!(context.contains("retry after upstream deploy"), "{context}");
         assert!(context.contains("PRIOR ATTEMPTS"), "{context}");
         assert!(context.contains("ROOT CAUSE: off-by-one loop"), "{context}");
+        assert!(context.contains("VERIFIED FIXES IN THIS REPO"), "{context}");
+        assert!(context.contains("https://github.com/acme/spike/pull/7"), "{context}");
+        assert!(
+            !context.contains("current issue memory must be excluded"),
+            "the issue's own memory duplicates PRIOR ATTEMPTS: {context}"
+        );
         assert!(context.contains("verification gate failed"), "{context}");
     }
 

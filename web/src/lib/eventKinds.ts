@@ -28,6 +28,7 @@ const EVENT_KIND_LABELS: Record<string, string> = {
   runner_stopped: "运行器停止",
   runner_error: "运行器异常",
   sync: "对账",
+  decision: "决策",
 };
 
 export function eventKindLabel(kind: string): string {
@@ -54,8 +55,31 @@ const EVENT_KIND_VARIANTS: Record<string, BadgeVariant> = {
   runner_stopped: "neutral",
   runner_error: "danger",
   sync: "neutral",
+  decision: "info",
 };
 
 export function eventKindVariant(kind: string): BadgeVariant {
   return EVENT_KIND_VARIANTS[kind] ?? "neutral";
+}
+
+/**
+ * `decision` events carry structured JSON (`stage`/`decision`/`reason`).
+ * Render that as one readable line; anything malformed falls back to the raw
+ * detail so a trace is never hidden by a parser failure.
+ */
+export function decisionDetailLabel(detail: string): string {
+  try {
+    const parsed = JSON.parse(detail) as {
+      stage?: unknown;
+      decision?: unknown;
+      reason?: unknown;
+    };
+    if (typeof parsed.stage !== "string" || typeof parsed.decision !== "string") {
+      return detail;
+    }
+    const reason = typeof parsed.reason === "string" && parsed.reason ? ` — ${parsed.reason}` : "";
+    return `${parsed.stage} · ${parsed.decision}${reason}`;
+  } catch {
+    return detail;
+  }
 }

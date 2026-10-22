@@ -103,6 +103,16 @@ function RunRow({
             <FlashOnChange value={formatTokens(runTokenTotal(run))} />
           </dd>
         </div>
+        <div className="col-span-2 min-w-0">
+          <dt className="text-text-muted">上下文</dt>
+          <dd
+            className="mt-0.5 font-mono tabular-nums text-text-secondary"
+            title={`窗口 ${run.context_window} tokens · 自动压缩 ${run.compactions} 次 · ${run.messages} 条消息`}
+          >
+            {run.context_window > 0 ? `窗口 ${formatTokens(run.context_window)}` : "窗口未知"}
+            {" · "}压缩 {run.compactions} 次 · {run.messages} 条消息
+          </dd>
+        </div>
         <div className="min-w-0">
           <dt className="text-text-muted">Provider / 模型</dt>
           <dd className="mt-0.5 truncate font-mono text-text-secondary" title={provider}>

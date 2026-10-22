@@ -83,6 +83,19 @@ pub struct RepairReport {
     /// Absolute per-issue session directory (JSONL transcripts).
     // Read by the work-loop run telemetry (M1b Task 4).
     pub session_dir: String,
+    pub context: ContextBudget,
+}
+
+/// 上下文预算的可观测部分。逐条消息的淘汰与压缩后的摘要长度 harness 没有
+/// 暴露，这里只报告能作为证据的计数（压缩次数、模型窗口、最终消息数）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextBudget {
+    /// 模型上下文窗口（token）；0 = 未知。
+    pub model_context_window: u64,
+    /// run 期间的自动压缩次数。
+    pub compactions: u32,
+    /// run 结束时会话里的消息数。
+    pub messages: u64,
 }
 
 /// Resolve the requested Anthropic model. A typo must fail loudly instead of
@@ -110,6 +123,20 @@ fn pick_anthropic_model(
                         .join(", ")
                 )
             }),
+    }
+}
+
+/// 会话目录布局：每个 fingerprint 一个目录；常驻 runner 再按 run id 分桶，
+/// 使同指纹的重试不共用一份 JSONL。一次性 CLI 保持平铺。
+pub fn session_dir_for(
+    sessions_dir: &std::path::Path,
+    issue: &Issue,
+    run_id: Option<&str>,
+) -> std::path::PathBuf {
+    let base = sessions_dir.join(issue.short_fingerprint());
+    match run_id {
+        Some(run_id) => base.join(run_id),
+        None => base,
     }
 }
 
@@ -169,13 +196,7 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
     // Per-run subdirectory when the work loop supplies a run id, so retries of
     // the same fingerprint do not pile their JSONL into one shared directory
     // (the transcript endpoint resolves "newest JSONL in the run's dir").
-    let sessions_dir = match &job.run_id {
-        Some(run_id) => job
-            .sessions_dir
-            .join(job.issue.short_fingerprint())
-            .join(run_id),
-        None => job.sessions_dir.join(job.issue.short_fingerprint()),
-    };
+    let sessions_dir = session_dir_for(&job.sessions_dir, &job.issue, job.run_id.as_deref());
     let sessions_dir = std::path::absolute(&sessions_dir)
         .with_context(|| format!("resolve {}", sessions_dir.display()))?;
     std::fs::create_dir_all(&sessions_dir)
@@ -280,6 +301,7 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
     };
 
     // ---- events ----
+    let model_context_window = model.context_window;
     let (broadcast, mut rx) = BroadcastEmitter::new(1024);
     let emitter: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(broadcast);
     let turns = Arc::new(AtomicU32::new(0));
@@ -315,6 +337,20 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         ..AgentHarnessOptions::default()
     };
     let harness = Arc::new(AgentHarness::create(options).await.context("harness create")?);
+
+    // 压缩是上下文预算里唯一有事件的一环：每次自动压缩的 guard 会发
+    // active=true/false 两个事件，只数开始那一次。
+    let compactions = Arc::new(AtomicU32::new(0));
+    let _compaction_subscription = {
+        let counter = Arc::clone(&compactions);
+        harness
+            .events()
+            .on::<rpi_harness::events::CompactionProgressEvent, _>(move |event| {
+                if event.active && !event.manual {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+    };
 
     // ---- event drain: console visibility + usage write-back ----
     // Upstream rpi leaves `AgentLane::record_usage` unwired (no production
@@ -399,6 +435,11 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         uncached_tokens: stats.as_ref().map(|s| s.uncached_tokens as u64).unwrap_or(0),
         cached_tokens: stats.as_ref().map(|s| s.cached_tokens as u64).unwrap_or(0),
         session_dir: sessions_dir.to_string_lossy().into_owned(),
+        context: ContextBudget {
+            model_context_window,
+            compactions: compactions.load(Ordering::Relaxed),
+            messages: stats.as_ref().map(|s| s.message_count).unwrap_or(0),
+        },
     })
 }
 
@@ -481,6 +522,12 @@ mod tests {
 
         let report = run(&job).await.expect("run");
         assert!(!report.session_dir.is_empty());
+        assert!(
+            report.context.model_context_window > 0,
+            "faux model must expose a context window"
+        );
+        assert_eq!(report.context.compactions, 0, "short run needs no compaction");
+        assert!(report.context.messages > 0, "final session must count messages");
         let events = seen.lock().expect("lock");
         assert!(!events.is_empty(), "progress callback must fire at least once");
         assert!(events.last().expect("last").turns >= 1);

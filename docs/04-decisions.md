@@ -149,3 +149,17 @@
 - 决策：所有者授权**就地修补**这 5 处（os_env 并发驱动 stdout/stderr、settle 关键持久化失败传播、agent_harness 预算耗尽明确 outcome、compaction 继承 stream options、read 有预算流式读取）。每处改动加 `// Nuwa 本地补丁(2026-10-21): <原因>` 注释，保持公开签名稳定，带回归测试。
 - 约束：① 仅限这 5 处真实 bug，不借机重构/美化 vendored；② 与 upstream 对账时这些本地补丁是已知差异，未来 cherry-pick 上游修复时须保留本地语义；③ docs/07 §D 记录补丁清单。
 - 被否决备选：全部走上游 PR（周期长，os_env 挂死在生产持续发生）；仅 Nuwa 层规避（bash 工具在 vendored 内，无法完全规避）。
+
+## ADR-015 · 修复流水线单一入口、决策可审计与上下文预算
+
+- 状态：已接受（2026-10-22）
+- 背景：常驻 runner（`work_once`）与一次性 `nuwa fix` 各自拼装修复任务与交付参数，已出现真实漂移——CLI 路径不注入仓库 notes、不脱敏外部输入。claim→repair→deliver→CI 多步流程只留结果事件，没有“为什么”的结构化记录；成功修复的经验不成体系；token 数字看不到上下文窗口与压缩次数。
+- 决策：
+  1. `pipeline.rs` 是唯一修复/交付实现；两条入口只负责寻址、记账与失败分类。问题单构建、脱敏、技能选择、会话目录、交付参数都从这里走。
+  2. 版本化修复技能：内置技能随二进制分发（rust-embed），仓库 `.nuwa/skills/*.md` 同名覆盖；选择是确定性的（语言 + 失败命令打分，或 `skills` 白名单），有数量/长度上限，注入 runner 系统提示。
+  3. 决策 trace：kind=`decision` 的事件，detail 为 `{stage, decision, reason, details}` JSON，覆盖 claim/preflight/repair/budget/deliver/ci；控制台渲染为一行可读文本，原始 JSON 保留。
+  4. 修复记忆：仅在独立验证门通过且 CI 绿灯（或明确 branch-only 已推送）后写入 `repair_memory`；带 commit/PR/时间来源；同一 (repo, fingerprint) 只保留最新，每仓上限 50；注入下一轮 `PRIOR ATTEMPTS` 之后，仅限同仓且排除当前问题单。
+  5. 交付后验证：推送后用 `git ls-remote` 校验远端 tip == 已验证提交；PR 基线在验证后移动时，合并一次并重新过红绿验证后再推；合并冲突则中止交付、交人工 rebase。
+  6. 上下文预算：runs 表记录 `compactions/context_window/messages`，repair 报告同一组数字；压缩次数来自 harness 的 CompactionProgress 事件（vendored `events.rs` 补类型化订阅实现，属 ADR-014 授权范围）。
+- 已知盲区（诚实记录）：harness 未对外暴露逐条消息淘汰、压缩摘要长度与“当前上下文 token 占用”；`estimate_context_tokens` 也不对调用方开放。因此控制台只承诺“压缩发生了几次、模型窗口多大、结束时多少条消息”，不承诺实时上下文占用百分比。
+- 被否决备选：两条入口各写一套（漂移已经发生）；把技能选择交给模型（不确定、不可回放）；把全部历史修复注入提示（污染上下文且无来源）；无条件合并基线（会把未验证的树推给 PR）。

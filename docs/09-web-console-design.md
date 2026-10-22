@@ -332,7 +332,8 @@ CREATE TABLE IF NOT EXISTS signal_daily (
 | `repo` | TEXT | 事件所属仓库；配置/系统事件为空 |
 | `actor` | TEXT | `owner` / `runner` / `system`；历史事件为 NULL |
 
-新增事件 kind：`requeued`、`config_migrated`、`restart_requested`、`runner_started`、`runner_stopped`、`runner_error`。保留既有：`reported`、`state_changed`、`pr_opened`、`ci_green`、`ci_red`、`ci_timeout`、`merged`、`config_changed`。
+新增事件 kind：`requeued`、`config_migrated`、`restart_requested`、`runner_started`、`runner_stopped`、`runner_error`、`decision`。保留既有：`reported`、`state_changed`、`pr_opened`、`ci_green`、`ci_red`、`ci_timeout`、`merged`、`config_changed`。
+`decision` 是结构化决策 trace（ADR-015）：detail 为 `{stage, decision, reason, details}` JSON；活动页与问题时间线渲染为「stage · decision — reason」一行，原始 JSON 保留在 title 中。
 
 系统事件的合成指纹：配置变更/迁移用 `__config__`，重启请求用 `__system__`，runner 生命周期用 `__runner__:<runner_id>`。控制台遇到这些前缀时显示"系统"标签，不当作问题单链接。
 
@@ -387,8 +388,8 @@ CREATE INDEX idx_signal_day        ON signal_daily(day, repo);
 ### 8.3 run 生命周期与进度
 
 1. 领单成功：`start_run(id=uuid, fingerprint, runner_id, repo, started_at, phase=claim)`，设置 issues `owner_runner_id`。
-2. 开始修复：`phase=repair`；`RepairJob` 增加 `progress: Option<Arc<dyn Fn(RepairProgress) + Send + Sync>>`，事件汇在每次 `TurnEnd` 回调 `{turns, uncached_tokens, cached_tokens}`；心跳任务每 5s 落库。`RepairReport` 增加 `session_dir`；`DeliverReport` 增加 `verification_detail` 与 `change_stat`。
-3. 修复完成：写入 `harness_run_id`、`turns/tokens`、`root_cause`、`session_dir`、`phase=verify`。
+2. 开始修复：`phase=repair`；`RepairJob` 增加 `progress: Option<Arc<dyn Fn(RepairProgress) + Send + Sync>>`，事件汇在每次 `TurnEnd` 回调 `{turns, uncached_tokens, cached_tokens}`；心跳任务每 5s 落库。`RepairReport` 增加 `session_dir` 与 `context`（模型窗口/自动压缩次数/最终消息数）；`DeliverReport` 增加 `verification_detail` 与 `change_stat`。
+3. 修复完成：写入 `harness_run_id`、`turns/tokens/compactions/context_window/messages`、`root_cause`、`session_dir`、`phase=verify`。
 4. 验证/交付：写入 `verification_ok/detail`、`change_stat`、`branch/commit/pr_url/pr_opened_at`、`phase=ci`。
 5. CI：写 `ci_verdict`；成功 `outcome=success`；红 `outcome=ci_red`；超时/不可读 `outcome=success` + `ci_verdict=timeout|unavailable`，问题单保持 `pr_open` 等人工处理。
 6. 完成：`phase=done`、`finished_at`。

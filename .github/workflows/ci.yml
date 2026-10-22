@@ -10,9 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # vendored 补丁检查要 diff 到基线 tag 的 commit，浅克隆取不到。
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # check-arch 调用 cargo metadata，必须在上面的 toolchain 之后。
+      - name: 架构契约（crate/模块依赖方向）
+        run: python3 scripts/check-arch.py
+      - name: vendored 补丁清单
+        run: python3 scripts/check-vendored.py
       - uses: Swatinem/rust-cache@v2
       # rust-embed 在 release/CI 下编译期嵌入 web/dist——serve 的架构图页
       # 测试断言嵌入产物可访问，因此 rust job 必须先产出前端（与

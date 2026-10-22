@@ -22,6 +22,7 @@ export const EVENT_KINDS = [
   "ci_green",
   "ci_red",
   "ci_timeout",
+  "decision",
   "config_changed",
   "config_migrated",
   "restart_requested",

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { BadgeVariant } from "../components/ui";
-import { eventKindLabel, eventKindVariant } from "./eventKinds";
+import { decisionDetailLabel, eventKindLabel, eventKindVariant } from "./eventKinds";
 
 /**
  * Every kind the backend writes plus the legacy kinds still present in older
@@ -26,6 +26,7 @@ const CASES: readonly [kind: string, label: string, variant: BadgeVariant][] = [
   ["runner_stopped", "运行器停止", "neutral"],
   ["runner_error", "运行器异常", "danger"],
   ["sync", "对账", "neutral"],
+  ["decision", "决策", "info"],
   ["pr_merged", "PR 已合并", "success"],
   ["pr_closed", "PR 已关闭", "danger"],
 ];
@@ -39,5 +40,17 @@ describe("event kind catalog", () => {
   it("leaves unknown kinds neutral without losing the raw label", () => {
     expect(eventKindLabel("unknown_kind")).toBe("unknown_kind");
     expect(eventKindVariant("unknown_kind")).toBe("neutral");
+  });
+
+  it("renders a decision trace as one readable line", () => {
+    expect(
+      decisionDetailLabel(
+        JSON.stringify({ stage: "deliver", decision: "pr_opened", reason: "verification gate green" }),
+      ),
+    ).toBe("deliver · pr_opened — verification gate green");
+    expect(decisionDetailLabel("not json")).toBe("not json");
+    expect(decisionDetailLabel(JSON.stringify({ reason: "missing stage" }))).toBe(
+      JSON.stringify({ reason: "missing stage" }),
+    );
   });
 });

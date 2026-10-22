@@ -64,6 +64,9 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     validate_config(&config, &mut errors, &mut warnings);
+    let (skill_errors, skill_warnings) = crate::skills::validate(&repo_dir, &config.skills);
+    errors.extend(skill_errors);
+    warnings.extend(skill_warnings);
     let origin = git_ops::git(&repo_dir, &["remote", "get-url", "origin"])
         .ok()
         .map(|url| git_ops::sanitize_remote(&url));
@@ -231,6 +234,7 @@ mod tests {
             },
             forbidden_paths: vec!["*.pem".into()],
             notes: String::new(),
+            skills: Vec::new(),
             reproduce_check: None,
             max_attempts: 3,
             draft_first_n: 0,
