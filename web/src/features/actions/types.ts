@@ -1,26 +1,22 @@
 /**
  * Wire shape for `POST /api/v1/sync` (`crates/nuwa/src/ci.rs::SyncSummary`).
  *
- * The server serializes `errors` as `{ fingerprint, message }` objects
- * (docs/09 §9.2). A preformatted `"fp — message"` string is also accepted:
- * older fixtures and logs use that form, and a string must never reach the
- * toast as `[object Object]`.
+ * `errors` is generated from the Rust DTO (`{ fingerprint, message }`). A
+ * preformatted `"fp — message"` string is also accepted: older fixtures and
+ * logs use that form, and a string must never reach the toast as
+ * `[object Object]`.
  */
 
-export interface SyncError {
-  fingerprint: string;
-  message: string;
-}
+import type { SyncError } from "../../lib/api-types/SyncError";
+import type { SyncSummary } from "../../lib/api-types/SyncSummary";
+
+export type { SyncError };
 
 export type SyncErrorWire = SyncError | string;
 
-export interface SyncResponse {
-  checked: number;
-  merged: number;
-  rejected: number;
-  still_open: number;
+export type SyncResponse = Omit<SyncSummary, "errors"> & {
   errors: SyncErrorWire[];
-}
+};
 
 /** One line of per-issue error text, matching the reconciler's `fp — message`. */
 export function syncErrorText(error: SyncErrorWire): string {
