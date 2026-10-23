@@ -81,6 +81,18 @@ cookie = "0.18"
 rust-embed = "8"
 mime_guess = "2"
 
+# Debug info is OFF for dev builds. Rationale (ADR-017): the MSVC linker
+# writes one PDB per test binary — this workspace produces ~46 of them, and a
+# full-debug PDB reaches ~300 MB. Editing a low-level crate (rpi-tools /
+# rpi-telemetry) relinks all of them at once: a multi-GB write burst that
+# saturates the build disk (2026-10-21: three hard reboots; the build disk and
+# the system disk are the same NVMe).
+#
+# Need real backtraces for one session? Override per command, then unset:
+#   $env:CARGO_PROFILE_DEV_DEBUG="2"; cargo test -p nuwa --bins
+[profile.dev]
+debug = 0
+
 [profile.release]
 lto = "thin"
 codegen-units = 16

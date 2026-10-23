@@ -177,3 +177,15 @@
   6. **顺带修复**：基准首次运行暴露 Windows 子进程环境白名单按大小写精确查找 `SystemRoot` 的缺陷（Git Bash 导出 `SYSTEMROOT` 时被丢弃，Node 测试子进程在 crypto 初始化崩溃）；白名单改为大小写不敏感并回填规范键名。
 - 已知边界：内置场景只有 5 个，覆盖四类工具链的典型失败与一个负对照；它证明“流水线与门禁不退化”，不能替代真实仓库的多样化故障。`live` 结果受模型随机性与成本影响，比较时应固定 provider/model/场景集。
 - 被否决备选：控制台按钮直接跑基准（密钥/进程/预算边界不清）；只报通过率（无法发现误报）；接入外部基准服务（超出单所有者部署边界）；把 faux 结果当模型质量（faux 只证明流水线，不证明 LLM）。
+
+---
+
+## ADR-017 · dev 构建关闭调试信息（磁盘 IO 止血）
+
+- 状态：已接受（2026-10-21，2026-10-23 复核并入场）
+- 背景：本工作区 7 个 crate、约 40 个集成测试文件，dev profile 全量 debuginfo 下 MSVC 链接器为**每个测试二进制**写一个 PDB。实测 `target/` 里曾有 33 个 >50 MB 的 PDB、合计 5.84 GB，单文件最大 295 MB。编辑 rpi-tools / rpi-telemetry 这类底层 crate 会触发**全部 ~46 个测试二进制重链接**，一次落盘以 GB 计；而构建盘与系统盘是同一块 NVMe，写入突发直接挤占系统 IO → 整机冻结（2026-10-21 至 10-23 共四次强制关机）。已三层实证排除安全软件方向（DLP 白名单不含 cargo/rustc、受控重建期间其 IO 占比 0.01%、无 minifilter/目录监视、Defender 实时保护关闭、系统日志无磁盘错误）。
+- 决策：工作区根 `Cargo.toml` 固定 `[profile.dev] debug = 0`。需要完整回溯时按命令临时覆盖：`$env:CARGO_PROFILE_DEV_DEBUG="2"; cargo test -p <crate> --bins`，用完即清。备选 `debug = "line-tables-only"`（保留 panic 行号、PDB 仍小一个数量级）保留为后续可选项。
+- 理由：开发期几乎不需要可变级别调试（问题靠测试断言与日志定位），而链接写入是这台机器唯一的硬故障源；关闭后单个测试二进制 PDB 从 159 MB 降到 15.6 MB。
+- 实测（2026-10-23，冷缓存）：`cargo clean` 清掉 17158 个文件 / 13.7 GB（9.5 s）；随后 `cargo test --no-run -j 2` 全量通过；`target` 内 >50 MB 的 PDB **0 个**，154 个 PDB 合计 671.6 MB，最大 36.6 MB；`touch crates/rpi-tools/src/lib.rs` 后 `cargo test -p rpi-tools --lib` 72 通过（4.67 s）。
+- 已知边界（不是回归）：`touch` 底层 crate 仍会重链接全部测试二进制，即使 `debug = 0` 也是一次 GB 级写入、NVMe 上数十秒磁盘 100%——这是物理事实。**在这台开发机上，全量重建（`cargo clean` + `--workspace`）仍会整机冻结，因此全量构建与 clippy 一律交给 CI，本机只做单 crate 增量构建。** 仍卡顿时用 `cargo test -j 1`，或按 `-p` 分批。
+- 被否决备选：只在本地 `.cargo/config.toml` 覆盖（clone/换机/CI 即丢，团队照踩）；改 `[profile.release]`（与本问题无关）；加 `sccache`（不减少最终落盘，且引入新依赖）。
