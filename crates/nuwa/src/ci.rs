@@ -197,6 +197,8 @@ pub(crate) fn journal_terminal(
 /// Structured form of a `reconcile_all` result, for the Web console
 /// `POST /api/v1/sync` (docs/09 §9.2). The CLI keeps printing the raw lines.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct SyncSummary {
     /// pr_open issues the reconciler examined (one result line each).
     pub checked: u64,
@@ -208,6 +210,8 @@ pub struct SyncSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct SyncError {
     pub fingerprint: String,
     pub message: String,

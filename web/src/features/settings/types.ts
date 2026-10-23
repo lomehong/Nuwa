@@ -1,8 +1,17 @@
 /**
  * Wire shapes for the settings and system endpoints (docs/09 §9.2 settings,
- * §9.2 system, §13). Field names and nullability mirror the serde output of
- * `crates/nuwa/src/api/settings.rs` and `crates/nuwa/src/api/system.rs`.
+ * §9.2 system, §13). Response fields come from the Rust DTOs via ts-rs; the
+ * enum-ish strings (`group`, `type`, `scope`) are narrowed to the UI unions.
+ * Request shapes stay hand-written: the client sends a narrower scalar map
+ * than the server's `serde_json::Value`.
  */
+
+import type { DiffDto } from "../../lib/api-types/DiffDto";
+import type { LastChangeDto } from "../../lib/api-types/LastChangeDto";
+import type { ServiceState } from "../../lib/api-types/ServiceState";
+import type { SettingDto as ApiSettingDto } from "../../lib/api-types/SettingDto";
+import type { SettingsResponse as ApiSettingsResponse } from "../../lib/api-types/SettingsResponse";
+import type { SystemResponse } from "../../lib/api-types/SystemResponse";
 
 export type SettingGroup =
   | "credentials"
@@ -18,21 +27,11 @@ export type SettingType = "secret" | "string" | "int" | "enum" | "url" | "csv" |
 export type SettingScope = "both" | "work" | "serve";
 
 /** One schema row. `type` is the serialized `kind`; `min`/`max` bound `int`. */
-export interface SettingDto {
-  key: string;
-  label: string;
+export type SettingDto = Omit<ApiSettingDto, "group" | "type" | "scope"> & {
   group: SettingGroup;
   type: SettingType;
-  default: string | null;
-  options: string[];
-  secret: boolean;
   scope: SettingScope;
-  requires_restart: boolean;
-  read_only: boolean;
-  help: string;
-  min: number | null;
-  max: number | null;
-}
+};
 
 /** Secrets never echo their value: presence, last four characters and time. */
 export interface SecretValueDto {
@@ -57,48 +56,17 @@ export function isPlainValue(value: SettingValueDto | undefined): value is Plain
   return value !== undefined && "value" in value;
 }
 
-/** A runner-reported runtime value that differs from the env file. */
-export interface DiffDto {
-  file: string;
-  runtime: string;
-  source: "file" | "default" | string;
-}
+export type { DiffDto, LastChangeDto, ServiceState, SystemResponse };
 
-export interface LastChangeDto {
-  key: string;
-  ts_ms: number;
-  actor: string | null;
-}
-
-export interface SettingsResponse {
+export type SettingsResponse = Omit<
+  ApiSettingsResponse,
+  "schema" | "values" | "effective_diff" | "last_changes"
+> & {
   schema: SettingDto[];
   values: Record<string, SettingValueDto>;
-  env_path: string;
-  env_exists: boolean;
-  env_permissions: string | null;
-  needs_migration: boolean;
-  restart_pending: boolean;
   effective_diff: Record<string, DiffDto>;
-  unknown_keys: string[];
   last_changes: LastChangeDto[];
-}
-
-export interface ServiceState {
-  unit: string;
-  /** `systemctl is-active` output; `n/a` when systemd is unavailable. */
-  active: string;
-}
-
-export interface SystemResponse {
-  version: string;
-  build_commit: string;
-  started_at_ms: number;
-  uptime_secs: number;
-  db_path: string;
-  db_size_bytes: number;
-  local_mode: boolean;
-  services: ServiceState[];
-}
+};
 
 /** Env scalars; an int field may be sent as a number, everything else text. */
 export type SettingsValues = Record<string, string | number | boolean>;
@@ -147,4 +115,3 @@ export interface RestartConflictBody {
   };
   active_runs: ActiveRunSummary[];
 }
-
