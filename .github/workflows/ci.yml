@@ -104,18 +104,23 @@ jobs:
         run: cargo test -p nuwa --features ts-export export_bindings
       - name: commit on main / verify on PR
         run: |
-          if git diff --quiet -- web/src/lib/api-types; then
+          # 首次生成的文件是 untracked，`git diff` 看不见它们——必须先 add。
+          git add -A -- web/src/lib/api-types
+          if [ -z "$(ls -A web/src/lib/api-types 2>/dev/null)" ]; then
+            echo "::error::ts-rs produced no files — the export filter matched nothing"
+            exit 1
+          fi
+          if git diff --cached --quiet; then
             echo "types are up to date"
             exit 0
           fi
           if [ "${{ github.event_name }}" = "push" ]; then
             git config user.name "nuwa-types-bot"
             git config user.email "nuwa@localhost"
-            git add web/src/lib/api-types
             git commit -m "chore(types): 重新生成前端 API 类型 [skip ci]"
             git push
           else
             echo "::error::generated TS types are stale — run \`cargo test -p nuwa --features ts-export export_bindings\` and commit web/src/lib/api-types"
-            git diff --stat -- web/src/lib/api-types
+            git diff --cached --stat -- web/src/lib/api-types
             exit 1
           fi
