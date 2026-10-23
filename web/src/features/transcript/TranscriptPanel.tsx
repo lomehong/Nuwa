@@ -1,3 +1,5 @@
+import { useEffect, useRef } from "react";
+
 import { Card, CardContent } from "../../components/ui";
 import { useTranscriptQuery } from "./queries";
 import { TranscriptViewer } from "./TranscriptViewer";
@@ -19,7 +21,7 @@ export interface TranscriptPanelProps {
  * Data container for the transcript viewer. It owns the query keyed by
  * fingerprint/run_id/page; the page owns the URL so a selected run and page
  * survive reloads and can be linked. While the viewed run is unfinished the
- * query polls, so the "陪跑" view grows new messages without a manual reload.
+ * query polls for a redacted snapshot; raw in-flight messages are never served.
  */
 export function TranscriptPanel({
   fingerprint,
@@ -33,6 +35,16 @@ export function TranscriptPanel({
   const query = useTranscriptQuery(fingerprint, runId, page, {
     refetchIntervalMs: pollMs ?? undefined,
   });
+  const previousPoll = useRef(pollMs);
+  const refetch = query.refetch;
+  useEffect(() => {
+    // Run status may finish between transcript polls. Fetch once more before
+    // going static so a cached empty response cannot hide the final snapshot.
+    if (previousPoll.current && !pollMs) {
+      void refetch();
+    }
+    previousPoll.current = pollMs;
+  }, [pollMs, refetch]);
 
   return (
     <Card>

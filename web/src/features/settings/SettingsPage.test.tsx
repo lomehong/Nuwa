@@ -891,7 +891,7 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(within(dialog).getByRole("button", { name: "添加" }));
     expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-      "请填写 HTTPS 或 SSH 地址",
+      "请填写 HTTP/HTTPS、SSH、git 或无协议仓库地址",
     );
     expect(posted).toBe(false);
 

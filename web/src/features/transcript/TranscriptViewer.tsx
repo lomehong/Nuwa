@@ -431,9 +431,8 @@ export function TranscriptViewer({
             />
             <p className="text-body font-medium text-text">暂无会话转录</p>
             <p className="max-w-prose text-body-sm text-text-secondary">
-              {runId
-                ? "所选运行没有可显示的会话消息，可能未产生转录文件。"
-                : "该问题单还没有可读取的会话转录。修复运行进行中时此视图会自动刷新；结束后可重试。"}
+              {runId ? "所选运行的会话转录" : "该问题单的会话转录"}
+              完成脱敏后可用。运行中会自动刷新；未发布脱敏快照的历史或中断运行不会显示原始日志。
             </p>
           </div>
         </div>
@@ -472,8 +471,8 @@ export function TranscriptViewer({
             >
               下一页
             </Button>
-            {/* Messages stream in ascending order, so the last page tracks the
-                live tail of an in-flight run (docs/09 §10.5). */}
+            {/* Published messages are in ascending order; the last page holds
+                the newest messages in the redacted snapshot. */}
             <Button
               variant="secondary"
               size="sm"

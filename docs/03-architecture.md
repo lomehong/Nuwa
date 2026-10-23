@@ -41,7 +41,7 @@ flowchart TB
   → fetch + reset 最新 origin/<base>（失败回滚预检）
   → runner 选型（按仓库技术栈）
   → clone 目标仓库（私有，deploy key）
-  → 读取权威指令文件（tracked: base commit；untracked: runner 私有副本；每轮校验防篡改）
+  → fetch/reset 后读取权威指令文件（tracked: 本轮 base commit；untracked: 已校验的 runner 私有副本；每轮校验防篡改）
   → 定位与复现（结合上下文包 + 最近 3 次 run/owner note）
   → 修改（五色石：补丁 + 修改说明）
   → 验证（base 红 / 分支绿；reproduce_check 或 .nuwa/repro.sh；failing_check 回归门；diff glob 禁改终检）

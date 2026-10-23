@@ -130,21 +130,25 @@ impl TrustedInstructions {
         }
 
         let private_path = private_path(store_dir, &repo_dir);
-        let bytes = if private_path.exists() {
+        let seed = !private_path.exists();
+        let bytes = if seed {
+            std::fs::read(&path).with_context(|| format!("read instructions {}", path.display()))?
+        } else {
             std::fs::read(&private_path)
                 .with_context(|| format!("read trusted instructions {}", private_path.display()))?
-        } else {
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("read instructions {}", path.display()))?;
+        };
+        // Only valid instructions may become authoritative. A failed first load
+        // must remain recoverable by correcting the working-tree file; existing
+        // private copies (even invalid ones) are never replaced from that file.
+        let instructions = parse(&bytes, &path)?;
+        if seed {
             if let Some(parent) = private_path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
             }
             std::fs::write(&private_path, &bytes)
                 .with_context(|| format!("seed trusted instructions {}", private_path.display()))?;
-            bytes
-        };
-        let instructions = parse(&bytes, &path)?;
+        }
         Ok(Self {
             sha256: sha256_hex(&bytes),
             instructions,
@@ -160,7 +164,8 @@ impl TrustedInstructions {
     /// Restore the working-tree file if it no longer matches the authoritative
     /// bytes. Returns `true` when a write happened.
     pub fn verify_and_restore(&self) -> anyhow::Result<bool> {
-        let expected = self.expected_bytes();
+        // Only restore bytes already parsed and adopted by load/refresh.
+        let expected = &self.bytes;
         let current = std::fs::read(&self.path).ok();
         if current.as_deref() == Some(expected.as_slice()) {
             return Ok(false);
@@ -169,7 +174,7 @@ impl TrustedInstructions {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
-        std::fs::write(&self.path, &expected)
+        std::fs::write(&self.path, expected)
             .with_context(|| format!("restore instructed {}", self.path.display()))?;
         Ok(true)
     }
@@ -186,14 +191,18 @@ impl TrustedInstructions {
     /// ignored). Returns what changed so the caller can log base moves and
     /// tamper restores distinctly.
     pub fn refresh(&mut self) -> anyhow::Result<RefreshOutcome> {
-        let expected = self.expected_bytes();
+        // Re-evaluate the base even if startup used a private copy: a newly
+        // tracked config takes precedence, never the agent's working-tree copy.
+        let (expected, source) = read_tracked(&self.repo_dir, &self.base)?
+            .unwrap_or_else(|| (self.expected_bytes(), self.source));
         let config_changed = expected != self.bytes;
-        if config_changed {
-            // A malformed new base config must stop the runner, not silently
-            // keep the stale one: re-parse before adopting the bytes.
-            self.instructions = parse(&expected, &self.path)?;
+        if config_changed || source != self.source {
+            // Parse before changing any authoritative state or working file.
+            let instructions = parse(&expected, &self.path)?;
+            self.instructions = instructions;
             self.sha256 = sha256_hex(&expected);
             self.bytes = expected;
+            self.source = source;
         }
         let restored = self.verify_and_restore()?;
         Ok(RefreshOutcome {
@@ -207,14 +216,11 @@ impl TrustedInstructions {
     }
 
     fn expected_bytes(&self) -> Vec<u8> {
-        if self.source == TrustSource::Tracked {
-            if let Ok(Some((bytes, _))) = read_tracked(&self.repo_dir, &self.base) {
-                return bytes;
-            }
-        }
-        if let Some(private) = &self.private_path {
-            if let Ok(bytes) = std::fs::read(private) {
-                return bytes;
+        if self.source == TrustSource::PrivateCopy {
+            if let Some(private) = &self.private_path {
+                if let Ok(bytes) = std::fs::read(private) {
+                    return bytes;
+                }
             }
         }
         self.bytes.clone()
@@ -376,6 +382,96 @@ mod tests {
     }
 
     #[test]
+    fn review_private_copy_switches_to_tracked_on_first_refresh() {
+        let dir = tempfile::tempdir().expect("test fixture");
+        let repo = dir.path().join("repo");
+        init_repo(&repo, false);
+        let path = repo.join(INSTRUCTION_FILE);
+        let mut trusted =
+            TrustedInstructions::load(&repo, &path, "main", &dir.path().join("trust"))
+                .expect("test fixture");
+        let original = trusted.bytes.clone();
+        let tracked = r#"{"repo":"main","failing_check":{"command":"cargo test"},"forbidden_paths":["secrets/"]}"#;
+        std::fs::write(&path, tracked).expect("test fixture");
+        git(&repo, &["add", INSTRUCTION_FILE]);
+        git(&repo, &["commit", "-m", "track instructions"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(&path, config_json("agent-tampered")).expect("test fixture");
+
+        let outcome = trusted.refresh().expect("refresh first tracked base");
+        assert_eq!(trusted.source(), TrustSource::Tracked);
+        assert!(outcome.config_changed && outcome.restored);
+        assert_eq!(trusted.instructions.failing_check.command, "cargo test");
+        assert_eq!(trusted.instructions.forbidden_paths, ["secrets/"]);
+        assert_eq!(trusted.bytes, tracked.as_bytes());
+        assert_eq!(
+            std::fs::read(&path).expect("test fixture"),
+            tracked.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(trusted.private_path.as_ref().expect("test fixture"))
+                .expect("test fixture"),
+            original,
+            "promotion must not overwrite the private copy"
+        );
+    }
+
+    #[test]
+    fn review_invalid_tracked_promotion_preserves_private_authority() {
+        let dir = tempfile::tempdir().expect("test fixture");
+        let repo = dir.path().join("repo");
+        init_repo(&repo, false);
+        let path = repo.join(INSTRUCTION_FILE);
+        let mut trusted =
+            TrustedInstructions::load(&repo, &path, "main", &dir.path().join("trust"))
+                .expect("test fixture");
+        let original = trusted.bytes.clone();
+        let hash = trusted.sha256.clone();
+        std::fs::write(&path, "{invalid tracked JSON").expect("test fixture");
+        git(&repo, &["add", INSTRUCTION_FILE]);
+        git(&repo, &["commit", "-m", "invalid tracked config"]);
+        std::fs::write(&path, "worktree sentinel").expect("test fixture");
+
+        assert!(
+            trusted.refresh().is_err(),
+            "invalid base must fail before adoption"
+        );
+        assert_eq!(trusted.source(), TrustSource::PrivateCopy);
+        assert_eq!(trusted.bytes, original);
+        assert_eq!(trusted.sha256, hash);
+        assert_eq!(trusted.instructions.failing_check.command, "echo ok");
+        assert_eq!(
+            std::fs::read(&path).expect("test fixture"),
+            b"worktree sentinel"
+        );
+        assert_eq!(
+            std::fs::read(trusted.private_path.as_ref().expect("test fixture"))
+                .expect("test fixture"),
+            original
+        );
+        trusted.verify_and_restore().expect("test fixture");
+        assert_eq!(std::fs::read(&path).expect("test fixture"), original);
+    }
+
+    #[test]
+    fn review_refresh_without_tracked_config_rejects_worktree_tampering() {
+        let dir = tempfile::tempdir().expect("test fixture");
+        let repo = dir.path().join("repo");
+        init_repo(&repo, false);
+        let path = repo.join(INSTRUCTION_FILE);
+        let mut trusted =
+            TrustedInstructions::load(&repo, &path, "main", &dir.path().join("trust"))
+                .expect("test fixture");
+        std::fs::write(&path, config_json("agent-tampered")).expect("test fixture");
+        let outcome = trusted.refresh().expect("test fixture");
+        assert!(!outcome.config_changed);
+        assert!(outcome.restored);
+        assert_eq!(trusted.source(), TrustSource::PrivateCopy);
+        assert_eq!(trusted.instructions.repo, "main");
+        assert_eq!(std::fs::read(&path).expect("test fixture"), trusted.bytes);
+    }
+
+    #[test]
     fn untracked_config_is_copied_to_private_store() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().join("repo");
@@ -412,6 +508,49 @@ mod tests {
         )
         .expect_err("invalid config");
         assert!(format!("{err:#}").contains("parse repo instructions JSON"));
+    }
+
+    #[test]
+    fn systemic_invalid_first_load_does_not_poison_private_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo, false);
+        let path = repo.join(INSTRUCTION_FILE);
+        let store = dir.path().join("trust");
+        std::fs::write(&path, "{not json").expect("write");
+        assert!(TrustedInstructions::load(&repo, &path, "main", &store).is_err());
+        assert!(
+            !private_path(&store, &repo).exists(),
+            "invalid first load must not seed an authoritative copy"
+        );
+        std::fs::write(&path, config_json("corrected")).expect("write");
+        let trusted = TrustedInstructions::load(&repo, &path, "main", &store).expect("reload");
+        assert_eq!(trusted.instructions.repo, "corrected");
+    }
+
+    #[test]
+    fn systemic_existing_private_copy_remains_authoritative_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo, false);
+        let path = repo.join(INSTRUCTION_FILE);
+        let store = dir.path().join("trust");
+        TrustedInstructions::load(&repo, &path, "main", &store).expect("seed");
+        std::fs::write(&path, config_json("replacement")).expect("write");
+        let trusted = TrustedInstructions::load(&repo, &path, "main", &store).expect("reload");
+        assert_eq!(trusted.instructions.repo, "main");
+
+        let private = private_path(&store, &repo);
+        std::fs::write(&private, "{existing invalid cache").expect("write");
+        assert!(TrustedInstructions::load(&repo, &path, "main", &store).is_err());
+        assert_eq!(
+            std::fs::read_to_string(private).expect("read"),
+            "{existing invalid cache"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read"),
+            config_json("replacement")
+        );
     }
 
     #[test]

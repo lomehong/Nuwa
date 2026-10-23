@@ -961,15 +961,15 @@ fn validate_updates(
         }
         // systemd `EnvironmentFile=` strips surrounding quotes and processes
         // backslash escapes, while nuwa's own `parse_env` reads the value raw.
-        // A value containing `"` or `\` would therefore load differently at
-        // runtime than it validates/displays here — e.g. a UI token saved as
-        // `"alpha"` becomes `alpha` under systemd, locking the owner out. No
+        // A value containing `'`, `"` or `\` would therefore load differently
+        // at runtime than it validates/displays here — e.g. a UI token saved as
+        // `'alpha'` becomes `alpha` under systemd, locking the owner out. No
         // legitimate value for these keys (tokens, URLs, numbers, identifiers,
-        // unit names) needs either character, so reject rather than corrupt.
-        if raw_text.contains('"') || raw_text.contains('\\') {
+        // unit names) needs these characters, so reject rather than corrupt.
+        if raw_text.contains(['\'', '"', '\\']) {
             fields.insert(
                 key.clone(),
-                "must not contain quote or backslash characters".to_string(),
+                "must not contain single quotes, double quotes or backslashes".to_string(),
             );
             continue;
         }
@@ -1751,6 +1751,48 @@ mod tests {
             file.as_bytes(),
             "a rejected PUT must leave the file byte-identical"
         );
+    }
+
+    #[tokio::test]
+    async fn put_rejects_single_quotes_without_writes_or_audit() {
+        let file = "NUWA_UI_TOKEN=good-token-1234\nnuwa_provider=zai\n";
+        for initial in [Some(file), None] {
+            let (_dir, app, store, env_path) = test_app(initial);
+            let csrf = csrf_token(&app).await;
+            for key in ["NUWA_UI_TOKEN", "NUWA_MODEL"] {
+                for raw in ["'alpha'", "'alpha", "alpha'", "al'pha"] {
+                    let body = serde_json::json!({"values": {
+                        (key): raw,
+                        "NUWA_INTERVAL": "60"
+                    }});
+                    let response = put_json(&app, &body.to_string(), Some(&csrf)).await;
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "single quotes must be rejected for {key}: {raw:?}"
+                    );
+                    let value = json_body(response).await;
+                    assert_eq!(value["error"]["code"], "validation_failed");
+                    assert!(value["error"]["fields"][key]
+                        .as_str()
+                        .expect("field error")
+                        .contains("quote"));
+                    if let Some(text) = initial {
+                        assert_eq!(std::fs::read(&env_path).expect("env"), text.as_bytes());
+                    } else {
+                        assert!(!env_path.exists(), "invalid PUT must not create env");
+                    }
+                    assert!(!env_path.with_extension("env.bak").exists());
+                    assert!(
+                        store
+                            .events_for("__config__", 10)
+                            .expect("events")
+                            .is_empty(),
+                        "invalid PUT must not journal changes or key migration"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

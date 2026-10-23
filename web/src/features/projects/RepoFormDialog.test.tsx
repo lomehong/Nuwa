@@ -6,8 +6,41 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { ToastProvider } from "../../components/ui";
 import { makeRepo, server } from "../../test/msw";
 import { createTestQueryClient } from "../../test/render";
-import { RepoFormDialog } from "./RepoFormDialog";
+import { RepoFormDialog, validateRepoForm } from "./RepoFormDialog";
 import type { RepoDto } from "./registry";
+
+// Keep these examples in sync with api/repos.rs's URL contract test.
+const repoUrlCases: [string, boolean][] = [
+  ["http://example.com/app", true],
+  ["https://example.com/app", true],
+  ["ssh://git@example.com/app.git", true],
+  ["git://example.com/app.git", true],
+  ["git@example.com:app.git", true],
+  ["HTTP://example.com/app", true],
+  ["HTTPS://example.com/app", true],
+  ["SSH://git@example.com/app.git", true],
+  ["GIT://example.com/app.git", true],
+  ["example.com/app", true],
+  ["../app.git", true],
+  ["/srv/git/app.git", true],
+  ["example.com/app:mirror", true],
+  ["git:app", true],
+  ["javascript:alert(1)", false],
+  ["JavaScript:alert(1)", false],
+  ["data:text/html,test", false],
+  ["file:///etc/passwd", false],
+  ["ftp://example.com/app", false],
+  ["https://example.com/a b", false],
+  ["https://example.com/a\tb", false],
+  ["https://example.com/a\nb", false],
+  ["https://example.com/a\u00a0b", false],
+  ["https://example.com/a\u2003b", false],
+  ["https://example.com/a\0b", false],
+  ["https://example.com/a\u007fb", false],
+  ["https://example.com/a\u0085b", false],
+  ["https://example.com/a\u009fb", false],
+  ["", false],
+];
 
 const repoA = makeRepo({
   repo: "example.com/a",
@@ -44,6 +77,71 @@ function renderEditDialog(initialTarget: RepoDto) {
   const view = render(element(initialTarget));
   return { ...view, retarget: (target: RepoDto) => view.rerender(element(target)) };
 }
+
+describe("repository URL contract", () => {
+  it.each(repoUrlCases)("validates %j with accepted=%s for create and edit", (url, valid) => {
+    for (const identityLocked of [false, true]) {
+      const errors = validateRepoForm(
+        { repo: "example.com/app", name: "App", url, description: "" },
+        identityLocked,
+      );
+      expect(errors.url === undefined).toBe(valid);
+    }
+  });
+
+  it.each(["http://example.com/app", "git://example.com/app.git"])(
+    "registers %s and submits a name-only edit without changing its URL",
+    async (url) => {
+      let registered: RepoDto | undefined;
+      let edited: unknown;
+      server.use(
+        http.post("/api/v1/repos", async ({ request }) => {
+          const body = await request.json() as Record<string, string>;
+          registered = makeRepo(body);
+          return HttpResponse.json({ data: registered }, { status: 201 });
+        }),
+        http.put("/api/v1/repos/:repo", async ({ request }) => {
+          edited = { path: new URL(request.url).pathname, body: await request.json() };
+          return HttpResponse.json({ data: { ...registered, name: "Renamed App" } });
+        }),
+      );
+      const queryClient = createTestQueryClient();
+      const createView = render(
+        <QueryClientProvider client={queryClient}>
+          <ToastProvider>
+            <RepoFormDialog open mode="create" onClose={() => {}} />
+          </ToastProvider>
+        </QueryClientProvider>,
+      );
+      const createDialog = screen.getByRole("dialog", { name: "添加仓库" });
+      for (const [label, value] of [
+        ["名称", "App"],
+        ["仓库标识", "example.com/app"],
+        ["仓库地址", url],
+      ]) {
+        fireEvent.change(within(createDialog).getByLabelText(label), { target: { value } });
+      }
+      fireEvent.click(within(createDialog).getByRole("button", { name: "添加" }));
+      await screen.findByText("仓库已添加");
+      expect(registered).toMatchObject({ repo: "example.com/app", name: "App", url });
+      createView.unmount();
+      if (!registered) throw new Error("registration did not reach the API");
+
+      renderEditDialog(registered);
+      const editDialog = screen.getByRole("dialog", { name: "编辑仓库" });
+      expect(within(editDialog).getByLabelText("仓库地址")).toHaveValue(url);
+      fireEvent.change(within(editDialog).getByLabelText("名称"), {
+        target: { value: "Renamed App" },
+      });
+      fireEvent.click(within(editDialog).getByRole("button", { name: "保存" }));
+      await screen.findByText("仓库已更新");
+      expect(edited).toEqual({
+        path: "/api/v1/repos/example.com%2Fapp",
+        body: { name: "Renamed App", url, description: "" },
+      });
+    },
+  );
+});
 
 describe("RepoFormDialog identity binding", () => {
   it("re-seeds to the new project when target changes while open, never submitting A onto B", async () => {

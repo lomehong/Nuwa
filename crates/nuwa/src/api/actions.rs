@@ -1517,6 +1517,9 @@ mod tests {
                 }),
             ],
         );
+        crate::secrets::Secrets::default()
+            .redact_session_dir(&session_root)
+            .expect("publish transcript fixture");
         set_session_dir(&store, "run-combined-transcript", &session_root);
 
         let base = format!("/api/v1/issues/{transcript_fp}/transcript?page_size=1");

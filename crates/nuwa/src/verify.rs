@@ -109,7 +109,7 @@ fn verdict(output: &CheckOutput) -> &'static str {
     }
 }
 
-/// Run the red-green protocol. `base` is the freshly fetched base branch name.
+/// Run the red-green protocol. `base` is a base ref or a pinned fetched SHA.
 pub async fn verify(
     repo: &Path,
     issue: &Issue,
@@ -392,67 +392,123 @@ impl Drop for BaseWorktree<'_> {
     }
 }
 
-/// Compute the delivery diff, forbidden-path hits, and the risk flags used by
-/// the PR body. `base` is a branch name; the working tree is the branch side.
+/// Compute the complete base-to-working-tree delivery diff. `base` may be a
+/// branch or a pinned SHA. A private index models exactly what delivery stages,
+/// without touching the caller's index, and includes committed changes too.
 pub fn diff_summary(
     repo: &Path,
     base: &str,
     forbidden_paths: &[String],
 ) -> anyhow::Result<DiffSummary> {
     let mut summary = DiffSummary::default();
-    // Raw bytes, never trimmed: porcelain `XY path` records carry a meaningful
-    // leading status column (` M` = modified-not-staged), and the shared `git()`
-    // helper trims, which would corrupt the first record (` M go.sum` → path
-    // `o.sum`) and silently miss a forbidden file. `--untracked-files=all`
-    // lists untracked files individually instead of folding a new directory to
-    // `dir/`, so a forbidden file inside it is matched the same way `git add -A`
-    // would stage it.
-    let status_bytes = git_ops::git_raw(
-        repo,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )?;
-    let status = String::from_utf8_lossy(&status_bytes);
-    let mut parts = status.split('\0').filter(|part| !part.is_empty());
-    while let Some(entry) = parts.next() {
-        if entry.len() < 4 {
-            continue;
-        }
-        let code = entry[..2].to_string();
-        let path = entry[3..].to_string();
-        if path == "nuwa.repo.json" {
-            continue;
-        }
-        if code.starts_with('R') {
-            if let Some(old) = parts.next() {
-                summary.files.push(DiffFile {
-                    status: code.clone(),
-                    path: old.to_string(),
-                });
-            }
-        }
-        summary.files.push(DiffFile { status: code, path });
+    let scratch = tempfile::tempdir().context("create diff index directory")?;
+    let index = scratch.path().join("index");
+    let source = repo.join(git_ops::git(repo, &["rev-parse", "--git-path", "index"])?);
+    if source.exists() {
+        // Preserve staged additions (including explicitly added ignored files).
+        // Starting from HEAD instead would silently lose those paths.
+        std::fs::copy(&source, &index).context("copy delivery index")?;
     }
+    let git = |args: &[&str]| -> anyhow::Result<Vec<u8>> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .current_dir(repo)
+            .output()
+            .with_context(|| format!("git {} (diff index)", args.join(" ")))?;
+        if !out.status.success() {
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(out.stdout)
+    };
+    // One final tree avoids double-counting staged/unstaged changes or a staged
+    // deletion followed by an untracked recreation of the same path.
+    git(&["add", "-A", "--", ":(exclude)nuwa.repo.json"])?;
+    let names = git(&[
+        "diff",
+        "--cached",
+        "--name-status",
+        "-z",
+        "--find-renames",
+        base,
+        "--",
+        ":(exclude)nuwa.repo.json",
+    ])?;
+    // Parse NUL-delimited bytes before converting paths for display/matching:
+    // tabs, newlines, leading spaces and non-UTF-8 bytes are not record syntax.
+    let mut parts = names
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty());
+    let mut files = BTreeMap::new();
+    while let Some(code) = parts.next() {
+        let status = std::str::from_utf8(code)
+            .context("diff status is not ASCII")?
+            .to_string();
+        let path = parts.next().context("diff status missing path")?;
+        let file = DiffFile {
+            status,
+            path: String::from_utf8_lossy(path).into_owned(),
+        };
+        if file.status.starts_with('R') || file.status.starts_with('C') {
+            let destination = parts.next().context("diff rename missing destination")?;
+            files.insert(
+                destination.to_vec(),
+                DiffFile {
+                    status: file.status.clone(),
+                    path: String::from_utf8_lossy(destination).into_owned(),
+                },
+            );
+        }
+        // Both ends of a rename must pass forbidden-path and test/CI checks.
+        files.insert(path.to_vec(), file);
+    }
+    summary.files = files.into_values().collect();
 
-    let numstat = git_ops::git(repo, &["diff", "--numstat", base]).unwrap_or_default();
-    for line in numstat.lines() {
-        let mut fields = line.splitn(3, '\t');
-        let added = fields
+    let numstat = git(&[
+        "diff",
+        "--cached",
+        "--numstat",
+        "-z",
+        "--find-renames",
+        base,
+        "--",
+        ":(exclude)nuwa.repo.json",
+    ])?;
+    let mut records = numstat
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty());
+    while let Some(record) = records.next() {
+        let mut fields = record.splitn(3, |byte| *byte == b'\t');
+        let mut count = || -> anyhow::Result<u64> {
+            let field = fields.next().context("diff numstat missing count")?;
+            if field == b"-" {
+                return Ok(0); // Binary files have no line counts.
+            }
+            std::str::from_utf8(field)?
+                .parse()
+                .context("invalid diff line count")
+        };
+        summary.added += count()?;
+        summary.removed += count()?;
+        if fields
             .next()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        let removed = fields
-            .next()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        summary.added += added;
-        summary.removed += removed;
+            .context("diff numstat missing path")?
+            .is_empty()
+        {
+            // Rename numstat is `added<TAB>removed<TAB>NUL>old<NUL>new<NUL>`.
+            records
+                .next()
+                .context("diff numstat missing rename source")?;
+            records
+                .next()
+                .context("diff numstat missing rename destination")?;
+        }
     }
     for file in &summary.files {
-        if file.status.starts_with("??") {
-            if let Ok(text) = std::fs::read_to_string(repo.join(&file.path)) {
-                summary.added += text.lines().count() as u64;
-            }
-        }
         if is_test_path(&file.path) {
             summary.touches_tests = true;
         }
@@ -777,6 +833,130 @@ mod tests {
         let summary = diff_summary(&repo, "main", &[]).expect("diff");
         assert!(summary.touches_tests);
         assert!(summary.touches_ci);
+    }
+
+    #[tokio::test]
+    async fn systemic_committed_fix_after_base_merge_keeps_full_risk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        git(&repo, &["checkout", "-b", "fix"]);
+        std::fs::write(repo.join("fixed.txt"), "fixed\n").expect("write");
+        std::fs::write(repo.join("fix_test.go"), "package main\n").expect("write");
+        std::fs::create_dir_all(repo.join(".github/workflows")).expect("mkdir");
+        std::fs::write(repo.join(".github/workflows/ci.yml"), "name: ci\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "fix and tests"]);
+        git(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("upstream.txt"), "upstream\n".repeat(20)).expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "upstream advance"]);
+        let tip = git_ops::git(&repo, &["rev-parse", "HEAD"]).expect("tip");
+        git(&repo, &["checkout", "fix"]);
+        git(&repo, &["merge", "--no-edit", "main"]);
+
+        let evidence = verify(
+            &repo,
+            &issue(&exists_command("fixed.txt")),
+            &tip,
+            &Secrets::default(),
+        )
+        .await
+        .expect("reverify merged fix");
+        assert_eq!(
+            evidence.diff.files.len(),
+            3,
+            "committed fix must remain visible"
+        );
+        assert!(evidence.diff.touches_tests);
+        assert!(evidence.diff.touches_ci);
+        assert_eq!((evidence.diff.added, evidence.diff.removed), (3, 0));
+        assert!(!evidence.failing_base.ok);
+        assert!(evidence.failing_branch.ok);
+    }
+
+    #[tokio::test]
+    async fn systemic_committed_forbidden_change_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        git(&repo, &["checkout", "-b", "fix"]);
+        std::fs::write(repo.join("fixed.txt"), "fixed\n").expect("write");
+        std::fs::write(repo.join("secret.pem"), "not a real key\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "forbidden fix"]);
+        let mut issue = issue(&exists_command("fixed.txt"));
+        issue.forbidden_paths = vec!["*.pem".into()];
+        let err = verify(&repo, &issue, "main", &Secrets::default())
+            .await
+            .expect_err("committed forbidden path must block delivery");
+        assert!(format!("{err:#}").contains("secret.pem"));
+    }
+
+    #[test]
+    fn systemic_full_diff_preserves_rename_paths_and_counts_final_tree_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(repo.join("protected.txt"), "keep\n".repeat(20)).expect("write");
+        std::fs::write(repo.join("nuwa.repo.json"), "{}\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base files"]);
+        git(&repo, &["checkout", "-b", "fix"]);
+        git(&repo, &["mv", "protected.txt", "renamed_test.go"]);
+        git(&repo, &["commit", "-m", "rename"]);
+        std::fs::write(repo.join("base.txt"), "base\nstaged\n").expect("write");
+        git(&repo, &["add", "base.txt"]);
+        std::fs::write(repo.join("base.txt"), "base\nstaged\nunstaged\n").expect("write");
+        std::fs::write(repo.join("new file.txt"), "new\n").expect("write");
+        std::fs::write(repo.join("nuwa.repo.json"), "ignored\n".repeat(10)).expect("write");
+        // A staged deletion followed by an untracked recreation is one final
+        // modification, not a deletion plus an unrelated added file.
+        git(&repo, &["rm", "--cached", "renamed_test.go"]);
+        let before = git_ops::git_raw(&repo, &["status", "--porcelain=v1", "-z"]).expect("status");
+        let summary = diff_summary(&repo, "main", &["protected.txt".into()]).expect("diff");
+        let mut paths: Vec<_> = summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            [
+                "base.txt",
+                "new file.txt",
+                "protected.txt",
+                "renamed_test.go"
+            ]
+        );
+        assert!(summary.touches_tests);
+        assert_eq!(summary.forbidden_hits.len(), 1);
+        assert!(summary.forbidden_hits[0].contains("protected.txt"));
+        assert_eq!((summary.added, summary.removed), (3, 0));
+        assert_eq!(
+            git_ops::git_raw(&repo, &["status", "--porcelain=v1", "-z"]).expect("status"),
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemic_diff_parses_nul_paths_without_line_or_utf8_assumptions() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        git(dir.path(), &["checkout", "-b", "fix"]);
+        let name = std::ffi::OsString::from_vec(b" odd\tname\n\xff_test.go".to_vec());
+        std::fs::write(dir.path().join(name), "one\ntwo\n").expect("write");
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-m", "odd path"]);
+        let summary = diff_summary(dir.path(), "main", &["*_test.go".into()]).expect("diff");
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].path, " odd\tname\n\u{fffd}_test.go");
+        assert_eq!((summary.added, summary.removed), (2, 0));
+        assert!(summary.touches_tests);
+        assert_eq!(summary.forbidden_hits.len(), 1);
     }
 
     fn reproduction_path() -> &'static str {

@@ -4,9 +4,8 @@
 //! run is resumable and every turn is auditable after the fact.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use rpi_agent::events::{AgentEvent, BroadcastEmitter};
@@ -121,26 +120,111 @@ impl std::fmt::Display for ProviderFailure {
 
 impl std::error::Error for ProviderFailure {}
 
-/// Give the event drain a bounded window to pick up the events that are
-/// still in flight — the final `TurnEnd` usually is — so the last turn's
-/// token usage is not lost when the drain is aborted.
-async fn settle_drain(turns: &Arc<AtomicU32>) {
-    let deadline = Instant::now() + Duration::from_millis(300);
-    let mut previous = turns.load(Ordering::Relaxed);
-    let mut stable = 0;
-    while Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let current = turns.load(Ordering::Relaxed);
-        if current == previous {
-            stable += 1;
-            if stable >= 2 {
-                return;
+// prompt_text joins its emitters; draining to Empty afterwards captures the final usage without a detached task.
+async fn collect_run_events<P, R, F, U>(
+    prompt: P,
+    mut rx: tokio::sync::broadcast::Receiver<AgentEvent>,
+    mut record_usage: F,
+    progress: Option<&(dyn Fn(RepairProgress) + Send + Sync)>,
+) -> (R, anyhow::Result<RepairProgress>)
+where
+    P: std::future::Future<Output = R>,
+    F: FnMut(rpi_ai::types::Usage) -> U,
+    U: std::future::Future<Output = anyhow::Result<()>>,
+{
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    let (done, mut completed) = tokio::sync::oneshot::channel();
+    let drain = async {
+        let mut finished = false;
+        let mut error = None;
+        let mut totals = RepairProgress {
+            turns: 0,
+            uncached_tokens: 0,
+            cached_tokens: 0,
+        };
+        loop {
+            let event = if finished {
+                match rx.try_recv() {
+                    Ok(event) => Ok(event),
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                    Err(TryRecvError::Lagged(n)) => Err(RecvError::Lagged(n)),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = &mut completed => {
+                        finished = true;
+                        continue;
+                    }
+                    event = rx.recv() => event,
+                }
+            };
+            match event {
+                Ok(AgentEvent::ToolExecutionStart {
+                    tool_name, args, ..
+                }) => {
+                    eprintln!("  [tool] {tool_name} {args}");
+                }
+                Ok(AgentEvent::ToolExecutionEnd {
+                    tool_name,
+                    is_error,
+                    ..
+                }) => {
+                    eprintln!("  [tool→] {tool_name} err={is_error}");
+                }
+                Ok(AgentEvent::TurnEnd { message, .. }) => {
+                    eprintln!("  -- turn end --");
+                    totals.turns += 1;
+                    if let rpi_agent::AgentMessage::Assistant(assistant) = message {
+                        let usage = assistant.usage;
+                        // Output is billable too; harness SessionStats' uncached
+                        // bucket only includes input + cache_write.
+                        totals.uncached_tokens +=
+                            (usage.input + usage.cache_write + usage.output).max(0) as u64;
+                        totals.cached_tokens += usage.cache_read.max(0) as u64;
+                        if let Err(failure) = record_usage(usage).await {
+                            error.get_or_insert(failure.context("record usage"));
+                        }
+                        // Publish spend even if persistence failed, and continue
+                        // draining so a failed run cannot silently discard its tail.
+                        if let Some(callback) = progress {
+                            callback(totals);
+                        }
+                    }
+                }
+                Ok(AgentEvent::RetryScheduled {
+                    attempt,
+                    max_retries,
+                    error,
+                    ..
+                }) => {
+                    eprintln!("  [retry {attempt}/{max_retries}] {error}");
+                }
+                Ok(_) => {}
+                Err(RecvError::Lagged(n)) => {
+                    error.get_or_insert_with(|| {
+                        anyhow::anyhow!("repair events lagged by {n}; usage may be incomplete")
+                    });
+                }
+                Err(RecvError::Closed) => break,
             }
-        } else {
-            stable = 0;
-            previous = current;
         }
-    }
+        match error {
+            Some(error) => Err(error.context(format!(
+                "repair usage accounting failed (observed uncached={}, cached={})",
+                totals.uncached_tokens, totals.cached_tokens
+            ))),
+            None => Ok(totals),
+        }
+    };
+    tokio::join!(
+        async {
+            let result = prompt.await;
+            let _ = done.send(());
+            result
+        },
+        drain
+    )
 }
 
 /// Resolve the requested Anthropic model. A typo must fail loudly instead of
@@ -211,7 +295,8 @@ fn default_faux_script() -> FauxScript {
         .with_text(
             "ROOT CAUSE: Average iterated with i <= len(xs), indexing one past the last element — index out of range panic on every non-empty window.\n\
              CHANGE: bounded the loop at i < len(xs) so the sum covers exactly the slice.\n\
-             VERIFICATION: go test ./... — all tests pass.",
+             VERIFICATION: go test ./... — all tests pass.\n\
+             OUTCOME: fixed",
         )
 }
 
@@ -219,10 +304,6 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
     // Turn budget (rpi-harness RunBudget reads this per run). Token-level caps
     // land with the 运行器池 scheduler; the turn cap bounds runaway loops now.
     std::env::set_var("RPI_MAX_TURNS_PER_RUN", job.max_turns.to_string());
-
-    let progress = job.progress.clone();
-    let uncached = Arc::new(AtomicU64::new(0));
-    let cached = Arc::new(AtomicU64::new(0));
 
     let repo = std::path::absolute(&job.repo)
         .with_context(|| format!("resolve repo {}", job.repo.display()))?;
@@ -350,9 +431,8 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
 
     // ---- events ----
     let model_context_window = model.context_window;
-    let (broadcast, mut rx) = BroadcastEmitter::new(1024);
+    let (broadcast, rx) = BroadcastEmitter::new(1024);
     let emitter: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(broadcast);
-    let turns = Arc::new(AtomicU32::new(0));
 
     // ---- harness + run ----
     let notes = job.notes.trim();
@@ -409,81 +489,28 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
     // caller), so session stats never see tokens. The drain observes each
     // TurnEnd's assistant usage and feeds it back — this is the nuwa-side
     // wiring that makes the token budget gate real.
-    let turn_counter = Arc::clone(&turns);
-    let drain_harness = harness.clone();
-    let drain = tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) => match ev {
-                    AgentEvent::ToolExecutionStart {
-                        tool_name,
-                        ref args,
-                        ..
-                    } => {
-                        eprintln!("  [tool] {tool_name} {args}");
-                    }
-                    AgentEvent::ToolExecutionEnd {
-                        tool_name,
-                        is_error,
-                        ..
-                    } => {
-                        eprintln!("  [tool→] {tool_name} err={is_error}");
-                    }
-                    AgentEvent::TurnEnd { ref message, .. } => {
-                        eprintln!("  -- turn end --");
-                        let turns = turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if let rpi_agent::AgentMessage::Assistant(assistant) = message {
-                            let usage = assistant.usage.clone();
-                            // Output tokens are billable and belong to the
-                            // uncached bucket: a repair run spends most of its
-                            // tokens writing the patch, and leaving them out
-                            // made every budget gate (per issue, per day, per
-                            // month) undercount the real spend.
-                            let uncached_delta =
-                                (usage.input + usage.cache_write + usage.output).max(0) as u64;
-                            let cached_delta = usage.cache_read.max(0) as u64;
-                            let uncached_total = uncached
-                                .fetch_add(uncached_delta, Ordering::Relaxed)
-                                + uncached_delta;
-                            let cached_total =
-                                cached.fetch_add(cached_delta, Ordering::Relaxed) + cached_delta;
-                            let _ = drain_harness.record_usage(usage, None, None).await;
-                            if let Some(cb) = &progress {
-                                cb(RepairProgress {
-                                    turns,
-                                    uncached_tokens: uncached_total,
-                                    cached_tokens: cached_total,
-                                });
-                            }
-                        }
-                    }
-                    AgentEvent::RetryScheduled {
-                        attempt,
-                        max_retries,
-                        ref error,
-                        ..
-                    } => {
-                        eprintln!("  [retry {attempt}/{max_retries}] {error}");
-                    }
-                    _ => {}
-                },
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    eprintln!("  [events] lagged by {n}");
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let result = harness.prompt_text(&job.issue.user_prompt(), vec![]).await;
-    let stats = harness.get_stats().await.ok();
-    // The drain task holds an Arc of the harness and the harness holds the
-    // event emitter, so neither ends on its own: every exit path has to
-    // abort it, or each failed run leaks a task (and its harness) for the
-    // lifetime of the runner process.
-    settle_drain(&turns).await;
-    harness.close().await.ok();
-    drain.abort();
+    let (result, usage) = collect_run_events(
+        harness.prompt_text(&job.issue.user_prompt(), vec![]),
+        rx,
+        |usage| async {
+            harness
+                .record_usage(usage, None, None)
+                .await
+                .map(|_| ())
+                .context("harness usage write-back")
+        },
+        job.progress.as_deref(),
+    )
+    .await;
+    // Never snapshot stats or close the harness while a usage write is pending.
+    // Retain errors until after cleanup, including on prompt failure.
+    let stats = harness
+        .get_stats()
+        .await
+        .context("read final session stats");
+    let closed = harness.close().await.context("close repair harness");
+    let usage = usage?;
+    closed?;
     let result = match result {
         Ok(result) => result,
         // The prompt call is the provider call: a failure here is the
@@ -518,20 +545,22 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         }
     };
 
+    let stats = stats?;
     Ok(RepairReport {
         run_id: result.run_id,
         root_cause_text,
-        turns: turns.load(Ordering::Relaxed),
-        uncached_tokens: stats
-            .as_ref()
-            .map(|s| s.uncached_tokens as u64)
-            .unwrap_or(0),
-        cached_tokens: stats.as_ref().map(|s| s.cached_tokens as u64).unwrap_or(0),
+        turns: usage.turns,
+        // SessionStats excludes output tokens; never let it lower the spend
+        // already published by progress (including the fully drained last turn).
+        uncached_tokens: usage
+            .uncached_tokens
+            .max(stats.uncached_tokens.max(0) as u64),
+        cached_tokens: usage.cached_tokens.max(stats.cached_tokens.max(0) as u64),
         session_dir: sessions_dir.to_string_lossy().into_owned(),
         context: ContextBudget {
             model_context_window,
             compactions: compactions.load(Ordering::Relaxed),
-            messages: stats.as_ref().map(|s| s.message_count).unwrap_or(0),
+            messages: stats.message_count,
         },
     })
 }
@@ -564,6 +593,153 @@ mod tests {
         }
     }
 
+    fn usage_event(input: i64, output: i64, cache_read: i64, cache_write: i64) -> AgentEvent {
+        let mut message = rpi_ai::providers::faux::faux_assistant_message(
+            "done",
+            rpi_ai::types::StopReason::Stop,
+        );
+        message.usage.input = input;
+        message.usage.output = output;
+        message.usage.cache_read = cache_read;
+        message.usage.cache_write = cache_write;
+        message.usage.total_tokens = input + output + cache_read + cache_write;
+        AgentEvent::TurnEnd {
+            message: rpi_agent::AgentMessage::Assistant(Box::new(message)),
+            tool_results: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_tail_usage_is_joined_on_success_and_failure() {
+        for fail in [false, true] {
+            let (emitter, rx) = BroadcastEmitter::new(16);
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let mut wait = Some(wait);
+            let owner = Arc::new(());
+            let weak = Arc::downgrade(&owner);
+            let recorded = Arc::new(Mutex::new(Vec::new()));
+            let records = Arc::clone(&recorded);
+            let seen = Mutex::new(Vec::new());
+            let progress = |p| seen.lock().expect("progress").push(p);
+            let prompt = async {
+                emitter.try_emit(usage_event(10, 3, 4, 2));
+                emitter.try_emit(usage_event(20, 7, 8, 5));
+                if fail {
+                    anyhow::bail!("prompt failed")
+                }
+                Ok(())
+            };
+            let mut collection = Box::pin(collect_run_events(
+                prompt,
+                rx,
+                move |usage: rpi_ai::types::Usage| {
+                    let _keep_alive = &owner;
+                    let wait = if usage.input == 20 { wait.take() } else { None };
+                    let records = Arc::clone(&records);
+                    async move {
+                        if let Some(wait) = wait {
+                            wait.await.expect("release tail");
+                        }
+                        records.lock().expect("records").push(usage);
+                        Ok(())
+                    }
+                },
+                Some(&progress),
+            ));
+            // The prompt is already done, but the final usage write is explicitly
+            // held. No elapsed-time heuristic can prove that this drain is done.
+            assert!(futures::poll!(collection.as_mut()).is_pending());
+            assert_eq!(recorded.lock().expect("records").len(), 1);
+            release.send(()).expect("release");
+            let (result, totals) = collection.await;
+            assert_eq!(result.is_err(), fail);
+            let totals = totals.expect("usage");
+            assert_eq!(totals.turns, 2);
+            assert_eq!(totals.uncached_tokens, 47);
+            assert_eq!(totals.cached_tokens, 12);
+            assert_eq!(recorded.lock().expect("records").len(), 2);
+            let seen = seen.lock().expect("progress");
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[1].uncached_tokens, 47);
+            assert_eq!(seen[1].cached_tokens, 12);
+            assert!(weak.upgrade().is_none(), "drain retained its owner");
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_write_failure_is_visible_and_does_not_discard_tail() {
+        let (emitter, rx) = BroadcastEmitter::new(16);
+        let seen = Mutex::new(Vec::new());
+        let progress = |p| seen.lock().expect("progress").push(p);
+        let (_, result) = collect_run_events(
+            async {
+                emitter.try_emit(usage_event(10, 3, 4, 2));
+                emitter.try_emit(usage_event(20, 7, 8, 5));
+            },
+            rx,
+            |usage| async move {
+                if usage.input == 10 {
+                    anyhow::bail!("usage disk full")
+                }
+                Ok(())
+            },
+            Some(&progress),
+        )
+        .await;
+        let error = result.expect_err("usage failure cannot become zero spend");
+        assert!(format!("{error:#}").contains("usage disk full"));
+        let seen = seen.lock().expect("progress");
+        assert_eq!(seen.len(), 2, "drain must continue after a write failure");
+        assert_eq!(seen[1].uncached_tokens, 47);
+        assert_eq!(seen[1].cached_tokens, 12);
+    }
+
+    #[tokio::test]
+    async fn lost_events_fail_accounting_but_drain_the_remaining_usage() {
+        let (emitter, rx) = BroadcastEmitter::new(1);
+        let seen = Mutex::new(Vec::new());
+        let progress = |p| seen.lock().expect("progress").push(p);
+        let (_, result) = collect_run_events(
+            async {
+                emitter.try_emit(usage_event(10, 3, 4, 2));
+                emitter.try_emit(usage_event(20, 7, 8, 5));
+            },
+            rx,
+            |_| async { Ok(()) },
+            Some(&progress),
+        )
+        .await;
+        let error = result.expect_err("lost events must not silently undercount");
+        assert!(format!("{error:#}").contains("lagged by 1"));
+        let seen = seen.lock().expect("progress");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].uncached_tokens, 32);
+        assert_eq!(seen[0].cached_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn cancelled_collection_does_not_detach_a_drain_task() {
+        let (emitter, rx) = BroadcastEmitter::new(16);
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        emitter.try_emit(usage_event(10, 3, 4, 2));
+        let mut collection = Box::pin(collect_run_events(
+            std::future::pending::<()>(),
+            rx,
+            move |_| {
+                let _keep_alive = &owner;
+                std::future::pending::<anyhow::Result<()>>()
+            },
+            None,
+        ));
+        assert!(futures::poll!(collection.as_mut()).is_pending());
+        drop(collection);
+        assert!(
+            weak.upgrade().is_none(),
+            "cancelled drain retained its owner"
+        );
+    }
+
     #[test]
     fn unknown_anthropic_model_is_rejected() {
         let catalog = anthropic_models();
@@ -575,6 +751,71 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("unknown Anthropic model"), "{text}");
         assert!(text.contains("available:"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn faux_failure_persists_tail_usage_and_releases_progress() {
+        use rpi_ai::providers::faux::{faux_assistant_message, FauxStep};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = FauxScript::new().with_tool_call(
+            "write",
+            serde_json::json!({"path": "attempt.txt", "content": "attempt"}),
+        );
+        let mut failure = faux_assistant_message("cannot repair", rpi_ai::types::StopReason::Error);
+        failure.error_message = Some("invalid request".into());
+        script.append_responses(vec![FauxStep::message(failure)]);
+        let seen = Arc::new(Mutex::new(Vec::<RepairProgress>::new()));
+        let seen_cb = Arc::clone(&seen);
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let job = RepairJob {
+            repo: dir.path().to_path_buf(),
+            issue: issue(),
+            sessions_dir: dir.path().join("sessions"),
+            provider: ProviderKind::Faux,
+            max_turns: 5,
+            guards: Arc::new(Guards::new(Vec::new())),
+            secrets: Arc::new(crate::secrets::Secrets::default()),
+            notes: String::new(),
+            progress: Some(Arc::new(move |p| {
+                let _keep_alive = &owner;
+                seen_cb.lock().expect("progress").push(p);
+            })),
+            faux_script: Some(script),
+            run_id: None,
+        };
+        let error = run(&job).await.err().expect("provider failure");
+        assert!(
+            error.downcast_ref::<ProviderFailure>().is_some(),
+            "{error:#}"
+        );
+        let session_dir = session_dir_for(&job.sessions_dir, &job.issue, None);
+        let transcript = std::fs::read_dir(session_dir)
+            .expect("sessions")
+            .flat_map(|entry| {
+                std::fs::read_dir(entry.expect("cwd bucket").path()).expect("cwd sessions")
+            })
+            .map(|entry| entry.expect("entry").path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .expect("transcript");
+        let transcript = std::fs::read_to_string(transcript).expect("read transcript");
+        let usages: Vec<rpi_ai::types::Usage> = transcript
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("jsonl"))
+            .filter(|line| line["kind"] == "record" && line["type"] == "usage")
+            .map(|line| serde_json::from_value(line["usage"].clone()).expect("usage"))
+            .collect();
+        assert_eq!(usages.len(), 2, "failure must persist both turns' usage");
+        let seen = seen.lock().expect("progress");
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].uncached_tokens > seen[0].uncached_tokens);
+        let persisted: i64 = usages
+            .iter()
+            .map(|usage| usage.input + usage.output + usage.cache_write)
+            .sum();
+        assert_eq!(seen[1].uncached_tokens, persisted as u64);
+        drop(job);
+        assert!(weak.upgrade().is_none(), "failed run retained progress");
     }
 
     // The harness calls `block_in_place` (rpi-harness agent_harness.rs), which
@@ -617,6 +858,7 @@ mod tests {
 
         let report = run(&job).await.expect("run");
         assert!(!report.session_dir.is_empty());
+        assert!(report.root_cause_text.ends_with("OUTCOME: fixed"));
         assert!(
             report.context.model_context_window > 0,
             "faux model must expose a context window"
@@ -634,7 +876,15 @@ mod tests {
             !events.is_empty(),
             "progress callback must fire at least once"
         );
-        assert!(events.last().expect("last").turns >= 1);
+        let last = events.last().expect("last");
+        assert_eq!(last.turns, 3);
+        assert!(
+            last.uncached_tokens > 0,
+            "faux supplies real usage estimates"
+        );
+        assert_eq!(report.turns, last.turns);
+        assert_eq!(report.uncached_tokens, last.uncached_tokens);
+        assert_eq!(report.cached_tokens, last.cached_tokens);
 
         let fixed = std::fs::read_to_string(&source).expect("read");
         assert!(fixed.contains("i < len(xs)"), "faux edit must land");

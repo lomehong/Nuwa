@@ -463,7 +463,7 @@ async fn run_one_inner(
     result.tokens_cached = report.cached_tokens as i64;
     result.root_cause = Some(bounded(&secrets.redact(&report.root_cause_text), 8_000));
     result.final_report = Some(bounded(&secrets.redact(&report.root_cause_text), 8_000));
-    result.claimed_fixed = report.root_cause_text.contains("VERIFICATION:");
+    result.claimed_fixed = claimed_fixed(&report.root_cause_text);
 
     match verify::check_working_tree(&repo, &check, secrets).await {
         Ok(output) => result.repaired = output.ok,
@@ -501,6 +501,15 @@ async fn run_one_inner(
         }
     }
     Ok(())
+}
+
+/// A claim is not verification evidence. Only one exact, explicit outcome
+/// counts; duplicate (even identical), unknown and missing outcomes fail closed.
+fn claimed_fixed(final_message: &str) -> bool {
+    let mut outcomes = final_message
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("OUTCOME:").map(str::trim));
+    outcomes.next() == Some("fixed") && outcomes.next().is_none()
 }
 
 fn scenario_check(scenario: &Scenario) -> FailingCheck {
@@ -589,6 +598,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_one_explicit_fixed_outcome_counts_as_a_claim() {
+        for (text, expected) in [
+            ("OUTCOME: fixed", true),
+            ("VERIFICATION: failed\nOUTCOME: not_fixed", false),
+            ("VERIFICATION: not run\nOUTCOME: unverified", false),
+            ("VERIFICATION: pass", false),
+            ("fixed all bugs", false),
+            ("OUTCOME: fixed\nOUTCOME: not_fixed", false),
+            ("OUTCOME: unverified\nOUTCOME: fixed", false),
+            ("OUTCOME: fixed\nOUTCOME: fixed", false),
+            ("OUTCOME: fixed\nOUTCOME: unknown", false),
+            ("VERIFICATION: pass\nOUTCOME: unknown", false),
+            ("OUTCOME: fixed maybe", false),
+            ("The sample says OUTCOME: fixed", false),
+            ("VERIFICATION: failed\nOUTCOME: fixed", true),
+            (
+                "ROOT CAUSE: x\r\nCHANGE: y\r\nVERIFICATION: pass\r\nOUTCOME: fixed\r\n",
+                true,
+            ),
+        ] {
+            assert_eq!(claimed_fixed(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
     fn builtin_scenarios_parse_and_have_fixtures() {
         let scenarios = load_scenarios().expect("scenarios");
         assert!(scenarios.len() >= 4, "expected a meaningful seed set");
@@ -598,6 +632,11 @@ mod tests {
             "negative control is required to measure false positives"
         );
         for scenario in &scenarios {
+            assert!(
+                claimed_fixed(&scenario.final_message),
+                "{} must explicitly claim fixed, including the negative control",
+                scenario.name
+            );
             assert!(
                 BenchmarkAssets::iter()
                     .any(|name| name.starts_with(&format!("{}/repo/", scenario.name))),
@@ -657,6 +696,31 @@ mod tests {
             "green branch must pass the delivery gate"
         );
         assert!(result.error.is_none(), "{:?}", result.error);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn honest_failure_is_not_a_fixed_claim() {
+        let mut scenario = load_scenarios()
+            .expect("scenarios")
+            .into_iter()
+            .find(|scenario| scenario.name == "node-noop-claim")
+            .expect("negative scenario");
+        scenario.final_message = "ROOT CAUSE: wrong operator\nCHANGE: none\nVERIFICATION: node --test — failed\nOUTCOME: not_fixed".into();
+        let result = run_one(
+            "honest",
+            &scenario,
+            &ProviderKind::Faux,
+            12,
+            &secrets::Secrets::default(),
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(
+            !result.claimed_fixed,
+            "failed verification is not a success claim"
+        );
+        assert!(!result.repaired);
+        assert!(!result.delivery_ok);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

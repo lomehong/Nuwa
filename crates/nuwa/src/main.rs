@@ -553,42 +553,9 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let mut cycles: u64 = 0;
     let result: anyhow::Result<()> = async {
         loop {
-            // Integrity + freshness check before any claim: re-read the
-            // authoritative config (the base may have moved since the preflight
-            // fetch) and restore the working file. An agent that bypassed the
-            // tool guard cannot persist a weakened failing_check/forbidden list
-            // across a restart, and a base move is adopted rather than running
-            // the stale startup config.
-            let refresh = match trusted.refresh() {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
-                    return Err(e);
-                }
-            };
-            if refresh.config_changed {
-                eprintln!("preflight   : trusted instructions changed on base — reloaded");
-            }
-            // A restore that is not a base move means the working file was
-            // tampered with; journal it. (On a base move the file legitimately
-            // differs and is rewritten — that is not tampering.)
-            if refresh.restored && !refresh.config_changed {
-                eprintln!(
-                    "preflight   : {} was modified — restored from the trusted source",
-                    trusted.path().display()
-                );
-                let _ = store.record_event(
-                    "__system__",
-                    now_ms(),
-                    Some(&trusted.instructions.repo),
-                    "runner",
-                    "config_tampered",
-                    "nuwa.repo.json restored from trusted source",
-                );
-            }
             let worked = match work_once(
                 &store,
-                &trusted.instructions,
+                &mut trusted,
                 &repo_dir,
                 sessions_dir.clone(),
                 provider.clone(),
@@ -1374,7 +1341,7 @@ fn remember_verified_fix(
 #[allow(clippy::too_many_arguments)]
 async fn work_once(
     store: &Arc<shanhaijing::Store>,
-    repo_config: &instructions::RepoInstructions,
+    trusted: &mut instructions::TrustedInstructions,
     repo_dir: &Path,
     sessions_dir: PathBuf,
     provider: repair::ProviderKind,
@@ -1391,6 +1358,7 @@ async fn work_once(
     secrets: &Arc<secrets::Secrets>,
 ) -> anyhow::Result<bool> {
     let now = now_ms();
+    let repo_config = &trusted.instructions;
     // 活性必须在任何早退之前可见：配额待定/预检失败都不是"进程死了"。
     store.heartbeat(now)?;
     if let Some(remaining) = stand_down_remaining(&live, now).await {
@@ -1459,6 +1427,21 @@ async fn work_once(
         }
     };
     println!("preflight   : base {base}");
+    let refresh = trusted.refresh()?;
+    let repo_config = &trusted.instructions;
+    if refresh.config_changed {
+        eprintln!("preflight   : trusted instructions changed on base — reloaded");
+    }
+    if refresh.restored && !refresh.config_changed {
+        store.record_event(
+            "__system__",
+            now_ms(),
+            Some(&repo_config.repo),
+            "runner",
+            "config_tampered",
+            "nuwa.repo.json restored from trusted source",
+        )?;
+    }
 
     // ---- claim (atomic: N runners can never share an issue) ----
     let Some(snapshot) = store.claim_ready_issue_for_repo(
@@ -1694,7 +1677,14 @@ async fn work_once(
     let progress_store = Arc::clone(store);
     let progress_run = run_id.clone();
     let progress_live = Arc::clone(&live);
+    let final_usage = Arc::new(std::sync::Mutex::new(repair::RepairProgress {
+        turns: 0,
+        uncached_tokens: 0,
+        cached_tokens: 0,
+    }));
+    let progress_usage = Arc::clone(&final_usage);
     let progress: Option<pipeline::ProgressSink> = Some(Arc::new(move |p| {
+        *progress_usage.lock().unwrap_or_else(|e| e.into_inner()) = p;
         let store = Arc::clone(&progress_store);
         let run_id = progress_run.clone();
         // Every completed turn is real progress: refresh the watchdog
@@ -1759,9 +1749,28 @@ async fn work_once(
         },
     )
     .await;
-    let report = match prepared.execute().await {
+    let repair_result = prepared.execute().await;
+    let usage = *final_usage.lock().unwrap_or_else(|e| e.into_inner());
+    let usage_store = Arc::clone(store);
+    let usage_run = run_id.clone();
+    tokio::task::spawn_blocking(move || {
+        usage_store.update_run(
+            &usage_run,
+            &shanhaijing::RunUpdate {
+                turns: Some(i64::from(usage.turns)),
+                tokens_uncached: Some(usage.uncached_tokens as i64),
+                tokens_cached: Some(usage.cached_tokens as i64),
+                ..Default::default()
+            },
+        )
+    })
+    .await
+    .context("persist final usage task")?
+    .context("persist final usage")?;
+    let report = match repair_result {
         Ok(r) => r,
         Err(e) => {
+            let now = now_ms();
             let class = classify_failure(&e);
             let detail = bounded_text(&secrets.redact(&format!("repair_failed: {e:#}")));
             let outcome = match class {
@@ -1943,9 +1952,7 @@ async fn work_once(
         },
     );
 
-    // 事件排水在 prompt 返回时被 abort，尾部的 TurnEnd 可能缺失；以
-    // RepairReport 的累计值/轮数为准覆盖进度回调的中间态。这不是尽力而为
-    // 的遥测：证据必须在 run 结束前落库，所以等待阻塞池完成而不占用异步 worker。
+    // 排水完成后的报告补齐验证与上下文证据；累计 usage 已独立持久化。
     persist_run(
         store,
         &run_id,
@@ -2365,6 +2372,16 @@ async fn work_once(
                         error: Some(bounded_text(&format!("CI red — PR #{number} closed"))),
                     },
                 );
+                let rejected = store.reject_pr(
+                    &fp,
+                    delivered
+                        .pr_url
+                        .as_deref()
+                        .context("delivered PR URL missing")?,
+                    now_ms(),
+                    &format!("ci_red: PR #{number} closed without merge"),
+                    "runner",
+                )?;
                 let _ = store.record_event(
                     &fp,
                     now_ms(),
@@ -2383,52 +2400,40 @@ async fn work_once(
                     trace::Decision {
                         stage: "ci",
                         decision: "ci_red",
-                        reason: "CI failed; PR closed and issue rejected",
+                        reason: if rejected {
+                            "CI failed; PR closed and issue rejected"
+                        } else {
+                            "CI failed and PR closed; issue state changed concurrently, not rejected"
+                        },
                         details: serde_json::json!({
                             "pr": number,
                             "slug": slug,
                             "commit": delivered.commit,
+                            "issue_rejected": rejected,
                         }),
                     },
                 );
-                let _ = store.increment_attempts(&fp);
-                store.set_state_as(
-                    &fp,
-                    shanhaijing::State::Rejected,
-                    now_ms(),
-                    Some(&format!(
-                        "ci_red: CI red — PR #{number} closed, back to owner"
-                    )),
-                    "runner",
-                )?;
                 emit_webhook(
                     "ci_red",
                     &fp,
                     &repo_config.repo,
-                    format!("PR #{number} closed after CI failure"),
+                    if rejected {
+                        format!("PR #{number} closed after CI failure; issue rejected")
+                    } else {
+                        format!(
+                            "PR #{number} closed after CI failure; issue state changed, left unchanged"
+                        )
+                    },
                 );
-                // Trends bucket producer: the state change alone is not a
-                // merge/rejection signal (docs/09 §9.2).
-                let _ = ci::journal_terminal(
-                    store,
-                    &fp,
-                    &repo_config.repo,
-                    "runner",
-                    "rejected",
-                    &format!("ci_red: PR #{number} closed without merge"),
-                    now_ms(),
-                );
-                live_update(
-                    &live,
-                    "error",
-                    Some(&fp),
-                    None,
-                    Some(format!("CI red — PR #{number} closed")),
-                )
-                .await;
-                // CI red is a business outcome: the PR is closed and the issue
-                // is back with the owner. The runner keeps running.
-                println!("ci gate    : CI red — PR #{number} closed, issue rejected");
+                let note = if rejected {
+                    format!("CI red — PR #{number} closed, issue rejected")
+                } else {
+                    format!("CI red — PR #{number} closed; issue state changed, left unchanged")
+                };
+                live_update(&live, "error", Some(&fp), None, Some(note.clone())).await;
+                // CI red is a business outcome: the runner keeps running even
+                // when a concurrent state change means it did not reject the issue.
+                println!("ci gate    : {note}");
                 return Ok(true);
             }
             Ok(ci::Verdict::TimedOut) => {
@@ -2913,7 +2918,7 @@ mod tests {
         };
         let worked = work_once(
             &store,
-            &cfg,
+            &mut test_trusted_instructions(dir.path(), &cfg),
             dir.path(),
             dir.path().join("sessions"),
             repair::ProviderKind::Faux,
@@ -2995,7 +3000,7 @@ mod tests {
         };
         let worked = work_once(
             &store,
-            &cfg,
+            &mut test_trusted_instructions(repo_dir.path(), &cfg),
             repo_dir.path(),
             dir.path().join("sessions"),
             repair::ProviderKind::Faux,
@@ -3059,6 +3064,32 @@ mod tests {
             .expect("git");
         assert!(out.status.success(), "git {:?} failed", args);
         String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn test_trusted_instructions(
+        repo: &Path,
+        cfg: &RepoInstructions,
+    ) -> instructions::TrustedInstructions {
+        let check = |value: &FailingCheck| {
+            serde_json::json!({
+                "command": value.command, "target": value.target, "timeout_secs": value.timeout_secs,
+            })
+        };
+        let value = serde_json::json!({
+            "repo": cfg.repo, "failing_check": check(&cfg.failing_check),
+            "reproduce_check": cfg.reproduce_check.as_ref().map(check),
+            "forbidden_paths": cfg.forbidden_paths, "notes": cfg.notes, "skills": cfg.skills,
+            "max_attempts": cfg.max_attempts, "draft_first_n": cfg.draft_first_n,
+        });
+        let path = repo.join("nuwa.repo.json");
+        std::fs::write(&path, value.to_string()).expect("test instructions");
+        instructions::TrustedInstructions::load(
+            repo,
+            &path,
+            "main",
+            &repo.join(".git/test-trusted"),
+        )
+        .expect("trusted test instructions")
     }
 
     fn fixed_loop_check() -> String {
@@ -3137,6 +3168,179 @@ mod tests {
             git_output(&work, &["rev-parse", "HEAD"]).trim(),
             git_output(&work, &["rev-parse", "origin/main"]).trim()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_claim_after_fetch_uses_new_forbidden_paths() {
+        assert_first_claim_uses_new_config(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_first_private_claim_adopts_tracked_guard_and_command() {
+        assert_first_claim_uses_new_config(false).await;
+    }
+
+    async fn assert_first_claim_uses_new_config(initially_tracked: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let origin = dir.path().join("origin");
+        init_git_repo(&origin);
+        let config = serde_json::json!({
+            "repo": "example.com/fresh-config",
+            "failing_check": {"command": "exit 1", "timeout_secs": 10},
+            "forbidden_paths": []
+        });
+        if initially_tracked {
+            std::fs::write(origin.join("nuwa.repo.json"), config.to_string()).expect("config");
+        }
+        std::fs::write(origin.join("calc.go"), "for i := 0; i <= len(xs); i++ {\n")
+            .expect("source");
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-m", "initial repair config"]);
+        let repo = dir.path().join("runner");
+        git(
+            dir.path(),
+            &["clone", origin.to_str().expect("origin"), "runner"],
+        );
+        if !initially_tracked {
+            std::fs::write(repo.join("nuwa.repo.json"), config.to_string())
+                .expect("private config");
+        }
+        let sessions = dir.path().join("sessions");
+        let mut trusted = instructions::TrustedInstructions::load(
+            &repo,
+            &repo.join("nuwa.repo.json"),
+            "main",
+            &sessions.join("_trusted"),
+        )
+        .expect("trusted config");
+        assert_eq!(
+            trusted.source() == instructions::TrustSource::Tracked,
+            initially_tracked
+        );
+        let mut updated = config;
+        updated["failing_check"]["command"] = serde_json::json!(fixed_loop_check());
+        updated["forbidden_paths"] = serde_json::json!(["fixed.marker"]);
+        std::fs::write(origin.join("nuwa.repo.json"), updated.to_string()).expect("new config");
+        git(&origin, &["add", "nuwa.repo.json"]);
+        git(&origin, &["commit", "-m", "protect marker"]);
+        trusted.refresh().expect("refresh cached remote");
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("store"));
+        store
+            .report_signal(
+                &shanhaijing::Signal {
+                    repo: "example.com/fresh-config".into(),
+                    language: "go".into(),
+                    title: "panic".into(),
+                    severity: "high".into(),
+                    message: None,
+                    log_window: Vec::new(),
+                    stack_trace: "panic: bounds\nexample.com/app.F()\n /app/a.go:1".into(),
+                },
+                now_ms(),
+            )
+            .expect("signal");
+        work_once(
+            &store,
+            &mut trusted,
+            &repo,
+            sessions,
+            repair::ProviderKind::Faux,
+            10,
+            false,
+            false,
+            5,
+            1_000_000,
+            5_000_000,
+            50_000_000,
+            10,
+            "fresh:runner",
+            Arc::new(tokio::sync::Mutex::new(RunnerLive::new())),
+            &Arc::new(secrets::Secrets::default()),
+        )
+        .await
+        .expect("work cycle");
+        assert_eq!(trusted.source(), instructions::TrustSource::Tracked);
+        assert_eq!(
+            trusted.instructions.failing_check.command,
+            fixed_loop_check()
+        );
+        let row = store.list_issues().expect("issues").remove(0);
+        assert_eq!(
+            row.state, "escalated",
+            "the first run must enforce the fetched base's forbidden paths"
+        );
+        assert!(!repo.join("fixed.marker").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_stand_down_starts_after_the_probe_finishes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo);
+        std::fs::write(repo.join("probe.cjs"), "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,300);require('fs').writeFileSync('probe-finished',String(Date.now()));process.exit(1);").expect("probe script");
+        git(&repo, &["add", "probe.cjs"]);
+        git(&repo, &["commit", "-m", "slow preflight probe"]);
+        let cfg = RepoInstructions {
+            repo: "example.com/backoff".into(),
+            failing_check: FailingCheck {
+                command: "node probe.cjs".into(),
+                target: None,
+                timeout_secs: 10,
+            },
+            forbidden_paths: Vec::new(),
+            notes: String::new(),
+            skills: Vec::new(),
+            reproduce_check: None,
+            max_attempts: 3,
+            draft_first_n: 0,
+        };
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("store"));
+        store
+            .report_signal(
+                &shanhaijing::Signal {
+                    repo: cfg.repo.clone(),
+                    language: "node".into(),
+                    title: "failure".into(),
+                    severity: "high".into(),
+                    message: None,
+                    log_window: Vec::new(),
+                    stack_trace: "failure at calculate".into(),
+                },
+                now_ms(),
+            )
+            .expect("signal");
+        let live = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
+        let worked = work_once(
+            &store,
+            &mut test_trusted_instructions(&repo, &cfg),
+            &repo,
+            dir.path().join("sessions"),
+            repair::ProviderKind::Anthropic { model: None },
+            10,
+            false,
+            false,
+            5,
+            1_000_000,
+            5_000_000,
+            50_000_000,
+            10,
+            "backoff:runner",
+            Arc::clone(&live),
+            &Arc::new(secrets::Secrets::default()),
+        )
+        .await
+        .expect("work cycle");
+        assert!(!worked);
+        let probe_finished: i64 = std::fs::read_to_string(repo.join("probe-finished"))
+            .expect("probe timestamp")
+            .parse()
+            .expect("timestamp");
+        assert!(
+            live.lock().await.stand_down_until_ms >= probe_finished + 15 * 60_000,
+            "preflight time must not consume failure backoff"
+        );
+        let fp = fp_of(&store, 0);
+        assert_eq!(store.get(&fp).expect("issue").expect("exists").attempts, 0);
     }
 
     #[test]
@@ -3363,7 +3567,7 @@ mod tests {
         let live: SharedLive = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
         let worked = work_once(
             &store,
-            &cfg,
+            &mut test_trusted_instructions(&repo, &cfg),
             &repo,
             dir.path().join("sessions"),
             repair::ProviderKind::Faux,
@@ -3457,7 +3661,7 @@ mod tests {
         };
         let worked = work_once(
             &store,
-            &cfg,
+            &mut test_trusted_instructions(&repo, &cfg),
             &repo,
             dir.path().join("sessions"),
             repair::ProviderKind::Faux,

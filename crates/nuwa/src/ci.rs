@@ -326,29 +326,18 @@ pub async fn reconcile_all(
                 out.push(format!("merged     : {} → {url}", row.fingerprint));
             }
             Ok(s) if s == "closed" => {
-                store
-                    .set_state(
-                        &row.fingerprint,
-                        State::Rejected,
-                        now,
-                        Some("PR closed without merge"),
-                    )
-                    .map_err(|e| anyhow::anyhow!(e))?;
                 let detail = format!("PR #{number} closed without merge");
-                journal_terminal(
-                    store,
-                    &row.fingerprint,
-                    &row.repo,
-                    "system",
-                    "rejected",
-                    &detail,
-                    now,
-                )
-                .map_err(|e| anyhow::anyhow!(e))?;
-                out.push(format!(
-                    "rejected   : {} (PR #{number} closed without merge)",
-                    row.fingerprint
-                ));
+                if store.reject_pr(&row.fingerprint, url, now, &detail, "system")? {
+                    out.push(format!(
+                        "rejected   : {} (PR #{number} closed without merge)",
+                        row.fingerprint
+                    ));
+                } else {
+                    out.push(format!(
+                        "skip       : {} — issue state changed during reconcile",
+                        row.fingerprint
+                    ));
+                }
             }
             Ok(_) => out.push(format!("still open : {} — PR #{number}", row.fingerprint)),
             // Per-issue GitHub failures stay 200-level for the console: the
@@ -415,6 +404,11 @@ mod tests {
             .find(|row| row.fingerprint == fp)
             .expect("issue");
         assert_eq!(row.state, "rejected");
+        assert_eq!(
+            store.attempts_for(&fp).expect("attempts"),
+            0,
+            "branch-only reconcile is not an issue-level repair failure"
+        );
     }
 
     #[test]

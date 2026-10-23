@@ -22,9 +22,9 @@ pub struct SessionManager {
     /// have expired anyway. Without this, logging out only cleared the cookie:
     /// a copied cookie stayed valid until its TTL.
     ///
-    /// In memory on purpose: a restart forgets the list, but a restart also
-    /// re-reads `NUWA_UI_TOKEN`, and rotating the token invalidates every
-    /// session immediately.
+    /// In memory on purpose: every new manager has a fresh signing key bound
+    /// to `NUWA_UI_TOKEN`. A restart invalidates all prior sessions, even when
+    /// the UI token is unchanged, so forgetting revocations cannot revive them.
     revoked: Mutex<HashMap<String, i64>>,
 }
 
@@ -35,7 +35,13 @@ pub struct IssuedSession {
 
 impl SessionManager {
     pub fn new(ui_token: &str, ttl_ms: i64) -> Self {
-        let key: [u8; 32] = Sha256::digest(ui_token.as_bytes()).into();
+        // The random startup generation prevents copied cookies from becoming
+        // valid again after a restart loses the in-memory revocation list.
+        let key = Sha256::new()
+            .chain_update(uuid::Uuid::new_v4().as_bytes())
+            .chain_update(ui_token.as_bytes())
+            .finalize()
+            .into();
         Self {
             key,
             ttl_ms,
@@ -263,6 +269,40 @@ mod tests {
         let mut tampered = issued.token.clone();
         tampered.push('x');
         assert!(m.verify(&tampered, 1_001).is_none());
+    }
+
+    #[test]
+    fn independent_managers_with_the_same_ui_token_reject_each_others_sessions() {
+        let first = SessionManager::new("ui-secret", 60_000);
+        let second = SessionManager::new("ui-secret", 60_000);
+        let first_session = first.issue(1_000);
+        let second_session = second.issue(1_000);
+
+        assert_eq!(first.verify(&first_session.token, 1_001), Some(61_000));
+        assert_eq!(second.verify(&second_session.token, 1_001), Some(61_000));
+        assert!(second.verify(&first_session.token, 1_001).is_none());
+        assert!(first.verify(&second_session.token, 1_001).is_none());
+    }
+
+    #[test]
+    fn restart_does_not_resurrect_a_logged_out_session() {
+        let original = SessionManager::new("ui-secret", 60_000);
+        let issued = original.issue(1_000);
+        assert!(original.revoke(&issued.token, 1_001));
+        assert!(original.verify(&issued.token, 1_002).is_none());
+        drop(original);
+
+        let restarted = SessionManager::new("ui-secret", 60_000);
+        assert!(restarted.verify(&issued.token, 1_003).is_none());
+    }
+
+    #[test]
+    fn changing_the_ui_token_invalidates_old_sessions() {
+        let original = SessionManager::new("ui-secret", 60_000);
+        let issued = original.issue(1_000);
+        let rotated = SessionManager::new("new-ui-secret", 60_000);
+        assert_eq!(original.verify(&issued.token, 1_001), Some(61_000));
+        assert!(rotated.verify(&issued.token, 1_001).is_none());
     }
 
     /// 登出必须让会话立即失效：只清 cookie 的话，被复制的 cookie 在 TTL

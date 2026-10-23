@@ -46,6 +46,17 @@ describe("validateSettingValue", () => {
     expect(validateSettingValue(spec({ type: "url" }), "")).toBeNull();
   });
 
+  it.each(["'alpha'", "'alpha", "alpha'", "al'pha", '"alpha"', "al\\pha"])(
+    "rejects env quoting or escaping in %j for secrets and ordinary values",
+    (raw) => {
+      for (const secret of [false, true]) {
+        expect(validateSettingValue(spec({ secret }), raw)).toBe(
+          "不能包含单引号、双引号或反斜杠",
+        );
+      }
+    },
+  );
+
   it("leaves empty non-int values and free text to the server", () => {
     expect(validateSettingValue(spec({ type: "string" }), "")).toBeNull();
     expect(validateSettingValue(spec({ type: "string" }), "任意 值")).toBeNull();

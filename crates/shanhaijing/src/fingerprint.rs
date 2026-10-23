@@ -249,21 +249,37 @@ fn parse_rust(stack: &str) -> (String, Vec<String>) {
             error_class = normalize_text(trimmed);
             continue;
         }
-        if trimmed.starts_with("at ") {
+        if let Some(file_part) = trimmed.strip_prefix("at ") {
             if let Some(func) = pending_func.take() {
-                push_frame(&mut frames, &func, trimmed.trim_start_matches("at "));
+                push_frame(&mut frames, &func, file_part);
             }
-        } else if let Some(num_colon) = trimmed.strip_suffix(':') {
-            if num_colon.chars().next().is_some_and(|c| c.is_ascii_digit()) && trimmed.contains(':')
-            {
-                // `4: pkg::func` — the func is the part after the ordinal
-                if let Some(idx) = trimmed.find(": ") {
-                    pending_func = Some(trimmed[idx + 2..].trim().to_string());
+        } else if let Some((ordinal, func)) = trimmed.split_once(": ") {
+            if !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit()) {
+                // Release backtraces may omit locations entirely. A new ordinal
+                // completes the preceding valid function-only frame.
+                if let Some(func) = pending_func.take() {
+                    frames.push(func);
                 }
+                let func = func.trim();
+                // As with Go/Java, runtime and test harness frames must not
+                // consume the limited application-frame budget. Clear pending
+                // even for noise, so its location cannot attach to an app frame.
+                let noise = func.starts_with("std::")
+                    || func.starts_with("core::")
+                    || func.starts_with("alloc::")
+                    || func.starts_with("test::")
+                    || func.starts_with("__rustc::")
+                    || func == "rust_begin_unwind";
+                pending_func = (!func.is_empty() && !noise).then(|| func.to_string());
             }
         }
         if frames.len() >= 5 {
             break;
+        }
+    }
+    if frames.len() < 5 {
+        if let Some(func) = pending_func {
+            frames.push(func);
         }
     }
     (error_class, frames)
@@ -379,6 +395,124 @@ mod tests {
     }
 
     #[test]
+    fn rust_standard_frames_distinguish_functions_and_ignore_line_drift() {
+        let trace = "thread 'main' panicked at src/calc.rs:17:9:\nboom\nstack backtrace:\n\
+            0: app::average\n at src/calc.rs:17:9\n\
+            1: app::run\n at src/main.rs:25:1";
+        assert_eq!(
+            parse("rust", trace).1,
+            [
+                "<panic>@calc.rs",
+                "app::average@calc.rs",
+                "app::run@main.rs"
+            ]
+        );
+        let median = trace.replace("app::average", "app::median");
+        assert_ne!(
+            compute(GOLDEN_REPO, "rust", Some("boom"), trace),
+            compute(GOLDEN_REPO, "rust", Some("boom"), &median)
+        );
+        let drifted = trace
+            .replace(":17:9", ":101:2")
+            .replace(":25:1", ":99:3")
+            .replace("0: app", "12: app")
+            .replace("1: app", "13: app");
+        assert_eq!(
+            compute(GOLDEN_REPO, "rust", None, trace),
+            compute(GOLDEN_REPO, "rust", None, &drifted)
+        );
+    }
+
+    #[test]
+    fn review_rust_function_only_frames_distinguish_same_message() {
+        let trace = "thread 'main' panicked at src/calc.rs:17:9:\nboom\nstack backtrace:\n\
+            0: std::panicking::begin_panic_handler\n\
+            1: app::average\n\
+            2: app::run";
+        assert_ne!(
+            compute(GOLDEN_REPO, "rust", Some("boom"), trace),
+            compute(
+                GOLDEN_REPO,
+                "rust",
+                Some("boom"),
+                &trace.replace("app::average", "app::median")
+            )
+        );
+        assert_eq!(
+            parse("rust", trace).1,
+            ["<panic>@calc.rs", "app::average", "app::run"]
+        );
+    }
+
+    #[test]
+    fn review_rust_mixed_locations_flush_pending_at_next_frame_and_eof() {
+        let trace = "boom\nstack backtrace:\n\
+            0: app::no_location\n\
+            1: core::panicking::panic_fmt\n at library/core/src/panicking.rs:1:1\n\
+            2: app::with_location\n at src/calc.rs:17:9\n\
+            3: app::last";
+        assert_eq!(
+            parse("rust", trace).1,
+            [
+                "app::no_location",
+                "app::with_location@calc.rs",
+                "app::last"
+            ]
+        );
+        assert_eq!(parse("rust", "boom\n0: app::only").1, ["app::only"]);
+    }
+
+    #[test]
+    fn review_rust_function_only_frames_respect_frame_budget() {
+        let trace =
+            "boom\n0: app::a\n1: app::b\n2: app::c\n3: app::d\n4: app::e\n5: app::f\n6: app::g";
+        assert_eq!(
+            parse("rust", trace).1,
+            ["app::a", "app::b", "app::c", "app::d", "app::e"]
+        );
+    }
+
+    #[test]
+    fn rust_runtime_noise_does_not_displace_application_frames() {
+        let trace = "thread 'main' panicked at src/calc.rs:17:9:\nboom\nstack backtrace:\n\
+            0: std::backtrace_rs::backtrace::libunwind::trace\n at library/std/src/backtrace.rs:1:1\n\
+            1: std::panicking::begin_panic_handler\n at library/std/src/panicking.rs:2:1\n\
+            2: core::panicking::panic_fmt\n at library/core/src/panicking.rs:3:1\n\
+            3: rust_begin_unwind\n at library/std/src/panicking.rs:4:1\n\
+            4: __rustc::rust_begin_unwind\n at library/std/src/panicking.rs:5:1\n\
+            5: alloc::vec::Vec<T>::push\n at library/alloc/src/vec.rs:6:1\n\
+            6: test::run_test\n at library/test/src/lib.rs:7:1\n\
+            7: app::average\n at src/calc.rs:17:9\n\
+            8: core::ops::function::FnOnce::call_once\n at library/core/src/function.rs:8:1\n\
+            9: app::run\n at src/main.rs:25:1";
+        assert_eq!(
+            parse("rust", trace).1,
+            [
+                "<panic>@calc.rs",
+                "app::average@calc.rs",
+                "app::run@main.rs"
+            ]
+        );
+        let other = trace.replace("app::average", "app::median");
+        assert_ne!(
+            compute(GOLDEN_REPO, "rust", None, trace),
+            compute(GOLDEN_REPO, "rust", None, &other)
+        );
+    }
+
+    #[test]
+    fn rust_frame_ordinals_must_be_entirely_numeric() {
+        let trace = "thread 'main' panicked at src/calc.rs:1:1:\nboom\n\
+            1bad: not::a_frame\n at src/wrong.rs:1\n\
+            : not::a_frame\n at src/wrong.rs:2\n\
+            12: app::run\n at src/calc.rs:3";
+        assert_eq!(
+            parse("rust", trace).1,
+            ["<panic>@calc.rs", "app::run@calc.rs"]
+        );
+    }
+
+    #[test]
     fn explicit_message_wins_over_derived() {
         let derived = compute(GOLDEN_REPO, "go", None, GO_TRACE);
         let explicit = compute(
@@ -398,10 +532,10 @@ mod tests {
     }
 
     #[test]
-    fn rust_panic_fingerprint_matches_the_sdk_golden() {
-        // Pinned together with qingniao-rust's
-        // `rust_panic_fingerprint_matches_the_server_golden`: the Rust SDK
-        // mirrors this parser, so a change on either side must update both.
+    fn rust_panic_fingerprint_matches_the_server_golden() {
+        // Includes the standard numbered application frame, formerly dropped.
+        // qingniao-rust must adopt this parser/golden separately; the server
+        // recomputes fingerprints, so an older SDK only has a stale throttle key.
         let trace = "thread 'main' panicked at src/calc.rs:17:9:\n\
                      index out of range: the len is 3 but the index is 3\n\
                      stack backtrace:\n\
@@ -409,7 +543,7 @@ mod tests {
                                  at src/calc.rs:17:9";
         assert_eq!(
             compute("example.com/app", "rust", None, trace),
-            "53188b455b43cc5d1e02760404ae3c36"
+            "912e5aca6f97d582ae5e7e4b1ab644d6"
         );
     }
 

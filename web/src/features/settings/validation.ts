@@ -1,9 +1,9 @@
 /**
  * Schema-aware validation for the settings form (docs/09 §9.2 settings).
  *
- * This mirrors only the cheap client-side checks (int range, enum membership,
- * http(s) URL). The server stays authoritative: its 422 `fields` map is what
- * reaches the operator when anything else fails. An empty value is allowed
+ * This mirrors only the cheap client-side checks (env quoting, int range,
+ * enum membership, http(s) URL). The server stays authoritative: its 422 `fields`
+ * map is what reaches the operator when anything else fails. An empty value is allowed
  * here because clearing (or keeping a secret) is a server-side rule.
  */
 
@@ -23,6 +23,9 @@ export function validateSettingValue(spec: SettingDto, raw: string): string | nu
     // An empty non-secret follows the server's default/clear rules; an empty
     // secret means "keep the current value".
     return null;
+  }
+  if (/["'\\]/.test(raw)) {
+    return "不能包含单引号、双引号或反斜杠";
   }
   if (spec.type === "int") {
     if (!INTEGER_PATTERN.test(raw)) {

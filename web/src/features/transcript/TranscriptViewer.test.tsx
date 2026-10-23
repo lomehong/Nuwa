@@ -192,10 +192,11 @@ describe("TranscriptViewer", () => {
     expect(props.onPageChange).toHaveBeenCalledWith(1);
   });
 
-  it("renders the empty state when no session exists", () => {
-    renderViewer({ response: makeTranscript() });
+  it.each([null, "run-pending"])("explains that an unpublished transcript awaits redaction (%s)", (runId) => {
+    renderViewer({ response: makeTranscript(), runId });
     expect(screen.getByText("暂无会话转录")).toBeInTheDocument();
-    expect(screen.getByText(/还没有可读取的会话转录/)).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("完成脱敏后可用");
+    expect(screen.getByRole("status")).toHaveTextContent("自动刷新");
     expect(screen.queryByRole("navigation", { name: "会话分页" })).not.toBeInTheDocument();
   });
 

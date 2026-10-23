@@ -173,7 +173,7 @@ web/
 - 成功返回 `204` 并设置：
   - `nuwa_session`：`HttpOnly; SameSite=Strict; Path=/; Max-Age=<NUWA_SESSION_TTL_SECS>`（默认 86400）；`NUWA_COOKIE_SECURE=always`，或 `auto` 且请求带可信 `X-Forwarded-Proto: https` 时加 `Secure`。直接 HTTP 部署使用 `auto` 不会加 Secure；生产建议 TLS 代理 + `always`。
   - `nuwa_csrf`：非 HttpOnly，供双提交读取；`SameSite=Strict; Path=/; Max-Age=<NUWA_SESSION_TTL_SECS>`。
-- 会话值：`v1.<exp_ms>.<nonce>.<hmac_sha256(key, "v1.<exp_ms>.<nonce>")>`，base64url。`key = SHA256(ui_token)`；改 UI 令牌即全部会话失效。
+- 会话值：`v1.<exp_ms>.<nonce>.<hmac_sha256(key, "v1.<exp_ms>.<nonce>")>`，base64url。`key = SHA256(startup_generation || ui_token)`；每次 serve 启动生成随机代际，重启或改 UI 令牌都会使旧会话失效，避免内存撤销表清空后已登出的 Cookie 恢复有效（ADR-019）。
 - `GET /api/v1/auth/me`：返回 `{ authenticated, local_mode, expires_at_ms }`；若 CSRF Cookie 缺失则补发。
 - `POST /api/v1/auth/logout`：清除两个 Cookie。
 
@@ -820,7 +820,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
   - 验证：命令 + 输出（折叠、等宽、复制）。
   - 改动：`change_stat`、branch、commit（复制）。
   - CI：`ci_verdict`、PR 链接、head sha。
-  - 会话：转录查看器；user/assistant/tool 分组；thinking 默认折叠；长输出截断可展开（注明全文在运行器会话文件）；分页含「首页 / 末页（最新）」；**所选 run 未完成时以 15s+退避轮询**，陪跑视图自动增长。
+  - 会话：转录查看器；user/assistant/tool 分组；thinking 默认折叠；长输出截断可展开（注明全文在运行器会话文件）；分页含「首页 / 末页（最新）」；**所选 run 未完成时以 15s+退避轮询**，但只显示已发布的脱敏快照。修复结束并完成脱敏前显示等待说明；中断、发布失败或历史未发布的转录不回退读取原始日志（ADR-019）。
 - **堆栈样本**：等宽、复制、保留换行（React 文本节点，不用 `dangerouslySetInnerHTML`）。
 
 侧栏：

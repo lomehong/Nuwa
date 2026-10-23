@@ -3,9 +3,10 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { describe, expect, it } from "vitest";
 
-import { server } from "../../test/msw";
+import { makeTranscript, server } from "../../test/msw";
 import { createTestQueryClient } from "../../test/render";
 import { useTranscriptQuery } from "./queries";
+import { TranscriptPanel } from "./TranscriptPanel";
 import type { TranscriptMessage } from "./types";
 
 const FP = "fp-transcript";
@@ -120,4 +121,43 @@ describe("useTranscriptQuery placeholder data", () => {
     releasePage2();
     expect(await screen.findByText("page 2")).toBeInTheDocument();
   });
+});
+
+describe("TranscriptPanel snapshot availability", () => {
+  it.each([false, true])(
+    "loads a published snapshot after an empty response (run finished: %s)",
+    async (finished) => {
+      let published = false;
+      server.use(
+        http.get("/api/v1/issues/:fp/transcript", () => HttpResponse.json(
+          published ? makeTranscript({
+            data: [message("safe published transcript")],
+            meta: { page: 1, page_size: 20, total: 1, truncated: false, empty: false },
+          }) : makeTranscript(),
+        )),
+      );
+      const client = createTestQueryClient();
+      const panel = (pollMs: number | null) => (
+        <QueryClientProvider client={client}>
+          <TranscriptPanel
+            fingerprint={FP}
+            runId="run-pending"
+            page={1}
+            runLabel="运行"
+            pollMs={pollMs}
+            onPageChange={() => {}}
+            onClearRun={() => {}}
+          />
+        </QueryClientProvider>
+      );
+      // The long cadence ensures the completion case cannot pass via a timer.
+      const view = render(panel(finished ? 60_000 : 20));
+      expect(await screen.findByText(/完成脱敏后可用/)).toBeInTheDocument();
+      published = true;
+      if (finished) {
+        view.rerender(panel(null));
+      }
+      expect(await screen.findByText("safe published transcript")).toBeInTheDocument();
+    },
+  );
 });

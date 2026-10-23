@@ -13,6 +13,6 @@
       "content": "export function average(values) {\n  if (values.length === 0) {\n    return 0;\n  }\n  return values.reduce((sum, value) => sum + value, 0) / values.length;\n}\n"
     }
   ],
-  "final": "ROOT CAUSE: average 对空数组除以 0。\nCHANGE: 空输入返回 0。\nVERIFICATION: node --test — pass.",
+  "final": "ROOT CAUSE: average 对空数组除以 0。\nCHANGE: 空输入返回 0。\nVERIFICATION: node --test — pass.\nOUTCOME: fixed",
   "expect_fixed": true
 }

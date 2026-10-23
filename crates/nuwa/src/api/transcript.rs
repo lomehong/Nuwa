@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use crate::api::common::parse_page_number;
 use crate::api::ApiError;
+use crate::secrets::{MAX_SESSION_DEPTH, MAX_SESSION_ENTRIES, REDACTED_SESSION_SUBDIR};
 use crate::serve::AppState;
 use shanhaijing::{ShanResult, Store};
 
@@ -29,9 +30,6 @@ const TAIL_BYTES: u64 = 2 * 1024 * 1024;
 /// Per-block byte budget (16KB of UTF-8 content before the ellipsis). Applied
 /// to text, thinking, tool_result text and serialized tool_call arguments.
 const MAX_BLOCK_BYTES: usize = 16 * 1024;
-/// Session lookup bounds: the layout is `<run dir>/<cwd slug>/<ts>_<id>.jsonl`.
-const MAX_SESSION_DEPTH: usize = 4;
-const MAX_SESSION_ENTRIES: usize = 1_000;
 
 /// Raw transcript query. Values stay strings so invalid input maps to the
 /// `validation_failed` contract instead of axum's plain-text rejection.
@@ -210,8 +208,8 @@ fn build_transcript(store: &Store, fingerprint: &str, params: &Params) -> ShanRe
     let (tail, truncated) = match read_tail(&file) {
         Ok(tail) => tail,
         Err(error) => {
-            // The file can vanish or stay locked while the runner appends;
-            // the transcript is auxiliary, so log and serve an empty page.
+            // A snapshot can vanish or become unreadable; log and serve an
+            // empty page, never retry with a private raw transcript.
             eprintln!(
                 "transcript: unreadable session file {}: {error}",
                 file.display()
@@ -279,12 +277,21 @@ struct SessionFile {
     modified: Option<SystemTime>,
 }
 
-/// Newest `.jsonl` under the run dir, newest by mtime (a resumed session is
-/// appended to) with the timestamped filename as the deterministic tiebreak.
+/// Only published snapshots may be selected, regardless of run status. There
+/// is no fallback to raw logs for running, interrupted or historical runs.
+/// Publication preserves source mtime; timestamped filenames break ties.
 fn newest_jsonl(root: &FsPath) -> Option<PathBuf> {
+    let published = root.join(REDACTED_SESSION_SUBDIR);
+    // A linked snapshot root (or ancestor) must not redirect serve to raw logs.
+    for dir in published.ancestors() {
+        let metadata = std::fs::symlink_metadata(dir).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return None;
+        }
+    }
     let mut files = Vec::new();
     let mut budget = MAX_SESSION_ENTRIES;
-    collect_jsonl(root, 0, &mut budget, &mut files);
+    collect_jsonl(&published, 0, &mut budget, &mut files);
     files
         .into_iter()
         .max_by(|left, right| {
@@ -628,6 +635,30 @@ mod tests {
         std::fs::write(empty_dir.join("notes.txt"), "not a session").expect("notes");
         set_session_dir(&store, "run-empty", &empty_dir);
 
+        // These fixtures represent finished, published runs. Keep the private
+        // originals too, so pagination/truncation never rely on a raw fallback.
+        for (id, root) in [
+            ("run-main", &main_dir),
+            ("run-heavy", &heavy_dir),
+            ("run-bounded", &bounded_dir),
+            ("run-other", &other_dir),
+        ] {
+            crate::secrets::Secrets::default()
+                .redact_session_dir(root)
+                .expect("publish fixture");
+            store
+                .finish_run(
+                    id,
+                    &shanhaijing::RunFinish {
+                        finished_at: 6_000_000,
+                        outcome: "success".into(),
+                        ci_verdict: None,
+                        error: None,
+                    },
+                )
+                .expect("finish fixture");
+        }
+
         let state = AppState {
             store,
             ui_token: Arc::new(None),
@@ -898,6 +929,152 @@ mod tests {
     }
 
     // ---- tests ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn transcript_unpublished_raw_is_private_running_or_finished() {
+        let fixture = fixture();
+        let store = Store::open(fixture._dir.path().join("s.db")).expect("test fixture");
+        let root = fixture._dir.path().join("unpublished");
+        start_run(&store, &fixture.fp, "run-private", 9_000_000);
+        write_jsonl(&root, "raw.jsonl", &main_lines());
+        set_session_dir(&store, "run-private", &root);
+        for finished in [false, true] {
+            if finished {
+                store
+                    .finish_run(
+                        "run-private",
+                        &shanhaijing::RunFinish {
+                            finished_at: 9_001_000,
+                            outcome: "success".into(),
+                            ci_verdict: None,
+                            error: None,
+                        },
+                    )
+                    .expect("test fixture");
+            }
+            for suffix in ["", "?run_id=run-private"] {
+                let value = json_body(
+                    get(
+                        &fixture.app,
+                        &format!("/api/v1/issues/{}/transcript{suffix}", fixture.fp),
+                    )
+                    .await,
+                )
+                .await;
+                assert_eq!(value["meta"]["empty"], true, "finished={finished}: {value}");
+                assert_eq!(value["data"], json!([]));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_only_reads_published_snapshot_while_raw_secrets_remain() {
+        let fixture = fixture();
+        let store = Store::open(fixture._dir.path().join("s.db")).expect("test fixture");
+        let root = fixture._dir.path().join("private-and-public");
+        start_run(&store, &fixture.fp, "run-safe", 9_000_000);
+        let secret = "private\"key\\with\nnewline";
+        let raw = json!({
+            "kind": "entry", "type": "message", "seq": 1,
+            "message": {"kind": "assistant", "content": [{
+                "type": "toolCall", "name": "write", "arguments": {
+                    "nested": [{"value": secret}],
+                    "token": "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+                }
+            }]}
+        })
+        .to_string();
+        let raw_path = write_jsonl(&root, "raw.jsonl", std::slice::from_ref(&raw));
+        set_session_dir(&store, "run-safe", &root);
+        crate::secrets::Secrets::with_values(vec![secret.into()])
+            .redact_session_dir(&root)
+            .expect("publish");
+        assert_eq!(
+            std::fs::read_to_string(&raw_path).expect("test fixture"),
+            format!("{raw}\n")
+        );
+        // Even a newer raw file must never win the API's selection.
+        write_jsonl(&root, "zzz-newer.jsonl", &main_lines());
+        let value = json_body(
+            get(
+                &fixture.app,
+                &format!("/api/v1/issues/{}/transcript?run_id=run-safe", fixture.fp),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(value["meta"]["total"], 1);
+        assert_eq!(
+            value["data"][0]["blocks"][0]["arguments"],
+            json!({
+                "nested": [{"value": "[REDACTED]"}], "token": "[REDACTED]"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn review_numeric_credential_is_redacted_from_raw_json_through_api() {
+        let fixture = fixture();
+        let store = Store::open(fixture._dir.path().join("s.db")).expect("test fixture");
+        let root = fixture._dir.path().join("numeric-credential");
+        start_run(&store, &fixture.fp, "run-numeric", 9_000_000);
+        let raw = r#"{"kind":"entry","type":"message","seq":1,"message":{"kind":"assistant","content":[{"type":"toolCall","name":"write","arguments":{"credential":123456789,"nested":[123456789],"count":42}}]}}"#.to_string();
+        let raw_path = write_jsonl(&root, "raw.jsonl", std::slice::from_ref(&raw));
+        set_session_dir(&store, "run-numeric", &root);
+        crate::secrets::Secrets::with_values(vec!["123456789".into()])
+            .redact_session_dir(&root)
+            .expect("test fixture");
+        let response = get(
+            &fixture.app,
+            &format!(
+                "/api/v1/issues/{}/transcript?run_id=run-numeric",
+                fixture.fp
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["meta"]["total"], 1);
+        assert_eq!(
+            value["data"][0]["blocks"][0]["arguments"],
+            json!({
+                "credential": "[REDACTED]", "nested": ["[REDACTED]"], "count": 42
+            })
+        );
+        assert!(!value.to_string().contains("123456789"));
+        let snapshot = std::fs::read_to_string(root.join("redacted/--repo--/raw.jsonl"))
+            .expect("test fixture");
+        assert!(!snapshot.contains("123456789"));
+        assert_eq!(
+            std::fs::read_to_string(raw_path).expect("test fixture"),
+            format!("{raw}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_failed_publication_never_falls_back_to_raw() {
+        let fixture = fixture();
+        let store = Store::open(fixture._dir.path().join("s.db")).expect("test fixture");
+        let root = fixture._dir.path().join("failed-publication");
+        start_run(&store, &fixture.fp, "run-failed", 9_000_000);
+        let mut lines = main_lines();
+        lines.push("{broken JSON with secret-value".into());
+        write_jsonl(&root, "raw.jsonl", &lines);
+        set_session_dir(&store, "run-failed", &root);
+        assert!(crate::secrets::Secrets::default()
+            .redact_session_dir(&root)
+            .is_err());
+        let value = json_body(
+            get(
+                &fixture.app,
+                &format!("/api/v1/issues/{}/transcript?run_id=run-failed", fixture.fp),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(value["meta"]["empty"], true);
+        assert_eq!(value["data"], json!([]));
+    }
 
     #[tokio::test]
     async fn transcript_defaults_to_latest_run_with_session_and_maps_blocks() {
@@ -1182,6 +1359,37 @@ mod tests {
         std::fs::write(dir.path().join("repo").join("notes.txt"), "x").expect("write");
         assert!(newest_jsonl(dir.path()).is_none());
         assert!(newest_jsonl(&dir.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn newest_jsonl_ignores_private_logs_and_unpublished_temporary_files() {
+        let dir = tempfile::tempdir().expect("test fixture");
+        std::fs::write(dir.path().join("raw.jsonl"), "{}\n").expect("test fixture");
+        let published = dir.path().join(crate::secrets::REDACTED_SESSION_SUBDIR);
+        std::fs::create_dir(&published).expect("test fixture");
+        std::fs::write(published.join(".tmp-partial"), "{\"incomplete\":").expect("test fixture");
+        assert!(newest_jsonl(dir.path()).is_none());
+        let snapshot = published.join("safe.jsonl");
+        std::fs::write(&snapshot, "{}\n").expect("test fixture");
+        assert_eq!(newest_jsonl(dir.path()), Some(snapshot));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newest_jsonl_does_not_follow_snapshot_or_nested_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("test fixture");
+        let outside = tempfile::tempdir().expect("test fixture");
+        let raw = outside.path().join("raw.jsonl");
+        std::fs::write(&raw, "{}\n").expect("test fixture");
+        let published = dir.path().join(crate::secrets::REDACTED_SESSION_SUBDIR);
+        symlink(outside.path(), &published).expect("test fixture");
+        assert!(newest_jsonl(dir.path()).is_none());
+        std::fs::remove_file(&published).expect("test fixture");
+        std::fs::create_dir(&published).expect("test fixture");
+        symlink(&raw, published.join("linked.jsonl")).expect("test fixture");
+        symlink(outside.path(), published.join("linked-dir")).expect("test fixture");
+        assert!(newest_jsonl(dir.path()).is_none());
     }
 
     #[tokio::test]

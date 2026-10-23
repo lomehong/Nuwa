@@ -55,13 +55,20 @@ impl PreparedRepair {
 
     pub async fn execute(&self) -> anyhow::Result<repair::RepairReport> {
         let result = repair::run(&self.job).await;
-        // 成功与失败都要脱敏：模型可能在 run 死掉前把凭证写进转录，而
-        // serve 会实时读取该文件展示 transcript。
+        // 成功或失败都在 repair 停止写入后发布脱敏快照；serve 永不读取原始日志。
         let dir = match &result {
             Ok(report) => Path::new(&report.session_dir),
             Err(_) => self.session_dir.as_path(),
         };
-        let _ = self.job.secrets.redact_session_dir(dir);
+        if let Err(error) = self.job.secrets.redact_session_dir(dir) {
+            let detail = self
+                .job
+                .secrets
+                .redact(&format!("publish redacted transcript failed: {error:#}"));
+            eprintln!("transcript: {detail}");
+            // Snapshots are auxiliary: serve never falls back to raw logs.
+            // Keep both a successful report and an original repair error intact.
+        }
         result
     }
 }
@@ -354,5 +361,102 @@ mod tests {
         let dir = std::env::temp_dir().join("nuwa-pipeline-flat");
         let dir = repair::session_dir_for(&dir, &issue(), None);
         assert!(dir.ends_with("abc-def"));
+    }
+
+    fn snapshot_repair(dir: &Path, fail: bool) -> PreparedRepair {
+        prepare_repair(RepairRequest {
+            repo: dir.to_path_buf(),
+            issue: issue(),
+            sessions_dir: dir.join("sessions"),
+            provider: if fail {
+                repair::ProviderKind::Anthropic { model: None }
+            } else {
+                repair::ProviderKind::Faux
+            },
+            max_turns: 1,
+            repo_config: None,
+            secrets: Arc::new(secrets::Secrets::default()),
+            progress: None,
+            faux_script: Some(rpi_ai::providers::faux::FauxScript::new().with_text("done")),
+            run_id: Some("snapshot-run".into()),
+        })
+        .expect("test fixture")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_is_published_after_success_or_repair_failure() {
+        for fail in [false, true] {
+            let dir = tempfile::tempdir().expect("test fixture");
+            let prepared = snapshot_repair(dir.path(), fail);
+            std::fs::create_dir_all(prepared.session_dir()).expect("test fixture");
+            let raw = "{\"text\":\"ghp_abcdefghijklmnopqrstuvwxyz0123456789\"}\n";
+            std::fs::write(prepared.session_dir().join("private.jsonl"), raw)
+                .expect("test fixture");
+            let result = prepared.execute().await;
+            assert_eq!(result.is_err(), fail, "{:?}", result.err());
+            assert_eq!(
+                std::fs::read_to_string(prepared.session_dir().join("private.jsonl"))
+                    .expect("test fixture"),
+                raw
+            );
+            assert_eq!(
+                std::fs::read_to_string(prepared.session_dir().join("redacted/private.jsonl"))
+                    .expect("test fixture"),
+                "{\"text\":\"[REDACTED]\"}\n"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_snapshot_failure_preserves_successful_report() {
+        for obstructed in [false, true] {
+            let dir = tempfile::tempdir().expect("test fixture");
+            let prepared = snapshot_repair(dir.path(), false);
+            std::fs::create_dir_all(prepared.session_dir()).expect("test fixture");
+            std::fs::write(prepared.session_dir().join("private.jsonl"), "invalid JSON")
+                .expect("test fixture");
+            if obstructed {
+                std::fs::write(prepared.session_dir().join("redacted"), "not a directory")
+                    .expect("test fixture");
+            }
+            let report = prepared
+                .execute()
+                .await
+                .expect("snapshot failure is auxiliary");
+            assert_eq!(report.root_cause_text, "done");
+            assert_eq!(Path::new(&report.session_dir), prepared.session_dir());
+            assert!(report.turns > 0);
+            assert!(!prepared
+                .session_dir()
+                .join("redacted/private.jsonl")
+                .exists());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_snapshot_failure_preserves_original_repair_error() {
+        let dir = tempfile::tempdir().expect("test fixture");
+        let prepared = snapshot_repair(dir.path(), true);
+        let original = repair::run(&prepared.job)
+            .await
+            .err()
+            .expect("missing synthetic key");
+        std::fs::create_dir_all(prepared.session_dir()).expect("test fixture");
+        std::fs::write(prepared.session_dir().join("private.jsonl"), "invalid JSON")
+            .expect("test fixture");
+        let error = prepared
+            .execute()
+            .await
+            .err()
+            .expect("original repair failure");
+        assert_eq!(format!("{error:#}"), format!("{original:#}"));
+        assert_eq!(
+            error.root_cause().to_string(),
+            original.root_cause().to_string()
+        );
+        assert!(!prepared
+            .session_dir()
+            .join("redacted/private.jsonl")
+            .exists());
     }
 }

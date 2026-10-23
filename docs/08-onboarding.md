@@ -276,14 +276,15 @@ cd web && NUWA_E2E_BASE_URL=http://127.0.0.1:7404 NUWA_E2E_TOKEN=dummy npm run t
 
 ### 6.3 设置
 
-- **事实源**：`NUWA_ENV_FILE`（默认 `/opt/nuwa/nuwa.env`，systemd `EnvironmentFile`）。设置页不写 shell 变量、不热更新进程；保存后 `restart_pending=true`，需重启 serve/work 才生效。
+- **事实源**：`NUWA_ENV_FILE`（默认 `/opt/nuwa/nuwa.env`，systemd `EnvironmentFile`）。设置页不写 shell 变量、不热更新进程；保存后 `restart_pending=true`，需重启 serve/work 才生效。配置值不得含单引号、双引号、反斜杠或控制字符，避免 systemd 加载值与保存值不一致。
 - `GET /api/v1/settings`：返回 29 键 schema（分组/类型/默认/scope/是否密钥/是否只读）、掩码值、`env_path/env_exists/env_permissions`、`needs_migration`、`restart_pending`、`effective_diff`（runner 心跳的实际配置 vs 文件值，仅非密钥）、`unknown_keys`（只给键名）、`last_changes`。密钥只返回 `set/last4/updated_at_ms`，**永不回显值**；四位以内不返回 `last4`。
 - `PUT /api/v1/settings`：`{"values":{"NUWA_INTERVAL":"60","NUWA_GITHUB_TOKEN":""}}`。空密钥 = 保持不变；未知键与只读键（`NUWA_ENV_FILE`）422；任一字段非法则整单 422 且文件逐字节不变。成功保留注释/顺序/未知键，更新既有行或追加新键；写前备份 `<env>.bak`，Unix 同目录临时文件 + chmod 600 + rename。每个变更键写 `config_changed`（detail=key，actor=owner），历史小写已知键先迁移并写 `config_migrated`。
 - `POST /api/v1/settings/test`：`{"target":"github|llm","values":{…}}`；`values` 是未保存的候选值（不落盘、不写日志），未知键 422；**每个已知键的取值都做类型校验**——只接受字符串、数字或布尔（env 标量），对象/数组/null 一律 422（不会静默忽略后去测别的值）。github 调 `GET https://api.github.com/rate_limit`（不耗配额）；llm 用 `max_tokens=1` 的真实请求（可能产生极小费用）。空 model/base/provider 视为未设置（回退环境变量/默认值）；anthropic 的 base 固定 `https://api.anthropic.com`（忽略 `NUWA_BASE_URL`），模型取自 vendored catalog，未知名回退 catalog 首项；zai 默认 base `https://open.bigmodel.cn/api/coding/paas/v4`、默认模型 `glm-5.3-flash`；faux 完全离线。显式空密钥不回落环境变量，直接 422。网络失败/非 2xx/10s 超时 → 502，且不回显 provider 响应体。
-- `POST /api/v1/settings/restart`：`{"force":false}`。有未结束 run（`runs.finished_at IS NULL`）→ 409 `conflict`，body 含 `active_runs`；`force=true` 才继续。重启目标 = `NUWA_SERVE_UNIT`（默认 `nuwa-serve`）+ `NUWA_RUNNER_UNITS`（默认 `nuwa-work`，逗号分隔），逐个白名单校验；先写 `restart_requested` 审计（`__system__`），再 `systemd-run --on-active=2`，成功 202。无 unit 配置或 `systemd-run` 不可用 → 501 并给出手动命令。改 `NUWA_UI_TOKEN` 后重启会使当前会话失效，需重新登录。
+- `POST /api/v1/settings/restart`：`{"force":false}`。有未结束 run（`runs.finished_at IS NULL`）→ 409 `conflict`，body 含 `active_runs`；`force=true` 才继续。重启目标 = `NUWA_SERVE_UNIT`（默认 `nuwa-serve`）+ `NUWA_RUNNER_UNITS`（默认 `nuwa-work`，逗号分隔），逐个白名单校验；先写 `restart_requested` 审计（`__system__`），再 `systemd-run --on-active=2`，成功 202。无 unit 配置或 `systemd-run` 不可用 → 501 并给出手动命令。每次重启 serve 都会使旧会话失效，即使 `NUWA_UI_TOKEN` 未改变也需重新登录，避免已登出的 Cookie 在重启后恢复有效。
 
 ### 6.4 系统与转录
 
+- 转录只展示 runner 完成脱敏后发布的快照，不读取原始 JSONL。运行中、被中断、发布失败或历史未发布的 run 显示空态，不回退展示原始内容；成功和失败结束都会尝试发布。发布故障单独告警，不否决已经成功的修复，也不额外消耗 attempts。原始日志仍属于 runner 私有取证材料，不要直接通过静态服务公开。
 - `GET /api/v1/system`：`version/build_commit/started_at_ms/uptime_secs/db_path/db_size_bytes/local_mode/services[{unit,active}]`。systemd 不可用或 `systemctl is-active` 无输出时 `active="n/a"`，不算错误；本地模式会在页面显示无鉴权警告。
 - `GET /api/v1/issues/{fp}/transcript?run_id=&page=1&page_size=20`：省略 `run_id` 时取该指纹**最近一次有 `session_dir` 的 run**；指定不属于该指纹的 run → 404 `run not found`；未知单 → 404 `issue not found`。只解析 `kind=entry,type=message`，映射 user / assistant（thinking、text、tool_call）/ tool_result；其它记录（header/record/model_change/custom）忽略。单个块（text/thinking/tool_result/序列化后的 tool_call 参数）按 UTF-8 字节上限 16KB 截断并标 `truncated=true`；**超限 tool_call 的 `arguments` 会从 JSON 对象变成字符串预览 `<truncated: N bytes>`**（前端需同时处理 object 与 string 两种类型），避免单个调用占满页面。文件只读末尾 2MB（更早内容丢弃并标 `meta.truncated=true`），按消息分页：`page_size` 默认 **20**、最大 **100**（100 是上限不是默认值），越界或非数字 422；无 run/无会话返回 `data:[]`、`meta.empty=true`。转录路径由 DB 的 run 行派生（必须是绝对路径且不含 `..`），从不接受客户端路径；`work --sessions` 建议传绝对路径，否则失败/中断的 run 可能没有可读转录。
 
@@ -299,6 +300,7 @@ nuwa benchmark run --provider faux --scenario node-empty-average,go-off-by-one -
 ```
 
 - `faux` 只证明流水线与门禁，不证明模型修复质量；`live` 才衡量模型，比较时固定 provider/model/场景集。
+- 最终报告的 `OUTCOME: fixed|not_fixed|unverified` 是明确声明；仅唯一合法的 `OUTCOME: fixed` 计入 `claimed_fixed`。`VERIFICATION:` 的存在不代表成功，实际 `repaired` 由独立检查决定。
 - 每次运行写 `benchmark_runs` / `benchmark_results`；控制台 `/benchmarks` 看趋势、误报与逐场景证据。
 - 负对照（`expect_fixed=false`）必须保持“未修复”，否则说明门禁退化。
 - 基准在独立 CLI 进程运行；serve 不启动模型循环。

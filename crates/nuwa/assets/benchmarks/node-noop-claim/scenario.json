@@ -13,6 +13,6 @@
       "content": "The bug is fixed in my head.\n"
     }
   ],
-  "final": "ROOT CAUSE: double 的运算符写错。\nCHANGE: 已修复。\nVERIFICATION: node --test — pass.",
+  "final": "ROOT CAUSE: double 的运算符写错。\nCHANGE: 已修复。\nVERIFICATION: node --test — pass.\nOUTCOME: fixed",
   "expect_fixed": false
 }

@@ -13,6 +13,6 @@
       "content": "package calc\n\n// Average returns the arithmetic mean of xs.\nfunc Average(xs []int) float64 {\n\tif len(xs) == 0 {\n\t\treturn 0\n\t}\n\tsum := 0\n\tfor i := 0; i < len(xs); i++ {\n\t\tsum += xs[i]\n\t}\n\treturn float64(sum) / float64(len(xs))\n}\n"
     }
   ],
-  "final": "ROOT CAUSE: Average 用 i <= len(xs) 遍历并在空切片上除零。\nCHANGE: 边界改为 i < len(xs)，空切片返回 0。\nVERIFICATION: go test ./... — pass.",
+  "final": "ROOT CAUSE: Average 用 i <= len(xs) 遍历并在空切片上除零。\nCHANGE: 边界改为 i < len(xs)，空切片返回 0。\nVERIFICATION: go test ./... — pass.\nOUTCOME: fixed",
   "expect_fixed": true
 }

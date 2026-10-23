@@ -141,10 +141,11 @@ impl Issue {
              2. Make the smallest correct change that fixes the root cause. No drive-by refactors, no formatting churn.\n\
              {verify_rule}\n\
              4. These paths are blocked by a tool guard and re-checked against the delivered diff: {forbidden}. Never run `git push`, `git commit`, `git checkout`, `git switch`, `git reset`, `git branch`, `git tag`, `git remote`, `git config`, or any `gh` command — Nuwa's delivery step owns git and PRs.\n\
-             5. Your final message must end with exactly three lines:\n\
+             5. Report exactly one OUTCOME: fixed only when the repair is complete and verification passed; not_fixed when the bug remains or verification failed; unverified when verification was not run or is inconclusive. Your final message must end with exactly four lines:\n\
              ROOT CAUSE: <one sentence>\n\
              CHANGE: <what you changed and why>\n\
-             VERIFICATION: <command> — <result>\n",
+             VERIFICATION: <command> — <result>\n\
+             OUTCOME: <fixed|not_fixed|unverified>\n",
             forbidden = self.forbidden_paths.join(", "),
             lang = self.language,
         )
@@ -257,6 +258,17 @@ mod tests {
             forbidden_paths: Vec::new(),
             verification_mode: Default::default(),
         }
+    }
+
+    #[test]
+    fn final_report_requires_an_explicit_outcome() {
+        let prompt = issue("").system_prompt("/repo");
+        assert!(prompt.contains("exactly four lines"), "{prompt}");
+        let fields: Vec<_> = prompt.lines().rev().take(4).collect();
+        assert_eq!(fields[0], "OUTCOME: <fixed|not_fixed|unverified>");
+        assert!(fields[1].starts_with("VERIFICATION:"));
+        assert!(fields[2].starts_with("CHANGE:"));
+        assert!(fields[3].starts_with("ROOT CAUSE:"));
     }
 
     #[test]

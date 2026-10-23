@@ -44,8 +44,8 @@ const MAX_URL_LEN = 512;
 const MAX_DESCRIPTION_LEN = 1000;
 
 const REPO_PATTERN = /^[A-Za-z0-9._:/-]+$/;
-const HTTPS_OR_SSH = /^(https|ssh):\/\/\S+$/i;
-const SCP_STYLE_SSH = /^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:\S+$/;
+const REPO_URL_HINT =
+  "HTTP/HTTPS、SSH、git 或无协议仓库地址，例如 https://example.com/app 或 git@example.com:app.git";
 
 interface RepoFormValues {
   repo: string;
@@ -75,7 +75,14 @@ function charCount(value: string): number {
 }
 
 function isRepoUrl(url: string): boolean {
-  return HTTPS_OR_SSH.test(url) || SCP_STYLE_SSH.test(url);
+  // Match valid_repo_url: keep scheme-less paths and scp-style addresses
+  // editable, rather than imposing a stricter URL parser on existing data.
+  const colon = url.indexOf(":");
+  const head = url.slice(0, colon).toLowerCase();
+  if (colon < 0 || head.includes("/")) {
+    return true;
+  }
+  return head.includes("@") || ["http", "https", "ssh", "git"].includes(head);
 }
 
 /** Mirrors Rust's `char::is_control` without a control-character regex. */
@@ -118,11 +125,10 @@ export function validateRepoForm(
     errors.url = "请填写仓库地址";
   } else if (charCount(values.url) > MAX_URL_LEN) {
     errors.url = `仓库地址最多 ${MAX_URL_LEN} 个字符`;
-  } else if (/\s/.test(values.url)) {
-    errors.url = "仓库地址不能包含空白字符";
+  } else if (/\p{White_Space}/u.test(values.url) || hasControlChar(values.url)) {
+    errors.url = "仓库地址不能包含空白或控制字符";
   } else if (!isRepoUrl(values.url)) {
-    errors.url =
-      "请填写 HTTPS 或 SSH 地址，例如 https://example.com/app 或 git@example.com:app.git";
+    errors.url = `请填写 ${REPO_URL_HINT}`;
   }
 
   if (charCount(values.description) > MAX_DESCRIPTION_LEN) {
@@ -372,7 +378,7 @@ export function RepoFormDialog({
             value={url}
             maxLength={MAX_URL_LEN}
             disabled={pending}
-            hint="HTTPS 或 SSH 地址，例如 https://example.com/app 或 git@example.com:app.git"
+            hint={REPO_URL_HINT}
             error={errors.url}
             onChange={(event) => {
               setUrl(event.target.value);

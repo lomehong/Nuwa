@@ -7,11 +7,20 @@
 //! is redacted as a second layer.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
+use serde_json::Value;
+
+/// The only transcript tree serve may read: `<run session dir>/redacted/`.
+/// Relative paths below it mirror the private JSONL tree; raw files stay private.
+pub(crate) const REDACTED_SESSION_SUBDIR: &str = "redacted";
+/// Shared publication/lookup bounds, measured below the raw/snapshot root.
+pub(crate) const MAX_SESSION_DEPTH: usize = 4;
+pub(crate) const MAX_SESSION_ENTRIES: usize = 1_000;
 
 /// Keys the work process never passes to a child. `NUWA_UI_TOKEN` and
 /// `NUWA_INGEST_TOKEN` are serve-only but may be present in the shared env
@@ -185,49 +194,166 @@ impl Secrets {
         out
     }
 
-    /// Rewrite `.jsonl` transcripts in `dir` after a run. This is deliberately
-    /// post-hoc: the harness writes the transcript, and a tool output may have
-    /// contained a secret before redaction existed.
+    /// Publish sanitized copies only after repair has stopped writing. Serve
+    /// reads this separate tree, never private/in-flight/abandoned raw files.
+    /// Each JSONL is atomically published in full or not at all; failures are
+    /// reported even if other files have already been safely published.
     pub fn redact_session_dir(&self, dir: &Path) -> Result<()> {
-        if self.redact_values.is_empty() {
+        let absolute = std::path::absolute(dir).context("resolve session directory")?;
+        let dir = absolute.as_path();
+        let metadata = match std::fs::symlink_metadata(dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("inspect session dir"),
+        };
+        if metadata.file_type().is_symlink() {
             return Ok(());
         }
-        redact_dir(self, dir)
+        let mut budget = MAX_SESSION_ENTRIES;
+        redact_dir(
+            self,
+            dir,
+            &dir.join(REDACTED_SESSION_SUBDIR),
+            0,
+            &mut budget,
+        )
     }
 }
 
-fn redact_dir(secrets: &Secrets, dir: &Path) -> Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("read session dir {}", dir.display()))
-        }
-    };
+fn redact_dir(
+    secrets: &Secrets,
+    dir: &Path,
+    destination: &Path,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<()> {
+    if depth > MAX_SESSION_DEPTH {
+        bail!("session directory depth limit exceeded");
+    }
+    let entries =
+        std::fs::read_dir(dir).with_context(|| format!("read session dir {}", dir.display()))?;
     for entry in entries {
         let entry = entry?;
+        // Never walk our own published tree, including case aliases on Windows.
+        if entry
+            .file_name()
+            .eq_ignore_ascii_case(REDACTED_SESSION_SUBDIR)
+        {
+            continue;
+        }
+        if *budget == 0 {
+            bail!("session directory entry limit exceeded");
+        }
+        *budget -= 1;
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             continue;
         }
         let path = entry.path();
+        let target = destination.join(entry.file_name());
         if file_type.is_dir() {
-            redact_dir(secrets, &path)?;
-            continue;
-        }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let redacted = secrets.redact(&text);
-        if redacted != text {
-            std::fs::write(&path, redacted)
-                .with_context(|| format!("redact transcript {}", path.display()))?;
+            redact_dir(secrets, &path, &target, depth + 1, budget)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+        {
+            publish_jsonl(secrets, &path, &target)
+                .with_context(|| format!("publish transcript {}", path.display()))?;
         }
     }
     Ok(())
+}
+
+/// Do not follow pre-existing links in the snapshot path. Creating each level
+/// separately also avoids create_dir_all traversing a linked ancestor.
+fn snapshot_directory(dir: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            bail!(
+                "snapshot path is not a regular directory: {}",
+                dir.display()
+            );
+        }
+        Ok(_) => {
+            if let Some(parent) = dir.parent() {
+                snapshot_directory(parent)?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                snapshot_directory(parent)?;
+            }
+            std::fs::create_dir(dir).context("create snapshot directory")?;
+        }
+        Err(error) => return Err(error).context("inspect snapshot directory"),
+    }
+    Ok(())
+}
+
+fn publish_jsonl(secrets: &Secrets, source: &Path, target: &Path) -> Result<()> {
+    let input = std::fs::File::open(source).context("read private transcript")?;
+    let modified = input.metadata()?.modified()?;
+    let parent = target.parent().context("snapshot parent missing")?;
+    snapshot_directory(parent)?;
+    if let Ok(meta) = std::fs::symlink_metadata(target) {
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            bail!("snapshot target is not a regular file");
+        }
+    }
+    // A temporary file has no .jsonl suffix, so API lookup ignores it. persist
+    // is a same-filesystem atomic rename, not an in-place rewrite visible to readers.
+    let mut temp = tempfile::NamedTempFile::new_in(parent).context("create snapshot temp file")?;
+    {
+        let mut output = BufWriter::new(temp.as_file_mut());
+        for (index, line) in BufReader::new(input).lines().enumerate() {
+            let line = line.context("read transcript record")?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Never include untrusted record text (or parser excerpts) in errors.
+            let mut record: Value = serde_json::from_str(&line).map_err(|_| {
+                anyhow::anyhow!("invalid JSON transcript record at line {}", index + 1)
+            })?;
+            redact_json(secrets, &mut record);
+            serde_json::to_writer(&mut output, &record).context("serialize redacted record")?;
+            output.write_all(b"\n")?;
+        }
+        output.flush()?;
+    }
+    // Preserve session selection order rather than publication traversal order.
+    temp.as_file()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+    temp.as_file().sync_all().context("sync snapshot")?;
+    temp.persist(target)
+        .context("atomically publish snapshot")?;
+    Ok(())
+}
+
+fn redact_json(secrets: &Secrets, value: &mut Value) {
+    match value {
+        Value::String(text) => *text = secrets.redact(text),
+        Value::Number(number) => {
+            let text = number.to_string();
+            let redacted = secrets.redact(&text);
+            if redacted != text {
+                *value = Value::String(redacted);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json(secrets, item);
+            }
+        }
+        Value::Object(object) => {
+            let original = std::mem::take(object);
+            for (key, mut value) in original {
+                redact_json(secrets, &mut value);
+                object.insert(secrets.redact(&key), value);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Build the child-process environment from the whitelist plus explicit
@@ -422,21 +548,213 @@ mod tests {
     }
 
     #[test]
-    fn redact_session_dir_rewrites_jsonl() {
+    fn snapshot_preserves_raw_and_redacts_decoded_nested_strings() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("run.jsonl");
-        std::fs::write(
-            &file,
-            "{\"text\":\"token supersecret-value\"}\n{\"text\":\"clean\"}\n",
+        let secret = "private\"key\\with\nnewline";
+        let raw = serde_json::json!({
+            "kind": "entry", "type": "message",
+            "message": {"content": [{"type": "toolCall", "arguments": {
+                "nested": [{"value": secret}],
+                "token": "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+                (secret): "also redact object keys"
+            }}]}
+        })
+        .to_string();
+        std::fs::write(dir.path().join("run.jsonl"), &raw).expect("write raw");
+        Secrets::with_values(vec![secret.into()])
+            .redact_session_dir(dir.path())
+            .expect("publish");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("run.jsonl")).expect("test fixture"),
+            raw
+        );
+        let snapshot = std::fs::read_to_string(dir.path().join("redacted/run.jsonl"))
+            .expect("published snapshot");
+        let record: serde_json::Value = serde_json::from_str(&snapshot).expect("valid JSON");
+        let args = &record["message"]["content"][0]["arguments"];
+        assert_eq!(args["nested"][0]["value"], "[REDACTED]");
+        assert_eq!(args["token"], "[REDACTED]");
+        assert_eq!(args["[REDACTED]"], "also redact object keys");
+    }
+
+    #[test]
+    fn review_snapshot_redacts_numeric_credentials_without_changing_other_numbers() {
+        let dir = tempfile::tempdir().expect("test fixture");
+        let mut vars = vars(&[("NUWA_UI_TOKEN", "123456789")]);
+        let secrets = Secrets::from_vars(&mut vars);
+        let raw = r#"{"secret":123456789,"nested":[-123456789,99123456789,123456789.5],"count":42,"ratio":1.5,"nil":null,"ok":true}"#;
+        std::fs::write(dir.path().join("numeric.jsonl"), raw).expect("test fixture");
+        secrets
+            .redact_session_dir(dir.path())
+            .expect("test fixture");
+        let snapshot = std::fs::read_to_string(dir.path().join("redacted/numeric.jsonl"))
+            .expect("test fixture");
+        let record: Value = serde_json::from_str(&snapshot).expect("test fixture");
+        assert_eq!(record["secret"], "[REDACTED]");
+        assert_eq!(
+            record["nested"],
+            serde_json::json!(["-[REDACTED]", "99[REDACTED]", "[REDACTED].5"])
+        );
+        assert_eq!(record["count"], serde_json::json!(42));
+        assert_eq!(record["ratio"], serde_json::json!(1.5));
+        assert!(record["nil"].is_null());
+        assert_eq!(record["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("numeric.jsonl")).expect("test fixture"),
+            raw
+        );
+    }
+
+    #[test]
+    fn snapshot_runs_patterns_without_known_credentials_and_skips_its_own_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = "{\"text\":\"ghp_abcdefghijklmnopqrstuvwxyz0123456789\"}\n";
+        std::fs::write(dir.path().join("run.jsonl"), raw).expect("test fixture");
+        let secrets = Secrets::default();
+        secrets.redact_session_dir(dir.path()).expect("publish");
+        secrets.redact_session_dir(dir.path()).expect("republish");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("run.jsonl")).expect("test fixture"),
+            raw
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("redacted/run.jsonl")).expect("test fixture"),
+            "{\"text\":\"[REDACTED]\"}\n"
+        );
+        assert!(!dir.path().join("redacted/redacted").exists());
+    }
+
+    #[test]
+    fn snapshot_invalid_record_fails_without_publishing_a_partial_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = "{\"text\":\"first valid record\"}\n{broken secret-value\n";
+        std::fs::write(dir.path().join("run.jsonl"), raw).expect("test fixture");
+        let error = Secrets::default()
+            .redact_session_dir(dir.path())
+            .expect_err("invalid JSON");
+        assert!(!format!("{error:#}").contains("secret-value"));
+        assert!(!dir.path().join("redacted/run.jsonl").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("run.jsonl")).expect("test fixture"),
+            raw
+        );
+        if dir.path().join("redacted").exists() {
+            assert_eq!(
+                std::fs::read_dir(dir.path().join("redacted"))
+                    .expect("test fixture")
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_replacement_is_atomic_and_failed_replacement_keeps_previous_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw_path = dir.path().join("run.jsonl");
+        let snapshot = dir.path().join("redacted/run.jsonl");
+        std::fs::write(&raw_path, "{\"text\":\"old\"}\n").expect("test fixture");
+        let secrets = Secrets::default();
+        secrets
+            .redact_session_dir(dir.path())
+            .expect("test fixture");
+        let old_handle = std::fs::File::open(&snapshot).expect("published");
+        std::fs::write(&raw_path, "{\"text\":\"new\"}\n").expect("test fixture");
+        let replacement = secrets.redact_session_dir(dir.path());
+        // Windows MoveFileEx may refuse to replace an open destination. This
+        // must stay an explicit failure with the old snapshot intact, never a
+        // delete/truncate fallback. Once the reader closes, publication works.
+        #[cfg(windows)]
+        if let Err(error) = &replacement {
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .expect("test fixture")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                std::fs::read_to_string(&snapshot).expect("test fixture"),
+                "{\"text\":\"old\"}\n"
+            );
+        }
+        #[cfg(not(windows))]
+        assert!(replacement.is_ok(), "{replacement:?}");
+        let old: serde_json::Value = serde_json::from_reader(old_handle).expect("test fixture");
+        assert_eq!(
+            old["text"], "old",
+            "an open reader must not see an in-place rewrite"
+        );
+        drop(replacement);
+        secrets
+            .redact_session_dir(dir.path())
+            .expect("test fixture");
+        assert_eq!(
+            std::fs::read_to_string(&snapshot).expect("test fixture"),
+            "{\"text\":\"new\"}\n"
+        );
+        std::fs::write(&raw_path, "{\"text\":\"partial\"}\ninvalid\n").expect("test fixture");
+        assert!(secrets.redact_session_dir(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&snapshot).expect("test fixture"),
+            "{\"text\":\"new\"}\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(snapshot.parent().expect("test fixture"))
+                .expect("test fixture")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_utf8_and_obstructed_destination() {
+        let dir = tempfile::tempdir().expect("test fixture");
+        std::fs::write(dir.path().join("run.jsonl"), [0xff, b'\n']).expect("test fixture");
+        assert!(Secrets::default().redact_session_dir(dir.path()).is_err());
+        assert!(!dir.path().join("redacted/run.jsonl").exists());
+        let other = tempfile::tempdir().expect("test fixture");
+        std::fs::write(other.path().join("run.jsonl"), "{}\n").expect("test fixture");
+        std::fs::write(other.path().join("redacted"), "not a directory").expect("test fixture");
+        assert!(Secrets::default().redact_session_dir(other.path()).is_err());
+    }
+
+    #[test]
+    fn snapshot_directory_walk_has_depth_and_entry_budgets() {
+        let dir = tempfile::tempdir().expect("test fixture");
+        let deep = dir.path().join("one/two/three/four/five");
+        std::fs::create_dir_all(&deep).expect("test fixture");
+        std::fs::write(deep.join("run.jsonl"), "{}\n").expect("test fixture");
+        assert!(Secrets::default().redact_session_dir(dir.path()).is_err());
+        let wide = tempfile::tempdir().expect("test fixture");
+        for index in 0..1_001 {
+            std::fs::write(wide.path().join(format!("{index}.txt")), "").expect("test fixture");
+        }
+        assert!(Secrets::default().redact_session_dir(wide.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_skips_source_symlinks_and_rejects_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("test fixture");
+        let outside = tempfile::tempdir().expect("test fixture");
+        std::fs::write(outside.path().join("private.jsonl"), "{}\n").expect("test fixture");
+        symlink(outside.path(), dir.path().join("linked-dir")).expect("test fixture");
+        symlink(
+            outside.path().join("private.jsonl"),
+            dir.path().join("linked.jsonl"),
         )
-        .expect("write");
-        let secrets = Secrets {
-            redact_values: vec!["supersecret-value".to_string()],
-            ..Secrets::default()
-        };
-        secrets.redact_session_dir(dir.path()).expect("redact");
-        let text = std::fs::read_to_string(&file).expect("read");
-        assert!(!text.contains("supersecret-value"));
-        assert!(text.contains("clean"));
+        .expect("test fixture");
+        Secrets::default()
+            .redact_session_dir(dir.path())
+            .expect("test fixture");
+        assert!(!dir.path().join("redacted/linked.jsonl").exists());
+        assert!(!dir.path().join("redacted/linked-dir").exists());
+        std::fs::write(dir.path().join("run.jsonl"), "{}\n").expect("test fixture");
+        symlink(outside.path(), dir.path().join("redacted")).expect("test fixture");
+        assert!(Secrets::default().redact_session_dir(dir.path()).is_err());
+        assert!(!outside.path().join("run.jsonl").exists());
     }
 }

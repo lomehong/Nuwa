@@ -14,6 +14,6 @@
       "content": "def average(values):\n    if not values:\n        return 0\n    return sum(values) / len(values)\n"
     }
   ],
-  "final": "ROOT CAUSE: average 对空列表执行除法。\nCHANGE: 空列表返回 0。\nVERIFICATION: python -m unittest -q — pass.",
+  "final": "ROOT CAUSE: average 对空列表执行除法。\nCHANGE: 空列表返回 0。\nVERIFICATION: python -m unittest -q — pass.\nOUTCOME: fixed",
   "expect_fixed": true
 }

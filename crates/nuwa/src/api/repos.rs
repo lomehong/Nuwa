@@ -608,6 +608,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repo_url_contract_supports_registration_and_name_edits() {
+        // Keep these examples in sync with RepoFormDialog.test.tsx.
+        let cases = [
+            ("http://example.com/app", true),
+            ("https://example.com/app", true),
+            ("ssh://git@example.com/app.git", true),
+            ("git://example.com/app.git", true),
+            ("git@example.com:app.git", true),
+            ("HTTP://example.com/app", true),
+            ("HTTPS://example.com/app", true),
+            ("SSH://git@example.com/app.git", true),
+            ("GIT://example.com/app.git", true),
+            ("example.com/app", true),
+            ("../app.git", true),
+            ("/srv/git/app.git", true),
+            ("example.com/app:mirror", true),
+            ("git:app", true),
+            ("javascript:alert(1)", false),
+            ("JavaScript:alert(1)", false),
+            ("data:text/html,test", false),
+            ("file:///etc/passwd", false),
+            ("ftp://example.com/app", false),
+            ("https://example.com/a b", false),
+            ("https://example.com/a\tb", false),
+            ("https://example.com/a\nb", false),
+            ("https://example.com/a\u{a0}b", false),
+            ("https://example.com/a\u{2003}b", false),
+            ("https://example.com/a\0b", false),
+            ("https://example.com/a\u{7f}b", false),
+            ("https://example.com/a\u{85}b", false),
+            ("https://example.com/a\u{9f}b", false),
+            ("", false),
+        ];
+        let (_dir, app) = test_app();
+        let csrf = csrf_token(&app).await;
+        for (index, (url, valid)) in cases.into_iter().enumerate() {
+            let repo = format!("example.com/case-{index}");
+            let body = json!({"repo": repo, "name": "App", "url": url});
+            let response = post_json(&app, "/api/v1/repos", Some(&csrf), &body.to_string()).await;
+            assert_eq!(
+                response.status(),
+                if valid {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                },
+                "registration: {url:?}"
+            );
+            let value = json_body(response).await;
+            if valid {
+                assert_eq!(value["data"]["url"], url);
+            } else {
+                assert!(value["error"]["fields"]["url"].is_string());
+            }
+
+            // The edit resends the stored URL even when only the name changes.
+            let body = json!({"name": "Renamed App", "url": url});
+            let response = put_json(&app, &repo_path(&repo), Some(&csrf), &body.to_string()).await;
+            assert_eq!(
+                response.status(),
+                if valid {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                },
+                "name edit: {url:?}"
+            );
+            let value = json_body(response).await;
+            if valid {
+                assert_eq!(value["data"]["name"], "Renamed App");
+                assert_eq!(value["data"]["url"], url);
+            } else {
+                assert!(value["error"]["fields"]["url"].is_string());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn duplicate_identity_is_409_conflict() {
         let (_dir, app) = test_app();
         let csrf = csrf_token(&app).await;

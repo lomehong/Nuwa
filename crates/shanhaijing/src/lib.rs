@@ -92,13 +92,6 @@ impl State {
             _ => return None,
         })
     }
-
-    fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            State::Merged | State::Rejected | State::Escalated | State::Ignored
-        )
-    }
 }
 
 /// Allowed transitions. `(Merged|Rejected, New)` is the regression-reopen
@@ -703,8 +696,11 @@ impl Store {
             signal.message.as_deref(),
             &signal.stack_trace,
         );
-        let conn = self.lock();
-        let existing: Option<(String, u64, i64, String)> = conn
+        let mut conn = self.lock();
+        // Serialize before reading the state: a concurrent owner mute must not
+        // be reopened using a stale terminal-state observation.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: Option<(String, u64, i64, String)> = tx
             .query_row(
                 "SELECT state, occurrences, cooldown_until, severity FROM issues WHERE fingerprint = ?1",
                 [&fp],
@@ -717,7 +713,7 @@ impl Store {
             })?;
 
         let Some((state, occurrences, cooldown_until, current_severity)) = existing else {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO issues(fingerprint, title, language, severity, state, occurrences, first_seen, last_seen, cooldown_until, repo, stack_sample, log_sample)
                  VALUES (?1, ?2, ?3, ?4, 'new', 1, ?5, ?5, 0, ?6, ?7, ?8)",
                 rusqlite::params![
@@ -731,9 +727,9 @@ impl Store {
                     encode_log_window(&signal.log_window),
                 ],
             )?;
-            bump_signal_daily(&conn, &fp, &signal.repo, now_ms)?;
-            drop(conn);
-            self.record_event(
+            bump_signal_daily(&tx, &fp, &signal.repo, now_ms)?;
+            record_event_on(
+                &tx,
                 &fp,
                 now_ms,
                 Some(&signal.repo),
@@ -741,6 +737,7 @@ impl Store {
                 "reported",
                 "first sighting",
             )?;
+            tx.commit()?;
             return Ok(ReportOutcome::NewIssue { fingerprint: fp });
         };
 
@@ -749,7 +746,7 @@ impl Store {
         // otherwise sink it in the claim order. Keep the higher of the two;
         // downgrading is an explicit owner action, not a side effect of noise.
         let severity = higher_severity(&current_severity, &signal.severity);
-        conn.execute(
+        tx.execute(
             "UPDATE issues SET occurrences = occurrences + 1, last_seen = ?2, stack_sample = ?3,
                 severity = ?4, log_sample = COALESCE(?5, log_sample)
              WHERE fingerprint = ?1",
@@ -761,41 +758,51 @@ impl Store {
                 encode_log_window(&signal.log_window)
             ],
         )?;
-        bump_signal_daily(&conn, &fp, &signal.repo, now_ms)?;
+        bump_signal_daily(&tx, &fp, &signal.repo, now_ms)?;
         let occurrences = occurrences + 1;
-        drop(conn);
 
         let state = State::parse(&state).ok_or(ShanError::UnknownState(state))?;
-        if state == State::Ignored {
-            return Ok(ReportOutcome::Muted {
+        let outcome = if state == State::Ignored {
+            ReportOutcome::Muted {
                 fingerprint: fp,
                 occurrences,
-            });
-        }
-        if state.is_terminal() && state != State::Escalated {
-            self.set_state(
-                &fp,
-                State::New,
-                now_ms,
-                Some("regression: terminal issue reported again"),
+            }
+        } else if matches!(state, State::Merged | State::Rejected) {
+            // Automatic regression is narrower than the owner's generic
+            // transition API, which also permits Ignored/Escalated -> New.
+            tx.execute(
+                "UPDATE issues SET state='new', state_changed_at=?2,
+                    cooldown_until=0, owner_runner_id=NULL
+                 WHERE fingerprint=?1 AND state IN ('merged', 'rejected')",
+                rusqlite::params![fp, now_ms],
             )?;
-            self.set_cooldown(&fp, 0)?;
-            return Ok(ReportOutcome::Regression {
+            record_event_on(
+                &tx,
+                &fp,
+                now_ms,
+                Some(&signal.repo),
+                "system",
+                "state_changed",
+                "regression: terminal issue reported again",
+            )?;
+            ReportOutcome::Regression {
                 fingerprint: fp,
                 occurrences,
-            });
-        }
-        if now_ms < cooldown_until {
-            return Ok(ReportOutcome::CooldownActive {
+            }
+        } else if now_ms < cooldown_until {
+            ReportOutcome::CooldownActive {
                 fingerprint: fp,
                 occurrences,
                 retry_after_ms: cooldown_until - now_ms,
-            });
-        }
-        Ok(ReportOutcome::Deduped {
-            fingerprint: fp,
-            occurrences,
-        })
+            }
+        } else {
+            ReportOutcome::Deduped {
+                fingerprint: fp,
+                occurrences,
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
     }
 
     /// Highest-priority pickable issue: state `new`, cooldown passed,
@@ -882,8 +889,9 @@ impl Store {
         now_ms: i64,
         cooldown_until_ms: i64,
     ) -> ShanResult<Option<IssueSnapshot>> {
-        let conn = self.lock();
-        let claimed: Option<IssueSnapshot> = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let claimed: Option<IssueSnapshot> = tx
             .query_row(
                 &format!(
                     "UPDATE issues SET state = 'triggered', cooldown_until = ?2, state_changed_at = ?1
@@ -903,9 +911,9 @@ impl Store {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        drop(conn);
         if let Some(snapshot) = &claimed {
-            self.record_event(
+            record_event_on(
+                &tx,
                 &snapshot.fingerprint,
                 now_ms,
                 Some(&snapshot.repo),
@@ -914,6 +922,7 @@ impl Store {
                 "claimed by runner",
             )?;
         }
+        tx.commit()?;
         Ok(claimed)
     }
 
@@ -934,8 +943,9 @@ impl Store {
         repo: &str,
         runner_id: &str,
     ) -> ShanResult<Option<IssueSnapshot>> {
-        let conn = self.lock();
-        let claimed: Option<IssueSnapshot> = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let claimed: Option<IssueSnapshot> = tx
             .query_row(
                 &format!(
                     "UPDATE issues SET state = 'triggered', cooldown_until = ?2, state_changed_at = ?1, owner_runner_id = ?4
@@ -955,9 +965,9 @@ impl Store {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        drop(conn);
         if let Some(snapshot) = &claimed {
-            self.record_event(
+            record_event_on(
+                &tx,
                 &snapshot.fingerprint,
                 now_ms,
                 Some(&snapshot.repo),
@@ -966,6 +976,7 @@ impl Store {
                 "claimed by runner",
             )?;
         }
+        tx.commit()?;
         Ok(claimed)
     }
 
@@ -1242,6 +1253,46 @@ impl Store {
             [fingerprint],
         )?;
         Ok(())
+    }
+
+    /// Reject the identified open PR once, counting the failed attempt and both
+    /// audit events atomically. A duplicate, stale state or mismatched PR URL
+    /// (including no stored URL) is a no-op.
+    pub fn reject_pr(
+        &self,
+        fingerprint: &str,
+        expected_pr_url: &str,
+        now_ms: i64,
+        detail: &str,
+        actor: &str,
+    ) -> ShanResult<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let repo: Option<String> = tx
+            .query_row(
+                "UPDATE issues SET state='rejected', attempts=attempts+1, state_changed_at=?2
+                 WHERE fingerprint=?1 AND state='pr_open' AND pr_url=?3 RETURNING repo",
+                rusqlite::params![fingerprint, now_ms, expected_pr_url],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(repo) = repo else {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM issues WHERE fingerprint=?1)",
+                [fingerprint],
+                |row| row.get(0),
+            )?;
+            return if exists {
+                Ok(false)
+            } else {
+                Err(ShanError::UnknownIssue(fingerprint.to_string()))
+            };
+        };
+        for kind in ["state_changed", "rejected"] {
+            record_event_on(&tx, fingerprint, now_ms, Some(&repo), actor, kind, detail)?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Increment the issue-level attempt counter and return the new value.
@@ -2541,9 +2592,9 @@ impl Store {
         let changed = conn.execute(
             "UPDATE runs SET
                 phase = COALESCE(?2, phase),
-                turns = COALESCE(?3, turns),
-                tokens_uncached = COALESCE(?4, tokens_uncached),
-                tokens_cached = COALESCE(?5, tokens_cached),
+                turns = MAX(COALESCE(?3, turns), turns),
+                tokens_uncached = MAX(COALESCE(?4, tokens_uncached), tokens_uncached),
+                tokens_cached = MAX(COALESCE(?5, tokens_cached), tokens_cached),
                 harness_run_id = COALESCE(?6, harness_run_id),
                 root_cause = COALESCE(?7, root_cause),
                 verification_ok = COALESCE(?8, verification_ok),
@@ -2775,14 +2826,27 @@ impl Store {
         kind: &str,
         detail: &str,
     ) -> ShanResult<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO events(fingerprint, ts, repo, actor, kind, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![fingerprint, now_ms, repo, actor, kind, detail],
-        )?;
-        Ok(())
+        record_event_on(&self.lock(), fingerprint, now_ms, repo, actor, kind, detail)
     }
+}
+
+/// Append using the caller's connection so state changes and their audit can
+/// share a transaction without reacquiring the store mutex.
+fn record_event_on(
+    conn: &Connection,
+    fingerprint: &str,
+    now_ms: i64,
+    repo: Option<&str>,
+    actor: &str,
+    kind: &str,
+    detail: &str,
+) -> ShanResult<()> {
+    conn.execute(
+        "INSERT INTO events(fingerprint, ts, repo, actor, kind, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![fingerprint, now_ms, repo, actor, kind, detail],
+    )?;
+    Ok(())
 }
 
 /// UTC calendar day (`YYYY-MM-DD`) containing `now_ms` — the `signal_daily`
@@ -2870,6 +2934,479 @@ mod tests {
         sig.title = title.to_string();
         sig.stack_trace = TRACE.replace("Average", symbol);
         sig
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct WriteEffects {
+        issues: String,
+        events: String,
+        daily: u64,
+        extra: Vec<(i64, Option<String>, String)>,
+    }
+
+    // Snapshot every issue field touched by report/claim plus both journals.
+    fn write_effects(store: &Store) -> WriteEffects {
+        let issues = serde_json::to_string(&store.list_issues().expect("issues")).expect("json");
+        let fp = fingerprint::compute(&signal().repo, "go", None, TRACE);
+        let events =
+            serde_json::to_string(&store.events_for(&fp, 100).expect("events")).expect("json");
+        let daily = store.reports_on(&utc_day(1)).expect("daily");
+        let conn = store.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT cooldown_until, log_sample, stack_sample FROM issues ORDER BY fingerprint",
+            )
+            .expect("prepare");
+        let extra = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        WriteEffects {
+            issues,
+            events,
+            daily,
+            extra,
+        }
+    }
+
+    fn abort_event(store: &Store, kind: &str) {
+        store
+            .lock()
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER fail_audit BEFORE INSERT ON events
+             WHEN NEW.kind = '{kind}' BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;"
+            ))
+            .expect("trigger");
+    }
+
+    const TEST_PR_URL: &str = "https://example.com/pull/1";
+
+    fn advance_to_pr(store: &Store, fp: &str) {
+        for state in [State::Triggered, State::Fixing, State::PrOpen] {
+            store.set_state(fp, state, 2, None).expect("advance to PR");
+        }
+        store.set_pr(fp, TEST_PR_URL, 2).expect("PR identity");
+    }
+
+    #[test]
+    fn unscoped_claim_rolls_back_when_audit_fails() {
+        assert_claim_rolls_back(false);
+    }
+
+    #[test]
+    fn scoped_claim_rolls_back_when_audit_fails() {
+        assert_claim_rolls_back(true);
+    }
+
+    fn assert_claim_rolls_back(scoped: bool) {
+        let store = Store::open(":memory:").expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let before = write_effects(&store);
+        abort_event(&store, "state_changed");
+        let result = if scoped {
+            store.claim_ready_issue_for_repo(2, 1_000, &signal().repo, "runner-a")
+        } else {
+            store.claim_ready_issue(2, 1_000)
+        };
+        assert!(result.is_err(), "audit failure must reach caller");
+        assert_eq!(write_effects(&store), before, "scoped={scoped}");
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER fail_audit")
+            .expect("drop trigger");
+        assert!(store.claim_ready_issue(3, 1_000).expect("retry").is_some());
+    }
+
+    #[test]
+    fn reject_pr_counts_once_and_audits_the_actor_and_repo() {
+        let store = Store::open(":memory:").expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        advance_to_pr(&store, &fp);
+        store
+            .set_pr(&fp, "https://example.com/pull/1", 3)
+            .expect("PR");
+        assert!(store
+            .reject_pr(&fp, TEST_PR_URL, 4, "CI red", "runner-a")
+            .expect("reject"));
+        let issue = &store.list_issues().expect("issues")[0];
+        assert_eq!(
+            (issue.state.as_str(), issue.attempts, issue.state_changed_at),
+            ("rejected", 1, 4)
+        );
+        let events = store.events_for(&fp, 100).expect("events");
+        let rejection: Vec<_> = events.iter().filter(|event| event.ts == 4).collect();
+        assert_eq!(rejection.len(), 2);
+        assert!(rejection.iter().any(|event| event.kind == "state_changed"));
+        assert!(rejection.iter().any(|event| event.kind == "rejected"));
+        for event in rejection {
+            assert_eq!(event.actor.as_deref(), Some("runner-a"));
+            assert_eq!(event.repo, signal().repo);
+            assert_eq!(event.detail, "CI red");
+        }
+        let stored_repos: u64 = store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE ts=4 AND repo=?1 AND actor='runner-a'",
+                [&signal().repo],
+                |row| row.get(0),
+            )
+            .expect("stored audit repo, not read fallback");
+        assert_eq!(stored_repos, 2);
+        let before = write_effects(&store);
+        assert!(!store
+            .reject_pr(&fp, TEST_PR_URL, 5, "duplicate", "runner-b")
+            .expect("duplicate"));
+        assert_eq!(write_effects(&store), before);
+    }
+
+    #[test]
+    fn reject_pr_is_a_noop_outside_pr_open_and_unknown_is_an_error() {
+        let store = Store::open(":memory:").expect("open");
+        assert!(
+            matches!(store.reject_pr("missing", TEST_PR_URL, 1, "CI red", "runner"),
+            Err(ShanError::UnknownIssue(fp)) if fp == "missing")
+        );
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        store.set_pr(&fp, TEST_PR_URL, 2).expect("PR identity");
+        for state in [
+            "new",
+            "triggered",
+            "fixing",
+            "merged",
+            "rejected",
+            "escalated",
+            "ignored",
+        ] {
+            store
+                .lock()
+                .execute(
+                    "UPDATE issues SET state=?1 WHERE fingerprint=?2",
+                    rusqlite::params![state, fp],
+                )
+                .expect("fixture state");
+            let before = write_effects(&store);
+            assert!(!store
+                .reject_pr(&fp, TEST_PR_URL, 4, "not an open PR", "runner")
+                .expect("noop"));
+            assert_eq!(write_effects(&store), before, "{state}");
+        }
+    }
+
+    #[test]
+    fn reject_pr_rolls_back_if_either_audit_fails() {
+        for kind in ["state_changed", "rejected"] {
+            let store = Store::open(":memory:").expect("open");
+            store.report_signal(&signal(), 1).expect("report");
+            let fp = store
+                .ready_issue(1)
+                .expect("ready")
+                .expect("issue")
+                .fingerprint;
+            advance_to_pr(&store, &fp);
+            let before = write_effects(&store);
+            abort_event(&store, kind);
+            assert!(store
+                .reject_pr(&fp, TEST_PR_URL, 4, "CI red", "runner")
+                .is_err());
+            assert_eq!(write_effects(&store), before, "{kind}");
+            store
+                .lock()
+                .execute_batch("DROP TRIGGER fail_audit")
+                .expect("drop trigger");
+            assert!(store
+                .reject_pr(&fp, TEST_PR_URL, 5, "retry", "runner")
+                .expect("retry"));
+            assert_eq!(store.attempts_for(&fp).expect("attempts"), 1);
+        }
+    }
+
+    #[test]
+    fn reject_pr_counts_a_new_cycle_after_regression() {
+        let store = Store::open(":memory:").expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        advance_to_pr(&store, &fp);
+        assert!(store
+            .reject_pr(&fp, TEST_PR_URL, 3, "first", "runner")
+            .expect("first"));
+        assert!(matches!(
+            store.report_signal(&signal(), 4).expect("regression"),
+            ReportOutcome::Regression { occurrences: 2, .. }
+        ));
+        assert_eq!(store.attempts_for(&fp).expect("attempts"), 1);
+        advance_to_pr(&store, &fp);
+        assert!(store
+            .reject_pr(&fp, TEST_PR_URL, 5, "second", "runner")
+            .expect("second"));
+        assert_eq!(store.attempts_for(&fp).expect("attempts"), 2);
+        assert_eq!(
+            store
+                .events_for(&fp, 100)
+                .expect("events")
+                .iter()
+                .filter(|event| event.kind == "rejected")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn review_late_old_pr_rejection_cannot_reject_a_new_cycle() {
+        let store = Store::open(":memory:").expect("test fixture");
+        store.report_signal(&signal(), 1).expect("test fixture");
+        let fp = store
+            .ready_issue(1)
+            .expect("test fixture")
+            .expect("test fixture")
+            .fingerprint;
+        let old_url = "https://github.com/example/app/pull/1";
+        let new_url = "https://github.com/example/app/pull/2";
+        advance_to_pr(&store, &fp);
+        store.set_pr(&fp, old_url, 2).expect("test fixture");
+        assert!(store
+            .reject_pr(&fp, old_url, 3, "first PR closed", "runner")
+            .expect("test fixture"));
+        store.report_signal(&signal(), 4).expect("test fixture");
+        advance_to_pr(&store, &fp);
+        store.set_pr(&fp, new_url, 5).expect("test fixture");
+        let before = write_effects(&store);
+        assert!(
+            !store
+                .reject_pr(&fp, old_url, 6, "old PR closed", "late-reconcile")
+                .expect("test fixture"),
+            "a verdict queried for the old PR must not reject the new PR"
+        );
+        assert_eq!(write_effects(&store), before);
+        let row = &store.list_issues().expect("test fixture")[0];
+        assert_eq!(row.state, "pr_open");
+        assert_eq!(row.pr_url.as_deref(), Some(new_url));
+        assert_eq!(row.attempts, 1);
+        assert!(store
+            .reject_pr(&fp, new_url, 7, "new PR closed", "reconcile")
+            .expect("test fixture"));
+        let after = write_effects(&store);
+        assert!(!store
+            .reject_pr(&fp, new_url, 8, "new PR still closed", "repeat-reconcile")
+            .expect("test fixture"));
+        assert_eq!(write_effects(&store), after);
+        assert_eq!(store.attempts_for(&fp).expect("test fixture"), 2);
+    }
+
+    #[test]
+    fn concurrent_reject_pr_counts_at_most_once_across_connections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.db");
+        let first = Store::open(&path).expect("first");
+        let second = Store::open(&path).expect("second");
+        first.report_signal(&signal(), 1).expect("report");
+        let fp = first
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        advance_to_pr(&first, &fp);
+        let barrier = std::sync::Barrier::new(2);
+        let (a, b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                first.reject_pr(&fp, TEST_PR_URL, 4, "CI red", "runner-a")
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                second.reject_pr(&fp, TEST_PR_URL, 4, "CI red", "runner-b")
+            });
+            (
+                a.join().expect("join a").expect("reject a"),
+                b.join().expect("join b").expect("reject b"),
+            )
+        });
+        assert_ne!(a, b, "exactly one caller must win");
+        assert_eq!(first.attempts_for(&fp).expect("attempts"), 1);
+        let events = first.events_for(&fp, 100).expect("events");
+        let rejection: Vec<_> = events.iter().filter(|event| event.ts == 4).collect();
+        assert_eq!(rejection.len(), 2);
+        for event in rejection {
+            assert_eq!(
+                event.actor.as_deref(),
+                Some(if a { "runner-a" } else { "runner-b" })
+            );
+        }
+    }
+
+    #[test]
+    fn first_report_rolls_back_when_audit_fails() {
+        let store = Store::open(":memory:").expect("open");
+        let before = write_effects(&store);
+        abort_event(&store, "reported");
+        assert!(store.report_signal(&signal(), 1).is_err());
+        assert_eq!(write_effects(&store), before);
+    }
+
+    #[test]
+    fn regression_report_rolls_back_when_audit_fails() {
+        let store = Store::open(":memory:").expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        advance_to_pr(&store, &fp);
+        store
+            .set_state(&fp, State::Rejected, 3, None)
+            .expect("reject");
+        store.set_cooldown(&fp, 1_000).expect("cooldown");
+        let before = write_effects(&store);
+        abort_event(&store, "state_changed");
+        let mut sig = signal();
+        sig.severity = "critical".into();
+        sig.log_window = vec!["new log".into()];
+        assert!(store.report_signal(&sig, 4).is_err());
+        assert_eq!(write_effects(&store), before);
+    }
+
+    #[test]
+    fn repeat_report_rolls_back_when_daily_count_fails() {
+        let store = Store::open(":memory:").expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let before = write_effects(&store);
+        store
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_daily BEFORE INSERT ON signal_daily
+             BEGIN SELECT RAISE(ABORT, 'injected daily failure'); END;",
+            )
+            .expect("trigger");
+        assert!(store.report_signal(&signal(), 2).is_err());
+        assert_eq!(write_effects(&store), before);
+    }
+
+    type WriterGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+    thread_local! {
+        static WRITER_GATE: std::cell::RefCell<Option<WriterGate>> = const { std::cell::RefCell::new(None) };
+    }
+
+    // SQLite invokes this at the blocked write (or BEGIN IMMEDIATE). The test
+    // releases the writer only after committing ignore, without timing sleeps.
+    fn wait_for_test_writer(_: i32) -> bool {
+        WRITER_GATE.with(|gate| {
+            gate.borrow_mut().take().is_some_and(|(blocked, resume)| {
+                blocked.send(()).is_ok()
+                    && resume
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .is_ok()
+            })
+        })
+    }
+
+    #[test]
+    fn concurrent_ignore_wins_before_report_can_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.db");
+        let owner = Store::open(&path).expect("owner");
+        let reporter = Store::open(&path).expect("reporter");
+        owner.report_signal(&signal(), 1).expect("report");
+        let fp = owner
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        advance_to_pr(&owner, &fp);
+        owner
+            .set_state(&fp, State::Rejected, 3, None)
+            .expect("reject");
+        owner
+            .lock()
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold writer");
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let report = std::thread::spawn(move || {
+            WRITER_GATE.with(|gate| *gate.borrow_mut() = Some((blocked_tx, resume_rx)));
+            reporter
+                .lock()
+                .busy_handler(Some(wait_for_test_writer))
+                .expect("busy handler");
+            reporter.report_signal(&signal(), 5)
+        });
+        blocked_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("report blocked");
+        owner
+            .ignore_issue(&fp, "owner mute", "owner", 4)
+            .expect("ignore");
+        owner.lock().execute_batch("COMMIT").expect("commit ignore");
+        resume_tx.send(()).expect("resume report");
+        let outcome = report.join().expect("join").expect("report");
+        assert!(
+            matches!(outcome, ReportOutcome::Muted { occurrences: 2, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(owner.list_issues().expect("issues")[0].state, "ignored");
+        assert_eq!(owner.reports_on(&utc_day(5)).expect("daily"), 2);
+        assert!(!owner
+            .events_for(&fp, 100)
+            .expect("events")
+            .iter()
+            .any(|event| event.detail.starts_with("regression:")));
+    }
+
+    #[test]
+    fn delayed_progress_cannot_reduce_run_usage() {
+        let store = Store::open(":memory:").expect("store");
+        store.report_signal(&signal(), 1).expect("signal");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        store
+            .start_run(&RunStart {
+                id: "usage-order".into(),
+                fingerprint: fp.clone(),
+                runner_id: "runner".into(),
+                repo: signal().repo,
+                started_at: 2,
+                provider: None,
+                model: None,
+            })
+            .expect("run");
+        for (turns, uncached, cached) in [(5, 1000, 100), (2, 400, 20)] {
+            store
+                .update_run(
+                    "usage-order",
+                    &RunUpdate {
+                        turns: Some(turns),
+                        tokens_uncached: Some(uncached),
+                        tokens_cached: Some(cached),
+                        ..Default::default()
+                    },
+                )
+                .expect("progress");
+        }
+        let run = store
+            .run_for(&fp, "usage-order")
+            .expect("read")
+            .expect("run");
+        assert_eq!(
+            (run.turns, run.tokens_uncached, run.tokens_cached),
+            (5, 1000, 100)
+        );
     }
 
     #[test]

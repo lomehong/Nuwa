@@ -708,6 +708,218 @@ mod tests {
             .to_string()
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corrupt_cli_history_does_not_block_repair_or_expose_raw_logs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("s.db");
+        let store = Arc::new(shanhaijing::Store::open(&db_path).expect("open"));
+        store
+            .report_signal(
+                &shanhaijing::Signal {
+                    repo: "example.com/cli-history".into(),
+                    language: "rust".into(),
+                    title: "synthetic snapshot regression".into(),
+                    severity: "high".into(),
+                    message: None,
+                    log_window: Vec::new(),
+                    stack_trace: "boom".into(),
+                },
+                1,
+            )
+            .expect("signal");
+        let fp = store
+            .ready_issue(2)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+
+        let repo = dir.path().join("cli-repo");
+        std::fs::create_dir(&repo).expect("repo");
+        crate::git_ops::git(&repo, &["init", "-b", "main"]).expect("git init");
+        std::fs::write(repo.join("base.txt"), "base\n").expect("base");
+        crate::git_ops::git(&repo, &["add", "base.txt"]).expect("add");
+        crate::git_ops::git(
+            &repo,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "synthetic base",
+            ],
+        )
+        .expect("commit");
+
+        let secrets = Arc::new(crate::secrets::Secrets::with_values(vec![
+            "history-secret-123456".into(),
+        ]));
+        let prepared = crate::pipeline::prepare_repair(crate::pipeline::RepairRequest {
+            repo: repo.clone(),
+            issue: crate::issue::Issue {
+                fingerprint: fp.clone(),
+                title: "synthetic snapshot regression".into(),
+                language: "rust".into(),
+                occurrences: 1,
+                severity: "high".into(),
+                first_seen: String::new(),
+                last_seen: String::new(),
+                stack_trace: "boom".into(),
+                log_window: Vec::new(),
+                prior_context: String::new(),
+                failing_check: crate::issue::FailingCheck {
+                    command: if cfg!(windows) {
+                        "if exist fixed.marker (exit 0) else (exit 1)".into()
+                    } else {
+                        "test -f fixed.marker".into()
+                    },
+                    target: None,
+                    timeout_secs: 10,
+                },
+                reproduce_check: None,
+                forbidden_paths: Vec::new(),
+                verification_mode: Default::default(),
+            },
+            sessions_dir: dir.path().join("cli-sessions"),
+            provider: crate::repair::ProviderKind::Faux,
+            max_turns: 3,
+            repo_config: None,
+            secrets: Arc::clone(&secrets),
+            progress: None,
+            faux_script: Some(
+                rpi_ai::providers::faux::FauxScript::new()
+                    .with_tool_call(
+                        "write",
+                        serde_json::json!({"path": "fixed.marker", "content": "fixed\n"}),
+                    )
+                    .with_text("successful repair"),
+            ),
+            run_id: None,
+        })
+        .expect("prepare");
+        let root = prepared.session_dir().to_path_buf();
+        std::fs::create_dir_all(&root).expect("session root");
+        let raw = serde_json::json!({
+            "kind": "entry", "type": "message", "seq": 1,
+            "message": {"kind": "user", "content": "history-secret-123456"}
+        })
+        .to_string();
+        std::fs::write(root.join("old.jsonl"), format!("{raw}\n{{broken history\n"))
+            .expect("old history");
+
+        store
+            .start_run(&shanhaijing::RunStart {
+                id: "run-cli".into(),
+                fingerprint: fp.clone(),
+                runner_id: "test:runner".into(),
+                repo: "example.com/cli-history".into(),
+                started_at: 9_000_000,
+                provider: None,
+                model: None,
+            })
+            .expect("run");
+        store
+            .update_run(
+                "run-cli",
+                &shanhaijing::RunUpdate {
+                    session_dir: Some(root.display().to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("session dir");
+
+        let app = build_app(AppState {
+            store: Arc::clone(&store),
+            ui_token: Arc::new(None),
+            ingest_token: Arc::new(None),
+            session: Arc::new(crate::session::SessionManager::new("", 86_400_000)),
+            limiter: Arc::new(crate::session::LoginLimiter::new()),
+            started_at_ms: crate::now_ms(),
+            env_path: dir.path().join("nuwa.env"),
+            db_path,
+            cookie_secure: false,
+            cookie_secure_never: false,
+            serve_unit: "nuwa-serve".to_string(),
+            runner_units: vec!["nuwa-work".to_string()],
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/issues/{fp}/transcript?run_id=run-cli"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("transcript before repair");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["meta"]["empty"], true);
+
+        let report = prepared
+            .execute()
+            .await
+            .expect("old JSONL must not block a new CLI repair");
+        assert_eq!(report.root_cause_text, "successful repair");
+        assert!(repo.join("fixed.marker").is_file());
+        let delivered = crate::pipeline::deliver(crate::pipeline::DeliveryRequest {
+            repo: &repo,
+            issue: prepared.issue(),
+            report: &report,
+            sessions_dir: &dir.path().join("cli-sessions"),
+            push: false,
+            create_pr: false,
+            public_base_url: None,
+            draft: false,
+            secrets: &secrets,
+        })
+        .await
+        .expect("a successful repair must remain deliverable");
+        assert!(!delivered.commit.is_empty());
+        assert!(delivered.pr_url.is_none());
+        assert!(crate::git_ops::branch_exists(&repo, &delivered.branch).expect("branch"));
+        assert_eq!(store.attempts_for(&fp).expect("attempts"), 0);
+        assert_eq!(
+            std::fs::read_to_string(root.join("old.jsonl")).expect("raw"),
+            format!("{raw}\n{{broken history\n")
+        );
+        assert!(!root.join("redacted").join("old.jsonl").exists());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/issues/{fp}/transcript?run_id=run-cli"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("transcript after repair");
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert!(!value.to_string().contains("history-secret-123456"));
+        // Traversal may publish the valid harness file before failing on the
+        // corrupt legacy file; that safe prefix is still allowed to be served.
+        let published = root.join("redacted");
+        if published.exists() {
+            std::fs::remove_dir_all(&published).expect("clear published prefix");
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/issues/{fp}/transcript?run_id=run-cli"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("transcript without snapshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert!(!value.to_string().contains("history-secret-123456"));
+        assert_eq!(value["meta"]["empty"], true);
+        assert_eq!(value["data"], serde_json::json!([]));
+    }
+
     fn assert_common_security_headers(response: &Response) {
         assert_eq!(
             header_str(response, header::X_CONTENT_TYPE_OPTIONS),
