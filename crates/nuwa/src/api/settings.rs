@@ -2268,6 +2268,7 @@ mod tests {
             title: "restart guard".to_string(),
             severity: "high".to_string(),
             message: Some("boom".to_string()),
+            log_window: Vec::new(),
             stack_trace: "panic: restart guard\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/app.go:1 +0x1"
                 .to_string(),
         };

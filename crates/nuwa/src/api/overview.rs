@@ -364,6 +364,7 @@ mod tests {
                         title: title.to_string(),
                         severity: "high".to_string(),
                         message: None,
+                        log_window: Vec::new(),
                         stack_trace: format!("panic: {title}"),
                     },
                     stale,

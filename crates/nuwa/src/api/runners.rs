@@ -261,6 +261,7 @@ mod tests {
             title: title.to_string(),
             severity: "high".to_string(),
             message: Some(format!("boom {title}")),
+            log_window: Vec::new(),
             stack_trace: format!(
                 "panic: {title}\ngoroutine 1 [running]:\nexample.com/app.Fn_{}()\n\t/app/x.go:1 +0x1",
                 title.replace(' ', "_")

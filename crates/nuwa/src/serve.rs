@@ -1906,6 +1906,7 @@ mod tests {
             title: title.to_string(),
             severity: severity.to_string(),
             message: Some(format!("boom {title}")),
+            log_window: Vec::new(),
             stack_trace: format!(
                 "panic: boom {title}\ngoroutine 1 [running]:\nexample.com/app.Fn_{}()\n\t/app/{}.go:1 +0x1",
                 title.replace(' ', "_"),
@@ -2432,6 +2433,7 @@ mod tests {
             title: title.to_string(),
             severity: severity.to_string(),
             message: Some(format!("boom {title}")),
+            log_window: Vec::new(),
             stack_trace: format!(
                 "panic: boom {title}\ngoroutine 1 [running]:\nexample.com/read.Fn_{}()\n\t/read/{}.go:1 +0x1",
                 title.replace(' ', "_"),

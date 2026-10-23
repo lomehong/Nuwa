@@ -288,6 +288,7 @@ mod tests {
             title: title.into(),
             severity: severity.into(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: format!("panic: {title}\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/a.go:1 +0x1"),
         }
     }

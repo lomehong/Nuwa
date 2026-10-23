@@ -99,6 +99,8 @@ curl -sS -X POST "$NUWA_INGEST_URL/ingest" \
 
 字段最小集是 `repo/title/severity/message/stack_trace`；其余字段可省略。
 
+可选字段 `log_window`（字符串数组）：采集器提供的现场日志窗口。服务端会随问题单落库（schema v7，保留前 40 行、每行 2000 字符），并在修复 prompt 的 `LOG WINDOW` 段展示给 agent——这是 agent 除堆栈外唯一的现场上下文。青鸟 SDK 目前尚未发送该字段，服务端已就绪。
+
 ## 2 · 目标仓库放指令文件
 
 仓库根放 `nuwa.repo.json`（并建议加进该仓库 `.gitignore`——交付面已排除它，双保险）：

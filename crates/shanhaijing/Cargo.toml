@@ -9,13 +9,13 @@ description = "山海经 — problem-issue store: fingerprinting, dedup, cooldow
 [dependencies]
 rusqlite = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { version = "0.3", features = ["std"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

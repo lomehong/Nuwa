@@ -40,6 +40,11 @@ pub struct Signal {
     #[serde(default)]
     pub message: Option<String>,
     pub stack_trace: String,
+    /// Log lines around the incident, when the collector sends them. The
+    /// repair prompt shows this window to the agent — without it the agent
+    /// sees the stack and nothing else about the failure.
+    #[serde(default)]
+    pub log_window: Vec<String>,
 }
 
 fn default_severity() -> String {
@@ -176,6 +181,10 @@ pub struct IssueSnapshot {
     pub occurrences: u64,
     pub attempts: u64,
     pub stack_sample: String,
+    /// Log lines around the incident, as the collector reported them.
+    pub log_window: Vec<String>,
+    pub first_seen: i64,
+    pub last_seen: i64,
 }
 
 /// Full issue row — the `nuwa status` / ops view.
@@ -641,8 +650,8 @@ impl Store {
 
         let Some((state, occurrences, cooldown_until, current_severity)) = existing else {
             conn.execute(
-                "INSERT INTO issues(fingerprint, title, language, severity, state, occurrences, first_seen, last_seen, cooldown_until, repo, stack_sample)
-                 VALUES (?1, ?2, ?3, ?4, 'new', 1, ?5, ?5, 0, ?6, ?7)",
+                "INSERT INTO issues(fingerprint, title, language, severity, state, occurrences, first_seen, last_seen, cooldown_until, repo, stack_sample, log_sample)
+                 VALUES (?1, ?2, ?3, ?4, 'new', 1, ?5, ?5, 0, ?6, ?7, ?8)",
                 rusqlite::params![
                     fp,
                     signal.title,
@@ -651,6 +660,7 @@ impl Store {
                     now_ms,
                     signal.repo,
                     signal.stack_trace,
+                    encode_log_window(&signal.log_window),
                 ],
             )?;
             bump_signal_daily(&conn, &fp, &signal.repo, now_ms)?;
@@ -665,8 +675,16 @@ impl Store {
         // downgrading is an explicit owner action, not a side effect of noise.
         let severity = higher_severity(&current_severity, &signal.severity);
         conn.execute(
-            "UPDATE issues SET occurrences = occurrences + 1, last_seen = ?2, stack_sample = ?3, severity = ?4 WHERE fingerprint = ?1",
-            rusqlite::params![fp, now_ms, signal.stack_trace, severity],
+            "UPDATE issues SET occurrences = occurrences + 1, last_seen = ?2, stack_sample = ?3,
+                severity = ?4, log_sample = COALESCE(?5, log_sample)
+             WHERE fingerprint = ?1",
+            rusqlite::params![
+                fp,
+                now_ms,
+                signal.stack_trace,
+                severity,
+                encode_log_window(&signal.log_window)
+            ],
         )?;
         bump_signal_daily(&conn, &fp, &signal.repo, now_ms)?;
         let occurrences = occurrences + 1;
@@ -705,7 +723,7 @@ impl Store {
     pub fn ready_issue(&self, now_ms: i64) -> ShanResult<Option<IssueSnapshot>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
-            "SELECT fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample
+            "SELECT fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample, log_sample, first_seen, last_seen
              FROM issues
              WHERE state = 'new' AND cooldown_until <= ?1
              ORDER BY {READY_ORDER}
@@ -722,7 +740,7 @@ impl Store {
     pub fn ready_issues(&self, now_ms: i64, limit: u32) -> ShanResult<Vec<IssueSnapshot>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
-            "SELECT fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample
+            "SELECT fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample, log_sample, first_seen, last_seen
              FROM issues
              WHERE state = 'new' AND cooldown_until <= ?1
              ORDER BY {READY_ORDER}
@@ -759,6 +777,7 @@ impl Store {
     }
 
     fn snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IssueSnapshot> {
+        let log_sample: Option<String> = row.get(8)?;
         Ok(IssueSnapshot {
             fingerprint: row.get(0)?,
             title: row.get(1)?,
@@ -768,6 +787,9 @@ impl Store {
             occurrences: row.get(5)?,
             attempts: row.get(6)?,
             stack_sample: row.get(7)?,
+            log_window: decode_log_window(log_sample.as_deref()),
+            first_seen: row.get(9)?,
+            last_seen: row.get(10)?,
         })
     }
 
@@ -791,7 +813,7 @@ impl Store {
                          ORDER BY {READY_ORDER}
                          LIMIT 1
                      )
-                     RETURNING fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample"
+                     RETURNING fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample, log_sample, first_seen, last_seen"
                 ),
                 rusqlite::params![now_ms, cooldown_until_ms],
                 Self::snapshot_from_row,
@@ -843,7 +865,7 @@ impl Store {
                          ORDER BY {READY_ORDER}
                          LIMIT 1
                      )
-                     RETURNING fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample"
+                     RETURNING fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample, log_sample, first_seen, last_seen"
                 ),
                 rusqlite::params![now_ms, cooldown_until_ms, repo, runner_id],
                 Self::snapshot_from_row,
@@ -1662,7 +1684,7 @@ impl Store {
     pub fn get(&self, fingerprint: &str) -> ShanResult<Option<IssueSnapshot>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample
+            "SELECT fingerprint, title, language, repo, severity, occurrences, attempts, stack_sample, log_sample, first_seen, last_seen
              FROM issues WHERE fingerprint = ?1",
         )?;
         let mut rows = stmt.query([fingerprint])?;
@@ -2599,6 +2621,36 @@ pub fn utc_day(now_ms: i64) -> String {
     format!("{:04}-{:02}-{:02}", dt.year(), u8::from(dt.month()), dt.day())
 }
 
+/// How many log lines of the incident window are kept.
+const LOG_WINDOW_MAX_LINES: usize = 40;
+/// How many characters one log line may contribute.
+const LOG_WINDOW_MAX_LINE_CHARS: usize = 2_000;
+
+/// Encode the collector's log window for storage. JSON keeps multi-line
+/// entries intact; the window is bounded so a runaway collector cannot grow
+/// the issue row without limit.
+fn encode_log_window(window: &[String]) -> Option<String> {
+    if window.is_empty() {
+        return None;
+    }
+    let bounded: Vec<String> = window
+        .iter()
+        .take(LOG_WINDOW_MAX_LINES)
+        .map(|line| line.chars().take(LOG_WINDOW_MAX_LINE_CHARS).collect())
+        .collect();
+    serde_json::to_string(&bounded).ok()
+}
+
+/// Decode a stored log window. A row written before the column existed (or
+/// by a future version with a different shape) decodes to an empty window
+/// instead of failing the whole read.
+fn decode_log_window(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+}
+
 fn bump_signal_daily(
     conn: &rusqlite::Connection,
     fingerprint: &str,
@@ -2629,6 +2681,7 @@ mod tests {
             title: "panic in Average".to_string(),
             severity: "high".to_string(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: TRACE.to_string(),
         }
     }
@@ -2670,6 +2723,55 @@ mod tests {
             .claim_ready_issue_for_repo(3, 1_000, "example.com/other", "r-b")
             .expect("claim b")
             .is_some());
+    }
+
+    /// 采集器的日志窗口必须随问题单落库并随快照交给 runner——否则修复
+    /// prompt 里的 LOG WINDOW 永远是 "(none)"。
+    #[test]
+    fn log_window_round_trips_through_the_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let mut sig = signal();
+        sig.log_window = vec!["line one".into(), "line two\nwith newline".into()];
+        let fp = match store.report_signal(&sig, 1).expect("report") {
+            ReportOutcome::NewIssue { fingerprint } => fingerprint,
+            other => panic!("expected new, got {other:?}"),
+        };
+        let snapshot = store.ready_issue(1).expect("ready").expect("issue");
+        assert_eq!(snapshot.fingerprint, fp);
+        assert_eq!(
+            snapshot.log_window,
+            vec!["line one".to_string(), "line two\nwith newline".to_string()]
+        );
+        // The sighting window comes from the row, not from the prompt.
+        assert_eq!(snapshot.first_seen, 1);
+        assert_eq!(snapshot.last_seen, 1);
+    }
+
+    #[test]
+    fn log_window_is_bounded_and_refreshed_only_when_provided() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let mut sig = signal();
+        sig.log_window = (0..60).map(|i| format!("line {i}")).collect();
+        store.report_signal(&sig, 1).expect("report");
+        let snapshot = store.ready_issue(1).expect("ready").expect("issue");
+        assert_eq!(snapshot.log_window.len(), 40, "window is capped");
+
+        // A later report without a window keeps the stored one.
+        let mut quiet = signal();
+        quiet.log_window = Vec::new();
+        store.report_signal(&quiet, 2).expect("report again");
+        let snapshot = store.ready_issue(2).expect("ready").expect("issue");
+        assert_eq!(snapshot.log_window.len(), 40);
+        assert_eq!(snapshot.last_seen, 2);
+
+        // A later report with a window replaces it.
+        let mut fresh = signal();
+        fresh.log_window = vec!["fresh".into()];
+        store.report_signal(&fresh, 3).expect("third");
+        let snapshot = store.ready_issue(3).expect("ready").expect("issue");
+        assert_eq!(snapshot.log_window, vec!["fresh".to_string()]);
     }
 
     #[test]
@@ -4760,6 +4862,7 @@ mod heartbeat_tests {
             title: "panic in Average".into(),
             severity: "high".into(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: trace.into(),
         };
         store.report_signal(&sig, 1).expect("report");
@@ -4852,6 +4955,7 @@ mod repo_tests {
             title: title.into(),
             severity: severity.into(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: format!(
                 "panic: {title}\ngoroutine 1 [running]:\nexample.com/spike-target.{symbol}()\n\t/app/a.go:1 +0x1"
             ),

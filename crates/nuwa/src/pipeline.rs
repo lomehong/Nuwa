@@ -156,10 +156,10 @@ pub fn issue_from_snapshot(
             language: snapshot.language.clone(),
             occurrences: snapshot.occurrences,
             severity: snapshot.severity.clone(),
-            first_seen: String::new(),
-            last_seen: String::new(),
+            first_seen: format_timestamp(snapshot.first_seen),
+            last_seen: format_timestamp(snapshot.last_seen),
             stack_trace: snapshot.stack_sample.clone(),
-            log_window: Vec::new(),
+            log_window: snapshot.log_window.clone(),
             prior_context,
             failing_check: repo_config.failing_check.clone(),
             reproduce_check: repo_config.reproduce_check.clone(),
@@ -168,6 +168,39 @@ pub fn issue_from_snapshot(
         },
         secrets,
     )
+}
+
+/// Unix milliseconds as `YYYY-MM-DD HH:MM:SS UTC` for the repair prompt.
+/// Hand-rolled so the runner needs no date library.
+fn format_timestamp(ms: i64) -> String {
+    if ms <= 0 {
+        return "(unknown)".to_string();
+    }
+    let seconds = ms.div_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let secs_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60,
+        secs_of_day % 60
+    )
+}
+
+/// Days since 1970-01-01 → `(year, month, day)`. Howard Hinnant's
+/// `civil_from_days` (public-domain algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if month <= 2 { year + 1 } else { year }, month as u32, day as u32)
 }
 
 /// 一次性 CLI 从文件加载的问题单同样是外部输入。
@@ -232,6 +265,58 @@ mod tests {
         let redacted = redact_issue(issue(), &secrets);
         assert!(!redacted.title.contains("ghp_"));
         assert!(!redacted.log_window[0].contains("ghp_"));
+    }
+
+    fn snapshot() -> shanhaijing::IssueSnapshot {
+        shanhaijing::IssueSnapshot {
+            fingerprint: "abc/def".into(),
+            title: "panic".into(),
+            language: "go".into(),
+            repo: "example.com/app".into(),
+            severity: "high".into(),
+            occurrences: 2,
+            attempts: 0,
+            stack_sample: "panic: boom".into(),
+            log_window: vec!["line one".into(), "line two".into()],
+            first_seen: 1_000,
+            last_seen: 2_000,
+        }
+    }
+
+    #[test]
+    fn issue_from_snapshot_carries_the_log_window_and_timestamps() {
+        let instructions = RepoInstructions {
+            repo: "example.com/app".into(),
+            failing_check: FailingCheck {
+                command: "go test ./...".into(),
+                target: None,
+                timeout_secs: 60,
+            },
+            forbidden_paths: Vec::new(),
+            notes: String::new(),
+            reproduce_check: None,
+            max_attempts: 3,
+            draft_first_n: 0,
+        };
+        let built = issue_from_snapshot(
+            &snapshot(),
+            &instructions,
+            String::new(),
+            &secrets::Secrets::default(),
+        );
+        assert_eq!(built.log_window, vec!["line one".to_string(), "line two".to_string()]);
+        assert_eq!(built.first_seen, "1970-01-01 00:00:01 UTC");
+        assert_eq!(built.last_seen, "1970-01-01 00:00:02 UTC");
+    }
+
+    #[test]
+    fn timestamps_format_as_utc_for_the_prompt() {
+        assert_eq!(format_timestamp(0), "(unknown)");
+        assert_eq!(format_timestamp(1_000), "1970-01-01 00:00:01 UTC");
+        // Unix billennium — a well-known checkpoint.
+        assert_eq!(format_timestamp(1_000_000_000_000), "2001-09-09 01:46:40 UTC");
+        // Leap day in a leap century (2000 is divisible by 400).
+        assert_eq!(format_timestamp(951_782_400_000), "2000-02-29 00:00:00 UTC");
     }
 
     #[test]

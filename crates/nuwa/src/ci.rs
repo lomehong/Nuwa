@@ -362,6 +362,7 @@ mod tests {
             title: "panic: no pr".into(),
             severity: "high".into(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: "panic: no pr\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/a.go:1 +0x1".into(),
         };
         let fp = match store.report_signal(&signal, t).expect("report") {

@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::ShanResult;
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub fn apply(conn: &mut Connection) -> ShanResult<()> {
     conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
@@ -50,9 +50,16 @@ pub fn apply(conn: &mut Connection) -> ShanResult<()> {
         tx.commit()?;
         version = 5;
     }
-    if version < SCHEMA_VERSION {
+    if version < 6 {
         let tx = conn.transaction()?;
         migrate_v6(&tx)?;
+        tx.pragma_update(None, "user_version", 6)?;
+        tx.commit()?;
+        version = 6;
+    }
+    if version < SCHEMA_VERSION {
+        let tx = conn.transaction()?;
+        migrate_v7(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
     }
@@ -253,6 +260,13 @@ fn migrate_v6(conn: &Connection) -> ShanResult<()> {
     Ok(())
 }
 
+/// v7：采集器的日志窗口（JSON 数组，有界）。修复 prompt 会把它展示给 agent，
+/// 所以必须随问题单落库——此前 `Signal.log_window` 字段存在，但从未被接收。
+fn migrate_v7(conn: &Connection) -> ShanResult<()> {
+    add_column_if_missing(conn, "issues", "log_sample", "TEXT")?;
+    Ok(())
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -337,7 +351,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
         for table in ["issues", "events", "runners", "runs", "signal_daily", "repos", "repair_memory", "benchmark_runs", "benchmark_results"] {
             assert!(table_exists(&conn, table), "missing {table}");
         }
@@ -345,6 +359,7 @@ mod tests {
             ("issues", "state_changed_at"),
             ("issues", "owner_runner_id"),
             ("issues", "attempts"),
+            ("issues", "log_sample"),
             ("runners", "progress_at"),
             ("events", "repo"),
             ("events", "actor"),
@@ -372,7 +387,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6, "v0 must run v1 through v6");
+        assert_eq!(version, SCHEMA_VERSION, "v0 must run every migration");
         assert!(table_exists(&conn, "repos"));
         let (state_changed_at, owner): (i64, Option<String>) = conn
             .query_row(
@@ -406,7 +421,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(table_exists(&conn, "repos"));
         assert!(column_exists(&conn, "issues", "attempts"));
         // v1 data survives the upgrade.
@@ -434,7 +449,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(column_exists(&conn, "issues", "attempts"));
         assert!(column_exists(&conn, "runners", "progress_at"));
         let title: String = conn
@@ -462,7 +477,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(table_exists(&conn, "repair_memory"));
         let title: String = conn
             .query_row("SELECT title FROM issues WHERE fingerprint='fp1'", [], |row| {
@@ -490,7 +505,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
         for column in ["compactions", "context_window", "messages"] {
             assert!(column_exists(&conn, "runs", column), "missing runs.{column}");
         }
@@ -516,7 +531,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(table_exists(&conn, "benchmark_runs"));
         assert!(table_exists(&conn, "benchmark_results"));
         assert!(column_exists(&conn, "repair_memory", "disabled"));
@@ -533,7 +548,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

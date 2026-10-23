@@ -673,6 +673,7 @@ mod tests {
             title: title.to_string(),
             severity: severity.to_string(),
             message: Some(format!("boom {title} {variant}")),
+            log_window: Vec::new(),
             stack_trace: format!(
                 "panic: {title} [{variant}]\ngoroutine 1 [running]:\nexample.com/{language}.Fn_{variant}()\n\t/app/{language}.go:1 +0x1"
             ),

@@ -2737,6 +2737,7 @@ mod tests {
             title: "panic: boom".into(),
             severity: "high".into(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.F()\n\t/app/a.go:1 +0x1".into(),
         };
         store.report_signal(&signal, now).expect("report");
@@ -2798,6 +2799,7 @@ mod tests {
             title: "panic: boom".into(),
             severity: "high".into(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/other.F()\n\t/app/a.go:1 +0x1".into(),
         };
         store.report_signal(&signal, now).expect("report");
@@ -2967,6 +2969,7 @@ mod tests {
                 title: (*title).into(),
                 severity: "high".into(),
                 message: None,
+                log_window: Vec::new(),
                 stack_trace: format!(
                     "panic: {title}\ngoroutine 1 [running]:\nexample.com/spike.F{i}()\n\t/app/a.go:1 +0x1"
                 ),
@@ -3021,6 +3024,7 @@ mod tests {
                 title: title.clone(),
                 severity: "high".into(),
                 message: None,
+                log_window: Vec::new(),
                 stack_trace: format!(
                     "panic: cleanup {i}\ngoroutine 1 [running]:\nexample.com/spike.F{i}()\n\t/app/a.go:1 +0x1"
                 ),
@@ -3114,6 +3118,7 @@ mod tests {
             title: "panic in Average".into(),
             severity: "high".into(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
         };
         store.report_signal(&signal, now).expect("report");
@@ -3197,6 +3202,7 @@ mod tests {
             title: "panic in Average".into(),
             severity: "high".into(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
         };
         store.report_signal(&signal, now).expect("report");
@@ -3264,6 +3270,7 @@ mod tests {
             title: "panic in Average".into(),
             severity: "high".into(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
         };
         store.report_signal(&signal, now).expect("report");
@@ -3396,10 +3403,12 @@ mod tests {
             title: "panic in Average".into(),
             severity: "high".into(),
             message: None,
+            log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
         };
         let sig_b = shanhaijing::Signal {
             title: "panic in Pipeline".into(),
+            log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Pipeline()\n\t/app/calc.go:25 +0x1".into(),
             ..sig_a.clone()
         };
