@@ -21,18 +21,24 @@ const DEFAULT_LIMIT: u32 = 20;
 const MAX_LIMIT: u32 = 100;
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ListQuery {
     #[serde(default)]
     pub limit: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct BenchmarkRunsResponse {
     pub data: Vec<BenchmarkRunDto>,
     pub scenarios: Vec<ScenarioMeta>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct BenchmarkRunDto {
     pub id: String,
     #[serde(rename = "started_at_ms")]
@@ -80,12 +86,16 @@ impl From<BenchmarkRunRow> for BenchmarkRunDto {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct BenchmarkDetailResponse {
     pub run: BenchmarkRunDto,
     pub results: Vec<BenchmarkResultDto>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct BenchmarkResultDto {
     pub scenario: String,
     pub language: String,
@@ -181,6 +191,8 @@ pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Re
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ScenariosResponse {
     pub data: Vec<ScenarioMeta>,
 }

@@ -21,12 +21,16 @@ const QUEUE_NEXT_LIMIT: u32 = 3;
 
 /// `?repo=` scopes issues, runners and active runs; an empty value means all.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct OverviewQuery {
     #[serde(default)]
     pub repo: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct OverviewResponse {
     pub counts: BTreeMap<String, usize>,
     pub attention: Vec<AttentionItem>,
@@ -37,6 +41,8 @@ pub struct OverviewResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct AttentionItem {
     pub fingerprint: String,
     pub title: String,
@@ -52,6 +58,8 @@ pub struct AttentionItem {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ActiveRun {
     pub id: String,
     pub fingerprint: String,
@@ -66,12 +74,16 @@ pub struct ActiveRun {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct Queue {
     pub ready_count: u64,
     pub next: Vec<QueueItem>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct QueueItem {
     pub fingerprint: String,
     pub title: String,
@@ -80,6 +92,8 @@ pub struct QueueItem {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct Health {
     pub runners_total: usize,
     pub runners_online: usize,
@@ -92,6 +106,8 @@ pub struct Health {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct CiCounts {
     pub green: u64,
     pub red: u64,

@@ -25,16 +25,22 @@ const MAX_URL_LEN: usize = 512;
 const MAX_DESCRIPTION_LEN: usize = 1000;
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RepoListResponse {
     pub data: Vec<RepoDto>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RepoResponse {
     pub data: RepoDto,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RepoDto {
     pub repo: String,
     pub name: String,
@@ -60,6 +66,8 @@ impl From<RepoRow> for RepoDto {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct CreateRepoRequest {
     #[serde(default)]
     pub repo: Option<String>,
@@ -74,6 +82,8 @@ pub struct CreateRepoRequest {
 /// The identity comes from the path and is immutable, so an update body never
 /// carries `repo` — a stray value is ignored by serde.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct UpdateRepoRequest {
     #[serde(default)]
     pub name: Option<String>,

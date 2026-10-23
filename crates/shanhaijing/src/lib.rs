@@ -368,6 +368,8 @@ pub struct EventQuery {
 /// One UTC day of the console trends chart. Aggregates are window-scoped by
 /// the optional repo filter; days without data are zero-filled.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TrendBucket {
     pub day: String,
     pub reports: u64,

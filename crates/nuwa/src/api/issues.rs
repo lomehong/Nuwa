@@ -34,6 +34,8 @@ const SEVERITIES: [&str; 4] = ["critical", "high", "medium", "low"];
 /// Raw list query. Every value stays a string so invalid input maps to the
 /// `validation_failed` contract instead of axum's plain-text rejection.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct IssueListQuery {
     state: Option<String>,
     severity: Option<String>,
@@ -225,6 +227,8 @@ fn parse_choice(
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct IssueListResponse {
     pub data: Vec<IssueListItem>,
     pub meta: PageMeta,
@@ -233,6 +237,8 @@ pub struct IssueListResponse {
 /// The list/detail issue shape: `IssueRow` (already ms-suffixed) plus the
 /// per-owner `stuck` flag.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct IssueListItem {
     #[serde(flatten)]
     pub issue: IssueRow,
@@ -240,6 +246,8 @@ pub struct IssueListItem {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct IssueDetailResponse {
     pub issue: IssueListItem,
     pub stack_sample: String,
@@ -249,6 +257,8 @@ pub struct IssueDetailResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TimelineItem {
     pub kind: String,
     pub detail: String,
@@ -274,6 +284,8 @@ impl From<EventRow> for TimelineItem {
 /// the issue fingerprint/runner id are already implied by the response
 /// (docs/09 §9.2).
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RunDto {
     pub id: String,
     #[serde(rename = "started_at_ms")]
@@ -335,12 +347,16 @@ impl From<RunRow> for RunDto {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct SimilarIssues {
     pub count: usize,
     pub items: Vec<SimilarItem>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct SimilarItem {
     pub fingerprint: String,
     pub state: String,

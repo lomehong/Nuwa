@@ -47,6 +47,8 @@ const RUNTIME_FIELDS: &[(&str, &str)] = &[
 ];
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct SettingsResponse {
     pub schema: Vec<SettingDto>,
     pub values: BTreeMap<String, SettingValueDto>,
@@ -63,18 +65,27 @@ pub struct SettingsResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct SettingDto {
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub key: &'static str,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub label: &'static str,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub group: &'static str,
     #[serde(rename = "type")]
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub kind: &'static str,
     pub default: Option<&'static str>,
+    #[cfg_attr(feature = "ts-export", ts(type = "string[]"))]
     pub options: &'static [&'static str],
     pub secret: bool,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub scope: &'static str,
     pub requires_restart: bool,
     pub read_only: bool,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub help: &'static str,
     /// Inclusive numeric bounds for `int` keys; the console echoes them so the
     /// browser can reject an out-of-range value before the PUT (docs/09 §9.2).
@@ -106,6 +117,8 @@ impl From<&SettingSpec> for SettingDto {
 /// characters and the newest `config_changed` timestamp.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub enum SettingValueDto {
     Secret {
         set: bool,
@@ -119,16 +132,21 @@ pub enum SettingValueDto {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct DiffDto {
     /// File value, or the schema default when the key is absent.
     pub file: String,
     pub runtime: String,
     /// `file` when the compared value comes from the env file, `default` when
     /// the key is absent and the schema default is shown instead.
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub source: &'static str,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct LastChangeDto {
     pub key: String,
     pub ts_ms: i64,
@@ -136,18 +154,24 @@ pub struct LastChangeDto {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct PutSettingsRequest {
     #[serde(default)]
     pub values: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct PutSettingsResponse {
     pub changed: Vec<String>,
     pub restart_required: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TestSettingsRequest {
     #[serde(default)]
     pub target: Option<String>,
@@ -158,12 +182,16 @@ pub struct TestSettingsRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TestSettingsResponse {
     pub ok: bool,
     pub detail: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RestartRequest {
     #[serde(default)]
     pub force: bool,

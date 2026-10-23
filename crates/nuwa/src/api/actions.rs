@@ -23,18 +23,24 @@ use shanhaijing::{IssueRow, ShanError, Store};
 /// The console's optional operator note. The reason is persisted in the
 /// action's audit event and fed back into the next repair prompt.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ReopenRequest {
     #[serde(default)]
     reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct IgnoreRequest {
     #[serde(default)]
     reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RequeueRequest {
     #[serde(default)]
     force: bool,

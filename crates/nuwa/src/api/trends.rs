@@ -21,12 +21,16 @@ const DEFAULT_RANGE: &str = "14d";
 const RANGES: [(&str, u32); 4] = [("7d", 7), ("14d", 14), ("30d", 30), ("90d", 90)];
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TrendsQuery {
     range: Option<String>,
     repo: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TrendsResponse {
     pub range: String,
     pub buckets: Vec<TrendBucket>,
@@ -34,6 +38,8 @@ pub struct TrendsResponse {
 }
 
 #[derive(Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TrendTotals {
     pub reports: u64,
     pub new_issues: u64,

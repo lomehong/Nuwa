@@ -21,11 +21,15 @@ const SESSION_COOKIE: &str = "nuwa_session";
 const CSRF_COOKIE: &str = "nuwa_csrf";
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct LoginRequest {
     pub token: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct MeResponse {
     pub authenticated: bool,
     pub local_mode: bool,

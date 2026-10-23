@@ -21,6 +21,8 @@ use crate::serve::AppState;
 use shanhaijing::{IssueRow, RunnerRow, ShanResult, Store};
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ProjectDto {
     /// Repository identity — the project's stable key.
     pub repo: String,
@@ -58,6 +60,8 @@ pub struct ProjectDto {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ProjectsResponse {
     pub data: Vec<ProjectDto>,
 }

@@ -33,12 +33,17 @@ pub struct ApiError {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ErrorBody {
     pub error: ErrorDetail,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ErrorDetail {
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub code: &'static str,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]

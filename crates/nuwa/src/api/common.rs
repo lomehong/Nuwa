@@ -38,6 +38,8 @@ pub(crate) const MAX_PAGE_SIZE: u64 = 200;
 
 /// `{page, page_size, total}` meta shared by the paginated list endpoints.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct PageMeta {
     pub page: u64,
     pub page_size: u64,

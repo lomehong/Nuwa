@@ -14,8 +14,12 @@ use crate::api::ApiError;
 use crate::serve::AppState;
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct SystemResponse {
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub version: &'static str,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub build_commit: &'static str,
     pub started_at_ms: i64,
     pub uptime_secs: u64,
@@ -26,6 +30,8 @@ pub struct SystemResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ServiceState {
     pub unit: String,
     /// `systemctl is-active` output; `n/a` when systemd is unavailable.

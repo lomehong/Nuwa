@@ -36,6 +36,12 @@ cookie = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 tempfile = { workspace = true }
+ts-rs = { version = "10", optional = true, features = ["serde-json-impl"] }
+
+[features]
+# `cargo test -p nuwa --features ts-export export_bindings` 把 API DTO 导出成
+# web/src/lib/api-types/*.ts（CI 的 types job 负责提交基线）。
+ts-export = ["dep:ts-rs", "shanhaijing/ts-export"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

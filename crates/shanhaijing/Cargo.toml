@@ -13,6 +13,11 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { version = "0.3", features = ["std"] }
+ts-rs = { version = "10", optional = true }
+
+[features]
+# 导出前端 TypeScript 类型时才引入 ts-rs（生产构建不付这个依赖）。
+ts-export = ["dep:ts-rs"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

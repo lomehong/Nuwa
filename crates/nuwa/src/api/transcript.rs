@@ -36,6 +36,8 @@ const MAX_SESSION_ENTRIES: usize = 1_000;
 /// Raw transcript query. Values stay strings so invalid input maps to the
 /// `validation_failed` contract instead of axum's plain-text rejection.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TranscriptQuery {
     run_id: Option<String>,
     page: Option<String>,
@@ -76,14 +78,19 @@ impl Params {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TranscriptResponse {
     pub data: Vec<TranscriptMessage>,
     pub meta: TranscriptMeta,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TranscriptMessage {
     pub seq: u64,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
     pub role: &'static str,
     #[serde(rename = "ts_ms")]
     pub ts: i64,
@@ -95,6 +102,8 @@ pub struct TranscriptMessage {
 /// content (or serialized arguments) hit the 16KB budget.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub enum TranscriptBlock {
     Thinking {
         text: String,
@@ -126,6 +135,8 @@ fn is_false(value: &bool) -> bool {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct TranscriptMeta {
     pub page: u64,
     pub page_size: u64,

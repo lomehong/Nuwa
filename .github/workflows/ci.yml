@@ -86,3 +86,36 @@ jobs:
           tool: cargo-audit
       - name: cargo audit (RUSTSEC advisories)
         run: cargo audit
+
+  types:
+    # API DTO → 前端 TypeScript 类型的单一来源：ts-rs 只在 `ts-export` feature
+    # 下编译（生产构建零负担）。main 上生成并自动提交基线；PR 上只校验
+    # "生成结果与仓库一致"，防止手写类型漂移。
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: export TS bindings
+        env:
+          TS_RS_EXPORT_DIR: ${{ github.workspace }}/web/src/lib/api-types
+        run: cargo test -p nuwa --features ts-export export_bindings
+      - name: commit on main / verify on PR
+        run: |
+          if git diff --quiet -- web/src/lib/api-types; then
+            echo "types are up to date"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "push" ]; then
+            git config user.name "nuwa-types-bot"
+            git config user.email "nuwa@localhost"
+            git add web/src/lib/api-types
+            git commit -m "chore(types): 重新生成前端 API 类型 [skip ci]"
+            git push
+          else
+            echo "::error::generated TS types are stale — run \`cargo test -p nuwa --features ts-export export_bindings\` and commit web/src/lib/api-types"
+            git diff --stat -- web/src/lib/api-types
+            exit 1
+          fi

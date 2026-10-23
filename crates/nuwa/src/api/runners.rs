@@ -17,11 +17,15 @@ use crate::serve::AppState;
 use shanhaijing::{RunnerRow, ShanResult, Store};
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RunnerListResponse {
     pub data: Vec<RunnerDto>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RunnerDto {
     pub id: String,
     pub repo: String,
@@ -51,6 +55,8 @@ pub struct RunnerDto {
 /// stay `null` instead of guessing a default: the console must show what the
 /// runner actually runs with.
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct EffectiveConfig {
     pub interval_secs: Option<u64>,
     pub ci_timeout_secs: Option<u64>,

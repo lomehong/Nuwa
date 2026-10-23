@@ -23,6 +23,8 @@ use shanhaijing::{RunnerRow, Store};
 const MAX_BODY_CHARS: usize = 20_000;
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ProjectSkillsResponse {
     pub repo: String,
     /// `pinned` when `nuwa.repo.json` lists skills, `auto` otherwise.
@@ -35,6 +37,8 @@ pub struct ProjectSkillsResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct SkillDto {
     pub name: String,
     pub version: u32,

@@ -25,6 +25,8 @@ const HOUR_MS: i64 = 3_600_000;
 /// Raw feed query. Values stay strings so invalid input maps to the JSON
 /// `validation_failed` contract instead of axum's plain-text rejection.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct EventListQuery {
     kind: Option<String>,
     repo: Option<String>,
@@ -97,6 +99,8 @@ fn parse_kinds(raw: Option<&str>) -> Vec<String> {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct EventListResponse {
     pub data: Vec<EventItem>,
     pub meta: PageMeta,
@@ -105,6 +109,8 @@ pub struct EventListResponse {
 /// One feed row. Raw rows carry `count=1` and `first_ts_ms = last_ts_ms =
 /// ts_ms`; aggregated `reported` rows carry the group size and hour bounds.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct EventItem {
     pub fingerprint: String,
     pub kind: String,

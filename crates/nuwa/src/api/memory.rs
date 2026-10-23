@@ -25,6 +25,8 @@ const MAX_FINGERPRINT_LEN: usize = 128;
 const MAX_AUDIT_DETAIL: usize = 300;
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ListQuery {
     #[serde(default)]
     pub limit: Option<u32>,
@@ -33,6 +35,8 @@ pub struct ListQuery {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct MemoryListResponse {
     pub data: Vec<MemoryDto>,
     pub total: u64,
@@ -41,6 +45,8 @@ pub struct MemoryListResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct MemoryDto {
     pub fingerprint: String,
     pub title: String,
@@ -73,6 +79,8 @@ impl From<RepairMemoryView> for MemoryDto {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct UpdateMemoryRequest {
     #[serde(default)]
     pub disabled: Option<bool>,
