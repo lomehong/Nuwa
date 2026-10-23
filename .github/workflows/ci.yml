@@ -37,9 +37,10 @@ jobs:
         # --no-deps: the command-line -D would otherwise propagate into the
         # vendored workspace members and flag their known unwraps.
         run: cargo clippy --no-deps -p nuwa -p shanhaijing --all-targets -- -D warnings
-      # 串行 + 不捕获：如果某个测试卡死，日志最后一行就是它（并行时会被
-      # 其他测试的输出淹没，且 CI 管道是块缓冲）。诊断完成后可去掉
-      # `-- --test-threads=1 --nocapture`，但保留 timeout-minutes。
+      # 串行 + 不捕获：2026-10-23 run #54 在并行模式下卡死过一次（最后启动的
+      # `verify::tests::star_pem_...` 30+ 分钟无输出，取消也停不下来）。串行
+      # 让卡死点可见，也避开了并行下的资源竞争；timeout-minutes 保证下次卡死
+      # 15 分钟就失败而不是挂满 6 小时。并行死锁本身仍是待查项（docs/07）。
       - name: tests
         timeout-minutes: 15
         run: cargo test --workspace -- --test-threads=1 --nocapture
