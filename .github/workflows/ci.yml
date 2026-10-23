@@ -37,8 +37,12 @@ jobs:
         # --no-deps: the command-line -D would otherwise propagate into the
         # vendored workspace members and flag their known unwraps.
         run: cargo clippy --no-deps -p nuwa -p shanhaijing --all-targets -- -D warnings
+      # 串行 + 不捕获：如果某个测试卡死，日志最后一行就是它（并行时会被
+      # 其他测试的输出淹没，且 CI 管道是块缓冲）。诊断完成后可去掉
+      # `-- --test-threads=1 --nocapture`，但保留 timeout-minutes。
       - name: tests
-        run: cargo test --workspace
+        timeout-minutes: 15
+        run: cargo test --workspace -- --test-threads=1 --nocapture
 
   web:
     runs-on: ubuntu-latest
