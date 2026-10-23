@@ -294,6 +294,7 @@ mod tests {
             },
             forbidden_paths: Vec::new(),
             notes: String::new(),
+            skills: Vec::new(),
             reproduce_check: None,
             max_attempts: 3,
             draft_first_n: 0,
