@@ -59,7 +59,6 @@ impl WebhookEvent {
     }
 }
 
-#[derive(Clone)]
 /// The delivery task, awaited on shutdown. Aliased because the nested generic
 /// trips `clippy::type_complexity` when written inline.
 type DeliveryTask = std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;

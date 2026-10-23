@@ -1102,7 +1102,7 @@ async fn cleanup_terminal_branches(
                     let Some(short) = refname.strip_prefix("refs/heads/") else {
                         continue;
                     };
-                    if short.is_empty() || branches.iter().any(|b| b == short) {
+                    if short.is_empty() || branches.contains(&short.to_string()) {
                         continue;
                     }
                     branches.push(short.to_string());
