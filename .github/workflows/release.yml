@@ -35,6 +35,10 @@ jobs:
         working-directory: web
         run: npm run build
       - run: cargo build --release -p nuwa
+        env:
+          # 编译期注入版本指纹：/api/v1/system 的 build_commit（tag 构建时是
+          # tag 指向的提交）。
+          NUWA_BUILD_COMMIT: ${{ github.sha }}
       - name: package
         shell: bash
         run: |

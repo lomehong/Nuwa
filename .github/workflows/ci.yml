@@ -8,6 +8,9 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      # 编译期注入；/api/v1/system 的 build_commit 由此而来（默认 "dev"）。
+      NUWA_BUILD_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,7 +18,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       # check-arch 调用 cargo metadata，必须在上面的 toolchain 之后。
       - name: 架构契约（crate/模块依赖方向）
         run: python3 scripts/check-arch.py
@@ -33,6 +36,10 @@ jobs:
       - name: build web console (embedded fixtures)
         working-directory: web
         run: npm ci && npm run build
+      - name: fmt (self-owned crates — rustfmt clean)
+        # vendored crates keep their upstream style (AGENTS.md rule 1);
+        # only the self-owned crates are gated.
+        run: cargo fmt --check -p nuwa -p shanhaijing
       - name: clippy (self-owned crates — zero-warning bar)
         # --no-deps: the command-line -D would otherwise propagate into the
         # vendored workspace members and flag their known unwraps.
@@ -67,3 +74,15 @@ jobs:
         run: npm test
       - name: build
         run: npm run build
+
+  audit:
+    # RustSec 公告库比对。独立 job：不拖慢主流程，也能在 PR 上单独看到结果。
+    # 只读 Cargo.lock，不编译任何 crate。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit (RUSTSEC advisories)
+        run: cargo audit
