@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::ShanResult;
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub fn apply(conn: &mut Connection) -> ShanResult<()> {
     conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
@@ -57,9 +57,15 @@ pub fn apply(conn: &mut Connection) -> ShanResult<()> {
         tx.commit()?;
         version = 6;
     }
-    if version < SCHEMA_VERSION {
+    if version < 7 {
         let tx = conn.transaction()?;
         migrate_v7(&tx)?;
+        tx.pragma_update(None, "user_version", 7)?;
+        tx.commit()?;
+    }
+    if version < SCHEMA_VERSION {
+        let tx = conn.transaction()?;
+        migrate_v8(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
     }
@@ -272,6 +278,15 @@ fn migrate_v7(conn: &Connection) -> ShanResult<()> {
     Ok(())
 }
 
+/// v8：runner 单实例租约。两个同 id 的活进程会在启动时按 id 互相「孤儿回收」，
+/// 重复修同一张单、双推同一分支；租约把「同 id 只能有一个活进程」变成启动
+/// 前置条件，心跳续租，崩溃后最迟一个 TTL 失效。
+fn migrate_v8(conn: &Connection) -> ShanResult<()> {
+    add_column_if_missing(conn, "runners", "instance_id", "TEXT")?;
+    add_column_if_missing(conn, "runners", "lease_until", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -376,6 +391,8 @@ mod tests {
             ("issues", "attempts"),
             ("issues", "log_sample"),
             ("runners", "progress_at"),
+            ("runners", "instance_id"),
+            ("runners", "lease_until"),
             ("events", "repo"),
             ("events", "actor"),
             ("repos", "created_at"),
@@ -575,6 +592,41 @@ mod tests {
         assert!(table_exists(&conn, "benchmark_results"));
         assert!(column_exists(&conn, "repair_memory", "disabled"));
         assert!(column_exists(&conn, "runs", "messages"));
+    }
+
+    #[test]
+    fn migrates_v7_database_to_v8() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v7.db");
+        {
+            let conn = Connection::open(&path).expect("open");
+            v0_schema(&conn);
+            migrate_v1(&conn).expect("v1");
+            migrate_v2(&conn).expect("v2");
+            migrate_v3(&conn).expect("v3");
+            migrate_v4(&conn).expect("v4");
+            migrate_v5(&conn).expect("v5");
+            migrate_v6(&conn).expect("v6");
+            migrate_v7(&conn).expect("v7");
+            conn.pragma_update(None, "user_version", 7)
+                .expect("version");
+        }
+        let _store = Store::open(&path).expect("migrate v8");
+        let conn = Connection::open(&path).expect("reopen");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(column_exists(&conn, "runners", "instance_id"));
+        assert!(column_exists(&conn, "runners", "lease_until"));
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM issues WHERE fingerprint='fp1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("issue title");
+        assert_eq!(title, "t");
     }
 
     #[test]

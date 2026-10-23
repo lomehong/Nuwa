@@ -170,7 +170,7 @@ nuwa work --db shanhaijing.db \
   --provider anthropic --pr --loop --interval 30
 ```
 
-- `--runner-id`：控制台可见的 runner 身份，默认 `hostname:repo`；仅保留字母数字与 `.:_-`，超长截断
+- `--runner-id`：控制台可见的 runner 身份，默认 `hostname:repo`；仅保留字母数字与 `.:_-`，超长截断。**同一 id 只允许一个活进程**（ADR-018）：第二个进程会等待旧租约过期（≤60s），仍被持有则启动失败；要并行跑多个 runner 请给每个进程不同的 `--runner-id`。被接管时进程以 0 退出（systemd 不再重启），由新持有者继续。
 - `--service-unit`：记录 systemd 单元名（默认 `nuwa-work`）。控制台的「重启 unit」动作会消费它（缺失/非法时该动作禁用或 422）
 - `--daily-token-limit` / `--monthly-token-limit`：每仓库每日 / 滚动 30 天 token 上限（默认 5M / 50M；失败尝试也计入）
 - 密钥隔离：work 启动时把 `NUWA_GITHUB_TOKEN`/`GITHUB_TOKEN`/`ZAI_API_KEY`/`ANTHROPIC_API_KEY` 读入内存并从 env 移除；bash/验证子进程只收到白名单（PATH/HOME/GOCACHE 等）。非敏感的额外变量用 `NUWA_AGENT_ENV_ALLOW` 逗号追加。ssh-agent / credential store 仍需部署侧隔离（建议 runner 专用用户）。

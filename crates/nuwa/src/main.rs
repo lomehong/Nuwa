@@ -462,35 +462,70 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         daily_token_limit,
         monthly_token_limit,
     );
-    let now = now_ms();
-    let _ = store.mark_interrupted(&runner_id, now);
-    if let Err(error) = crate::serve::prune_retention(&store, now, event_retention_days) {
-        eprintln!("warning    : retention prune failed: {error}");
-    }
-    if let Err(e) = store.upsert_runner(&shanhaijing::RunnerUpsert {
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let make_registration = |at: i64| shanhaijing::RunnerUpsert {
         id: runner_id.clone(),
         repo: repo_config.repo.clone(),
         host: std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| "host".to_string()),
         pid: Some(std::process::id() as i64),
-        started_at: now,
-        heartbeat_at: now,
+        started_at: at,
+        heartbeat_at: at,
         status: "starting".into(),
-        provider: Some(provider_name),
-        model: Some(model_name),
+        provider: Some(provider_name.clone()),
+        model: Some(model_name.clone()),
         daily_pr_limit: Some(daily_pr_limit as i64),
         repo_path: Some(repo_dir.display().to_string()),
-        service_unit: Some(service_unit),
+        service_unit: Some(service_unit.clone()),
         config_json: config_json.clone(),
-    }) {
-        eprintln!("runner register failed (telemetry only): {e}");
+    };
+    // 同 id 双活不是无害的：每个进程启动时都会按 id 复活对方的在途单，两个
+    // runner 会修同一张单、推同一分支。先等死进程的租约过期，仍被活进程持有
+    // 就拒绝启动，而不是和它抢。
+    let lease_wait = std::time::Duration::from_millis(RUNNER_LEASE_TTL_MS as u64 + 10_000);
+    let lease_deadline = std::time::Instant::now() + lease_wait;
+    let mut lease_wait_announced = false;
+    loop {
+        let at = now_ms();
+        match store.try_acquire_runner_lease(
+            &make_registration(at),
+            &instance_id,
+            at,
+            RUNNER_LEASE_TTL_MS,
+        ) {
+            Ok(true) => break,
+            Ok(false) if std::time::Instant::now() < lease_deadline => {
+                if !lease_wait_announced {
+                    eprintln!(
+                        "lease       : runner id `{runner_id}` is held by another process; \
+                         waiting up to {}s for its lease to expire",
+                        lease_wait.as_secs()
+                    );
+                    lease_wait_announced = true;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Ok(false) => bail!(
+                "runner id `{runner_id}` is already active — stop the other process \
+                 or pass a distinct --runner-id"
+            ),
+            Err(e) => return Err(e).context("acquire runner lease"),
+        }
+    }
+    #[cfg(unix)]
+    spawn_sigterm_lease_release(Arc::clone(&store), runner_id.clone(), instance_id.clone());
+    let now = now_ms();
+    let _ = store.mark_interrupted(&runner_id, now);
+    if let Err(error) = crate::serve::prune_retention(&store, now, event_retention_days) {
+        eprintln!("warning    : retention prune failed: {error}");
     }
     let live = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
     let heartbeat_interval = std::time::Duration::from_secs(interval_secs.clamp(5, 15));
     let heartbeat = spawn_heartbeat(
         Arc::clone(&store),
         runner_id.clone(),
+        instance_id.clone(),
         heartbeat_interval,
         Arc::clone(&live),
         config_json,
@@ -619,6 +654,9 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     }
     .await;
     heartbeat.abort();
+    if let Err(e) = store.release_runner_lease(&runner_id, &instance_id) {
+        eprintln!("lease       : release failed: {e}");
+    }
     result
 }
 
@@ -886,9 +924,34 @@ async fn live_update(
     state.progress_at_ms = now_ms();
 }
 
+/// Same-id runner lease lifetime. The heartbeat renews it every 5–15s; a
+/// crashed process stops renewing and its id becomes claimable after this long.
+const RUNNER_LEASE_TTL_MS: i64 = 60_000;
+
+/// systemd stops the unit with SIGTERM. Release the lease before exiting so a
+/// restart does not wait out the full TTL; abrupt crashes still fall back to it.
+#[cfg(unix)]
+fn spawn_sigterm_lease_release(
+    store: Arc<shanhaijing::Store>,
+    runner_id: String,
+    instance_id: String,
+) {
+    tokio::spawn(async move {
+        let Ok(mut term) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            return;
+        };
+        term.recv().await;
+        let _ = store.release_runner_lease(&runner_id, &instance_id);
+        std::process::exit(0);
+    });
+}
+
 fn spawn_heartbeat(
     store: Arc<shanhaijing::Store>,
     runner_id: String,
+    instance_id: String,
     interval: std::time::Duration,
     live: SharedLive,
     config_json: String,
@@ -899,6 +962,7 @@ fn spawn_heartbeat(
             let (status, fp, phase, error, progress_at) = live_snapshot(&live).await;
             let store = Arc::clone(&store);
             let runner_id = runner_id.clone();
+            let instance_id = instance_id.clone();
             let config_json = config_json.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let result = store.heartbeat_runner(
@@ -914,6 +978,25 @@ fn spawn_heartbeat(
                 );
                 if result.is_ok() {
                     let _ = store.set_runner_progress(&runner_id, progress_at);
+                    // Losing the lease means another process took over this id.
+                    // Exit cleanly (not on-failure) so systemd does not start a
+                    // third contender: the new holder is the one that should run.
+                    match store.renew_runner_lease(
+                        &runner_id,
+                        &instance_id,
+                        now_ms(),
+                        RUNNER_LEASE_TTL_MS,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!(
+                                "lease       : runner id `{runner_id}` was taken over by \
+                                 another process — stopping this runner"
+                            );
+                            std::process::exit(0);
+                        }
+                        Err(e) => eprintln!("lease renew failed: {e}"),
+                    }
                 }
                 // v0.2.x 回滚保护：旧控制台仍读全局 heartbeat 表。
                 let _ = store.heartbeat(now_ms());

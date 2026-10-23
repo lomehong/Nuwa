@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 /// 每仓库保留的修复记忆条数。
@@ -640,6 +640,41 @@ const RUN_COLUMNS: &str =
         model, root_cause, change_stat, branch, commit_sha, pr_url, pr_opened_at,
         verification_ok, verification_detail, session_dir, error, compactions,
         context_window, messages";
+
+/// Runner telemetry upsert shared by the plain path and the lease acquisition,
+/// so both keep the same column list. Lease columns are never written here.
+fn upsert_runner_on(conn: &Connection, r: &RunnerUpsert) -> ShanResult<()> {
+    conn.execute(
+        "INSERT INTO runners(id, repo, host, pid, started_at, heartbeat_at, status,
+                             current_fingerprint, phase, provider, model, daily_pr_limit,
+                             repo_path, service_unit, config_json, last_error, progress_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,?9,?10,?11,?12,?13,NULL,?5)
+         ON CONFLICT(id) DO UPDATE SET
+            repo=excluded.repo, host=excluded.host, pid=excluded.pid,
+            started_at=excluded.started_at, heartbeat_at=excluded.heartbeat_at,
+            status=excluded.status, current_fingerprint=NULL, phase=NULL,
+            provider=excluded.provider, model=excluded.model,
+            daily_pr_limit=excluded.daily_pr_limit, repo_path=excluded.repo_path,
+            service_unit=excluded.service_unit, config_json=excluded.config_json,
+            last_error=NULL, progress_at=excluded.progress_at",
+        rusqlite::params![
+            r.id,
+            r.repo,
+            r.host,
+            r.pid,
+            r.started_at,
+            r.heartbeat_at,
+            r.status,
+            r.provider,
+            r.model,
+            r.daily_pr_limit,
+            r.repo_path,
+            r.service_unit,
+            r.config_json,
+        ],
+    )?;
+    Ok(())
+}
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> ShanResult<Self> {
@@ -2249,34 +2284,69 @@ impl Store {
 
     pub fn upsert_runner(&self, r: &RunnerUpsert) -> ShanResult<()> {
         let conn = self.lock();
+        upsert_runner_on(&conn, r)
+    }
+
+    /// Take the single-process lease for `r.id` and register the runner in one
+    /// transaction. False means a live process still holds the lease; a bare
+    /// [`upsert_runner`] would clobber that process's identity, so contenders
+    /// must not write anything before winning.
+    pub fn try_acquire_runner_lease(
+        &self,
+        r: &RunnerUpsert,
+        instance_id: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> ShanResult<bool> {
+        let mut conn = self.lock();
+        // IMMEDIATE takes the write lock before the lease check: two processes
+        // starting together must serialize here, not both read "free" and race
+        // the upgrade.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let free: Option<bool> = tx
+            .query_row(
+                "SELECT (lease_until <= ?2 OR instance_id = ?3) FROM runners WHERE id = ?1",
+                rusqlite::params![r.id, now_ms, instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if free == Some(false) {
+            return Ok(false);
+        }
+        upsert_runner_on(&tx, r)?;
+        tx.execute(
+            "UPDATE runners SET instance_id = ?2, lease_until = ?3 WHERE id = ?1",
+            rusqlite::params![r.id, instance_id, now_ms.saturating_add(ttl_ms)],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Extend the lease while this process is alive. False means another
+    /// process took over (or the runner row is gone): stop working now — a
+    /// second writer would race the same issue and branch.
+    pub fn renew_runner_lease(
+        &self,
+        runner_id: &str,
+        instance_id: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> ShanResult<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE runners SET lease_until = ?3 WHERE id = ?1 AND instance_id = ?2",
+            rusqlite::params![runner_id, instance_id, now_ms.saturating_add(ttl_ms)],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Drop the lease on a clean shutdown so a restart need not wait for the TTL.
+    pub fn release_runner_lease(&self, runner_id: &str, instance_id: &str) -> ShanResult<()> {
+        let conn = self.lock();
         conn.execute(
-            "INSERT INTO runners(id, repo, host, pid, started_at, heartbeat_at, status,
-                                 current_fingerprint, phase, provider, model, daily_pr_limit,
-                                 repo_path, service_unit, config_json, last_error, progress_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,?9,?10,?11,?12,?13,NULL,?5)
-             ON CONFLICT(id) DO UPDATE SET
-                repo=excluded.repo, host=excluded.host, pid=excluded.pid,
-                started_at=excluded.started_at, heartbeat_at=excluded.heartbeat_at,
-                status=excluded.status, current_fingerprint=NULL, phase=NULL,
-                provider=excluded.provider, model=excluded.model,
-                daily_pr_limit=excluded.daily_pr_limit, repo_path=excluded.repo_path,
-                service_unit=excluded.service_unit, config_json=excluded.config_json,
-                last_error=NULL, progress_at=excluded.progress_at",
-            rusqlite::params![
-                r.id,
-                r.repo,
-                r.host,
-                r.pid,
-                r.started_at,
-                r.heartbeat_at,
-                r.status,
-                r.provider,
-                r.model,
-                r.daily_pr_limit,
-                r.repo_path,
-                r.service_unit,
-                r.config_json,
-            ],
+            "UPDATE runners SET lease_until = 0, instance_id = NULL
+             WHERE id = ?1 AND instance_id = ?2",
+            rusqlite::params![runner_id, instance_id],
         )?;
         Ok(())
     }
@@ -5417,6 +5487,75 @@ mod runner_tests {
                 }
             )
             .is_err());
+    }
+
+    fn registration(pid: i64, at: i64) -> RunnerUpsert {
+        RunnerUpsert {
+            id: "host:repo".into(),
+            repo: "example.com/r".into(),
+            host: "host".into(),
+            pid: Some(pid),
+            started_at: at,
+            heartbeat_at: at,
+            status: "starting".into(),
+            provider: Some("zai".into()),
+            model: None,
+            daily_pr_limit: Some(5),
+            repo_path: Some("/opt/nuwa/repo".into()),
+            service_unit: Some("nuwa-work".into()),
+            config_json: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn runner_lease_is_exclusive_renewable_and_recoverable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let at = 1_000;
+        let ttl = 60;
+
+        assert!(store
+            .try_acquire_runner_lease(&registration(1, at), "a", at, ttl)
+            .expect("acquire a"));
+
+        // A contender must neither take the lease nor overwrite the live row.
+        assert!(!store
+            .try_acquire_runner_lease(&registration(2, at + 10), "b", at + 10, ttl)
+            .expect("contend b"));
+        let runner = store.list_runners().expect("list").pop().expect("runner");
+        assert_eq!(
+            runner.pid,
+            Some(1),
+            "a losing contender must not clobber the holder's row"
+        );
+
+        // Renewal extends the deadline; a non-holder cannot renew.
+        assert!(store
+            .renew_runner_lease("host:repo", "a", at + 50, ttl)
+            .expect("renew a"));
+        assert!(!store
+            .renew_runner_lease("host:repo", "b", at + 50, ttl)
+            .expect("renew b"));
+        assert!(!store
+            .try_acquire_runner_lease(&registration(2, at + 60), "b", at + 60, ttl)
+            .expect("still held"));
+
+        // A crashed holder stops renewing; after the TTL another process takes over.
+        let expired = at + 50 + ttl + 1;
+        assert!(store
+            .try_acquire_runner_lease(&registration(2, expired), "b", expired, ttl)
+            .expect("takeover"));
+        assert!(!store
+            .renew_runner_lease("host:repo", "a", expired + 1, ttl)
+            .expect("stale holder"));
+
+        // A clean shutdown releases the lease immediately.
+        store
+            .release_runner_lease("host:repo", "b")
+            .expect("release");
+        assert!(store
+            .try_acquire_runner_lease(&registration(3, expired + 2), "c", expired + 2, ttl)
+            .expect("after release"));
     }
 }
 
