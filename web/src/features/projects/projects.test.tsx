@@ -325,6 +325,8 @@ describe("项目登记编辑", () => {
             reproduce_check: ".nuwa/repro.sh",
             forbidden_paths_count: 3,
             max_attempts: 3,
+            draft_first_n: 0,
+            skills: [],
           },
         }),
       ]),

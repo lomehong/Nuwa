@@ -268,6 +268,7 @@ export function makeRunner(overrides: Partial<RunnerDto> = {}): RunnerDto {
     pid: 1234,
     started_at_ms: Date.now() - 3_600_000,
     heartbeat_at_ms: Date.now(),
+    progress_at_ms: Date.now(),
     status: "idle",
     offline: false,
     current_fingerprint: null,
@@ -286,6 +287,10 @@ export function makeRunner(overrides: Partial<RunnerDto> = {}): RunnerDto {
       max_tokens: 1_500_000,
       failing_check: "go test ./...",
       forbidden_paths_count: 3,
+      reproduce_check: null,
+      max_attempts: 3,
+      draft_first_n: 0,
+      skills: [],
     },
     ...overrides,
   };
