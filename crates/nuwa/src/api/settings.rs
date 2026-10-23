@@ -51,6 +51,12 @@ const RUNTIME_FIELDS: &[(&str, &str)] = &[
 #[cfg_attr(feature = "ts-export", ts(export))]
 pub struct SettingsResponse {
     pub schema: Vec<SettingDto>,
+    #[cfg_attr(
+        feature = "ts-export",
+        ts(
+            type = "Record<string, { set: boolean; last4: string | null; updated_at_ms: number } | { value: string; source: string }>"
+        )
+    )]
     pub values: BTreeMap<String, SettingValueDto>,
     pub env_path: String,
     pub env_exists: bool,
@@ -115,10 +121,11 @@ impl From<&SettingSpec> for SettingDto {
 
 /// Non-secret keys echo their value; secrets only the presence, last four
 /// characters and the newest `config_changed` timestamp.
+///
+/// ts-rs 不支持 untagged enum，所以这里不 derive；引用它的字段用
+/// `#[ts(type = "...")]` 显式给出联合类型。
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(export))]
 pub enum SettingValueDto {
     Secret {
         set: bool,
