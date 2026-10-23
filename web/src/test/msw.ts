@@ -96,7 +96,12 @@ export function makeTrends(overrides: Partial<TrendsResponse> = {}): TrendsRespo
       merged: 0,
       rejected: 0,
       tokens: 0,
+      ci_green: 0,
+      ci_red: 0,
       median_time_to_pr_secs: null,
+      false_positive_rate: null,
+      review_latency_p50_secs: null,
+      ci_red_rate: null,
     },
     ...overrides,
   };
