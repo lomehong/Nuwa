@@ -119,6 +119,7 @@ curl -sS -X POST "$NUWA_INGEST_URL/ingest" \
 - `repo` 必须与采集信封里的 repo 一致；runner 只领自己 repo 的单（多 runner 共享库时也不会互抢）
 - `failing_check.command` 是"当前失败、修复后必须过"的回归门；`timeout_secs` 默认 600
 - `reproduce_check` 可选：交付门要求它在 **base 上失败、分支上通过**。没有配置时，先跑 `failing_check`：base 红则直接作为复现；base 绿则要求分支提交自包含的 `.nuwa/repro.sh`（Windows 为 `.nuwa/repro.cmd`），否则 `escalated` 不开 PR
+- **验证模式在修复开始前探测**：runner 先确认 base 上 `failing_check` 是红还是绿，prompt 随之切换。base 绿时 prompt 会明确要求写 `.nuwa/repro.sh`（旧行为无条件告诉模型"check 当前失败"，base 绿的单必然在交付门硬失败）。配了 `reproduce_check` 的仓库跳过探测
 - `forbidden_paths` 在工具调用前做子串否决（拦截诚实错误），并在交付面对 `git diff --name-status` 做 glob 终检（权威；`*.pem` 现在真的能匹配嵌套文件）
 - `max_attempts`：problem-level 失败累计到阈值后自动 `ignored`，避免自动重试循环
 - `draft_first_n`：该仓前 N 个 PR 以 draft 打开；0 保持 ADR-003 的非 draft 默认
@@ -173,7 +174,7 @@ nuwa work --db shanhaijing.db \
 - 密钥隔离：work 启动时把 `NUWA_GITHUB_TOKEN`/`GITHUB_TOKEN`/`ZAI_API_KEY`/`ANTHROPIC_API_KEY` 读入内存并从 env 移除；bash/验证子进程只收到白名单（PATH/HOME/GOCACHE 等）。非敏感的额外变量用 `NUWA_AGENT_ENV_ALLOW` 逗号追加。ssh-agent / credential store 仍需部署侧隔离（建议 runner 专用用户）。
 - 指令文件：tracked 配置以 `origin/<base>:nuwa.repo.json` 为权威；untracked 配置首次启动复制到 `<sessions>/_trusted/`。每轮领单前校验并恢复被改写的文件，`nuwa.repo.json` 本身也在隐式禁改名单。合并到 main 的新配置会在下一轮恢复文件，但 runner 进程内的配置对象要重启后再生效。
 - pr_open 自动对账：serve 每 `NUWA_SYNC_INTERVAL` 秒（默认 600）对账一次，与手动 `nuwa sync` 共用锁。
-- 通知（可选）：`NUWA_WEBHOOK_URL`、`NUWA_WEBHOOK_SECRET`、`NUWA_WEBHOOK_EVENTS`；事件 JSON 带 `X-Nuwa-Signature: sha256=<HMAC>`，默认订阅 `escalated,ignored,provider_stand_down,heartbeat_stale,ci_red,sync_error,pr_opened`。
+- 通知（可选）：`NUWA_WEBHOOK_URL`、`NUWA_WEBHOOK_SECRET`、`NUWA_WEBHOOK_EVENTS`；事件 JSON 带 `id`（每个事件唯一）、`ts_ms` 与 `X-Nuwa-Signature: sha256=<HMAC>`（签名覆盖整个 body，含 `id`/`ts_ms`）。默认订阅 `escalated,ignored,provider_stand_down,heartbeat_stale,ci_red,sync_error,pr_opened,runner_error`。进程退出前会等待队列清空（最多 10s），`escalated` 不再随退出丢失；**接收方必须校验 `ts_ms` 新鲜度并按 `id` 去重**，否则捕获的 body 可被重放。
 - 会话保留：work 启动及运行中定期清理超过 365 天无新 run 的 `sessions/<fp>` 目录；`_trusted` 永不清理。
 
 ## 5 · 第一个真实系统接入（mindloop，进行中）
@@ -188,6 +189,8 @@ nuwa work --db shanhaijing.db \
 ## 4 · 日常运维命令
 
 **Web 控制台（v3 SPA，0.2.0 起是唯一控制台）**：`http://<server>:7321/`，在 `/login` 用 `NUWA_UI_TOKEN` 换取 HttpOnly 会话（**不再使用 Basic 头**）。`/` 就是 SPA 控制台；`/ui*` 308 永久重定向到 `/`，`/issue/{fp}` 重定向到 `/issues/{fp}`，`/settings` 直接由 SPA 提供；`/ingest` 与 `/health` 的路径和鉴权不变。SPA 提供总览、问题单列表/详情（含会话转录）、运行器、活动与设置。
+
+> **控制台令牌与上报令牌完全分离**：`NUWA_UI_TOKEN` 缺失时控制台进入本地模式，且**非回环监听会拒绝启动**。`NUWA_INGEST_TOKEN` 部署在每个被采集的服务上（泄露后果只是垃圾信号），绝不能当控制台凭据用——控制台能读设置页里的 LLM key。升级后只设了上报令牌的公网部署会启动失败，需补 `NUWA_UI_TOKEN`。`/api/v1/auth/logout` 会服务端撤销会话（复制走的 cookie 立即失效）；撤销表在内存中，重启清空——要强制所有设备下线就轮换 `NUWA_UI_TOKEN`。
 
 - **问题单动作**：escalated/rejected/ignored 可 `重新打开`（回到 `new`、清冷却并重置 attempts）；new/escalated/rejected 可 `忽略`（填写原因；ignored 后同指纹报告只计数，不再自动修复）；卡单（`triggered`/`fixing` 且超过卡单窗口）可 `重排`。动作出现在详情头部、列表与总览待处理队列；成功 toast、失败逐条显示服务端错误。CLI 对应 `nuwa reopen --reason` / `nuwa ignore --reason`，理由会写入事件并在下一轮 prompt 中作为 OWNER NOTE。
 - **对账与重启**：`GitHub 对账` 汇总 checked/merged/rejected/still_open，并逐条展示 `errors[]`；runner `重启 unit` 先确认影响（显示当前修复指纹，提示同一 unit 承载的多个 runner 会一起重启）。409 表示已有重启在排程，422 指出 `service_unit` 缺失/非法，501 直接给出手动 `systemctl restart <unit>` 命令。
