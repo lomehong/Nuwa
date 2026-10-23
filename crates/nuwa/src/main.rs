@@ -1096,13 +1096,16 @@ async fn cleanup_terminal_branches(
         {
             Ok(out) if out.success => {
                 for line in out.stdout.lines() {
-                    if let Some((_, refname)) = line.split_once('\t') {
-                        if let Some(short) = refname.strip_prefix("refs/heads/") {
-                            if !short.is_empty() && !branches.iter().any(|b| b == short) {
-                                branches.push(short.to_string());
-                            }
-                        }
+                    let Some((_, refname)) = line.split_once('\t') else {
+                        continue;
+                    };
+                    let Some(short) = refname.strip_prefix("refs/heads/") else {
+                        continue;
+                    };
+                    if short.is_empty() || branches.iter().any(|b| b == short) {
+                        continue;
                     }
+                    branches.push(short.to_string());
                 }
             }
             Ok(out) if out.timed_out => {

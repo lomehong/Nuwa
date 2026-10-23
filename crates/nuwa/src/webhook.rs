@@ -60,13 +60,17 @@ impl WebhookEvent {
 }
 
 #[derive(Clone)]
+/// The delivery task, awaited on shutdown. Aliased because the nested generic
+/// trips `clippy::type_complexity` when written inline.
+type DeliveryTask = std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
+
 #[derive(Clone)]
 pub struct WebhookHandle {
     tx: Option<mpsc::UnboundedSender<WebhookEvent>>,
     /// Tells the delivery task to drain the queue and stop.
     stop: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// The delivery task, awaited on shutdown.
-    task: Option<std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>>,
+    task: Option<DeliveryTask>,
 }
 
 impl WebhookHandle {
