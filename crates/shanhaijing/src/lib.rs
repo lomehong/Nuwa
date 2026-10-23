@@ -198,6 +198,8 @@ pub struct IssueSnapshot {
 
 /// Full issue row — the `nuwa status` / ops view.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct IssueRow {
     pub fingerprint: String,
     pub title: String,
@@ -221,6 +223,8 @@ pub struct IssueRow {
 
 /// One lifecycle event — console activity feed row.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct EventRow {
     pub fingerprint: String,
     pub ts: i64,
@@ -233,6 +237,8 @@ pub struct EventRow {
 /// 一条已验证的修复记忆。来源（提交/PR/时间）必须随记忆一起保存：
 /// 没有来源的"经验"无法被复核，也就不能进入下一次修复的上下文。
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RepairMemoryEntry {
     pub repo: String,
     pub fingerprint: String,
@@ -257,6 +263,8 @@ pub struct RepairMemoryRow {
 
 /// 控制台记忆列表行：内容 + 来源 + 所属问题单 + 是否停用。
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RepairMemoryView {
     pub fingerprint: String,
     /// 问题单标题；问题单已被清理时为空。
@@ -298,6 +306,8 @@ pub struct BenchmarkFinish {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct BenchmarkRunRow {
     pub id: String,
     pub started_at: i64,
@@ -337,6 +347,8 @@ pub struct BenchmarkResultInput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct BenchmarkResultRow {
     pub run_id: String,
     pub scenario: String,
@@ -410,6 +422,8 @@ pub struct RunnerHeartbeat {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RunnerRow {
     pub id: String,
     pub repo: String,
@@ -435,6 +449,8 @@ pub struct RunnerRow {
 /// Repository content (`failing_check`, `forbidden_paths`, `notes`) stays in
 /// the target repo's `nuwa.repo.json` and is deliberately not stored here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RepoRow {
     pub repo: String,
     pub name: String,
@@ -487,6 +503,8 @@ pub struct RunFinish {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct RunRow {
     pub id: String,
     pub harness_run_id: Option<String>,

@@ -51,6 +51,8 @@ pub struct ScenarioWrite {
 
 /// 控制台场景目录的只读元数据（不暴露脚本正文）。
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
 pub struct ScenarioMeta {
     pub name: String,
     pub title: String,
