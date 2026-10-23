@@ -2615,25 +2615,37 @@ mod tests {
         );
     }
 
-    /// 目标仓的测试输出（"connection refused"）不得被当成 provider 故障：
-    /// provider 故障由 repair runner 按来源打标，文本猜测只在这一层做。
+    /// 目标仓的测试输出（"connection refused"）不得被当成 provider 故障。
+    /// 交付门的失败是普通错误，靠 `failing_check` 前缀先归为 issue；带
+    /// `ProviderFailure` 标记的错误则无论文本都按 provider 处理。
     #[test]
     fn target_repo_output_is_not_mistaken_for_a_provider_outage() {
-        let error = anyhow::Error::new(repair::ProviderFailure(
-            "connection refused: dial tcp 127.0.0.1:5432".to_string(),
-        ))
-        .context("verification gate failed: go test ./... connection refused");
+        let verification = anyhow::anyhow!(
+            "failing_check does not pass on the branch:\n\
+             go test ./...: dial tcp 127.0.0.1:5432: connect: connection refused"
+        );
         assert_eq!(
-            classify_failure(&error),
+            classify_failure(&verification),
             FailureClass::Issue,
             "a failing check in the target repo is the issue's fault"
         );
 
+        // A provider-tagged failure stays a provider failure whatever its
+        // text looks like — that is the point of tagging it at the source.
         let provider = anyhow::Error::new(repair::ProviderFailure(
-            "429 rate limit exceeded".to_string(),
+            "connection refused: dial tcp 127.0.0.1:5432".to_string(),
         ))
         .context("repair run");
         assert_eq!(classify_failure(&provider), FailureClass::ProviderTransient);
+
+        let throttled = anyhow::Error::new(repair::ProviderFailure(
+            "429 rate limit exceeded".to_string(),
+        ))
+        .context("repair run");
+        assert_eq!(
+            classify_failure(&throttled),
+            FailureClass::ProviderTransient
+        );
 
         let auth = anyhow::Error::new(repair::ProviderFailure(
             "401 unauthorized: invalid x-api-key".to_string(),
