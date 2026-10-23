@@ -5,6 +5,7 @@ import type { EventsResponse } from "../features/events/types";
 import type {
   OverviewResponse,
   TrendsResponse,
+  TrendTotals,
 } from "../features/overview/types";
 import type { IssueDetailResponse, RunDto } from "../features/issue-detail/types";
 import type { IssueListItem, IssueListResponse } from "../features/issues/types";
@@ -85,7 +86,11 @@ export function mockOverview(overrides: Partial<OverviewResponse> = {}) {
   return http.get("/api/v1/overview", () => HttpResponse.json(body));
 }
 
-export function makeTrends(overrides: Partial<TrendsResponse> = {}): TrendsResponse {
+type TrendsOverrides = Partial<Omit<TrendsResponse, "totals">> & {
+  totals?: Partial<TrendTotals>;
+};
+
+export function makeTrends(overrides: TrendsOverrides = {}): TrendsResponse {
   const base: TrendsResponse = {
     range: "14d",
     buckets: [],
@@ -114,7 +119,7 @@ export function makeTrends(overrides: Partial<TrendsResponse> = {}): TrendsRespo
   };
 }
 
-export function mockTrends(overrides: Partial<TrendsResponse> = {}) {
+export function mockTrends(overrides: TrendsOverrides = {}) {
   const body = makeTrends(overrides);
   return http.get("/api/v1/metrics/trends", () => HttpResponse.json(body));
 }
