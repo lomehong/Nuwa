@@ -1,24 +1,21 @@
 /**
  * Response types for `GET /api/v1/issues/{fp}` (docs/09 §9.2, §10.5).
  *
- * `issue` is the same row shape as the list endpoint (plus the per-owner
- * `stuck` flag). `runs` is capped server-side at the newest 10; `timeline`
- * at the newest 200. The optional fields below are forward-compatible
- * additions: the current server sends `similar.items` with just
- * fingerprint/state/last_seen_ms and timeline rows without `count` or
- * `fingerprint`, but the UI already renders them when present (aggregated
- * history, system events) instead of dropping the information.
+ * Required fields come from the Rust DTOs via ts-rs
+ * (`web/src/lib/api-types/`); the optional extras the UI already renders when
+ * present (aggregated history, system events) are layered on top. `issue` is
+ * the same narrowed row shape as the list endpoint.
  */
 
+import type { IssueDetailResponse as ApiIssueDetailResponse } from "../../lib/api-types/IssueDetailResponse";
+import type { RunDto } from "../../lib/api-types/RunDto";
+import type { SimilarItem as ApiSimilarItem } from "../../lib/api-types/SimilarItem";
+import type { SimilarIssues as ApiSimilarIssues } from "../../lib/api-types/SimilarIssues";
+import type { TimelineItem as ApiTimelineItem } from "../../lib/api-types/TimelineItem";
 import type { IssueListItem } from "../issues/types";
 
 /** One lifecycle event on the issue timeline (newest first). */
-export interface TimelineItem {
-  kind: string;
-  detail: string;
-  ts_ms: number;
-  actor: string | null;
-  repo: string;
+export type TimelineItem = ApiTimelineItem & {
   /** Aggregated historical reports ("共 N 次"); absent on raw events. */
   count?: number;
   /**
@@ -26,56 +23,24 @@ export interface TimelineItem {
    * (`__config__`, `__system__`, `__runner__:<id>`) never link to an issue.
    */
   fingerprint?: string;
-}
+};
 
-/** One repair run (the newest 10 are returned). */
-export interface RunDto {
-  id: string;
-  started_at_ms: number;
-  finished_at_ms: number | null;
-  phase: string;
-  outcome: string | null;
-  ci_verdict: string | null;
-  turns: number;
-  tokens_uncached: number;
-  tokens_cached: number;
-  /** 上下文预算：自动压缩次数、模型窗口、run 结束时的消息数。 */
-  compactions: number;
-  context_window: number;
-  messages: number;
-  provider: string | null;
-  model: string | null;
-  root_cause: string | null;
-  change_stat: string | null;
-  branch: string | null;
-  commit_sha: string | null;
-  pr_url: string | null;
-  pr_opened_at_ms: number | null;
-  verification_ok: boolean | null;
-  verification_detail: string | null;
-  error: string | null;
-}
+export type { RunDto };
 
-/** Same-title neighbour. Extra fields are optional until the server adds them. */
-export interface SimilarItem {
-  fingerprint: string;
-  state: string;
-  last_seen_ms: number;
+/** Same-title neighbour. Extra fields arrive when the server adds them. */
+export type SimilarItem = ApiSimilarItem & {
   title?: string;
   repo?: string;
   severity?: string;
   occurrences?: number;
-}
+};
 
-export interface SimilarIssues {
-  count: number;
+export type SimilarIssues = Omit<ApiSimilarIssues, "items"> & {
   items: SimilarItem[];
-}
+};
 
-export interface IssueDetailResponse {
+export type IssueDetailResponse = Omit<ApiIssueDetailResponse, "issue" | "timeline" | "similar"> & {
   issue: IssueListItem;
-  stack_sample: string;
   timeline: TimelineItem[];
-  runs: RunDto[];
   similar: SimilarIssues;
-}
+};
