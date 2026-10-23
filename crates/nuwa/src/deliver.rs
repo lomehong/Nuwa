@@ -389,6 +389,13 @@ async fn deliver_inner(
     let mut slug_out = None;
     let mut pr_number = None;
     if push {
+        // A PR needs the token. Check it before pushing: a missing token
+        // discovered after the push would leave an orphan branch behind.
+        if create_pr {
+            secrets.github_token.as_deref().context(
+                "NUWA_GITHUB_TOKEN (or GITHUB_TOKEN) not set — PR creation needs a fine-grained token with pulls:write",
+            )?;
+        }
         push_with_retry(repo, &branch).await?;
 
         // 基线在验证之后移动时，PR 会落后于 base（GitHub 也可能因此不开
@@ -513,7 +520,7 @@ async fn deliver_inner(
             let token = secrets.github_token.as_deref().context(
                 "NUWA_GITHUB_TOKEN (or GITHUB_TOKEN) not set — PR creation needs a fine-grained token with pulls:write",
             )?;
-            let (url, number) = create_pr_via_api(
+            let (url, number) = match create_pr_via_api(
                 token,
                 &slug,
                 &base,
@@ -522,7 +529,24 @@ async fn deliver_inner(
                 &body,
                 draft,
             )
-            .await?;
+            .await
+            {
+                Ok(created) => created,
+                Err(e) => {
+                    // The branch is already on the remote but no PR exists:
+                    // an orphan. The next attempt for this fingerprint would
+                    // push on top of it and be rejected as non-fast-forward,
+                    // and the cleanup paths only look at local refs — the
+                    // issue would escalate on every retry. Remove it here.
+                    let _ = git_ops::delete_remote_branch(
+                        repo,
+                        &branch,
+                        std::time::Duration::from_secs(60),
+                    )
+                    .await;
+                    return Err(e.context(format!("PR creation failed for branch {branch}")));
+                }
+            };
             pr_url = Some(url);
             slug_out = Some(slug);
             pr_number = Some(number);
@@ -626,6 +650,7 @@ mod tests {
             },
             reproduce_check: None,
             forbidden_paths: Vec::new(),
+            verification_mode: Default::default(),
         }
     }
 

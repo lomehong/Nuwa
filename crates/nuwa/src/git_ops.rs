@@ -251,6 +251,29 @@ pub async fn delete_remote_branch(
     );
 }
 
+/// Does the remote already carry this branch?
+///
+/// A push that succeeded but whose PR creation failed leaves the branch
+/// behind. The next delivery for the same fingerprint would push on top of
+/// it and be rejected as non-fast-forward, so the orphan has to be found
+/// before the repair starts.
+pub async fn remote_branch_exists(
+    repo: &Path,
+    branch: &str,
+    timeout: Duration,
+) -> anyhow::Result<bool> {
+    let out = git_with_timeout(repo, &["ls-remote", "--heads", "origin", branch], timeout).await?;
+    if out.timed_out {
+        bail!("git ls-remote {branch} timed out after {:?}", timeout);
+    }
+    if !out.success {
+        // Unreachable remote or no `origin`: treat as "unknown" and let the
+        // push itself report the real problem.
+        return Ok(false);
+    }
+    Ok(!out.stdout.trim().is_empty())
+}
+
 pub async fn fetch_base(
     repo: &Path,
     base: &str,
