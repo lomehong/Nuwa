@@ -1,30 +1,16 @@
-/** `GET /api/v1/projects/{repo}/skills` response. */
+/** `GET /api/v1/projects/{repo}/skills` response (generated from the Rust DTOs). */
+
+import type { ProjectSkillsResponse as ApiProjectSkillsResponse } from "../../lib/api-types/ProjectSkillsResponse";
+import type { SkillDto as ApiSkillDto } from "../../lib/api-types/SkillDto";
 
 export type SkillSource = "builtin" | "repo";
 export type SkillSelectionMode = "auto" | "pinned";
 
-export interface SkillDto {
-  name: string;
-  version: number;
-  description: string;
-  languages: string[];
-  matches: string[];
-  body: string;
-  body_truncated: boolean;
+export type SkillDto = Omit<ApiSkillDto, "source"> & {
   source: SkillSource;
-  /** `builtin:<file>` or the repo-relative `.nuwa/skills/<file>` path. */
-  origin: string;
-  /** False when a repo skill shadows this built-in definition. */
-  effective: boolean;
-  overrides_builtin: boolean;
-  allowlisted: boolean;
-}
+};
 
-export interface ProjectSkillsResponse {
-  repo: string;
+export type ProjectSkillsResponse = Omit<ApiProjectSkillsResponse, "skills" | "selection_mode"> & {
   selection_mode: SkillSelectionMode;
-  allowlist: string[];
-  repo_path: string | null;
   skills: SkillDto[];
-  warnings: string[];
-}
+};
