@@ -176,9 +176,7 @@ fn go_func_symbol(line: &str) -> &str {
 }
 
 fn is_go_noise(func: &str) -> bool {
-    func.starts_with("runtime.")
-        || func.starts_with("testing.")
-        || func.starts_with("reflect.")
+    func.starts_with("runtime.") || func.starts_with("testing.") || func.starts_with("reflect.")
 }
 
 /// Java exception chain: first `…Exception/…Error:` line + `at` frames,
@@ -273,10 +271,7 @@ fn parse_rust(stack: &str) -> (String, Vec<String>) {
 
 fn parse_generic(stack: &str) -> (String, Vec<String>) {
     let first = stack.lines().map(str::trim).find(|l| !l.is_empty());
-    (
-        first.map(normalize_text).unwrap_or_default(),
-        Vec::new(),
-    )
+    (first.map(normalize_text).unwrap_or_default(), Vec::new())
 }
 
 #[cfg(test)]
@@ -332,7 +327,10 @@ mod tests {
             "distinct pointer-receiver methods must fingerprint differently"
         );
         let (_, frames) = parse("go", avg);
-        assert_eq!(frames[0], "example.com/app.(*Calc).Average@calc.go", "{frames:?}");
+        assert_eq!(
+            frames[0], "example.com/app.(*Calc).Average@calc.go",
+            "{frames:?}"
+        );
     }
 
     #[test]
@@ -347,7 +345,11 @@ mod tests {
     #[test]
     fn go_frames_skip_runtime_and_testing() {
         let (_, frames) = parse("go", GO_TRACE);
-        assert_eq!(frames.len(), 2, "runtime/testing frames skipped: {frames:?}");
+        assert_eq!(
+            frames.len(),
+            2,
+            "runtime/testing frames skipped: {frames:?}"
+        );
         assert!(frames[0].starts_with("example.com/spike-target.Average@calc.go"));
         assert!(frames[1].starts_with("example.com/spike-target.main@calc.go"));
     }
@@ -379,7 +381,12 @@ mod tests {
     #[test]
     fn explicit_message_wins_over_derived() {
         let derived = compute(GOLDEN_REPO, "go", None, GO_TRACE);
-        let explicit = compute(GOLDEN_REPO, "go", Some("reporter crashed on window N"), GO_TRACE);
+        let explicit = compute(
+            GOLDEN_REPO,
+            "go",
+            Some("reporter crashed on window N"),
+            GO_TRACE,
+        );
         assert_ne!(derived, explicit);
     }
 

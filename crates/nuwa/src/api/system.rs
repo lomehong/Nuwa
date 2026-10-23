@@ -136,7 +136,10 @@ mod tests {
             cookie_secure: false,
             cookie_secure_never: false,
             serve_unit: serve_unit.to_string(),
-            runner_units: runner_units.iter().map(|unit| (*unit).to_string()).collect(),
+            runner_units: runner_units
+                .iter()
+                .map(|unit| (*unit).to_string())
+                .collect(),
         };
         let app = build_app(state);
         (dir, app, db_path)

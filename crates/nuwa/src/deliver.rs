@@ -263,14 +263,20 @@ async fn create_pr_via_api(
         bail!(
             "GitHub API {status}: {}{}",
             payload["message"].as_str().unwrap_or("(no message)"),
-            if details.is_empty() { String::new() } else { format!(" — {details}") }
+            if details.is_empty() {
+                String::new()
+            } else {
+                format!(" — {details}")
+            }
         );
     }
     let url = payload["html_url"]
         .as_str()
         .map(str::to_string)
         .context("PR response missing html_url")?;
-    let number = payload["number"].as_u64().context("PR response missing number")?;
+    let number = payload["number"]
+        .as_u64()
+        .context("PR response missing number")?;
     Ok((url, number))
 }
 
@@ -315,7 +321,10 @@ async fn deliver_inner(
     fail_point: Option<FailPoint>,
 ) -> anyhow::Result<DeliverReport> {
     // ---- 1. cheap preconditions ----
-    let status = git(repo, &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"])?;
+    let status = git(
+        repo,
+        &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
+    )?;
     if status.trim().is_empty() {
         bail!("agent made no changes — refusing to open an empty PR");
     }
@@ -323,7 +332,12 @@ async fn deliver_inner(
     let base_oid = git(repo, &["rev-parse", "--verify", &base])
         .with_context(|| format!("resolve delivery base {base}"))?;
     let branch = format!("agent/fix/{}", issue.short_fingerprint());
-    if git(repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).is_ok() {
+    if git(
+        repo,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .is_ok()
+    {
         bail!("branch {branch} already exists — this fingerprint already has work in flight; refusing a duplicate PR");
     }
     // Created before verification so a failed gate gets the same clean
@@ -332,7 +346,10 @@ async fn deliver_inner(
     guard.branch(&branch);
 
     // ---- 2. independent verification gate (base red / branch green) ----
-    println!("deliver   : verification gate `{}`…", issue.failing_check.command);
+    println!(
+        "deliver   : verification gate `{}`…",
+        issue.failing_check.command
+    );
     let mut evidence = crate::verify::verify(repo, issue, &base, secrets).await?;
     let check_command = secrets.redact(&issue.failing_check.command);
     let mut evidence_detail = secrets.redact(&evidence.detail(issue));
@@ -456,8 +473,9 @@ async fn deliver_inner(
             let origin = git(repo, &["remote", "get-url", "origin"])
                 .context("read origin remote (PR creation needs a GitHub remote)")?;
             let origin_display = git_ops::sanitize_remote(&origin);
-            let slug = parse_github_slug(&origin)
-                .with_context(|| format!("parse GitHub owner/repo from origin `{origin_display}`"))?;
+            let slug = parse_github_slug(&origin).with_context(|| {
+                format!("parse GitHub owner/repo from origin `{origin_display}`")
+            })?;
             let public_base = public_base_url
                 .map(|base| base.trim().trim_end_matches('/'))
                 .filter(|base| !base.is_empty());
@@ -739,9 +757,7 @@ mod tests {
         let mut issue = issue();
         issue.title = "panic secret-value-123456".into();
         issue.failing_check.command = check_command_with_secret("secret-value-123456");
-        let secrets = crate::secrets::Secrets::with_values(vec![
-            "secret-value-123456".to_string(),
-        ]);
+        let secrets = crate::secrets::Secrets::with_values(vec!["secret-value-123456".to_string()]);
         deliver_inner(
             &repo,
             &issue,
@@ -758,7 +774,10 @@ mod tests {
         .expect("deliver");
 
         let log = git_output(&repo, &["log", "-1", "--format=%B"]);
-        assert!(!log.contains("secret-value-123456"), "commit message leaks: {log}");
+        assert!(
+            !log.contains("secret-value-123456"),
+            "commit message leaks: {log}"
+        );
         let evidence = std::fs::read_to_string(
             dir.path()
                 .join("sessions")
@@ -785,7 +804,10 @@ mod tests {
     async fn pushed_commit_must_match_the_remote_tip() {
         let dir = tempfile::tempdir().expect("tempdir");
         let origin = dir.path().join("origin.git");
-        git(dir.path(), &["init", "--bare", origin.to_str().expect("utf8")]);
+        git(
+            dir.path(),
+            &["init", "--bare", origin.to_str().expect("utf8")],
+        );
         let repo = dir.path().join("repo");
         init_repo(&repo);
         git(
@@ -814,7 +836,10 @@ mod tests {
     fn missing_remote_branch_has_no_tip() {
         let dir = tempfile::tempdir().expect("tempdir");
         let origin = dir.path().join("origin.git");
-        git(dir.path(), &["init", "--bare", origin.to_str().expect("utf8")]);
+        git(
+            dir.path(),
+            &["init", "--bare", origin.to_str().expect("utf8")],
+        );
         let repo = dir.path().join("repo");
         init_repo(&repo);
         git(
@@ -853,7 +878,10 @@ mod tests {
 
     #[test]
     fn rejects_non_github_and_malformed() {
-        assert_eq!(parse_github_slug("https://gitlab.com/acme/spike-target"), None);
+        assert_eq!(
+            parse_github_slug("https://gitlab.com/acme/spike-target"),
+            None
+        );
         assert_eq!(parse_github_slug("git@github.com:acme"), None);
         assert_eq!(parse_github_slug("/some/local/path"), None);
     }

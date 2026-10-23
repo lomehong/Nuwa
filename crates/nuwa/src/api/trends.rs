@@ -53,10 +53,7 @@ pub struct TrendTotals {
 }
 
 /// `GET /api/v1/metrics/trends?range=7d|14d|30d|90d&repo=`.
-pub async fn trends(
-    State(state): State<AppState>,
-    Query(query): Query<TrendsQuery>,
-) -> Response {
+pub async fn trends(State(state): State<AppState>, Query(query): Query<TrendsQuery>) -> Response {
     let mut fields = BTreeMap::new();
     let (range, days) = parse_range(query.range.as_deref(), &mut fields);
     if !fields.is_empty() {
@@ -419,8 +416,24 @@ mod tests {
             (20, 0),
             Some((url_b, today + 2 * HOUR_MS + 120_000)),
         );
-        run(store, "run-c", &fp_a, APP, today + 3 * HOUR_MS, (5, 0), None);
-        run(store, "run-d", &fp_c, APP, d10 + 4 * HOUR_MS, (100, 0), None);
+        run(
+            store,
+            "run-c",
+            &fp_a,
+            APP,
+            today + 3 * HOUR_MS,
+            (5, 0),
+            None,
+        );
+        run(
+            store,
+            "run-d",
+            &fp_c,
+            APP,
+            d10 + 4 * HOUR_MS,
+            (100, 0),
+            None,
+        );
         run(store, "run-e", &fp_d, APP, d20 + 4 * HOUR_MS, (30, 0), None);
         run(
             store,
@@ -434,10 +447,18 @@ mod tests {
 
         // Pre-run legacy PRs: only the issue row carries them.
         store
-            .set_pr(&fp_c, "https://github.com/acme/app/pull/3", d10 + 5 * HOUR_MS)
+            .set_pr(
+                &fp_c,
+                "https://github.com/acme/app/pull/3",
+                d10 + 5 * HOUR_MS,
+            )
             .expect("legacy pr d10");
         store
-            .set_pr(&fp_d, "https://github.com/acme/app/pull/4", d20 + 5 * HOUR_MS)
+            .set_pr(
+                &fp_d,
+                "https://github.com/acme/app/pull/4",
+                d20 + 5 * HOUR_MS,
+            )
             .expect("legacy pr d20");
 
         let event = |fp: &str, ts: i64, actor: &str, kind: &str, detail: &str| {
@@ -446,9 +467,27 @@ mod tests {
                 .expect("record event");
         };
         event(&fp_a, today + 7 * HOUR_MS, "system", "merged", url_a);
-        event(&fp_b, today + 8 * HOUR_MS, "runner", "rejected", "ci_red: PR #2 closed");
-        event(&fp_c, d10 + 6 * HOUR_MS, "system", "rejected", "PR closed without merge");
-        event(&fp_d, d20 + 6 * HOUR_MS, "system", "merged", "https://github.com/acme/app/pull/4");
+        event(
+            &fp_b,
+            today + 8 * HOUR_MS,
+            "runner",
+            "rejected",
+            "ci_red: PR #2 closed",
+        );
+        event(
+            &fp_c,
+            d10 + 6 * HOUR_MS,
+            "system",
+            "rejected",
+            "PR closed without merge",
+        );
+        event(
+            &fp_d,
+            d20 + 6 * HOUR_MS,
+            "system",
+            "merged",
+            "https://github.com/acme/app/pull/4",
+        );
         event(&fp_a, today + 9 * HOUR_MS, "runner", "ci_green", "head");
         today
     }
@@ -601,7 +640,11 @@ mod tests {
         for range in ["1d", "weekly", "14D", "0d"] {
             let uri = format!("/api/v1/metrics/trends?range={range}");
             let response = get(&app, &uri).await;
-            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{range}");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{range}"
+            );
             assert_api_headers(&response);
             let value = json_body(response).await;
             assert_eq!(value["error"]["code"], "validation_failed");

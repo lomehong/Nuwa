@@ -55,7 +55,6 @@ pub struct RepoInstructions {
     pub draft_first_n: u32,
 }
 
-
 /// 读取工作区里的 `nuwa.repo.json`（不建立受信副本，供一次性 `nuwa fix` 使用）。
 /// 常驻 runner 走 [`TrustedInstructions::load`]，两者共享同一套解析与校验。
 pub fn load_working_tree(repo_dir: &Path) -> anyhow::Result<Option<RepoInstructions>> {
@@ -63,8 +62,8 @@ pub fn load_working_tree(repo_dir: &Path) -> anyhow::Result<Option<RepoInstructi
     if !path.is_file() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("read instructions {}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("read instructions {}", path.display()))?;
     parse(&bytes, &path).map(Some)
 }
 
@@ -354,7 +353,10 @@ mod tests {
             &dir.path().join("trust"),
         )
         .expect("load");
-        assert_eq!(trusted.instructions.forbidden_paths, vec!["go.sum".to_string()]);
+        assert_eq!(
+            trusted.instructions.forbidden_paths,
+            vec!["go.sum".to_string()]
+        );
 
         // The base moves: a new commit hardens the forbidden list.
         std::fs::write(

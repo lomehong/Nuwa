@@ -276,7 +276,11 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
     let local_mode = state.local_mode();
     let app = build_app(state);
 
-    let token_mode = if ingest_token.is_some() { "required" } else { "DISABLED (local mode)" };
+    let token_mode = if ingest_token.is_some() {
+        "required"
+    } else {
+        "DISABLED (local mode)"
+    };
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
@@ -295,9 +299,12 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         );
     }
     // ConnectInfo is required by the Task 4 login rate limiter (peer IP).
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .context("serve")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("serve")
 }
 
 /// The two server credentials.
@@ -599,22 +606,45 @@ async fn check_auth(
     next.run(req).await
 }
 
-async fn ingest_endpoint(State((store, _)): State<Shared>, body: axum::body::Bytes) -> (StatusCode, String) {
+async fn ingest_endpoint(
+    State((store, _)): State<Shared>,
+    body: axum::body::Bytes,
+) -> (StatusCode, String) {
     let raw = match std::str::from_utf8(&body) {
         Ok(s) => s,
-        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, format!("bad utf8: {e}")),
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("bad utf8: {e}"),
+            )
+        }
     };
     let signals = match parse_signals(raw) {
         Ok(s) if !s.is_empty() => s,
-        Ok(_) => return (axum::http::StatusCode::BAD_REQUEST, "empty payload".to_string()),
-        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, format!("bad payload: {e:#}")),
+        Ok(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "empty payload".to_string(),
+            )
+        }
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("bad payload: {e:#}"),
+            )
+        }
     };
     let now = now_ms();
     let mut lines = Vec::with_capacity(signals.len());
     for signal in &signals {
         match report_one(&store, signal, now) {
             Ok(line) => lines.push(line),
-            Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("store: {e:#}")),
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("store: {e:#}"),
+                )
+            }
         }
     }
     (axum::http::StatusCode::OK, lines.join("\n"))
@@ -637,10 +667,7 @@ mod tests {
             store,
             ui_token: Arc::clone(&ui_token),
             ingest_token: Arc::new(Some("ingest-secret".into())),
-            session: Arc::new(crate::session::SessionManager::new(
-                session_key,
-                86_400_000,
-            )),
+            session: Arc::new(crate::session::SessionManager::new(session_key, 86_400_000)),
             limiter: Arc::new(crate::session::LoginLimiter::new()),
             started_at_ms: crate::now_ms(),
             env_path: dir.path().join("nuwa.env"),
@@ -731,7 +758,11 @@ mod tests {
     }
 
     fn cookie_pair(set_cookie: &str) -> String {
-        set_cookie.split(';').next().expect("cookie pair").to_string()
+        set_cookie
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .to_string()
     }
 
     fn cookie_token(pair: &str) -> &str {
@@ -742,7 +773,12 @@ mod tests {
     async fn health_is_public() {
         let (_dir, app) = test_app();
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).expect("request"))
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -772,15 +808,15 @@ mod tests {
                 .await
                 .expect("response");
             assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT, "{uri}");
-            assert_eq!(
-                header_str(&response, header::LOCATION),
-                location,
-                "{uri}"
-            );
+            assert_eq!(header_str(&response, header::LOCATION), location, "{uri}");
             let csp = header_str(&response, header::CONTENT_SECURITY_POLICY);
             assert!(csp.contains("style-src 'self'"), "{uri}: {csp}");
             assert!(!csp.contains("unsafe-inline"), "{uri}: {csp}");
-            assert_eq!(header_str(&response, header::X_FRAME_OPTIONS), "DENY", "{uri}");
+            assert_eq!(
+                header_str(&response, header::X_FRAME_OPTIONS),
+                "DENY",
+                "{uri}"
+            );
         }
     }
 
@@ -809,7 +845,10 @@ mod tests {
             header_str(&response, header::X_CONTENT_TYPE_OPTIONS),
             "nosniff"
         );
-        assert_eq!(header_str(&response, header::REFERRER_POLICY), "no-referrer");
+        assert_eq!(
+            header_str(&response, header::REFERRER_POLICY),
+            "no-referrer"
+        );
         assert_eq!(
             header_str(
                 &response,
@@ -817,10 +856,7 @@ mod tests {
             ),
             "camera=(), microphone=(), geolocation=()"
         );
-        assert_eq!(
-            header_str(&response, header::X_FRAME_OPTIONS),
-            "SAMEORIGIN"
-        );
+        assert_eq!(header_str(&response, header::X_FRAME_OPTIONS), "SAMEORIGIN");
         let csp = header_str(&response, header::CONTENT_SECURITY_POLICY);
         assert!(csp.contains("frame-ancestors 'self'"), "{csp}");
         assert!(csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
@@ -872,13 +908,13 @@ mod tests {
     async fn issue_redirect_rejects_unsafe_fingerprints() {
         let (_dir, app) = test_app();
         for uri in [
-            "/issue/%0d%0aX",  // decoded CR/LF must never reach `Location`
-            "/issue/..",       // dot segments would be normalised by browsers
+            "/issue/%0d%0aX", // decoded CR/LF must never reach `Location`
+            "/issue/..",      // dot segments would be normalised by browsers
             "/issue/%2e%2e",
-            "/issue/a.b",      // dots are rejected: `web.rs` would dotfile-404
+            "/issue/a.b", // dots are rejected: `web.rs` would dotfile-404
             "/issue/abc.def",
-            "/issue/a%20b",    // outside the alphanumeric/-_: set
-            "/issue/a%2fb",    // encoded slash
+            "/issue/a%20b", // outside the alphanumeric/-_: set
+            "/issue/a%2fb", // encoded slash
         ] {
             let response = app
                 .clone()
@@ -903,7 +939,17 @@ mod tests {
         for fp in ["abc123", "ab-cd_ef:12", "A0"] {
             assert!(is_safe_fingerprint(fp), "{fp}");
         }
-        for fp in ["", ".", "..", "ab-cd_ef.1:2", "a.b", "a b", "a/b", "a\r\nb", "a\u{00e9}"] {
+        for fp in [
+            "",
+            ".",
+            "..",
+            "ab-cd_ef.1:2",
+            "a.b",
+            "a b",
+            "a/b",
+            "a\r\nb",
+            "a\u{00e9}",
+        ] {
             assert!(!is_safe_fingerprint(fp), "{fp:?}");
         }
     }
@@ -930,7 +976,12 @@ mod tests {
     async fn unknown_api_route_returns_json_404() {
         let (_dir, app) = test_app();
         let response = app
-            .oneshot(Request::builder().uri("/api/v1/nope").body(Body::empty()).expect("request"))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/nope")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -939,7 +990,10 @@ mod tests {
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert!(content_type.starts_with("application/json"), "got {content_type}");
+        assert!(
+            content_type.starts_with("application/json"),
+            "got {content_type}"
+        );
         let value: serde_json::Value =
             serde_json::from_str(&body_text(response).await).expect("json body");
         assert_eq!(value["error"]["code"], "not_found");
@@ -952,7 +1006,12 @@ mod tests {
     async fn root_serves_the_spa_shell() {
         let (_dir, app) = test_app();
         let response = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).expect("request"))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -1138,7 +1197,11 @@ mod tests {
         let response = app
             .clone()
             .oneshot(
-                Request::builder().method("POST").uri("/ingest").body(Body::empty()).expect("request"),
+                Request::builder()
+                    .method("POST")
+                    .uri("/ingest")
+                    .body(Body::empty())
+                    .expect("request"),
             )
             .await
             .expect("response");
@@ -1189,7 +1252,10 @@ mod tests {
             "csrf cookie must stay readable by the SPA: {csrf}"
         );
         for attr in ["SameSite=Strict", "Path=/", "Max-Age=86400"] {
-            assert!(csrf.contains(attr), "csrf Set-Cookie missing {attr}: {csrf}");
+            assert!(
+                csrf.contains(attr),
+                "csrf Set-Cookie missing {attr}: {csrf}"
+            );
         }
         assert!(
             !csrf.contains("Secure"),
@@ -1621,7 +1687,10 @@ mod tests {
     #[test]
     fn runner_units_env_splits_trims_and_defaults() {
         assert_eq!(runner_units_from_env(None), vec!["nuwa-work".to_string()]);
-        assert_eq!(runner_units_from_env(Some("")), vec!["nuwa-work".to_string()]);
+        assert_eq!(
+            runner_units_from_env(Some("")),
+            vec!["nuwa-work".to_string()]
+        );
         assert_eq!(
             runner_units_from_env(Some(" , ,")),
             vec!["nuwa-work".to_string()],
@@ -1679,9 +1748,7 @@ mod tests {
         let deleted = prune_retention(&store, now, 90).expect("prune");
         assert_eq!(deleted, 1);
 
-        let events = store
-            .list_events(&Default::default(), 100)
-            .expect("events");
+        let events = store.list_events(&Default::default(), 100).expect("events");
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| e.kind == "config_changed"));
         assert!(events.iter().any(|e| e.detail == "keep"));
@@ -1716,9 +1783,7 @@ mod tests {
 
         let deleted = prune_retention(&store, now, 400).expect("prune");
         assert_eq!(deleted, 1);
-        let events = store
-            .list_events(&Default::default(), 100)
-            .expect("events");
+        let events = store.list_events(&Default::default(), 100).expect("events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].detail, "audit");
     }
@@ -1788,9 +1853,7 @@ mod tests {
     #[tokio::test]
     async fn daily_prune_task_sweeps_after_the_first_period() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(
-            shanhaijing::Store::open(dir.path().join("daily.db")).expect("open"),
-        );
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("daily.db")).expect("open"));
         store
             .record_event(
                 "fp",
@@ -1812,9 +1875,7 @@ mod tests {
         );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let events = store
-                .list_events(&Default::default(), 100)
-                .expect("events");
+            let events = store.list_events(&Default::default(), 100).expect("events");
             if events.is_empty() {
                 break;
             }
@@ -2007,17 +2068,27 @@ mod tests {
         overview_state(store, &fixing_stuck, State::Triggered, now - 700_000, None);
         overview_state(store, &fixing_stuck, State::Fixing, now - 650_000, None);
 
-        let fixing_healthy = overview_issue(store, "fixing healthy", OVERVIEW_REPO, "medium", at(4));
+        let fixing_healthy =
+            overview_issue(store, "fixing healthy", OVERVIEW_REPO, "medium", at(4));
         overview_state(store, &fixing_healthy, State::Triggered, now - 2_000, None);
         overview_state(store, &fixing_healthy, State::Fixing, now - 1_000, None);
 
-        let rejected_closed = overview_issue(store, "rejected closed", OVERVIEW_REPO, "high", at(5));
+        let rejected_closed =
+            overview_issue(store, "rejected closed", OVERVIEW_REPO, "high", at(5));
         let pr_at = day_start.max(now - 5_000);
-        overview_state(store, &rejected_closed, State::Triggered, pr_at - 3_000, None);
+        overview_state(
+            store,
+            &rejected_closed,
+            State::Triggered,
+            pr_at - 3_000,
+            None,
+        );
         overview_state(store, &rejected_closed, State::Fixing, pr_at - 2_000, None);
         overview_state(store, &rejected_closed, State::PrOpen, pr_at - 1_000, None);
         let pr_url = "https://github.com/example/app/pull/42".to_string();
-        store.set_pr(&rejected_closed, &pr_url, pr_at).expect("set pr");
+        store
+            .set_pr(&rejected_closed, &pr_url, pr_at)
+            .expect("set pr");
         overview_state(
             store,
             &rejected_closed,
@@ -2026,8 +2097,15 @@ mod tests {
             Some("PR closed without merge"),
         );
 
-        let rejected_ci_red = overview_issue(store, "rejected ci red", OVERVIEW_REPO, "high", at(6));
-        overview_state(store, &rejected_ci_red, State::Triggered, at(6) + 1_000, None);
+        let rejected_ci_red =
+            overview_issue(store, "rejected ci red", OVERVIEW_REPO, "high", at(6));
+        overview_state(
+            store,
+            &rejected_ci_red,
+            State::Triggered,
+            at(6) + 1_000,
+            None,
+        );
         overview_state(store, &rejected_ci_red, State::Fixing, at(6) + 2_000, None);
         overview_state(store, &rejected_ci_red, State::PrOpen, at(6) + 3_000, None);
         overview_state(
@@ -2038,8 +2116,15 @@ mod tests {
             Some("ci_red: CI red — PR #7 closed, back to owner"),
         );
 
-        let pr_open_recent = overview_issue(store, "pr open recent", OVERVIEW_REPO, "medium", at(7));
-        overview_state(store, &pr_open_recent, State::Triggered, at(7) + 1_000, None);
+        let pr_open_recent =
+            overview_issue(store, "pr open recent", OVERVIEW_REPO, "medium", at(7));
+        overview_state(
+            store,
+            &pr_open_recent,
+            State::Triggered,
+            at(7) + 1_000,
+            None,
+        );
         overview_state(store, &pr_open_recent, State::Fixing, at(7) + 2_000, None);
         overview_state(store, &pr_open_recent, State::PrOpen, at(7) + 3_000, None);
         store
@@ -2088,9 +2173,20 @@ mod tests {
             Some("https://github.com/example/app/pull/9"),
         );
 
-        let run_repair_issue =
-            overview_issue(store, "other repairing", OVERVIEW_OTHER_REPO, "high", at(12));
-        overview_state(store, &run_repair_issue, State::Triggered, now - 2_000, None);
+        let run_repair_issue = overview_issue(
+            store,
+            "other repairing",
+            OVERVIEW_OTHER_REPO,
+            "high",
+            at(12),
+        );
+        overview_state(
+            store,
+            &run_repair_issue,
+            State::Triggered,
+            now - 2_000,
+            None,
+        );
         overview_state(store, &run_repair_issue, State::Fixing, now - 1_000, None);
 
         let new_critical = overview_issue(store, "new critical", OVERVIEW_REPO, "critical", at(13));
@@ -2102,10 +2198,31 @@ mod tests {
         // `idle` status must not leak into the online status counts.
         overview_runner(store, "runner-fresh", OVERVIEW_REPO, "working", now, now);
         overview_runner(store, "runner-idle", OVERVIEW_REPO, "idle", now, now);
-        overview_runner(store, "runner-standing", OVERVIEW_REPO, "standing_down", now, now);
+        overview_runner(
+            store,
+            "runner-standing",
+            OVERVIEW_REPO,
+            "standing_down",
+            now,
+            now,
+        );
         overview_runner(store, "runner-error", OVERVIEW_REPO, "error", now, now);
-        overview_runner(store, "runner-stale", OVERVIEW_REPO, "idle", now - 200_000, now);
-        overview_runner(store, "runner-other", OVERVIEW_OTHER_REPO, "working", now, now);
+        overview_runner(
+            store,
+            "runner-stale",
+            OVERVIEW_REPO,
+            "idle",
+            now - 200_000,
+            now,
+        );
+        overview_runner(
+            store,
+            "runner-other",
+            OVERVIEW_OTHER_REPO,
+            "working",
+            now,
+            now,
+        );
 
         store
             .start_run(&shanhaijing::RunStart {
@@ -2155,7 +2272,14 @@ mod tests {
             .expect("update repair run");
 
         store
-            .record_event(&merged, now - 1_000, Some(OVERVIEW_REPO), "runner", "ci_green", "head-green")
+            .record_event(
+                &merged,
+                now - 1_000,
+                Some(OVERVIEW_REPO),
+                "runner",
+                "ci_green",
+                "head-green",
+            )
             .expect("ci green event");
         // Older than the rejection state change, so the state_changed event
         // (detail prefix `ci_red:`) stays the newest for the attention reason.
@@ -2203,7 +2327,12 @@ mod tests {
 
     async fn overview_request(app: &Router, uri: &str) -> Response {
         app.clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).expect("request"))
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("response")
     }
@@ -2211,10 +2340,20 @@ mod tests {
     fn overview_counts(value: &serde_json::Value) -> [u64; 8] {
         let counts = &value["counts"];
         [
-            "new", "triggered", "fixing", "pr_open", "merged", "rejected", "escalated",
+            "new",
+            "triggered",
+            "fixing",
+            "pr_open",
+            "merged",
+            "rejected",
+            "escalated",
             "ignored",
         ]
-        .map(|state| counts[state].as_u64().unwrap_or_else(|| panic!("counts.{state} missing")))
+        .map(|state| {
+            counts[state]
+                .as_u64()
+                .unwrap_or_else(|| panic!("counts.{state} missing"))
+        })
     }
 
     #[tokio::test]
@@ -2240,23 +2379,73 @@ mod tests {
         // Escalated > stuck > rejected > ci_timeout; same level by last_seen asc.
         let attention = value["attention"].as_array().expect("attention array");
         let expected = [
-            (seed.escalated_old.as_str(), "escalated", "repair_failed", "修复 runner 失败，需要复核", false),
-            (seed.escalated_new.as_str(), "escalated", "budget_exceeded", "token 预算超限，需要复核", false),
-            (seed.fixing_stuck.as_str(), "fixing", "stuck", "疑似卡单，runner 心跳已过期", true),
-            (seed.rejected_closed.as_str(), "rejected", "pr_closed", "PR 未合并被关闭", false),
-            (seed.rejected_ci_red.as_str(), "rejected", "ci_red", "CI 红灯，PR 已关闭", false),
-            (seed.pr_open_recent.as_str(), "pr_open", "ci_timeout", "CI 超时，需要人工查看", false),
+            (
+                seed.escalated_old.as_str(),
+                "escalated",
+                "repair_failed",
+                "修复 runner 失败，需要复核",
+                false,
+            ),
+            (
+                seed.escalated_new.as_str(),
+                "escalated",
+                "budget_exceeded",
+                "token 预算超限，需要复核",
+                false,
+            ),
+            (
+                seed.fixing_stuck.as_str(),
+                "fixing",
+                "stuck",
+                "疑似卡单，runner 心跳已过期",
+                true,
+            ),
+            (
+                seed.rejected_closed.as_str(),
+                "rejected",
+                "pr_closed",
+                "PR 未合并被关闭",
+                false,
+            ),
+            (
+                seed.rejected_ci_red.as_str(),
+                "rejected",
+                "ci_red",
+                "CI 红灯，PR 已关闭",
+                false,
+            ),
+            (
+                seed.pr_open_recent.as_str(),
+                "pr_open",
+                "ci_timeout",
+                "CI 超时，需要人工查看",
+                false,
+            ),
         ];
         assert_eq!(attention.len(), expected.len(), "attention: {attention:?}");
         for (index, (fp, state, code, text, stuck)) in expected.iter().enumerate() {
             let item = &attention[index];
-            assert_eq!(item["fingerprint"].as_str(), Some(*fp), "attention[{index}]");
+            assert_eq!(
+                item["fingerprint"].as_str(),
+                Some(*fp),
+                "attention[{index}]"
+            );
             assert_eq!(item["state"].as_str(), Some(*state), "attention[{index}]");
-            assert_eq!(item["reason_code"].as_str(), Some(*code), "attention[{index}]");
-            assert_eq!(item["reason_text"].as_str(), Some(*text), "attention[{index}]");
+            assert_eq!(
+                item["reason_code"].as_str(),
+                Some(*code),
+                "attention[{index}]"
+            );
+            assert_eq!(
+                item["reason_text"].as_str(),
+                Some(*text),
+                "attention[{index}]"
+            );
             assert_eq!(item["stuck"].as_bool(), Some(*stuck), "attention[{index}]");
             assert!(item["last_seen_ms"].is_i64(), "attention[{index}]: {item}");
-            assert!(item["title"].as_str().is_some_and(|title| !title.is_empty()));
+            assert!(item["title"]
+                .as_str()
+                .is_some_and(|title| !title.is_empty()));
             assert_eq!(item["repo"].as_str(), Some(OVERVIEW_REPO));
         }
         assert_eq!(attention[0]["owner_runner_id"], serde_json::Value::Null);
@@ -2284,7 +2473,10 @@ mod tests {
         let runs = value["active_runs"].as_array().expect("active runs");
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0]["id"].as_str(), Some("run-ci"));
-        assert_eq!(runs[0]["fingerprint"].as_str(), Some(seed.fixing_healthy.as_str()));
+        assert_eq!(
+            runs[0]["fingerprint"].as_str(),
+            Some(seed.fixing_healthy.as_str())
+        );
         assert_eq!(runs[0]["title"].as_str(), Some("fixing healthy"));
         assert_eq!(runs[0]["repo"].as_str(), Some(OVERVIEW_REPO));
         assert_eq!(runs[0]["runner_id"].as_str(), Some("runner-fresh"));
@@ -2301,12 +2493,23 @@ mod tests {
         assert_eq!(value["queue"]["ready_count"].as_u64(), Some(5));
         let next = value["queue"]["next"].as_array().expect("queue next");
         assert_eq!(next.len(), 3);
-        assert_eq!(next[0]["fingerprint"].as_str(), Some(seed.new_critical.as_str()));
-        assert_eq!(next[1]["fingerprint"].as_str(), Some(seed.new_high.as_str()));
-        assert_eq!(next[2]["fingerprint"].as_str(), Some(seed.new_medium.as_str()));
+        assert_eq!(
+            next[0]["fingerprint"].as_str(),
+            Some(seed.new_critical.as_str())
+        );
+        assert_eq!(
+            next[1]["fingerprint"].as_str(),
+            Some(seed.new_high.as_str())
+        );
+        assert_eq!(
+            next[2]["fingerprint"].as_str(),
+            Some(seed.new_medium.as_str())
+        );
         assert_eq!(next[0]["severity"].as_str(), Some("critical"));
         assert_eq!(next[0]["occurrences"].as_u64(), Some(1));
-        assert!(next[0]["title"].as_str().is_some_and(|title| !title.is_empty()));
+        assert!(next[0]["title"]
+            .as_str()
+            .is_some_and(|title| !title.is_empty()));
 
         // Health: the stale runner counts offline, not as idle.
         let health = &value["health"];
@@ -2378,7 +2581,10 @@ mod tests {
         let runs = value["active_runs"].as_array().expect("active runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0]["id"].as_str(), Some("run-repair"));
-        assert_eq!(runs[0]["fingerprint"].as_str(), Some(seed.run_repair_issue.as_str()));
+        assert_eq!(
+            runs[0]["fingerprint"].as_str(),
+            Some(seed.run_repair_issue.as_str())
+        );
         assert_eq!(value["queue"]["ready_count"].as_u64(), Some(5));
         let health = &value["health"];
         assert_eq!(health["runners_total"].as_u64(), Some(1));
@@ -2400,7 +2606,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
         assert_eq!(overview_counts(&value), [5, 0, 3, 3, 1, 2, 2, 0]);
-        assert_eq!(value["active_runs"].as_array().expect("active runs").len(), 2);
+        assert_eq!(
+            value["active_runs"].as_array().expect("active runs").len(),
+            2
+        );
         assert_eq!(value["queue"]["ready_count"].as_u64(), Some(5));
         assert_eq!(value["health"]["runners_total"].as_u64(), Some(6));
         assert!(
@@ -2461,9 +2670,7 @@ mod tests {
     /// trick as `seed_overview`) so today-scoped counters are exact even when
     /// the test runs just after midnight.
     fn seed_read_api(store: &shanhaijing::Store) -> ReadApiSeed {
-        use shanhaijing::{
-            RunFinish, RunStart, RunUpdate, RunnerHeartbeat, RunnerUpsert, State,
-        };
+        use shanhaijing::{RunFinish, RunStart, RunUpdate, RunnerHeartbeat, RunnerUpsert, State};
 
         let now = crate::now_ms();
         let day_start = now - now.rem_euclid(86_400_000);
@@ -2673,7 +2880,12 @@ mod tests {
 
     async fn read_api_get(app: &Router, uri: &str) -> Response {
         app.clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).expect("request"))
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("response")
     }
@@ -2727,10 +2939,7 @@ mod tests {
         assert_eq!(attention[0]["repo"].as_str(), Some(READ_API_REPO));
         assert_eq!(attention[0]["stuck"].as_bool(), Some(false));
         assert_eq!(attention[0]["owner_runner_id"], serde_json::Value::Null);
-        assert_eq!(
-            attention[0]["reason_code"].as_str(),
-            Some("repair_failed")
-        );
+        assert_eq!(attention[0]["reason_code"].as_str(), Some("repair_failed"));
         assert_eq!(
             attention[0]["reason_text"].as_str(),
             Some("修复 runner 失败，需要复核")
@@ -2786,7 +2995,10 @@ mod tests {
         assert_eq!(page_one["data"][0]["severity"].as_str(), Some("low"));
         assert_eq!(page_one["data"][0]["occurrences"].as_u64(), Some(1));
         assert_eq!(page_one["data"][0]["stuck"].as_bool(), Some(false));
-        assert_eq!(page_one["data"][0]["owner_runner_id"], serde_json::Value::Null);
+        assert_eq!(
+            page_one["data"][0]["owner_runner_id"],
+            serde_json::Value::Null
+        );
         assert_eq!(page_one["data"][1]["state"].as_str(), Some("fixing"));
         assert_eq!(
             page_one["data"][1]["owner_runner_id"].as_str(),
@@ -2819,14 +3031,14 @@ mod tests {
         assert_eq!(page_three["meta"]["total"].as_u64(), Some(4));
 
         for (query, expected) in [
-            (
-                "attention=1",
-                vec![seed.escalated.as_str()],
-            ),
+            ("attention=1", vec![seed.escalated.as_str()]),
             ("state=escalated", vec![seed.escalated.as_str()]),
             ("severity=low", vec![seed.queued.as_str()]),
             ("q=merged", vec![seed.merged.as_str()]),
-            ("severity=critical&language=go", vec![seed.escalated.as_str()]),
+            (
+                "severity=critical&language=go",
+                vec![seed.escalated.as_str()],
+            ),
         ] {
             let uri = format!("/api/v1/issues?repo=example.com%2Fread&{query}");
             let response = read_api_get(&app, &uri).await;
@@ -2923,7 +3135,10 @@ mod tests {
         assert_read_api_headers(&response);
         let missing = json_body(response).await;
         assert_eq!(missing["error"]["code"].as_str(), Some("not_found"));
-        assert_eq!(missing["error"]["message"].as_str(), Some("issue not found"));
+        assert_eq!(
+            missing["error"]["message"].as_str(),
+            Some("issue not found")
+        );
 
         // ---- 4. GET /runners ----
         let response = read_api_get(&app, "/api/v1/runners").await;
@@ -3014,14 +3229,16 @@ mod tests {
         // Without aggregation the same fingerprint yields all five fixture
         // rows; `aggregate=1` groups the three same-hour `reported` rows even
         // though a `state_changed` row interleaves between them.
-        let response =
-            read_api_get(&app, "/api/v1/events?fingerprint=read-api-events").await;
+        let response = read_api_get(&app, "/api/v1/events?fingerprint=read-api-events").await;
         assert_eq!(response.status(), StatusCode::OK);
         let raw_events = json_body(response).await;
         assert_eq!(raw_events["meta"]["total"].as_u64(), Some(5));
 
-        let response =
-            read_api_get(&app, "/api/v1/events?fingerprint=read-api-events&aggregate=1").await;
+        let response = read_api_get(
+            &app,
+            "/api/v1/events?fingerprint=read-api-events&aggregate=1",
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_read_api_headers(&response);
         let aggregated = json_body(response).await;
@@ -3038,14 +3255,8 @@ mod tests {
         assert_eq!(rows[1]["detail"].as_str(), Some("r2"));
         assert_eq!(rows[1]["count"].as_u64(), Some(3));
         assert_eq!(rows[1]["ts_ms"].as_i64(), Some(seed.hour + 240_000));
-        assert_eq!(
-            rows[1]["first_ts_ms"].as_i64(),
-            Some(seed.hour + 60_000)
-        );
-        assert_eq!(
-            rows[1]["last_ts_ms"].as_i64(),
-            Some(seed.hour + 240_000)
-        );
+        assert_eq!(rows[1]["first_ts_ms"].as_i64(), Some(seed.hour + 60_000));
+        assert_eq!(rows[1]["last_ts_ms"].as_i64(), Some(seed.hour + 240_000));
         assert_eq!(rows[2]["kind"].as_str(), Some("state_changed"));
         assert_eq!(rows[2]["count"].as_u64(), Some(1));
         assert_eq!(rows[2]["ts_ms"].as_i64(), Some(seed.hour + 120_000));

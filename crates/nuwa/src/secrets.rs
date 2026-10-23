@@ -259,7 +259,11 @@ fn build_allowlist(vars: &BTreeMap<String, String>) -> BTreeMap<String, String> 
         }
     }
     if let Some(extra) = vars.get("NUWA_AGENT_ENV_ALLOW") {
-        for key in extra.split(',').map(str::trim).filter(|key| !key.is_empty()) {
+        for key in extra
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
             if KNOWN_SECRET_KEYS.contains(&key) {
                 continue;
             }
@@ -333,7 +337,9 @@ mod tests {
         assert_eq!(secrets.zai_key.as_deref(), Some("zai-secret-value-123456"));
         assert!(!vars.contains_key("NUWA_GITHUB_TOKEN"));
         assert!(!vars.contains_key("ZAI_API_KEY"));
-        assert!(secrets.redact("token ghp_abcdefghijklmnopqrstuvwx1234").contains("[REDACTED]"));
+        assert!(secrets
+            .redact("token ghp_abcdefghijklmnopqrstuvwx1234")
+            .contains("[REDACTED]"));
     }
 
     #[test]
@@ -343,7 +349,10 @@ mod tests {
         let mut vars = vars(&[("HTTPS_PROXY", "http://alice:supersecret@proxy.corp:8080")]);
         let secrets = Secrets::from_vars(&mut vars);
         // The proxy value itself is still allowed through to the child.
-        assert_eq!(vars.get("HTTPS_PROXY").map(String::as_str), Some("http://alice:supersecret@proxy.corp:8080"));
+        assert_eq!(
+            vars.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://alice:supersecret@proxy.corp:8080")
+        );
         let redacted = secrets.redact("dialing http://alice:supersecret@proxy.corp:8080");
         assert!(!redacted.contains("supersecret"), "{redacted}");
         assert!(redacted.contains("[REDACTED]"));
@@ -404,7 +413,10 @@ mod tests {
             ("CUSTOM_FLAG", "1"),
         ]);
         let allow = build_allowlist(&vars);
-        assert_eq!(allow.get("SystemRoot").map(String::as_str), Some(r"C:\Windows"));
+        assert_eq!(
+            allow.get("SystemRoot").map(String::as_str),
+            Some(r"C:\Windows")
+        );
         assert_eq!(allow.get("PATH").map(String::as_str), Some(r"C:\bin"));
         assert_eq!(allow.get("custom_flag").map(String::as_str), Some("1"));
     }

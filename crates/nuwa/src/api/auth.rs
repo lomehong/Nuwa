@@ -130,11 +130,7 @@ pub async fn login(
     (jar, StatusCode::NO_CONTENT).into_response()
 }
 
-pub async fn logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-) -> Response {
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap, jar: CookieJar) -> Response {
     let secure = secure_cookie(&state, &headers);
     // Revoke server-side before clearing the cookie: a copied cookie must
     // stop working now, not when its TTL runs out.
@@ -248,24 +244,36 @@ mod tests {
         // `never` wins even with `always` also set and a TLS proxy header.
         let (_dir, app) = test_app(true, true);
         let cookie = csrf_set_cookie(&app, Some("https")).await;
-        assert!(!cookie.contains("Secure"), "never must drop Secure: {cookie}");
+        assert!(
+            !cookie.contains("Secure"),
+            "never must drop Secure: {cookie}"
+        );
 
         // Without `never`, X-Forwarded-Proto: https still opts in...
         let (_dir, app) = test_app(false, false);
         let cookie = csrf_set_cookie(&app, Some("https")).await;
-        assert!(cookie.contains("Secure"), "https proxy must set Secure: {cookie}");
+        assert!(
+            cookie.contains("Secure"),
+            "https proxy must set Secure: {cookie}"
+        );
 
         // ...and `always` does so without any proxy header.
         let (_dir, app) = test_app(true, false);
         let cookie = csrf_set_cookie(&app, None).await;
-        assert!(cookie.contains("Secure"), "always must set Secure: {cookie}");
+        assert!(
+            cookie.contains("Secure"),
+            "always must set Secure: {cookie}"
+        );
     }
 
     #[test]
     fn session_cookie_is_httponly_and_csrf_is_readable() {
         let session = session_cookie("s".into(), 60_000, false).to_string();
         for attr in ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age=60"] {
-            assert!(session.contains(attr), "session cookie missing {attr}: {session}");
+            assert!(
+                session.contains(attr),
+                "session cookie missing {attr}: {session}"
+            );
         }
         assert!(!session.contains("Secure"), "{session}");
 

@@ -46,7 +46,12 @@ pub struct WebhookEvent {
 }
 
 impl WebhookEvent {
-    pub fn new(event: impl Into<String>, fingerprint: Option<String>, repo: Option<String>, detail: impl Into<String>) -> Self {
+    pub fn new(
+        event: impl Into<String>,
+        fingerprint: Option<String>,
+        repo: Option<String>,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             schema: "nuwa/webhook/v1",
             id: uuid::Uuid::new_v4().to_string(),
@@ -130,7 +135,12 @@ pub fn init_from_env() -> &'static WebhookHandle {
             .ok()
             .map(|raw| parse_events(&raw))
             .filter(|events| !events.is_empty())
-            .unwrap_or_else(|| DEFAULT_EVENTS.iter().map(|event| (*event).to_string()).collect());
+            .unwrap_or_else(|| {
+                DEFAULT_EVENTS
+                    .iter()
+                    .map(|event| (*event).to_string())
+                    .collect()
+            });
         spawn(WebhookConfig {
             url,
             secret,
@@ -207,7 +217,10 @@ async fn deliver(client: &reqwest::Client, config: &WebhookConfig, event: Webhoo
         Ok(body) => body,
         Err(_) => return,
     };
-    let signature = config.secret.as_deref().map(|secret| hmac_hex(secret, &body));
+    let signature = config
+        .secret
+        .as_deref()
+        .map(|secret| hmac_hex(secret, &body));
     for attempt in 1..=3u32 {
         let mut request = client
             .post(&config.url)
@@ -227,7 +240,10 @@ async fn deliver(client: &reqwest::Client, config: &WebhookConfig, event: Webhoo
                 );
             }
             Err(error) => {
-                eprintln!("webhook    : {} -> {error} (attempt {attempt}/3)", event.event);
+                eprintln!(
+                    "webhook    : {} -> {error} (attempt {attempt}/3)",
+                    event.event
+                );
             }
         }
         if attempt < 3 {

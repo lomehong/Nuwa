@@ -4,11 +4,11 @@
 //! run is resumable and every turn is auditable after the fact.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use rpi_agent::events::{AgentEvent, BroadcastEmitter};
 use rpi_agent::AgentTool;
 use rpi_ai::providers::anthropic::models::anthropic_models;
@@ -35,7 +35,9 @@ use crate::issue::Issue;
 
 #[derive(Debug, Clone)]
 pub enum ProviderKind {
-    Anthropic { model: Option<String> },
+    Anthropic {
+        model: Option<String>,
+    },
     Faux,
     /// OpenAI-completions-compatible endpoint (智谱 coding plan 等)。
     /// Base URL keeps its `/v4`-style version segment; the provider appends
@@ -213,7 +215,8 @@ fn default_faux_script() -> FauxScript {
         )
 }
 
-pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn budget (rpi-harness RunBudget reads this per run). Token-level caps
+pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
+    // Turn budget (rpi-harness RunBudget reads this per run). Token-level caps
     // land with the 运行器池 scheduler; the turn cap bounds runaway loops now.
     std::env::set_var("RPI_MAX_TURNS_PER_RUN", job.max_turns.to_string());
 
@@ -236,12 +239,11 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
     // unrelated host secrets out of build/test commands.
     let allowlist: std::collections::HashMap<String, String> =
         crate::secrets::agent_env_allowlist().into_iter().collect();
-    let prepare: rpi_tools::BashPrepare =
-        Arc::new(move |exec: &mut rpi_tools::BashExecution| {
-            exec.inherit_env = false;
-            exec.env = allowlist.clone();
-            Box::pin(async { Ok(()) })
-        });
+    let prepare: rpi_tools::BashPrepare = Arc::new(move |exec: &mut rpi_tools::BashExecution| {
+        exec.inherit_env = false;
+        exec.env = allowlist.clone();
+        Box::pin(async { Ok(()) })
+    });
     let tools: Vec<Arc<dyn AgentTool>> = vec![
         create_read_tool(&ctx, None),
         create_edit_tool(&ctx),
@@ -309,9 +311,9 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
                 .zai_key
                 .clone()
                 .context("ZAI_API_KEY not set (智谱 coding plan 的 API key)")?;
-            let base = base_url.clone().unwrap_or_else(|| {
-                "https://open.bigmodel.cn/api/coding/paas/v4".to_string()
-            });
+            let base = base_url
+                .clone()
+                .unwrap_or_else(|| "https://open.bigmodel.cn/api/coding/paas/v4".to_string());
             let model_id = model.clone().unwrap_or_else(|| "glm-5.3-flash".to_string());
             let provider_id = "zai-coding-cn";
             let mut picked = rpi_ai::Model::new(
@@ -335,11 +337,9 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
             (picked, vec![Arc::new(provider) as Arc<dyn Provider>])
         }
         ProviderKind::Anthropic { model } => {
-            let key = job
-                .secrets
-                .anthropic_key
-                .clone()
-                .context("ANTHROPIC_API_KEY not set (or use --provider faux for the offline path)")?;
+            let key = job.secrets.anthropic_key.clone().context(
+                "ANTHROPIC_API_KEY not set (or use --provider faux for the offline path)",
+            )?;
             let http = rpi_ai::http::build_client("https://api.anthropic.com", None, None)
                 .unwrap_or_else(|_| reqwest::Client::new());
             let provider = AnthropicProvider::new(Some(key), http);
@@ -384,7 +384,11 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
         },
         ..AgentHarnessOptions::default()
     };
-    let harness = Arc::new(AgentHarness::create(options).await.context("harness create")?);
+    let harness = Arc::new(
+        AgentHarness::create(options)
+            .await
+            .context("harness create")?,
+    );
 
     // 压缩是上下文预算里唯一有事件的一环：每次自动压缩的 guard 会发
     // active=true/false 两个事件，只数开始那一次。
@@ -411,10 +415,18 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
         loop {
             match rx.recv().await {
                 Ok(ev) => match ev {
-                    AgentEvent::ToolExecutionStart { tool_name, ref args, .. } => {
+                    AgentEvent::ToolExecutionStart {
+                        tool_name,
+                        ref args,
+                        ..
+                    } => {
                         eprintln!("  [tool] {tool_name} {args}");
                     }
-                    AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } => {
+                    AgentEvent::ToolExecutionEnd {
+                        tool_name,
+                        is_error,
+                        ..
+                    } => {
                         eprintln!("  [tool→] {tool_name} err={is_error}");
                     }
                     AgentEvent::TurnEnd { ref message, .. } => {
@@ -430,9 +442,9 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
                             let uncached_delta =
                                 (usage.input + usage.cache_write + usage.output).max(0) as u64;
                             let cached_delta = usage.cache_read.max(0) as u64;
-                            let uncached_total =
-                                uncached.fetch_add(uncached_delta, Ordering::Relaxed)
-                                    + uncached_delta;
+                            let uncached_total = uncached
+                                .fetch_add(uncached_delta, Ordering::Relaxed)
+                                + uncached_delta;
                             let cached_total =
                                 cached.fetch_add(cached_delta, Ordering::Relaxed) + cached_delta;
                             let _ = drain_harness.record_usage(usage, None, None).await;
@@ -445,7 +457,12 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
                             }
                         }
                     }
-                    AgentEvent::RetryScheduled { attempt, max_retries, ref error, .. } => {
+                    AgentEvent::RetryScheduled {
+                        attempt,
+                        max_retries,
+                        ref error,
+                        ..
+                    } => {
                         eprintln!("  [retry {attempt}/{max_retries}] {error}");
                     }
                     _ => {}
@@ -472,8 +489,7 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
         // The prompt call is the provider call: a failure here is the
         // provider's, not the issue's.
         Err(e) => {
-            return Err(anyhow::Error::new(ProviderFailure(format!("{e:#}")))
-                .context("repair run"));
+            return Err(anyhow::Error::new(ProviderFailure(format!("{e:#}"))).context("repair run"));
         }
     };
 
@@ -506,7 +522,10 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
         run_id: result.run_id,
         root_cause_text,
         turns: turns.load(Ordering::Relaxed),
-        uncached_tokens: stats.as_ref().map(|s| s.uncached_tokens as u64).unwrap_or(0),
+        uncached_tokens: stats
+            .as_ref()
+            .map(|s| s.uncached_tokens as u64)
+            .unwrap_or(0),
         cached_tokens: stats.as_ref().map(|s| s.cached_tokens as u64).unwrap_or(0),
         session_dir: sessions_dir.to_string_lossy().into_owned(),
         context: ContextBudget {
@@ -602,10 +621,19 @@ mod tests {
             report.context.model_context_window > 0,
             "faux model must expose a context window"
         );
-        assert_eq!(report.context.compactions, 0, "short run needs no compaction");
-        assert!(report.context.messages > 0, "final session must count messages");
+        assert_eq!(
+            report.context.compactions, 0,
+            "short run needs no compaction"
+        );
+        assert!(
+            report.context.messages > 0,
+            "final session must count messages"
+        );
         let events = seen.lock().expect("lock");
-        assert!(!events.is_empty(), "progress callback must fire at least once");
+        assert!(
+            !events.is_empty(),
+            "progress callback must fire at least once"
+        );
         assert!(events.last().expect("last").turns >= 1);
 
         let fixed = std::fs::read_to_string(&source).expect("read");

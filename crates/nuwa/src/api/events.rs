@@ -12,8 +12,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::api::common::{
-    non_empty, parse_flag, parse_ms, parse_page_number, PageMeta, DEFAULT_PAGE_SIZE,
-    MAX_PAGE_SIZE,
+    non_empty, parse_flag, parse_ms, parse_page_number, PageMeta, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use crate::api::ApiError;
 use crate::serve::AppState;
@@ -138,10 +137,7 @@ impl EventItem {
 }
 
 /// `GET /api/v1/events` — newest first, optional hour aggregation.
-pub async fn list(
-    State(state): State<AppState>,
-    Query(query): Query<EventListQuery>,
-) -> Response {
+pub async fn list(State(state): State<AppState>, Query(query): Query<EventListQuery>) -> Response {
     let params = match ListParams::parse(&query) {
         Ok(params) => params,
         Err(error) => return error.into_response(),
@@ -392,13 +388,21 @@ mod tests {
         let fp_b = report(store, "beta", APP, t_old);
         let fp_c = report(store, "gamma", OTHER, t_old);
 
-        let record = |fp: &str, ts: i64, repo: Option<&str>, actor: &str, kind: &str, detail: &str| {
-            store
-                .record_event(fp, ts, repo, actor, kind, detail)
-                .expect("record event");
-        };
+        let record =
+            |fp: &str, ts: i64, repo: Option<&str>, actor: &str, kind: &str, detail: &str| {
+                store
+                    .record_event(fp, ts, repo, actor, kind, detail)
+                    .expect("record event");
+            };
         record(&fp_a, t1, Some(APP), "system", "reported", "r1");
-        record(&fp_a, t_state, Some(APP), "runner", "state_changed", "claimed");
+        record(
+            &fp_a,
+            t_state,
+            Some(APP),
+            "runner",
+            "state_changed",
+            "claimed",
+        );
         record(&fp_a, t2, Some(APP), "system", "reported", "r2");
         record(&fp_a, t3, Some(APP), "system", "reported", "r3");
         record(&fp_a, t_next, Some(APP), "system", "reported", "r-next");
@@ -510,7 +514,10 @@ mod tests {
         let value = json_body(
             get(
                 &app,
-                &format!("/api/v1/events?repo=example.com%2Fother&from_ms={}", seed.hour),
+                &format!(
+                    "/api/v1/events?repo=example.com%2Fother&from_ms={}",
+                    seed.hour
+                ),
             )
             .await,
         )

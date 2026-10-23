@@ -59,7 +59,12 @@ impl From<ApiError> for ErrorBody {
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into(), fields: None }
+        Self {
+            status,
+            code,
+            message: message.into(),
+            fields: None,
+        }
     }
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", message)

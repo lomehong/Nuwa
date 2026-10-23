@@ -184,11 +184,7 @@ pub fn git_raw(repo: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-pub async fn git_ok(
-    repo: &Path,
-    args: &[&str],
-    timeout: Duration,
-) -> anyhow::Result<String> {
+pub async fn git_ok(repo: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
     let out = git_with_timeout(repo, args, timeout).await?;
     if out.timed_out {
         bail!("git {} timed out after {:?}", args.join(" "), timeout);
@@ -197,7 +193,11 @@ pub async fn git_ok(
         bail!(
             "git {} failed: {}",
             args.join(" "),
-            if out.stderr.is_empty() { &out.stdout } else { &out.stderr }
+            if out.stderr.is_empty() {
+                &out.stdout
+            } else {
+                &out.stderr
+            }
         );
     }
     Ok(out.stdout)
@@ -247,7 +247,11 @@ pub async fn delete_remote_branch(
     }
     bail!(
         "git push --delete {branch} failed: {}",
-        if out.stderr.is_empty() { &out.stdout } else { &out.stderr }
+        if out.stderr.is_empty() {
+            &out.stdout
+        } else {
+            &out.stderr
+        }
     );
 }
 
@@ -274,11 +278,7 @@ pub async fn remote_branch_exists(
     Ok(!out.stdout.trim().is_empty())
 }
 
-pub async fn fetch_base(
-    repo: &Path,
-    base: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
+pub async fn fetch_base(repo: &Path, base: &str, timeout: Duration) -> anyhow::Result<()> {
     git_ok(repo, &["fetch", "--prune", "origin", base], timeout)
         .await
         .map(|_| ())
@@ -286,11 +286,7 @@ pub async fn fetch_base(
 
 /// Push the delivery branch with a hard timeout. A stalled connection must
 /// not hold the runner forever.
-pub async fn push_branch(
-    repo: &Path,
-    branch: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
+pub async fn push_branch(repo: &Path, branch: &str, timeout: Duration) -> anyhow::Result<()> {
     let out = git_with_timeout(repo, &["push", "-u", "origin", branch], timeout).await?;
     if out.timed_out {
         bail!("git push {branch} timed out after {:?}", timeout);
@@ -298,7 +294,11 @@ pub async fn push_branch(
     if !out.success {
         bail!(
             "git push {branch} failed: {}",
-            if out.stderr.is_empty() { &out.stdout } else { &out.stderr }
+            if out.stderr.is_empty() {
+                &out.stdout
+            } else {
+                &out.stderr
+            }
         );
     }
     Ok(())
@@ -415,21 +415,13 @@ mod tests {
         #[cfg(unix)]
         let (program, args): (&str, &[&str]) = ("sh", &["-c", "sleep 5 & echo done"]);
         #[cfg(windows)]
-        let (program, args): (&str, &[&str]) = (
-            "cmd",
-            &["/C", "start /B ping -n 6 127.0.0.1 & echo done"],
-        );
+        let (program, args): (&str, &[&str]) =
+            ("cmd", &["/C", "start /B ping -n 6 127.0.0.1 & echo done"]);
 
         let start = Instant::now();
-        let out = run_process(
-            program,
-            args,
-            dir.path(),
-            Duration::from_millis(300),
-            None,
-        )
-        .await
-        .expect("run_process");
+        let out = run_process(program, args, dir.path(), Duration::from_millis(300), None)
+            .await
+            .expect("run_process");
         let elapsed = start.elapsed();
         // Bounded by the deadline plus kill/cleanup slack — never the ~5s the
         // grandchild would otherwise hold the pipe open.
@@ -449,7 +441,10 @@ mod tests {
 
         let work = root.path().join("work");
         std::fs::create_dir_all(&work).expect("mkdir");
-        run(&work, &["clone", origin.to_str().expect("origin path"), "."]);
+        run(
+            &work,
+            &["clone", origin.to_str().expect("origin path"), "."],
+        );
         run(&work, &["checkout", "-b", "main"]);
         run(&work, &["config", "user.name", "test"]);
         run(&work, &["config", "user.email", "test@example.com"]);
@@ -460,7 +455,10 @@ mod tests {
 
         let other = root.path().join("other");
         std::fs::create_dir_all(&other).expect("mkdir");
-        run(&other, &["clone", origin.to_str().expect("origin path"), "."]);
+        run(
+            &other,
+            &["clone", origin.to_str().expect("origin path"), "."],
+        );
         run(&other, &["config", "user.name", "test"]);
         run(&other, &["config", "user.email", "test@example.com"]);
         commit_file(&other, "g.txt", "two\n");
@@ -485,7 +483,10 @@ mod tests {
         run(&origin, &["init", "--bare", "-b", "main"]);
         let work = root.path().join("work");
         std::fs::create_dir_all(&work).expect("mkdir");
-        run(&work, &["clone", origin.to_str().expect("origin path"), "."]);
+        run(
+            &work,
+            &["clone", origin.to_str().expect("origin path"), "."],
+        );
         run(&work, &["checkout", "-b", "main"]);
         run(&work, &["config", "user.name", "test"]);
         run(&work, &["config", "user.email", "test@example.com"]);
@@ -504,8 +505,8 @@ mod tests {
         delete_remote_branch(&work, "agent/fix/x", Duration::from_secs(10))
             .await
             .expect("delete remote");
-        let remote = git(&work, &["ls-remote", "--heads", "origin", "agent/fix/x"])
-            .expect("ls-remote");
+        let remote =
+            git(&work, &["ls-remote", "--heads", "origin", "agent/fix/x"]).expect("ls-remote");
         assert!(remote.is_empty());
     }
 
@@ -527,5 +528,4 @@ mod tests {
         init_repo(dir.path());
         assert_eq!(current_branch(dir.path()).expect("branch"), "main");
     }
-
 }

@@ -231,7 +231,9 @@ pub(crate) fn stuck_floor_ms() -> i64 {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .map(|secs| secs.clamp(STUCK_FLOOR_MIN_SECS, STUCK_FLOOR_MAX_SECS))
     {
-        Some(secs) => i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1_000),
+        Some(secs) => i64::try_from(secs)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000),
         None => STUCK_AFTER_FLOOR_MS,
     }
 }
@@ -346,8 +348,7 @@ const SYSTEMD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// `POST /settings/restart` and `POST /runners/{id}/restart` (docs/09 §9.2).
 /// `try_lock` keeps a concurrent request a 409 instead of a queue.
 pub(crate) fn restart_lock() -> &'static tokio::sync::Mutex<()> {
-    static RESTART_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
+    static RESTART_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     RESTART_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 

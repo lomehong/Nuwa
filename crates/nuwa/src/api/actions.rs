@@ -250,12 +250,7 @@ fn unit_error(message: &str) -> ApiError {
     ApiError::validation(fields)
 }
 
-fn requeue_issue(
-    store: &Store,
-    fingerprint: &str,
-    force: bool,
-    now: i64,
-) -> Result<(), ApiError> {
+fn requeue_issue(store: &Store, fingerprint: &str, force: bool, now: i64) -> Result<(), ApiError> {
     // The stuck window is sized like the overview/detail views: the owner
     // runner's configured interval plus the operator floor.
     let Some(issue) = find_issue(store, fingerprint)? else {
@@ -393,12 +388,7 @@ mod tests {
         token
     }
 
-    async fn post_json(
-        app: &Router,
-        uri: &str,
-        csrf: Option<&str>,
-        body: &str,
-    ) -> Response {
+    async fn post_json(app: &Router, uri: &str, csrf: Option<&str>, body: &str) -> Response {
         let mut request = Request::builder()
             .method("POST")
             .uri(uri)
@@ -410,21 +400,12 @@ mod tests {
                 .header("x-nuwa-csrf", token);
         }
         app.clone()
-            .oneshot(
-                request
-                    .body(Body::from(body.to_string()))
-                    .expect("request"),
-            )
+            .oneshot(request.body(Body::from(body.to_string())).expect("request"))
             .await
             .expect("response")
     }
 
-    async fn put_json(
-        app: &Router,
-        uri: &str,
-        csrf: Option<&str>,
-        body: &str,
-    ) -> Response {
+    async fn put_json(app: &Router, uri: &str, csrf: Option<&str>, body: &str) -> Response {
         let mut request = Request::builder()
             .method("PUT")
             .uri(uri)
@@ -556,13 +537,7 @@ mod tests {
             .expect("set state");
     }
 
-    fn upsert_runner(
-        store: &Store,
-        id: &str,
-        heartbeat_at: i64,
-        status: &str,
-        config_json: &str,
-    ) {
+    fn upsert_runner(store: &Store, id: &str, heartbeat_at: i64, status: &str, config_json: &str) {
         store
             .upsert_runner(&RunnerUpsert {
                 id: id.to_string(),
@@ -582,13 +557,7 @@ mod tests {
             .expect("upsert runner");
     }
 
-    fn heartbeat(
-        store: &Store,
-        runner_id: &str,
-        at: i64,
-        status: &str,
-        fingerprint: &str,
-    ) {
+    fn heartbeat(store: &Store, runner_id: &str, at: i64, status: &str, fingerprint: &str) {
         store
             .heartbeat_runner(
                 runner_id,
@@ -643,8 +612,7 @@ mod tests {
     /// fake `NUWA_GITHUB_TOKEN`/`GITHUB_TOKEN` serialize on this async lock,
     /// which may be held across the request await.
     async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
+        static ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
@@ -692,7 +660,13 @@ mod tests {
         let escalated = report(store, &signal("escalated action"), now - 50_000);
         set_state(store, &escalated, State::Triggered, now - 49_000);
         set_state(store, &escalated, State::Fixing, now - 48_000);
-        start_run(store, "run-escalated", &escalated, "runner-gone", now - 48_000);
+        start_run(
+            store,
+            "run-escalated",
+            &escalated,
+            "runner-gone",
+            now - 48_000,
+        );
         set_state(store, &escalated, State::Escalated, now - 47_000);
 
         // Same 600s of silence as `slow`, but no owner and the default 30s
@@ -721,7 +695,13 @@ mod tests {
         let healthy = report(store, &signal("healthy owner"), now - 700_000);
         set_state(store, &healthy, State::Triggered, now - 600_000);
         set_state(store, &healthy, State::Fixing, now - 600_000);
-        start_run(store, "run-healthy", &healthy, "runner-healthy", now - 600_000);
+        start_run(
+            store,
+            "run-healthy",
+            &healthy,
+            "runner-healthy",
+            now - 600_000,
+        );
         upsert_runner(store, "runner-healthy", now - 1_000, "working", "{}");
         heartbeat(store, "runner-healthy", now - 1_000, "working", &healthy);
 
@@ -1169,7 +1149,11 @@ mod tests {
                 "",
             )
             .await;
-            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{unit:?}");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{unit:?}"
+            );
             let value = json_body(response).await;
             assert_eq!(value["error"]["code"], "validation_failed");
             assert!(
@@ -1184,20 +1168,24 @@ mod tests {
         let _serial = restart_test_guard().await;
         // None of these can become a valid unit after trimming, so the
         // systemd-run path is never reached.
-        for unit in ["nuwa work", "nuwa-work; rm -rf /", "../etc/passwd", "-nuwa-work"] {
+        for unit in [
+            "nuwa work",
+            "nuwa-work; rm -rf /",
+            "../etc/passwd",
+            "-nuwa-work",
+        ] {
             let (_dir, state) = test_state();
             upsert_runner_with_unit(&state.store, "runner-odd", Some(unit));
             let app = build_app(state);
             let csrf = csrf_token(&app).await;
 
-            let response = post_json(
-                &app,
-                "/api/v1/runners/runner-odd/restart",
-                Some(&csrf),
-                "",
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY, "{unit:?}");
+            let response =
+                post_json(&app, "/api/v1/runners/runner-odd/restart", Some(&csrf), "").await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{unit:?}"
+            );
             let value = json_body(response).await;
             assert_eq!(value["error"]["code"], "validation_failed");
             assert!(

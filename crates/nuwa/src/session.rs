@@ -125,7 +125,9 @@ pub struct LoginLimiter {
 
 impl LoginLimiter {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn check(&self, ip: IpAddr, now_ms: i64) -> Result<(), i64> {
@@ -164,7 +166,11 @@ fn authority(url: &str) -> Option<&str> {
     let (_, rest) = url.split_once("://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let host = &rest[..end];
-    if host.is_empty() { None } else { Some(host) }
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
 }
 
 pub fn origin_ok(origin: Option<&str>, referer: Option<&str>, host: Option<&str>) -> bool {
@@ -225,9 +231,15 @@ pub async fn csrf_guard(
         .get("x-nuwa-csrf")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    let origin = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok());
-    let referer = headers.get(header::REFERER).and_then(|value| value.to_str().ok());
-    let host = headers.get(header::HOST).and_then(|value| value.to_str().ok());
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    let referer = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok());
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
     if cookie.is_empty()
         || !SessionManager::token_eq(cookie, header)
         || !origin_ok(origin, referer, host)

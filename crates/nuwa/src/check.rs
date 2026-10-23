@@ -39,7 +39,10 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let mut json = false;
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
-        let mut value = |name: &str| it.next().with_context(|| format!("missing value for {name}"));
+        let mut value = |name: &str| {
+            it.next()
+                .with_context(|| format!("missing value for {name}"))
+        };
         match flag.as_str() {
             "--instructions" => instructions_path = Some(PathBuf::from(value("--instructions")?)),
             "--repo" => repo_path = Some(PathBuf::from(value("--repo")?)),
@@ -58,8 +61,12 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let base = resolve_base(&repo_dir, &base)?;
     let raw = std::fs::read_to_string(&instructions_path)
         .with_context(|| format!("read {}", instructions_path.display()))?;
-    let config: RepoInstructions = serde_json::from_str(&raw)
-        .with_context(|| format!("parse repo instructions JSON from {}", instructions_path.display()))?;
+    let config: RepoInstructions = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "parse repo instructions JSON from {}",
+            instructions_path.display()
+        )
+    })?;
 
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -75,13 +82,7 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     }
 
     let secrets = Secrets::default();
-    let failing = match verify::probe_check(
-        &repo_dir,
-        &base,
-        &config.failing_check,
-        &secrets,
-    )
-    .await
+    let failing = match verify::probe_check(&repo_dir, &base, &config.failing_check, &secrets).await
     {
         Ok(output) => {
             if output.ok {

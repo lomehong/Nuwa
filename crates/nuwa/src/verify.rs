@@ -68,7 +68,11 @@ impl VerificationEvidence {
             self.failing_base.output
         ));
         if let Some(base) = &self.reproduce_base {
-            out.push_str(&format!("BASE reproduce: -> {}\n{}\n\n", verdict(base), base.output));
+            out.push_str(&format!(
+                "BASE reproduce: -> {}\n{}\n\n",
+                verdict(base),
+                base.output
+            ));
         }
         out.push_str(&format!(
             "BRANCH failing_check: `{}` -> {}\n{}\n\n",
@@ -165,7 +169,10 @@ pub async fn verify(
                 );
             }
             if branch_out.timed_out {
-                bail!("reproduce_check timed out on branch:\n{}", branch_out.output);
+                bail!(
+                    "reproduce_check timed out on branch:\n{}",
+                    branch_out.output
+                );
             }
             if !branch_out.ok {
                 bail!(
@@ -193,7 +200,10 @@ pub async fn verify(
                 bail!("reproducer timed out on branch:\n{}", branch_out.output);
             }
             if !branch_out.ok {
-                bail!(".nuwa/repro.sh still fails on the branch:\n{}", branch_out.output);
+                bail!(
+                    ".nuwa/repro.sh still fails on the branch:\n{}",
+                    branch_out.output
+                );
             }
         }
         _ => unreachable!("verification mode"),
@@ -339,8 +349,7 @@ fn copy_reproducer_if_present(repo: &Path, base_dir: &Path) -> anyhow::Result<()
     }
     let destination = base_dir.join(&path);
     if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     std::fs::copy(&source, &destination)
         .with_context(|| format!("copy {} to {}", source.display(), destination.display()))?;
@@ -354,16 +363,12 @@ struct BaseWorktree<'a> {
 
 impl<'a> BaseWorktree<'a> {
     fn create(repo: &'a Path, base: &str) -> anyhow::Result<Self> {
-        let reference = if git_ops::git(
-            repo,
-            &["rev-parse", "--verify", &format!("origin/{base}")],
-        )
-        .is_ok()
-        {
-            format!("origin/{base}")
-        } else {
-            base.to_string()
-        };
+        let reference =
+            if git_ops::git(repo, &["rev-parse", "--verify", &format!("origin/{base}")]).is_ok() {
+                format!("origin/{base}")
+            } else {
+                base.to_string()
+            };
         let path = std::env::temp_dir().join(format!("nuwa-verify-{}", uuid::Uuid::new_v4()));
         let path_str = path
             .to_str()
@@ -425,17 +430,20 @@ pub fn diff_summary(
                 });
             }
         }
-        summary.files.push(DiffFile {
-            status: code,
-            path,
-        });
+        summary.files.push(DiffFile { status: code, path });
     }
 
     let numstat = git_ops::git(repo, &["diff", "--numstat", base]).unwrap_or_default();
     for line in numstat.lines() {
         let mut fields = line.splitn(3, '\t');
-        let added = fields.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-        let removed = fields.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let added = fields
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let removed = fields
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
         summary.added += added;
         summary.removed += removed;
     }
@@ -590,8 +598,11 @@ mod tests {
         let file = repo.join(path);
         std::fs::create_dir_all(file.parent().expect("parent")).expect("dir");
         if cfg!(windows) {
-            std::fs::write(&file, "@if exist fixed.txt (exit /b 0) else (exit /b 1)\r\n")
-                .expect("write");
+            std::fs::write(
+                &file,
+                "@if exist fixed.txt (exit /b 0) else (exit /b 1)\r\n",
+            )
+            .expect("write");
         } else {
             std::fs::write(&file, "#!/bin/sh\ntest -f fixed.txt\n").expect("write");
         }
@@ -702,7 +713,10 @@ mod tests {
         std::fs::write(repo.join("deploy.pem"), "key\n").expect("write");
         let summary = diff_summary(&repo, "main", &["*.pem".to_string()]).expect("diff");
         assert!(
-            summary.forbidden_hits.iter().any(|hit| hit.contains("deploy.pem")),
+            summary
+                .forbidden_hits
+                .iter()
+                .any(|hit| hit.contains("deploy.pem")),
             "{:?}",
             summary.forbidden_hits
         );
@@ -743,7 +757,10 @@ mod tests {
         std::fs::write(repo.join("go.sum"), "module hash CHANGED\n").expect("rewrite");
         let summary = diff_summary(&repo, "main", &["go.sum".to_string()]).expect("diff");
         assert!(
-            summary.forbidden_hits.iter().any(|hit| hit.contains("go.sum")),
+            summary
+                .forbidden_hits
+                .iter()
+                .any(|hit| hit.contains("go.sum")),
             "a modified tracked forbidden file must be caught: {:?}",
             summary.forbidden_hits
         );

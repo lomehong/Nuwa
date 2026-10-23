@@ -176,9 +176,7 @@ fn shell_words(command: &str) -> Vec<String> {
         .map(|c| if c == '\\' { '/' } else { c })
         .collect();
     normalized
-        .split(|c: char| {
-            c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>')
-        })
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>'))
         .map(|word| word.trim().to_string())
         .filter(|word| !word.is_empty())
         .collect()
@@ -189,7 +187,13 @@ fn shell_words(command: &str) -> Vec<String> {
 fn normalize_guard_path(path: &str) -> String {
     let trimmed: String = path
         .chars()
-        .map(|c| if c.is_whitespace() && c != ' ' { ' ' } else { c })
+        .map(|c| {
+            if c.is_whitespace() && c != ' ' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let trimmed = trimmed.trim_start();
     trimmed.strip_prefix('@').unwrap_or(trimmed).to_string()
@@ -258,8 +262,7 @@ pub fn before_tool_hook(guards: Arc<Guards>) -> BeforeToolCall {
                     reason: Some(reason),
                     ..BeforeToolCallResult::default()
                 })
-            })
-                as BoxFuture<'static, Option<BeforeToolCallResult>>
+            }) as BoxFuture<'static, Option<BeforeToolCallResult>>
         },
     )
 }
@@ -290,7 +293,9 @@ mod tests {
 
     #[test]
     fn traversal_is_blocked() {
-        assert!(guards().check("write", &json!({"path": "../outside.go"})).is_err());
+        assert!(guards()
+            .check("write", &json!({"path": "../outside.go"}))
+            .is_err());
     }
 
     #[test]
@@ -317,7 +322,9 @@ mod tests {
 
     #[test]
     fn forbidden_path_in_command_is_blocked() {
-        assert!(guards().check("bash", &json!({"command": "cat go.sum"})).is_err());
+        assert!(guards()
+            .check("bash", &json!({"command": "cat go.sum"}))
+            .is_err());
         assert!(guards()
             .check("bash", &json!({"command": "cat ./go.sum"}))
             .is_err());
@@ -336,7 +343,9 @@ mod tests {
 
     #[test]
     fn routine_test_command_is_allowed() {
-        assert!(guards().check("bash", &json!({"command": "go test ./..."})).is_ok());
+        assert!(guards()
+            .check("bash", &json!({"command": "go test ./..."}))
+            .is_ok());
         // `push` as an argument is not the subcommand.
         assert!(guards()
             .check("bash", &json!({"command": "git log --grep push"}))
@@ -358,7 +367,9 @@ mod tests {
             "git rebase -i HEAD~2",
         ] {
             assert!(
-                guards().check("bash", &json!({"command": command})).is_err(),
+                guards()
+                    .check("bash", &json!({"command": command}))
+                    .is_err(),
                 "{command} must be blocked"
             );
         }
@@ -375,7 +386,9 @@ mod tests {
             "cat /opt/nuwa/nuwa.env",
         ] {
             assert!(
-                guards().check("bash", &json!({"command": command})).is_err(),
+                guards()
+                    .check("bash", &json!({"command": command}))
+                    .is_err(),
                 "{command} must be blocked"
             );
         }

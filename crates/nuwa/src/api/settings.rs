@@ -404,7 +404,9 @@ async fn probe_github(values: &BTreeMap<String, Value>) -> Result<TestSettingsRe
     let remaining = rate
         .and_then(|rate| rate.get("remaining"))
         .and_then(Value::as_u64);
-    let limit = rate.and_then(|rate| rate.get("limit")).and_then(Value::as_u64);
+    let limit = rate
+        .and_then(|rate| rate.get("limit"))
+        .and_then(Value::as_u64);
     let detail = match (remaining, limit) {
         (Some(remaining), Some(limit)) => {
             format!("token accepted; {remaining}/{limit} requests remaining")
@@ -448,8 +450,7 @@ fn llm_model(values: &BTreeMap<String, Value>, default: &str) -> Result<String, 
 }
 
 fn llm_base(values: &BTreeMap<String, Value>, default: &str) -> Result<String, ApiError> {
-    let base =
-        resolve_llm_setting(values, "NUWA_BASE_URL", env_value("NUWA_BASE_URL"), default)?;
+    let base = resolve_llm_setting(values, "NUWA_BASE_URL", env_value("NUWA_BASE_URL"), default)?;
     if !valid_http_url(&base) {
         return Err(field_error("NUWA_BASE_URL", "must be an http(s) URL"));
     }
@@ -516,7 +517,12 @@ async fn probe_zai(values: &BTreeMap<String, Value>) -> Result<TestSettingsRespo
     let requested_base = provided_value(values, "NUWA_BASE_URL")?
         .map(|value| value.trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty());
-    let key = probe_credential(values, "ZAI_API_KEY", requested_base.as_deref(), &process_base)?;
+    let key = probe_credential(
+        values,
+        "ZAI_API_KEY",
+        requested_base.as_deref(),
+        &process_base,
+    )?;
     let request = test_http_client()?
         .post(format!("{base}/chat/completions"))
         .bearer_auth(key)
@@ -533,7 +539,9 @@ async fn probe_zai(values: &BTreeMap<String, Value>) -> Result<TestSettingsRespo
     })
 }
 
-async fn probe_anthropic(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
+async fn probe_anthropic(
+    values: &BTreeMap<String, Value>,
+) -> Result<TestSettingsResponse, ApiError> {
     let key = llm_key(values, "ANTHROPIC_API_KEY")?;
     let (base, model) = resolve_anthropic_probe(values, env_value("NUWA_MODEL"))?;
     let request = test_http_client()?
@@ -608,7 +616,10 @@ pub async fn restart(
     }
     if let Some(unit) = units.iter().find(|unit| !valid_systemd_unit(unit)) {
         let mut fields = BTreeMap::new();
-        fields.insert("units".to_string(), format!("invalid systemd unit {unit:?}"));
+        fields.insert(
+            "units".to_string(),
+            format!("invalid systemd unit {unit:?}"),
+        );
         return ApiError::validation(fields).into_response();
     }
 
@@ -647,9 +658,14 @@ fn audit_then_schedule(
     detail: &str,
     schedule: impl FnOnce() -> bool,
 ) -> bool {
-    if let Err(error) =
-        store.record_event("__system__", now, None, "owner", "restart_requested", detail)
-    {
+    if let Err(error) = store.record_event(
+        "__system__",
+        now,
+        None,
+        "owner",
+        "restart_requested",
+        detail,
+    ) {
         eprintln!("settings restart: audit failed: {error}");
     }
     schedule()
@@ -729,7 +745,11 @@ fn read_settings(
             } else {
                 (spec.default.unwrap_or("").to_string(), "default")
             };
-            let diff_source = if source == "default" { "default" } else { "file" };
+            let diff_source = if source == "default" {
+                "default"
+            } else {
+                "file"
+            };
             plain.insert(spec.key.to_string(), (value.clone(), diff_source));
             values.insert(
                 spec.key.to_string(),
@@ -866,8 +886,7 @@ fn write_settings(
 }
 
 /// New map + changed keys, or the 422 field map.
-type ValidatedUpdates =
-    Result<(BTreeMap<String, String>, Vec<String>), BTreeMap<String, String>>;
+type ValidatedUpdates = Result<(BTreeMap<String, String>, Vec<String>), BTreeMap<String, String>>;
 
 /// Validate the whole write before anything is persisted. Returns the new map
 /// and the changed keys, or a 422 field map.
@@ -1905,8 +1924,13 @@ mod tests {
         );
         // Empty candidate and empty env -> provider default.
         assert_eq!(
-            resolve_llm_setting(&values, "NUWA_BASE_URL", Some(String::new()), "https://d.test")
-                .expect("base"),
+            resolve_llm_setting(
+                &values,
+                "NUWA_BASE_URL",
+                Some(String::new()),
+                "https://d.test"
+            )
+            .expect("base"),
             "https://d.test"
         );
         assert_eq!(
@@ -1914,7 +1938,10 @@ mod tests {
             "anthropic"
         );
         // A non-empty candidate always wins over env and default.
-        values.insert("NUWA_MODEL".to_string(), Value::String("typed-model".to_string()));
+        values.insert(
+            "NUWA_MODEL".to_string(),
+            Value::String("typed-model".to_string()),
+        );
         assert_eq!(
             resolve_llm_setting(
                 &values,
@@ -1997,8 +2024,8 @@ mod tests {
             Value::String("https://proxy.example.test".to_string()),
         );
         values.insert("NUWA_MODEL".to_string(), Value::String(String::new()));
-        let (base, model) = resolve_anthropic_probe(&values, Some("not-in-catalog".to_string()))
-            .expect("resolve");
+        let (base, model) =
+            resolve_anthropic_probe(&values, Some("not-in-catalog".to_string())).expect("resolve");
         assert_eq!(base, "https://api.anthropic.com");
         assert_eq!(model, first);
 
@@ -2028,7 +2055,10 @@ mod tests {
             );
             false
         });
-        assert!(!scheduled, "the 501 path keeps the audit but reports failure");
+        assert!(
+            !scheduled,
+            "the 501 path keeps the audit but reports failure"
+        );
         let events = store.events_for("__system__", 10).expect("events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "restart_requested");
@@ -2039,7 +2069,8 @@ mod tests {
 
     #[test]
     fn restart_unavailable_message_names_the_manual_command() {
-        let message = restart_unavailable_message(&["nuwa-serve".to_string(), "nuwa-work".to_string()]);
+        let message =
+            restart_unavailable_message(&["nuwa-serve".to_string(), "nuwa-work".to_string()]);
         assert!(
             message.contains("systemctl restart nuwa-serve nuwa-work"),
             "{message}"
@@ -2152,7 +2183,10 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let value = json_body(response).await;
-        assert!(value["error"]["fields"]["ZAI_API_KEY"].is_string(), "{value}");
+        assert!(
+            value["error"]["fields"]["ZAI_API_KEY"].is_string(),
+            "{value}"
+        );
 
         let response = post_json(
             &app,
@@ -2316,12 +2350,8 @@ mod tests {
             ("nuwa serve", vec!["nuwa-work"]),
             ("nuwa-serve", vec!["nuwa-work", "../etc/passwd"]),
         ] {
-            let (_dir, app, store, _env_path) = test_app_custom(
-                None,
-                crate::now_ms(),
-                serve_unit,
-                &runner_units,
-            );
+            let (_dir, app, store, _env_path) =
+                test_app_custom(None, crate::now_ms(), serve_unit, &runner_units);
             let csrf = csrf_token(&app).await;
 
             let response = post_json(&app, "/api/v1/settings/restart", Some(&csrf), "{}").await;

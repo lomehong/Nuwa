@@ -200,7 +200,11 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if month <= 2 { year + 1 } else { year }, month as u32, day as u32)
+    (
+        if month <= 2 { year + 1 } else { year },
+        month as u32,
+        day as u32,
+    )
 }
 
 /// 一次性 CLI 从文件加载的问题单同样是外部输入。
@@ -305,7 +309,10 @@ mod tests {
             String::new(),
             &secrets::Secrets::default(),
         );
-        assert_eq!(built.log_window, vec!["line one".to_string(), "line two".to_string()]);
+        assert_eq!(
+            built.log_window,
+            vec!["line one".to_string(), "line two".to_string()]
+        );
         assert_eq!(built.first_seen, "1970-01-01 00:00:01 UTC");
         assert_eq!(built.last_seen, "1970-01-01 00:00:02 UTC");
     }
@@ -315,7 +322,10 @@ mod tests {
         assert_eq!(format_timestamp(0), "(unknown)");
         assert_eq!(format_timestamp(1_000), "1970-01-01 00:00:01 UTC");
         // Unix billennium — a well-known checkpoint.
-        assert_eq!(format_timestamp(1_000_000_000_000), "2001-09-09 01:46:40 UTC");
+        assert_eq!(
+            format_timestamp(1_000_000_000_000),
+            "2001-09-09 01:46:40 UTC"
+        );
         // Leap day in a leap century (2000 is divisible by 400).
         assert_eq!(format_timestamp(951_782_400_000), "2000-02-29 00:00:00 UTC");
     }

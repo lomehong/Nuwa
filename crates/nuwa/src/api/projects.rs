@@ -155,7 +155,9 @@ fn build_projects(store: &Store, now: i64) -> ShanResult<ProjectsResponse> {
 
     let mut projects: BTreeMap<String, ProjectAccumulator> = BTreeMap::new();
     for issue in &issues {
-        let entry = projects.entry(issue.repo.clone()).or_insert_with(ProjectAccumulator::new);
+        let entry = projects
+            .entry(issue.repo.clone())
+            .or_insert_with(ProjectAccumulator::new);
         entry.count(&issue.state, 1);
         entry.last_signal_ms = entry.last_signal_ms.max(issue.last_seen);
         let open = !matches!(issue.state.as_str(), "merged" | "ignored");
@@ -216,12 +218,7 @@ fn build_projects(store: &Store, now: i64) -> ShanResult<ProjectsResponse> {
     let registry: BTreeMap<String, (String, String, String)> = store
         .list_repos()?
         .into_iter()
-        .map(|repo| {
-            (
-                repo.repo.clone(),
-                (repo.name, repo.url, repo.description),
-            )
-        })
+        .map(|repo| (repo.repo.clone(), (repo.name, repo.url, repo.description)))
         .collect();
 
     let mut data = Vec::with_capacity(projects.len());
@@ -289,7 +286,9 @@ mod tests {
             severity: severity.into(),
             message: None,
             log_window: Vec::new(),
-            stack_trace: format!("panic: {title}\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/a.go:1 +0x1"),
+            stack_trace: format!(
+                "panic: {title}\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/a.go:1 +0x1"
+            ),
         }
     }
 
@@ -309,9 +308,15 @@ mod tests {
         let store = Store::open(dir.path().join("s.db")).expect("open");
         let now = 1_000_000_000;
 
-        store.report_signal(&signal("app/alpha", "alpha one", "critical"), now).expect("a");
-        store.report_signal(&signal("app/alpha", "alpha two", "low"), now).expect("b");
-        store.report_signal(&signal("app/beta", "beta one", "high"), now).expect("c");
+        store
+            .report_signal(&signal("app/alpha", "alpha one", "critical"), now)
+            .expect("a");
+        store
+            .report_signal(&signal("app/alpha", "alpha two", "low"), now)
+            .expect("b");
+        store
+            .report_signal(&signal("app/beta", "beta one", "high"), now)
+            .expect("c");
         let alpha_one = fp_of(&store, "alpha one");
         store
             .set_state(&alpha_one, State::Triggered, now, None)
@@ -338,7 +343,13 @@ mod tests {
             })
             .expect("runner");
         store
-            .insert_repo("app/alpha", "Alpha", "https://example.com/alpha", "核心服务", now)
+            .insert_repo(
+                "app/alpha",
+                "Alpha",
+                "https://example.com/alpha",
+                "核心服务",
+                now,
+            )
             .expect("register");
 
         let response = build_projects(&store, now).expect("projects");
@@ -373,7 +384,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         let now = 1_000_000_000;
-        store.report_signal(&signal("app/quiet", "quiet one", "low"), now).expect("q");
+        store
+            .report_signal(&signal("app/quiet", "quiet one", "low"), now)
+            .expect("q");
         store
             .report_signal(&signal("app/loud", "loud one", "high"), now)
             .expect("l");

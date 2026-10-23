@@ -157,7 +157,10 @@ pub enum ReportOutcome {
     /// First sighting — eligible for pickup.
     NewIssue { fingerprint: String },
     /// Same fingerprint, already tracked, currently pickable.
-    Deduped { fingerprint: String, occurrences: u64 },
+    Deduped {
+        fingerprint: String,
+        occurrences: u64,
+    },
     /// Same fingerprint inside its cooldown — counted, not re-triggered.
     CooldownActive {
         fingerprint: String,
@@ -165,9 +168,15 @@ pub enum ReportOutcome {
         retry_after_ms: i64,
     },
     /// Terminal-state issue reported again: regression, reopened as `new`.
-    Regression { fingerprint: String, occurrences: u64 },
+    Regression {
+        fingerprint: String,
+        occurrences: u64,
+    },
     /// Owner-muted or attempt-capped; reports are counted but never reopen it.
-    Muted { fingerprint: String, occurrences: u64 },
+    Muted {
+        fingerprint: String,
+        occurrences: u64,
+    },
 }
 
 /// A pickable issue handed to the runner pool.
@@ -599,12 +608,14 @@ const ISSUE_VIEW_SELECT: &str = "SELECT i.fingerprint, i.title, i.language, i.re
 /// Event projection shared by the feed/detail/timeline queries; legacy rows
 /// with `events.repo` NULL fall back to the issue repo. Keep aligned with
 /// [`Store::event_from_row`].
-const EVENT_SELECT: &str = "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
+const EVENT_SELECT: &str =
+    "SELECT e.fingerprint, e.ts, COALESCE(e.kind, ''), COALESCE(e.detail, ''),
         COALESCE(e.repo, i.repo, ''), e.actor
  FROM events e LEFT JOIN issues i ON i.fingerprint = e.fingerprint";
 
 /// Full [`RunRow`] projection; keep aligned with [`Store::run_from_row`].
-const RUN_COLUMNS: &str = "id, harness_run_id, fingerprint, runner_id, repo, started_at, finished_at,
+const RUN_COLUMNS: &str =
+    "id, harness_run_id, fingerprint, runner_id, repo, started_at, finished_at,
         phase, outcome, ci_verdict, turns, tokens_uncached, tokens_cached, provider,
         model, root_cause, change_stat, branch, commit_sha, pr_url, pr_opened_at,
         verification_ok, verification_detail, session_dir, error, compactions,
@@ -621,7 +632,9 @@ impl Store {
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
         // A panic in another thread must not wedge the store forever.
-        self.conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Fingerprint a signal, dedup, and decide whether it may trigger a run.
@@ -665,7 +678,14 @@ impl Store {
             )?;
             bump_signal_daily(&conn, &fp, &signal.repo, now_ms)?;
             drop(conn);
-            self.record_event(&fp, now_ms, Some(&signal.repo), "system", "reported", "first sighting")?;
+            self.record_event(
+                &fp,
+                now_ms,
+                Some(&signal.repo),
+                "system",
+                "reported",
+                "first sighting",
+            )?;
             return Ok(ReportOutcome::NewIssue { fingerprint: fp });
         };
 
@@ -698,7 +718,12 @@ impl Store {
             });
         }
         if state.is_terminal() && state != State::Escalated {
-            self.set_state(&fp, State::New, now_ms, Some("regression: terminal issue reported again"))?;
+            self.set_state(
+                &fp,
+                State::New,
+                now_ms,
+                Some("regression: terminal issue reported again"),
+            )?;
             self.set_cooldown(&fp, 0)?;
             return Ok(ReportOutcome::Regression {
                 fingerprint: fp,
@@ -928,17 +953,13 @@ impl Store {
                 // Progress is the real liveness signal only while this runner
                 // is actively working this issue. Idle/other-owner heartbeats
                 // are still the meaningful timestamp for an abandoned issue.
-                let working =
-                    status == "working" && current.as_deref() == Some(fingerprint);
+                let working = status == "working" && current.as_deref() == Some(fingerprint);
                 let last = if working && *progress > 0 {
                     *progress
                 } else {
                     *heartbeat
                 };
-                (
-                    Some(last),
-                    working && now_ms - last <= stuck_after_ms,
-                )
+                (Some(last), working && now_ms - last <= stuck_after_ms)
             }
             None => (None, false),
         };
@@ -977,7 +998,10 @@ impl Store {
             })?;
         let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state))?;
         if !matches!(from, State::Triggered | State::Fixing) {
-            return Err(ShanError::InvalidTransition { from, to: State::New });
+            return Err(ShanError::InvalidTransition {
+                from,
+                to: State::New,
+            });
         }
         conn.execute(
             "UPDATE issues SET state='new', cooldown_until=0, owner_runner_id=NULL,
@@ -991,7 +1015,11 @@ impl Store {
             Some(&repo),
             "owner",
             "requeued",
-            if force { "forced by owner" } else { "stuck requeued by owner" },
+            if force {
+                "forced by owner"
+            } else {
+                "stuck requeued by owner"
+            },
         )
     }
 
@@ -1022,8 +1050,14 @@ impl Store {
                     rusqlite::params![fp, now_ms, runner_id],
                 )?;
             }
-            self.record_event(&fp, now_ms, Some(&repo), runner_id, "requeued",
-                "orphaned repair revived at runner startup")?;
+            self.record_event(
+                &fp,
+                now_ms,
+                Some(&repo),
+                runner_id,
+                "requeued",
+                "orphaned repair revived at runner startup",
+            )?;
             count += 1;
         }
         Ok(count)
@@ -1053,7 +1087,10 @@ impl Store {
             })?;
         let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state))?;
         if !matches!(from, State::Escalated | State::Rejected | State::Ignored) {
-            return Err(ShanError::InvalidTransition { from, to: State::New });
+            return Err(ShanError::InvalidTransition {
+                from,
+                to: State::New,
+            });
         }
         conn.execute(
             "UPDATE issues SET state='new', cooldown_until=0, owner_runner_id=NULL,
@@ -1063,7 +1100,10 @@ impl Store {
         drop(conn);
         let reason = reason.map(str::trim).filter(|reason| !reason.is_empty());
         let detail = match reason {
-            Some(reason) => format!("reopened by owner: {}", reason.chars().take(2_000).collect::<String>()),
+            Some(reason) => format!(
+                "reopened by owner: {}",
+                reason.chars().take(2_000).collect::<String>()
+            ),
             None => "reopened by owner".to_string(),
         };
         self.record_event(
@@ -1101,7 +1141,10 @@ impl Store {
             })?;
         let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state))?;
         if !matches!(from, State::Triggered | State::Fixing) {
-            return Err(ShanError::InvalidTransition { from, to: State::New });
+            return Err(ShanError::InvalidTransition {
+                from,
+                to: State::New,
+            });
         }
         conn.execute(
             "UPDATE issues SET state='new', cooldown_until=?2, owner_runner_id=NULL,
@@ -1132,15 +1175,12 @@ impl Store {
         let detail = if reason.is_empty() {
             "ignored".to_string()
         } else {
-            format!("ignored: {}", reason.chars().take(2_000).collect::<String>())
+            format!(
+                "ignored: {}",
+                reason.chars().take(2_000).collect::<String>()
+            )
         };
-        self.set_state_as(
-            fingerprint,
-            State::Ignored,
-            now_ms,
-            Some(&detail),
-            actor,
-        )?;
+        self.set_state_as(fingerprint, State::Ignored, now_ms, Some(&detail), actor)?;
         let conn = self.lock();
         conn.execute(
             "UPDATE issues SET owner_runner_id=NULL WHERE fingerprint=?1",
@@ -1301,7 +1341,14 @@ impl Store {
                 |row| row.get(0),
             )?
         };
-        self.record_event(fingerprint, now_ms, Some(&repo), "runner", "pr_opened", pr_url)
+        self.record_event(
+            fingerprint,
+            now_ms,
+            Some(&repo),
+            "runner",
+            "pr_opened",
+            pr_url,
+        )
     }
 
     /// PRs opened for `repo` since `since_ms` — the counter behind the
@@ -1389,7 +1436,10 @@ impl Store {
             [audit_cutoff],
         )? as u64;
         deleted += conn.execute("DELETE FROM runs WHERE started_at < ?1", [run_cutoff])? as u64;
-        deleted += conn.execute("DELETE FROM runners WHERE heartbeat_at < ?1", [runner_cutoff])? as u64;
+        deleted += conn.execute(
+            "DELETE FROM runners WHERE heartbeat_at < ?1",
+            [runner_cutoff],
+        )? as u64;
         Ok(deleted)
     }
 
@@ -1635,9 +1685,8 @@ impl Store {
                 .map(|kind| rusqlite::types::Value::Text((*kind).to_string())),
         );
         let conn = self.lock();
-        let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(params), |row| {
-            row.get(0)
-        })?;
+        let count: i64 =
+            conn.query_row(&sql, rusqlite::params_from_iter(params), |row| row.get(0))?;
         Ok(count as u64)
     }
 
@@ -1675,9 +1724,8 @@ impl Store {
             params.push(rusqlite::types::Value::Text(repo.to_string()));
         }
         let conn = self.lock();
-        let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(params), |row| {
-            row.get(0)
-        })?;
+        let count: i64 =
+            conn.query_row(&sql, rusqlite::params_from_iter(params), |row| row.get(0))?;
         Ok(count as u64)
     }
 
@@ -1696,7 +1744,10 @@ impl Store {
 
     /// All issues, newest-sighting first — the `nuwa status` view.
     pub fn list_issues(&self) -> ShanResult<Vec<IssueRow>> {
-        self.issue_rows(&format!("{ISSUE_VIEW_SELECT} ORDER BY i.last_seen DESC"), [])
+        self.issue_rows(
+            &format!("{ISSUE_VIEW_SELECT} ORDER BY i.last_seen DESC"),
+            [],
+        )
     }
 
     /// Issues sharing `title`, newest first, excluding `exclude_fp` itself —
@@ -1729,11 +1780,7 @@ impl Store {
         Ok(count.max(0) as u64)
     }
 
-    fn issue_rows(
-        &self,
-        sql: &str,
-        params: impl rusqlite::Params,
-    ) -> ShanResult<Vec<IssueRow>> {
+    fn issue_rows(&self, sql: &str, params: impl rusqlite::Params) -> ShanResult<Vec<IssueRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(params, Self::issue_from_row)?;
@@ -1851,20 +1898,17 @@ impl Store {
              WHERE repo = ?1 AND fingerprint != ?2 AND disabled = 0
              ORDER BY recorded_at DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(
-            rusqlite::params![repo, exclude_fingerprint, limit],
-            |row| {
-                Ok(RepairMemoryRow {
-                    fingerprint: row.get(0)?,
-                    commit_sha: row.get(1)?,
-                    pr_url: row.get(2)?,
-                    root_cause: row.get(3)?,
-                    change_stat: row.get(4)?,
-                    files: row.get(5)?,
-                    recorded_at: row.get(6)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(rusqlite::params![repo, exclude_fingerprint, limit], |row| {
+            Ok(RepairMemoryRow {
+                fingerprint: row.get(0)?,
+                commit_sha: row.get(1)?,
+                pr_url: row.get(2)?,
+                root_cause: row.get(3)?,
+                change_stat: row.get(4)?,
+                files: row.get(5)?,
+                recorded_at: row.get(6)?,
+            })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -2172,7 +2216,9 @@ impl Store {
     pub fn last_heartbeat(&self) -> ShanResult<Option<i64>> {
         let conn = self.lock();
         let ts: Option<i64> = conn
-            .query_row("SELECT ts FROM heartbeat WHERE id = 1", [], |row| row.get(0))
+            .query_row("SELECT ts FROM heartbeat WHERE id = 1", [], |row| {
+                row.get(0)
+            })
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
@@ -2197,8 +2243,19 @@ impl Store {
                 service_unit=excluded.service_unit, config_json=excluded.config_json,
                 last_error=NULL, progress_at=excluded.progress_at",
             rusqlite::params![
-                r.id, r.repo, r.host, r.pid, r.started_at, r.heartbeat_at, r.status,
-                r.provider, r.model, r.daily_pr_limit, r.repo_path, r.service_unit, r.config_json,
+                r.id,
+                r.repo,
+                r.host,
+                r.pid,
+                r.started_at,
+                r.heartbeat_at,
+                r.status,
+                r.provider,
+                r.model,
+                r.daily_pr_limit,
+                r.repo_path,
+                r.service_unit,
+                r.config_json,
             ],
         )?;
         Ok(())
@@ -2211,8 +2268,13 @@ impl Store {
                 config_json=COALESCE(?6, config_json), last_error=?7
              WHERE id=?1",
             rusqlite::params![
-                id, hb.heartbeat_at, hb.status, hb.current_fingerprint, hb.phase,
-                hb.config_json, hb.last_error,
+                id,
+                hb.heartbeat_at,
+                hb.status,
+                hb.current_fingerprint,
+                hb.phase,
+                hb.config_json,
+                hb.last_error,
             ],
         )?;
         if changed == 0 {
@@ -2361,7 +2423,13 @@ impl Store {
             "INSERT INTO runs(id, fingerprint, runner_id, repo, started_at, phase, provider, model)
              VALUES (?1, ?2, ?3, ?4, ?5, 'claim', ?6, ?7)",
             rusqlite::params![
-                r.id, r.fingerprint, r.runner_id, r.repo, r.started_at, r.provider, r.model
+                r.id,
+                r.fingerprint,
+                r.runner_id,
+                r.repo,
+                r.started_at,
+                r.provider,
+                r.model
             ],
         )?;
         let changed = tx.execute(
@@ -2403,10 +2471,26 @@ impl Store {
                 messages = COALESCE(?20, messages)
              WHERE id = ?1 AND finished_at IS NULL",
             rusqlite::params![
-                id, u.phase, u.turns, u.tokens_uncached, u.tokens_cached, u.harness_run_id,
-                u.root_cause, u.verification_ok, u.verification_detail, u.change_stat, u.branch,
-                u.commit_sha, u.pr_url, u.pr_opened_at, u.ci_verdict, u.session_dir, u.error,
-                u.compactions, u.context_window, u.messages,
+                id,
+                u.phase,
+                u.turns,
+                u.tokens_uncached,
+                u.tokens_cached,
+                u.harness_run_id,
+                u.root_cause,
+                u.verification_ok,
+                u.verification_detail,
+                u.change_stat,
+                u.branch,
+                u.commit_sha,
+                u.pr_url,
+                u.pr_opened_at,
+                u.ci_verdict,
+                u.session_dir,
+                u.error,
+                u.compactions,
+                u.context_window,
+                u.messages,
             ],
         )?;
         if changed == 0 {
@@ -2569,9 +2653,8 @@ impl Store {
     /// rollup sums the last two days to get a 24h report count.
     pub fn signal_counts_since_day(&self, day: &str) -> ShanResult<BTreeMap<String, u64>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT repo, SUM(count) FROM signal_daily WHERE day >= ?1 GROUP BY repo",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT repo, SUM(count) FROM signal_daily WHERE day >= ?1 GROUP BY repo")?;
         let rows = stmt.query_map([day], |row| {
             let repo: String = row.get(0)?;
             let count: i64 = row.get(1)?;
@@ -2618,7 +2701,12 @@ pub fn utc_day(now_ms: i64) -> String {
     use time::OffsetDateTime;
     let seconds = now_ms.div_euclid(1_000);
     let dt = OffsetDateTime::from_unix_timestamp(seconds).unwrap_or(OffsetDateTime::UNIX_EPOCH);
-    format!("{:04}-{:02}-{:02}", dt.year(), u8::from(dt.month()), dt.day())
+    format!(
+        "{:04}-{:02}-{:02}",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day()
+    )
 }
 
 /// How many log lines of the incident window are kept.
@@ -2792,7 +2880,10 @@ mod tests {
             .into_iter()
             .find(|r| r.fingerprint == fp)
             .expect("row");
-        assert_eq!(row.severity, "critical", "severity must keep the confirmed max");
+        assert_eq!(
+            row.severity, "critical",
+            "severity must keep the confirmed max"
+        );
         assert_eq!(row.occurrences, 2);
     }
 
@@ -2818,12 +2909,16 @@ mod tests {
         assert_eq!(row.state, "triggered");
         // A different runner must not revive it; the owner's own restart would.
         assert_eq!(
-            store.revive_orphaned_fixing(3, "runner-b").expect("revive b"),
+            store
+                .revive_orphaned_fixing(3, "runner-b")
+                .expect("revive b"),
             0,
             "another runner must not steal a live claim"
         );
         assert_eq!(
-            store.revive_orphaned_fixing(3, "runner-a").expect("revive a"),
+            store
+                .revive_orphaned_fixing(3, "runner-a")
+                .expect("revive a"),
             1,
             "the owner's restart revives its own orphaned claim"
         );
@@ -2924,11 +3019,21 @@ mod tests {
 
         // Runner picks up: triggered + cooldown 1h — further reports dedup
         // into CooldownActive, not a new trigger.
-        let fp = store.ready_issue(t0 + 2).expect("ready").expect("issue").fingerprint;
-        store.set_state(&fp, State::Triggered, t0 + 3, None).expect("state");
+        let fp = store
+            .ready_issue(t0 + 2)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        store
+            .set_state(&fp, State::Triggered, t0 + 3, None)
+            .expect("state");
         store.set_cooldown(&fp, t0 + 3_600_000).expect("cooldown");
         match store.report_signal(&signal(), t0 + 10).expect("report") {
-            ReportOutcome::CooldownActive { occurrences, retry_after_ms, .. } => {
+            ReportOutcome::CooldownActive {
+                occurrences,
+                retry_after_ms,
+                ..
+            } => {
                 assert_eq!(occurrences, 3);
                 assert_eq!(retry_after_ms, 3_600_000 - 10);
             }
@@ -2944,7 +3049,11 @@ mod tests {
         let store = Store::open(dir.path().join("s.db")).expect("open");
         let t0 = 5_000_000;
         store.report_signal(&signal(), t0).expect("report");
-        let fp = store.ready_issue(t0).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(t0)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         store.set_state(&fp, State::Triggered, t0, None).expect("t");
         store.set_state(&fp, State::Fixing, t0, None).expect("f");
         store.set_state(&fp, State::PrOpen, t0, None).expect("p");
@@ -2966,7 +3075,11 @@ mod tests {
         let store = Store::open(dir.path().join("s.db")).expect("open");
         let t0 = 7_000_000;
         store.report_signal(&signal(), t0).expect("report");
-        let fp = store.ready_issue(t0).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(t0)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         store.set_state(&fp, State::Triggered, t0, None).expect("t");
         store.set_state(&fp, State::Fixing, t0, None).expect("f");
         store.set_state(&fp, State::PrOpen, t0, None).expect("p");
@@ -2994,7 +3107,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store.report_signal(&signal(), 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         let err = store
             .set_state(&fp, State::PrOpen, 2, None)
             .expect_err("new -> pr_open must fail");
@@ -3057,7 +3174,10 @@ mod tests {
         assert_eq!(second.severity, "low");
 
         // Queue drained.
-        assert!(store.claim_ready_issue(12, 1_000_000).expect("claim 3").is_none());
+        assert!(store
+            .claim_ready_issue(12, 1_000_000)
+            .expect("claim 3")
+            .is_none());
 
         // No observer view either: claimed issues left the ready set.
         assert!(store.ready_issue(13).expect("ready").is_none());
@@ -3080,18 +3200,24 @@ mod tests {
 
         store.set_pr(&fp_a, "https://x/pr/1", 10).expect("pr1");
         assert_eq!(
-            store.prs_opened_since("example.com/spike-target", 0).expect("count"),
+            store
+                .prs_opened_since("example.com/spike-target", 0)
+                .expect("count"),
             1
         );
         assert_eq!(store.prs_opened_since("other/repo", 0).expect("count"), 0);
 
         store.set_pr(&fp_c, "https://x/pr/2", 20).expect("pr2");
         assert_eq!(
-            store.prs_opened_since("example.com/spike-target", 0).expect("count"),
+            store
+                .prs_opened_since("example.com/spike-target", 0)
+                .expect("count"),
             2
         );
         assert_eq!(
-            store.prs_opened_since("example.com/spike-target", 15).expect("count"),
+            store
+                .prs_opened_since("example.com/spike-target", 15)
+                .expect("count"),
             1,
             "window starts at since_ms"
         );
@@ -3103,8 +3229,14 @@ mod tests {
         let store = Store::open(dir.path().join("s.db")).expect("open");
         let now = 1_700_000_000_000;
         store.report_signal(&signal(), now).expect("report");
-        let fp = store.ready_issue(now).expect("ready").expect("issue").fingerprint;
-        store.set_pr(&fp, "https://github.com/a/b/pull/1", now).expect("legacy pr");
+        let fp = store
+            .ready_issue(now)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        store
+            .set_pr(&fp, "https://github.com/a/b/pull/1", now)
+            .expect("legacy pr");
         store
             .start_run(&RunStart {
                 id: "run1".into(),
@@ -3126,7 +3258,12 @@ mod tests {
                 },
             )
             .expect("update");
-        assert_eq!(store.prs_opened_since(&signal().repo, now - 1).expect("count"), 1);
+        assert_eq!(
+            store
+                .prs_opened_since(&signal().repo, now - 1)
+                .expect("count"),
+            1
+        );
 
         store
             .update_run(
@@ -3138,7 +3275,12 @@ mod tests {
                 },
             )
             .expect("update2");
-        assert_eq!(store.prs_opened_since(&signal().repo, now - 1).expect("count"), 2);
+        assert_eq!(
+            store
+                .prs_opened_since(&signal().repo, now - 1)
+                .expect("count"),
+            2
+        );
     }
 
     #[test]
@@ -3147,23 +3289,59 @@ mod tests {
         let store = Store::open(dir.path().join("s.db")).expect("open");
         let day = 86_400_000;
         let now = 400 * day;
-        store.record_event("fp", now - 100 * day, Some("r"), "system", "reported", "old").expect("e");
-        store.record_event("fp", now - 100 * day, Some("r"), "owner", "config_changed", "k").expect("audit");
         store
-            .record_event("fp", now - 400 * day, Some("r"), "owner", "config_changed", "old-audit")
+            .record_event(
+                "fp",
+                now - 100 * day,
+                Some("r"),
+                "system",
+                "reported",
+                "old",
+            )
+            .expect("e");
+        store
+            .record_event(
+                "fp",
+                now - 100 * day,
+                Some("r"),
+                "owner",
+                "config_changed",
+                "k",
+            )
+            .expect("audit");
+        store
+            .record_event(
+                "fp",
+                now - 400 * day,
+                Some("r"),
+                "owner",
+                "config_changed",
+                "old-audit",
+            )
             .expect("audit old");
         store
             .upsert_runner(&RunnerUpsert {
-                id: "r".into(), repo: "r".into(), host: "h".into(), pid: None,
-                started_at: 0, heartbeat_at: now - 40 * day, status: "idle".into(),
-                provider: None, model: None, daily_pr_limit: None, repo_path: None,
-                service_unit: None, config_json: "{}".into(),
+                id: "r".into(),
+                repo: "r".into(),
+                host: "h".into(),
+                pid: None,
+                started_at: 0,
+                heartbeat_at: now - 40 * day,
+                status: "idle".into(),
+                provider: None,
+                model: None,
+                daily_pr_limit: None,
+                repo_path: None,
+                service_unit: None,
+                config_json: "{}".into(),
             })
             .expect("runner");
         let deleted = store.prune(now, 90, 365, 365).expect("prune");
         assert!(deleted >= 3);
         let events = store.recent_events(100).expect("events");
-        assert!(events.iter().any(|e| e.kind == "config_changed" && e.detail == "k"));
+        assert!(events
+            .iter()
+            .any(|e| e.kind == "config_changed" && e.detail == "k"));
         assert!(!events.iter().any(|e| e.detail == "old"));
         assert!(!events.iter().any(|e| e.detail == "old-audit"));
         assert!(store.list_runners().expect("runners").is_empty());
@@ -3176,10 +3354,24 @@ mod tests {
         let day = 86_400_000;
         let now = 500 * day;
         store
-            .record_event("fp", now - 410 * day, Some("r"), "system", "reported", "old")
+            .record_event(
+                "fp",
+                now - 410 * day,
+                Some("r"),
+                "system",
+                "reported",
+                "old",
+            )
             .expect("e");
         store
-            .record_event("fp", now - 380 * day, Some("r"), "owner", "config_changed", "audit")
+            .record_event(
+                "fp",
+                now - 380 * day,
+                Some("r"),
+                "owner",
+                "config_changed",
+                "audit",
+            )
             .expect("audit");
         // audit_days=400 must outlive both the normal-event window and the
         // historical 365-day audit default.
@@ -3217,7 +3409,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store
-            .record_event("fp1", 1, Some("example.com/r"), "owner", "requeued", "manual")
+            .record_event(
+                "fp1",
+                1,
+                Some("example.com/r"),
+                "owner",
+                "requeued",
+                "manual",
+            )
             .expect("event");
         let events = store.recent_events(10).expect("events");
         let event = events.first().expect("event");
@@ -3231,7 +3430,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store.report_signal(&signal(), 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         store
             .set_state_as(&fp, State::Triggered, 2, Some("claimed"), "runner")
             .expect("state");
@@ -3246,7 +3449,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store.report_signal(&signal(), 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
 
         store
             .start_run(&RunStart {
@@ -3299,7 +3506,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store.report_signal(&signal(), 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
 
         // Insert out of id order so rowid alone cannot produce the result.
         for id in ["run-b", "run-a", "run-c"] {
@@ -3364,9 +3575,33 @@ mod tests {
         };
         assert_ne!(fp, other);
 
-        seed_run(&store, "run-old", &fp, "example.com/spike-target", 100, None, (0, 0));
-        seed_run(&store, "run-new", &fp, "example.com/spike-target", 200, None, (0, 0));
-        seed_run(&store, "run-other", &other, "example.com/spike-target", 300, None, (0, 0));
+        seed_run(
+            &store,
+            "run-old",
+            &fp,
+            "example.com/spike-target",
+            100,
+            None,
+            (0, 0),
+        );
+        seed_run(
+            &store,
+            "run-new",
+            &fp,
+            "example.com/spike-target",
+            200,
+            None,
+            (0, 0),
+        );
+        seed_run(
+            &store,
+            "run-other",
+            &other,
+            "example.com/spike-target",
+            300,
+            None,
+            (0, 0),
+        );
 
         // An old run id is found directly, without scanning recent runs.
         let old = store
@@ -3376,7 +3611,10 @@ mod tests {
         assert_eq!(old.id, "run-old");
         assert_eq!(old.fingerprint, fp);
         // A run of another fingerprint is never visible through this issue.
-        assert!(store.run_for(&other, "run-old").expect("cross fp").is_none());
+        assert!(store
+            .run_for(&other, "run-old")
+            .expect("cross fp")
+            .is_none());
         assert!(store.run_for(&fp, "missing").expect("missing").is_none());
 
         // Default transcript run: the newest run that wrote a session dir,
@@ -3559,7 +3797,9 @@ mod tests {
             .expect("fixing");
         // owner 尚未建立：超过阈值后才允许非 force requeue。
         assert!(store.requeue_stuck(&fp, false, old + 20, 300_000).is_err());
-        assert!(store.requeue_stuck(&fp, false, old + 400_000, 300_000).is_ok());
+        assert!(store
+            .requeue_stuck(&fp, false, old + 400_000, 300_000)
+            .is_ok());
         assert!(store.ready_issue(old + 400_001).expect("ready").is_some());
 
         // 重新领取并建立一个健康 owner。
@@ -3612,7 +3852,9 @@ mod tests {
                 },
             )
             .expect("heartbeat");
-        assert!(store.requeue_stuck(&fp, false, old + 400_021, 300_000).is_err());
+        assert!(store
+            .requeue_stuck(&fp, false, old + 400_021, 300_000)
+            .is_err());
         store
             .requeue_stuck(&fp, true, old + 400_022, 300_000)
             .expect("force");
@@ -3627,13 +3869,20 @@ mod tests {
         let store = Store::open(dir.path().join("s.db")).expect("open");
         let t = 1_000_000;
         store.report_signal(&signal(), t).expect("report");
-        let fp = store.ready_issue(t).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(t)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         store.set_state(&fp, State::Triggered, t, None).expect("t");
         store.set_state(&fp, State::Fixing, t, None).expect("f");
         store.set_state(&fp, State::Escalated, t, None).expect("e");
         store.reopen_issue(&fp, t + 1, None).expect("reopen");
         assert!(store.ready_issue(t + 2).expect("ready").is_some());
-        assert!(store.reopen_issue(&fp, t + 3, None).is_err(), "new is not reopenable");
+        assert!(
+            store.reopen_issue(&fp, t + 3, None).is_err(),
+            "new is not reopenable"
+        );
     }
 
     #[test]
@@ -3641,7 +3890,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store.report_signal(&signal(), 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         store
             .start_run(&RunStart {
                 id: "run2".into(),
@@ -3674,7 +3927,11 @@ mod tests {
         store.report_signal(&signal(), t0 + 1_000).expect("dedup");
         store.report_signal(&signal(), t0 + 2_000).expect("dedup");
 
-        let fp = store.ready_issue(t0).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(t0)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         let day = utc_day(t0);
         assert_eq!(store.signal_reports_on(&fp, &day).expect("count"), 3);
 
@@ -3703,7 +3960,10 @@ mod tests {
             })
             .expect_err("missing issue must fail");
         assert!(matches!(err, ShanError::UnknownIssue(_)));
-        assert!(store.runs_for("does-not-exist", 10).expect("runs").is_empty());
+        assert!(store
+            .runs_for("does-not-exist", 10)
+            .expect("runs")
+            .is_empty());
     }
 
     #[test]
@@ -3711,7 +3971,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store.report_signal(&signal(), 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         store
             .start_run(&RunStart {
                 id: "run-err".into(),
@@ -3726,7 +3990,10 @@ mod tests {
         store
             .update_run(
                 "run-err",
-                &RunUpdate { error: Some("provider exploded".into()), ..RunUpdate::default() },
+                &RunUpdate {
+                    error: Some("provider exploded".into()),
+                    ..RunUpdate::default()
+                },
             )
             .expect("update");
         assert_eq!(store.mark_interrupted("r", 2).expect("mark"), 1);
@@ -3740,7 +4007,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store.report_signal(&signal(), 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         store
             .start_run(&RunStart {
                 id: "run-done".into(),
@@ -3766,7 +4037,10 @@ mod tests {
         assert!(store
             .update_run(
                 "run-done",
-                &RunUpdate { phase: Some("ci".into()), ..RunUpdate::default() },
+                &RunUpdate {
+                    phase: Some("ci".into()),
+                    ..RunUpdate::default()
+                },
             )
             .is_err());
     }
@@ -3805,7 +4079,10 @@ mod tests {
             )
             .expect("heartbeat");
         store
-            .upsert_runner(&RunnerUpsert { config_json: "{\"v\":2}".into(), ..base })
+            .upsert_runner(&RunnerUpsert {
+                config_json: "{\"v\":2}".into(),
+                ..base
+            })
             .expect("second");
         let row = store.list_runners().expect("list").pop().expect("runner");
         assert_eq!(row.status, "starting");
@@ -3820,7 +4097,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store.report_signal(&signal(), 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         store
             .start_run(&RunStart {
                 id: "run-owner".into(),
@@ -3832,10 +4113,18 @@ mod tests {
                 model: None,
             })
             .expect("start");
-        store.set_state_as(&fp, State::Triggered, 2, None, "runner").expect("triggered");
-        store.set_state_as(&fp, State::Fixing, 3, None, "runner").expect("fixing");
-        store.set_state_as(&fp, State::Escalated, 4, None, "runner").expect("escalated");
-        store.set_state_as(&fp, State::New, 5, Some("reopen"), "owner").expect("new");
+        store
+            .set_state_as(&fp, State::Triggered, 2, None, "runner")
+            .expect("triggered");
+        store
+            .set_state_as(&fp, State::Fixing, 3, None, "runner")
+            .expect("fixing");
+        store
+            .set_state_as(&fp, State::Escalated, 4, None, "runner")
+            .expect("escalated");
+        store
+            .set_state_as(&fp, State::New, 5, Some("reopen"), "owner")
+            .expect("new");
         let conn = store.lock();
         let (owner, changed): (Option<String>, i64) = conn
             .query_row(
@@ -3873,7 +4162,10 @@ mod tests {
         store
             .update_run(
                 "run-1",
-                &RunUpdate { ci_verdict: Some("success".into()), ..RunUpdate::default() },
+                &RunUpdate {
+                    ci_verdict: Some("success".into()),
+                    ..RunUpdate::default()
+                },
             )
             .expect("update");
 
@@ -3914,7 +4206,10 @@ mod tests {
         store
             .update_run(
                 "run-a",
-                &RunUpdate { ci_verdict: Some("success".into()), ..RunUpdate::default() },
+                &RunUpdate {
+                    ci_verdict: Some("success".into()),
+                    ..RunUpdate::default()
+                },
             )
             .expect("ci a");
         store
@@ -3931,12 +4226,19 @@ mod tests {
         store
             .update_run(
                 "run-b",
-                &RunUpdate { ci_verdict: Some("failure".into()), ..RunUpdate::default() },
+                &RunUpdate {
+                    ci_verdict: Some("failure".into()),
+                    ..RunUpdate::default()
+                },
             )
             .expect("ci b");
 
         let row = store.list_issues().expect("issues").pop().expect("issue");
-        assert_eq!(row.ci_verdict.as_deref(), Some("failure"), "newest run wins");
+        assert_eq!(
+            row.ci_verdict.as_deref(),
+            Some("failure"),
+            "newest run wins"
+        );
         assert_eq!(row.owner_runner_id.as_deref(), Some("run-b-runner"));
     }
 
@@ -3944,7 +4246,9 @@ mod tests {
     fn issue_row_serializes_ms_suffixed_timestamps() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
-        store.report_signal(&signal(), 1_700_000_000_000).expect("report");
+        store
+            .report_signal(&signal(), 1_700_000_000_000)
+            .expect("report");
         let row = store.list_issues().expect("issues").pop().expect("issue");
         let value = serde_json::to_value(&row).expect("json");
         for key in ["first_seen_ms", "last_seen_ms", "state_changed_at_ms"] {
@@ -3962,7 +4266,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store.report_signal(&signal(), 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         for (id, started_at) in [("run-old", 100), ("run-new", 200)] {
             store
                 .start_run(&RunStart {
@@ -4021,8 +4329,14 @@ mod tests {
     fn ready_issues_mirrors_claim_priority_without_claiming() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
-        let low = Signal { severity: "low".into(), ..issue_signal("low", "Load") };
-        let critical = Signal { severity: "critical".into(), ..issue_signal("critical", "Submit") };
+        let low = Signal {
+            severity: "low".into(),
+            ..issue_signal("low", "Load")
+        };
+        let critical = Signal {
+            severity: "critical".into(),
+            ..issue_signal("critical", "Submit")
+        };
         let fp_low = fingerprint::compute(&low.repo, "go", None, &low.stack_trace);
         store.report_signal(&low, 1).expect("low");
         store.report_signal(&low, 2).expect("low again");
@@ -4034,7 +4348,11 @@ mod tests {
         assert_eq!(store.ready_issues(3, 1).expect("limited").len(), 1);
         assert_eq!(store.count_ready(3).expect("count"), 2);
         assert!(
-            store.list_issues().expect("issues").iter().all(|i| i.state == "new"),
+            store
+                .list_issues()
+                .expect("issues")
+                .iter()
+                .all(|i| i.state == "new"),
             "observing the queue must not flip states"
         );
 
@@ -4042,7 +4360,10 @@ mod tests {
             .claim_ready_issue(3, 1_000_000)
             .expect("claim")
             .expect("issue");
-        assert_eq!(claimed.severity, "critical", "observation left priority intact");
+        assert_eq!(
+            claimed.severity, "critical",
+            "observation left priority intact"
+        );
         assert_eq!(store.count_ready(3).expect("count"), 1);
         let remaining: Vec<String> = store
             .ready_issues(3, 10)
@@ -4058,7 +4379,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store.report_signal(&signal(), 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
         store.set_cooldown(&fp, 1_000).expect("cooldown");
 
         assert_eq!(store.count_ready(999).expect("count"), 0);
@@ -4085,13 +4410,20 @@ mod tests {
             .record_event("fp", t0 + 20, Some("r"), "system", "ci_red", "c")
             .expect("c");
 
-        assert_eq!(store.count_events_since(&["ci_green"], t0).expect("green"), 2);
         assert_eq!(
-            store.count_events_since(&["ci_green", "ci_red"], t0).expect("both"),
+            store.count_events_since(&["ci_green"], t0).expect("green"),
+            2
+        );
+        assert_eq!(
+            store
+                .count_events_since(&["ci_green", "ci_red"], t0)
+                .expect("both"),
             3
         );
         assert_eq!(
-            store.count_events_since(&["ci_green"], t0 + 10).expect("window"),
+            store
+                .count_events_since(&["ci_green"], t0 + 10)
+                .expect("window"),
             1
         );
         assert_eq!(store.count_events_since(&[], 0).expect("empty"), 0);
@@ -4135,13 +4467,18 @@ mod tests {
         let day_ms = 86_400_000;
         store.report_signal(&signal(), t0).expect("a1");
         store.report_signal(&signal(), t0 + 1).expect("a2");
-        store.report_signal(&issue_signal("panic in Submit", "Submit"), t0 + 2).expect("b");
+        store
+            .report_signal(&issue_signal("panic in Submit", "Submit"), t0 + 2)
+            .expect("b");
         store
             .report_signal(&issue_signal("panic in Load", "Load"), t0 + day_ms)
             .expect("next day");
 
         assert_eq!(store.reports_on(&utc_day(t0)).expect("today"), 3);
-        assert_eq!(store.reports_on(&utc_day(t0 + day_ms)).expect("tomorrow"), 1);
+        assert_eq!(
+            store.reports_on(&utc_day(t0 + day_ms)).expect("tomorrow"),
+            1
+        );
         assert_eq!(store.reports_on("1999-01-01").expect("empty"), 0);
     }
 
@@ -4157,9 +4494,7 @@ mod tests {
             ReportOutcome::NewIssue { fingerprint } => fingerprint,
             other => panic!("expected a new issue, got {other:?}"),
         };
-        store
-            .report_signal(&signal(), t0 + 1)
-            .expect("app repeat");
+        store.report_signal(&signal(), t0 + 1).expect("app repeat");
         let mut other_signal = issue_signal("panic in Other", "Other");
         other_signal.repo = other_repo.to_string();
         let other_fp = match store
@@ -4172,12 +4507,11 @@ mod tests {
 
         let day = utc_day(t0);
         assert_eq!(store.reports_on_repo(&day, None).expect("all"), 3);
+        assert_eq!(store.reports_on_repo(&day, Some(app_repo)).expect("app"), 2);
         assert_eq!(
-            store.reports_on_repo(&day, Some(app_repo)).expect("app"),
-            2
-        );
-        assert_eq!(
-            store.reports_on_repo(&day, Some(other_repo)).expect("other"),
+            store
+                .reports_on_repo(&day, Some(other_repo))
+                .expect("other"),
             1
         );
         assert_eq!(
@@ -4194,7 +4528,14 @@ mod tests {
             .record_event(&app_fp, t0, Some(app_repo), "runner", "ci_green", "app")
             .expect("app event");
         store
-            .record_event(&other_fp, t0, Some(other_repo), "runner", "ci_green", "other")
+            .record_event(
+                &other_fp,
+                t0,
+                Some(other_repo),
+                "runner",
+                "ci_green",
+                "other",
+            )
             .expect("other event");
         // Legacy rows written before events.repo existed fall back to the
         // owning issue's repo.
@@ -4287,7 +4628,10 @@ mod tests {
         let excluding_newest = store
             .similar_issues("panic in Average", &fp_d, 10)
             .expect("similar");
-        let fps: Vec<&str> = excluding_newest.iter().map(|i| i.fingerprint.as_str()).collect();
+        let fps: Vec<&str> = excluding_newest
+            .iter()
+            .map(|i| i.fingerprint.as_str())
+            .collect();
         assert_eq!(fps, [fp_b.as_str(), fp_a.as_str()]);
 
         assert!(store
@@ -4380,7 +4724,10 @@ mod tests {
             [2_000, 1_700, 1_600, 1_500, 1_000]
         );
         let legacy = rows.iter().find(|e| e.ts == 1_700).expect("legacy row");
-        assert_eq!(legacy.repo, repo_a, "NULL event.repo falls back to the issue repo");
+        assert_eq!(
+            legacy.repo, repo_a,
+            "NULL event.repo falls back to the issue repo"
+        );
 
         let other_repo = EventQuery {
             repo: Some(repo_b.to_string()),
@@ -4417,7 +4764,10 @@ mod tests {
         let mut limited = by_repo.clone();
         limited.kinds = Vec::new();
         let page = store.list_events(&limited, 2).expect("limit");
-        assert_eq!(page.iter().map(|e| e.ts).collect::<Vec<_>>(), [2_000, 1_700]);
+        assert_eq!(
+            page.iter().map(|e| e.ts).collect::<Vec<_>>(),
+            [2_000, 1_700]
+        );
         assert!(store
             .list_events(&EventQuery::default(), 0)
             .expect("zero limit")
@@ -4428,7 +4778,10 @@ mod tests {
             ..EventQuery::default()
         };
         assert!(
-            store.list_events(&injection, 10).expect("bound kind").is_empty(),
+            store
+                .list_events(&injection, 10)
+                .expect("bound kind")
+                .is_empty(),
             "kind values stay bound parameters"
         );
     }
@@ -4524,45 +4877,134 @@ mod tests {
         store.report_signal(&sig_c, at(d1, 4)).expect("c d1");
         store.report_signal(&sig_d, at(d2, 1)).expect("d d2");
         store.report_signal(&sig_a, at(d2, 2)).expect("a d2");
-        store.report_signal(&sig_old, at(before, 3)).expect("old issue");
+        store
+            .report_signal(&sig_old, at(before, 3))
+            .expect("old issue");
 
         // Tokens bucket by run start; PRs opened by pr_opened_at.
-        seed_run(&store, "run-1", &fp_a, repo_a, at(d0, 5), Some(at(d1, 5)), (100, 50));
-        seed_run(&store, "run-2", &fp_a, repo_a, at(d1, 5), Some(at(d2, 5)), (200, 100));
+        seed_run(
+            &store,
+            "run-1",
+            &fp_a,
+            repo_a,
+            at(d0, 5),
+            Some(at(d1, 5)),
+            (100, 50),
+        );
+        seed_run(
+            &store,
+            "run-2",
+            &fp_a,
+            repo_a,
+            at(d1, 5),
+            Some(at(d2, 5)),
+            (200, 100),
+        );
         seed_run(&store, "run-3", &fp_c, repo_b, at(d2, 5), None, (50, 10));
-        seed_run(&store, "run-old", &fp_a, repo_a, at(before, 5), Some(at(before, 6)), (999, 999));
+        seed_run(
+            &store,
+            "run-old",
+            &fp_a,
+            repo_a,
+            at(before, 5),
+            Some(at(before, 6)),
+            (999, 999),
+        );
 
         // Window is [d0 00:00, d2+1 00:00): the exact start is counted, the
         // exact end and earlier days are not.
         store
-            .record_event(&fp_c, d0, Some(repo_b), "system", "ci_green", "window start")
+            .record_event(
+                &fp_c,
+                d0,
+                Some(repo_b),
+                "system",
+                "ci_green",
+                "window start",
+            )
             .expect("start");
         store
             .record_event(&fp_c, at(d0, 6), Some(repo_b), "system", "ci_red", "d0 red")
             .expect("d0 red");
         store
-            .record_event(&fp_a, at(d1, 6), Some(repo_a), "system", "merged", "d1 merge")
+            .record_event(
+                &fp_a,
+                at(d1, 6),
+                Some(repo_a),
+                "system",
+                "merged",
+                "d1 merge",
+            )
             .expect("d1 merge");
         store
-            .record_event(&fp_c, at(d1, 7), Some(repo_b), "system", "rejected", "d1 reject")
+            .record_event(
+                &fp_c,
+                at(d1, 7),
+                Some(repo_b),
+                "system",
+                "rejected",
+                "d1 reject",
+            )
             .expect("d1 reject");
         store
-            .record_event(&fp_a, at(d2, 6), Some(repo_a), "system", "ci_green", "d2 green")
+            .record_event(
+                &fp_a,
+                at(d2, 6),
+                Some(repo_a),
+                "system",
+                "ci_green",
+                "d2 green",
+            )
             .expect("d2 green");
         store
-            .record_event(&fp_a, at(d2, 7), Some(repo_a), "system", "ci_green", "d2 green 2")
+            .record_event(
+                &fp_a,
+                at(d2, 7),
+                Some(repo_a),
+                "system",
+                "ci_green",
+                "d2 green 2",
+            )
             .expect("d2 green 2");
         store
-            .record_event(&fp_a, at(d2, 8), None, "system", "ci_green", "legacy null repo")
+            .record_event(
+                &fp_a,
+                at(d2, 8),
+                None,
+                "system",
+                "ci_green",
+                "legacy null repo",
+            )
             .expect("legacy green");
         store
-            .record_event(&fp_a, at(d1, 8), Some(repo_a), "system", "state_changed", "ignored")
+            .record_event(
+                &fp_a,
+                at(d1, 8),
+                Some(repo_a),
+                "system",
+                "state_changed",
+                "ignored",
+            )
             .expect("ignored kind");
         store
-            .record_event(&fp_a, at(before, 6), Some(repo_a), "system", "merged", "before")
+            .record_event(
+                &fp_a,
+                at(before, 6),
+                Some(repo_a),
+                "system",
+                "merged",
+                "before",
+            )
             .expect("before");
         store
-            .record_event(&fp_a, d2 + day_ms, Some(repo_a), "system", "merged", "window end")
+            .record_event(
+                &fp_a,
+                d2 + day_ms,
+                Some(repo_a),
+                "system",
+                "merged",
+                "window end",
+            )
             .expect("window end");
 
         let expected_all = vec![
@@ -4622,7 +5064,10 @@ mod tests {
                 ..TrendBucket::default()
             },
         ];
-        assert_eq!(store.trends(3, Some(repo_a), now).expect("repo a"), expected_a);
+        assert_eq!(
+            store.trends(3, Some(repo_a), now).expect("repo a"),
+            expected_a
+        );
 
         let expected_b = vec![
             TrendBucket {
@@ -4646,7 +5091,10 @@ mod tests {
                 ..TrendBucket::default()
             },
         ];
-        assert_eq!(store.trends(3, Some(repo_b), now).expect("repo b"), expected_b);
+        assert_eq!(
+            store.trends(3, Some(repo_b), now).expect("repo b"),
+            expected_b
+        );
     }
 
     #[test]
@@ -4668,7 +5116,10 @@ mod tests {
         for (bucket, day) in buckets.iter().take(4).zip(&days[..4]) {
             assert_eq!(
                 bucket,
-                &TrendBucket { day: day.clone(), ..TrendBucket::default() },
+                &TrendBucket {
+                    day: day.clone(),
+                    ..TrendBucket::default()
+                },
                 "missing days are zero-filled: {day}"
             );
         }
@@ -4690,7 +5141,9 @@ mod tests {
             .report_signal(&signal(), midnight)
             .expect("midnight report");
 
-        let before = store.trends(2, None, midnight - 1).expect("before midnight");
+        let before = store
+            .trends(2, None, midnight - 1)
+            .expect("before midnight");
         assert_eq!(before[1].day, utc_day(midnight - day_ms));
         assert_eq!(before[1].reports, 0, "midnight belongs to the next day");
 
@@ -4827,7 +5280,10 @@ mod tests {
         assert_eq!(bucket.rejected, 1);
         assert_eq!(bucket.ci_green, 0);
         assert_eq!(bucket.ci_red, 0);
-        assert_eq!(store.trends(1, Some(other), now).expect("other")[0].merged, 1);
+        assert_eq!(
+            store.trends(1, Some(other), now).expect("other")[0].merged,
+            1
+        );
         let all = &store.trends(1, None, now).expect("all")[0];
         assert_eq!(all.merged, 2);
         assert_eq!(all.rejected, 1);
@@ -4866,8 +5322,14 @@ mod heartbeat_tests {
             stack_trace: trace.into(),
         };
         store.report_signal(&sig, 1).expect("report");
-        let fp = store.ready_issue(1).expect("ready").expect("issue").fingerprint;
-        store.set_state(&fp, State::Triggered, 2, Some("claimed")).expect("t");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        store
+            .set_state(&fp, State::Triggered, 2, Some("claimed"))
+            .expect("t");
         let events = store.events_for(&fp, 10).expect("events");
         let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
         assert!(kinds.contains(&"state_changed"), "{kinds:?}");
@@ -4969,13 +5431,31 @@ mod repo_tests {
             .insert_repo("example.com/zed", "zed", "https://example.com/zed", "", 1)
             .expect("zed");
         store
-            .insert_repo("example.com/beta", "Beta", "git@example.com:beta.git", "", 2)
+            .insert_repo(
+                "example.com/beta",
+                "Beta",
+                "git@example.com:beta.git",
+                "",
+                2,
+            )
             .expect("beta");
         store
-            .insert_repo("example.com/alpha2", "Alpha", "https://example.com/alpha2", "", 3)
+            .insert_repo(
+                "example.com/alpha2",
+                "Alpha",
+                "https://example.com/alpha2",
+                "",
+                3,
+            )
             .expect("alpha2");
         store
-            .insert_repo("example.com/alpha", "alpha", "https://example.com/alpha", "", 4)
+            .insert_repo(
+                "example.com/alpha",
+                "alpha",
+                "https://example.com/alpha",
+                "",
+                4,
+            )
             .expect("alpha");
 
         let repos = store.list_repos().expect("list");
@@ -5165,7 +5645,10 @@ mod repo_tests {
             .expect("rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].fingerprint, "fp-a");
-        assert_eq!(rows[0].commit_sha, "sha-a-2", "upsert keeps the newest evidence");
+        assert_eq!(
+            rows[0].commit_sha, "sha-a-2",
+            "upsert keeps the newest evidence"
+        );
         assert!(rows[0].pr_url.is_some());
         assert!(rows[0].root_cause.contains("ROOT CAUSE"));
 
@@ -5188,7 +5671,10 @@ mod repo_tests {
             .recent_repair_memory("example.com/spike-target", "none", 1_000)
             .expect("rows");
         assert_eq!(rows.len(), REPAIR_MEMORY_KEEP);
-        assert_eq!(rows[0].fingerprint, format!("fp-{}", REPAIR_MEMORY_KEEP + 4));
+        assert_eq!(
+            rows[0].fingerprint,
+            format!("fp-{}", REPAIR_MEMORY_KEEP + 4)
+        );
     }
 
     #[test]
@@ -5208,14 +5694,20 @@ mod repo_tests {
         let rows = store
             .recent_repair_memory("example.com/spike-target", "none", 10)
             .expect("rows");
-        assert_eq!(rows.len(), 1, "disabled memory must not enter prior_context");
+        assert_eq!(
+            rows.len(),
+            1,
+            "disabled memory must not enter prior_context"
+        );
         assert_eq!(rows[0].fingerprint, "fp-b");
 
         let (listed, total) = store
             .list_repair_memory("example.com/spike-target", 10, 0)
             .expect("list");
         assert_eq!(total, 2);
-        assert!(listed.iter().any(|row| row.fingerprint == "fp-a" && row.disabled));
+        assert!(listed
+            .iter()
+            .any(|row| row.fingerprint == "fp-a" && row.disabled));
 
         assert!(store
             .set_repair_memory_disabled("example.com/spike-target", "fp-a", false)
@@ -5312,10 +5804,15 @@ mod repo_tests {
         assert_eq!(detail.claimed, 2);
         let results = store.benchmark_results("bench-1").expect("results");
         assert_eq!(results.len(), 2);
-        assert!(results.iter().any(|row| row.scenario == "go-off-by-one" && row.repaired));
+        assert!(results
+            .iter()
+            .any(|row| row.scenario == "go-off-by-one" && row.repaired));
         assert!(results
             .iter()
             .any(|row| row.scenario == "node-noop-claim" && !row.repaired && row.claimed_fixed));
-        assert!(store.get_benchmark_run("missing").expect("missing").is_none());
+        assert!(store
+            .get_benchmark_run("missing")
+            .expect("missing")
+            .is_none());
     }
 }

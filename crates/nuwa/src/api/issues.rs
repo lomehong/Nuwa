@@ -954,7 +954,13 @@ mod tests {
             .map(|(index, offset)| {
                 report(
                     store,
-                    &signal("detail crash", SIMILAR, "go", "low", &format!("simx{index}")),
+                    &signal(
+                        "detail crash",
+                        SIMILAR,
+                        "go",
+                        "low",
+                        &format!("simx{index}"),
+                    ),
                     now - offset,
                 )
             })

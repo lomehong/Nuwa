@@ -69,7 +69,12 @@ pub fn apply(conn: &mut Connection) -> ShanResult<()> {
 fn migrate_v1(conn: &Connection) -> ShanResult<()> {
     add_column_if_missing(conn, "issues", "pr_url", "TEXT")?;
     add_column_if_missing(conn, "issues", "pr_opened_at", "INTEGER")?;
-    add_column_if_missing(conn, "issues", "state_changed_at", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        conn,
+        "issues",
+        "state_changed_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(conn, "issues", "owner_runner_id", "TEXT")?;
     add_column_if_missing(conn, "events", "repo", "TEXT")?;
     add_column_if_missing(conn, "events", "actor", "TEXT")?;
@@ -352,7 +357,17 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
         assert_eq!(version, SCHEMA_VERSION);
-        for table in ["issues", "events", "runners", "runs", "signal_daily", "repos", "repair_memory", "benchmark_runs", "benchmark_results"] {
+        for table in [
+            "issues",
+            "events",
+            "runners",
+            "runs",
+            "signal_daily",
+            "repos",
+            "repair_memory",
+            "benchmark_runs",
+            "benchmark_results",
+        ] {
             assert!(table_exists(&conn, table), "missing {table}");
         }
         for (table, column) in [
@@ -370,7 +385,10 @@ mod tests {
             ("runs", "messages"),
             ("repair_memory", "disabled"),
         ] {
-            assert!(column_exists(&conn, table, column), "missing {table}.{column}");
+            assert!(
+                column_exists(&conn, table, column),
+                "missing {table}.{column}"
+            );
         }
     }
 
@@ -396,10 +414,17 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("issue");
-        assert_eq!(state_changed_at, 150, "backfill from latest state_changed event");
+        assert_eq!(
+            state_changed_at, 150,
+            "backfill from latest state_changed event"
+        );
         assert_eq!(owner, None);
         let repo: String = conn
-            .query_row("SELECT repo FROM events WHERE fingerprint='fp1'", [], |row| row.get(0))
+            .query_row(
+                "SELECT repo FROM events WHERE fingerprint='fp1'",
+                [],
+                |row| row.get(0),
+            )
             .expect("event repo");
         assert_eq!(repo, "example.com/r");
         assert!(column_exists(&conn, "issues", "pr_url"));
@@ -414,7 +439,8 @@ mod tests {
             let conn = Connection::open(&path).expect("open");
             v0_schema(&conn);
             migrate_v1(&conn).expect("v1 migration");
-            conn.pragma_update(None, "user_version", 1).expect("version");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("version");
         }
         let _store = Store::open(&path).expect("migrate v2/v3/v4/v5/v6");
         let conn = Connection::open(&path).expect("reopen");
@@ -426,9 +452,11 @@ mod tests {
         assert!(column_exists(&conn, "issues", "attempts"));
         // v1 data survives the upgrade.
         let title: String = conn
-            .query_row("SELECT title FROM issues WHERE fingerprint='fp1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT title FROM issues WHERE fingerprint='fp1'",
+                [],
+                |row| row.get(0),
+            )
             .expect("issue title");
         assert_eq!(title, "t");
     }
@@ -442,7 +470,8 @@ mod tests {
             v0_schema(&conn);
             migrate_v1(&conn).expect("v1");
             migrate_v2(&conn).expect("v2");
-            conn.pragma_update(None, "user_version", 2).expect("version");
+            conn.pragma_update(None, "user_version", 2)
+                .expect("version");
         }
         let _store = Store::open(&path).expect("migrate v3/v4/v5/v6");
         let conn = Connection::open(&path).expect("reopen");
@@ -453,9 +482,11 @@ mod tests {
         assert!(column_exists(&conn, "issues", "attempts"));
         assert!(column_exists(&conn, "runners", "progress_at"));
         let title: String = conn
-            .query_row("SELECT title FROM issues WHERE fingerprint='fp1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT title FROM issues WHERE fingerprint='fp1'",
+                [],
+                |row| row.get(0),
+            )
             .expect("issue title");
         assert_eq!(title, "t");
     }
@@ -470,7 +501,8 @@ mod tests {
             migrate_v1(&conn).expect("v1");
             migrate_v2(&conn).expect("v2");
             migrate_v3(&conn).expect("v3");
-            conn.pragma_update(None, "user_version", 3).expect("version");
+            conn.pragma_update(None, "user_version", 3)
+                .expect("version");
         }
         let _store = Store::open(&path).expect("migrate v4/v5/v6");
         let conn = Connection::open(&path).expect("reopen");
@@ -480,9 +512,11 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         assert!(table_exists(&conn, "repair_memory"));
         let title: String = conn
-            .query_row("SELECT title FROM issues WHERE fingerprint='fp1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT title FROM issues WHERE fingerprint='fp1'",
+                [],
+                |row| row.get(0),
+            )
             .expect("issue title");
         assert_eq!(title, "t");
     }
@@ -498,7 +532,8 @@ mod tests {
             migrate_v2(&conn).expect("v2");
             migrate_v3(&conn).expect("v3");
             migrate_v4(&conn).expect("v4");
-            conn.pragma_update(None, "user_version", 4).expect("version");
+            conn.pragma_update(None, "user_version", 4)
+                .expect("version");
         }
         let _store = Store::open(&path).expect("migrate v5");
         let conn = Connection::open(&path).expect("reopen");
@@ -507,7 +542,10 @@ mod tests {
             .expect("version");
         assert_eq!(version, SCHEMA_VERSION);
         for column in ["compactions", "context_window", "messages"] {
-            assert!(column_exists(&conn, "runs", column), "missing runs.{column}");
+            assert!(
+                column_exists(&conn, "runs", column),
+                "missing runs.{column}"
+            );
         }
         assert!(table_exists(&conn, "repair_memory"));
     }
@@ -524,7 +562,8 @@ mod tests {
             migrate_v3(&conn).expect("v3");
             migrate_v4(&conn).expect("v4");
             migrate_v5(&conn).expect("v5");
-            conn.pragma_update(None, "user_version", 5).expect("version");
+            conn.pragma_update(None, "user_version", 5)
+                .expect("version");
         }
         let _store = Store::open(&path).expect("migrate v6");
         let conn = Connection::open(&path).expect("reopen");

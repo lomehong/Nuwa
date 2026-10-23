@@ -65,7 +65,10 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<Cli> {
                 "anthropic" => cli.provider = repair::ProviderKind::Anthropic { model: None },
                 "faux" => cli.provider = repair::ProviderKind::Faux,
                 "zai" => {
-                    cli.provider = repair::ProviderKind::Zai { base_url: None, model: None }
+                    cli.provider = repair::ProviderKind::Zai {
+                        base_url: None,
+                        model: None,
+                    }
                 }
                 other => bail!("unknown provider {other} (anthropic|faux|zai)"),
             },
@@ -165,8 +168,8 @@ fn run_reopen(args: Vec<String>) -> anyhow::Result<()> {
         }
     }
     let fp = fingerprint.context("--fingerprint is required")?;
-    let store =
-        shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    let store = shanhaijing::Store::open(&db_path)
+        .with_context(|| format!("open db {}", db_path.display()))?;
     store.reopen_issue(&fp, now_ms(), reason.as_deref())?;
     store.set_cooldown(&fp, 0)?;
     println!("reopened   : {fp} — ready for pickup");
@@ -191,8 +194,8 @@ fn run_ignore(args: Vec<String>) -> anyhow::Result<()> {
         }
     }
     let fp = fingerprint.context("--fingerprint is required")?;
-    let store =
-        shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    let store = shanhaijing::Store::open(&db_path)
+        .with_context(|| format!("open db {}", db_path.display()))?;
     store.ignore_issue(&fp, &reason, "owner", now_ms())?;
     println!("ignored    : {fp} — reports will be counted, not repaired");
     Ok(())
@@ -213,7 +216,10 @@ fn run_migrate_env(args: Vec<String>) -> anyhow::Result<()> {
     }
     let changed = settings::migrate_env_file_at(&env_file).map_err(|e| anyhow::anyhow!(e))?;
     if changed.is_empty() {
-        println!("env        : no lowercase keys to migrate in {}", env_file.display());
+        println!(
+            "env        : no lowercase keys to migrate in {}",
+            env_file.display()
+        );
     } else {
         println!(
             "env        : migrated {} -> {} (backup: {})",
@@ -234,18 +240,19 @@ fn run_ingest(args: Vec<String>) -> anyhow::Result<()> {
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--signal" => {
-                signal_path =
-                    Some(std::path::PathBuf::from(it.next().context("--signal needs a value")?))
+                signal_path = Some(std::path::PathBuf::from(
+                    it.next().context("--signal needs a value")?,
+                ))
             }
             "--db" => db_path = std::path::PathBuf::from(it.next().context("--db needs a value")?),
             other => bail!("unknown ingest flag {other}"),
         }
     }
     let signal_path = signal_path.context("--signal <path> is required")?;
-    let raw =
-        std::fs::read_to_string(&signal_path).with_context(|| format!("read {}", signal_path.display()))?;
-    let store =
-        shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    let raw = std::fs::read_to_string(&signal_path)
+        .with_context(|| format!("read {}", signal_path.display()))?;
+    let store = shanhaijing::Store::open(&db_path)
+        .with_context(|| format!("open db {}", db_path.display()))?;
     let now = now_ms();
 
     let signals = parse_signals(&raw)?;
@@ -258,11 +265,7 @@ fn run_ingest(args: Vec<String>) -> anyhow::Result<()> {
     if let Some(issue) = store.ready_issue(now)? {
         println!(
             "next up    : {} [{}] {} — {}x, repo {}",
-            issue.fingerprint,
-            issue.severity,
-            issue.title,
-            issue.occurrences,
-            issue.repo
+            issue.fingerprint, issue.severity, issue.title, issue.occurrences, issue.repo
         );
     }
     Ok(())
@@ -313,8 +316,7 @@ pub(crate) fn report_one(
 /// `--sessions` default would leave those runs with an unreadable transcript
 /// and shadow older readable runs.
 fn absolute_sessions_dir(path: PathBuf) -> anyhow::Result<PathBuf> {
-    std::path::absolute(&path)
-        .with_context(|| format!("resolve sessions dir {}", path.display()))
+    std::path::absolute(&path).with_context(|| format!("resolve sessions dir {}", path.display()))
 }
 
 /// 应龙 runner v0 — claim the highest-priority ready issue from 山海经 and
@@ -334,7 +336,9 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let mut loop_run = false;
     let mut interval_secs: u64 = env_d("NUWA_INTERVAL", "30").parse().unwrap_or(30);
     let mut daily_pr_limit: u64 = env_d("NUWA_DAILY_PR_LIMIT", "5").parse().unwrap_or(5);
-    let mut max_tokens: u64 = env_d("NUWA_MAX_TOKENS", "1500000").parse().unwrap_or(1_500_000);
+    let mut max_tokens: u64 = env_d("NUWA_MAX_TOKENS", "1500000")
+        .parse()
+        .unwrap_or(1_500_000);
     let mut daily_token_limit: u64 = env_d("NUWA_DAILY_TOKEN_LIMIT", "5000000")
         .parse()
         .unwrap_or(5_000_000);
@@ -342,8 +346,9 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         .parse()
         .unwrap_or(50_000_000);
     let mut ci_timeout_secs: u64 = env_d("NUWA_CI_TIMEOUT", "600").parse().unwrap_or(600);
-    let mut runner_id_given: Option<String> =
-        std::env::var("NUWA_RUNNER_ID").ok().filter(|v| !v.is_empty());
+    let mut runner_id_given: Option<String> = std::env::var("NUWA_RUNNER_ID")
+        .ok()
+        .filter(|v| !v.is_empty());
     let mut service_unit = std::env::var("NUWA_SERVICE_UNIT")
         .ok()
         .filter(|v| !v.is_empty())
@@ -353,18 +358,24 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     );
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
-        let mut value =
-            |name: &str| it.next().with_context(|| format!("missing value for {name}"));
+        let mut value = |name: &str| {
+            it.next()
+                .with_context(|| format!("missing value for {name}"))
+        };
         match flag.as_str() {
             "--db" => db_path = PathBuf::from(value("--db")?),
             "--instructions" => instructions_path = Some(PathBuf::from(value("--instructions")?)),
             "--sessions" => sessions_dir = PathBuf::from(value("--sessions")?),
             "--provider" => match value("--provider")?.as_str() {
-                "anthropic" => provider_given = Some(repair::ProviderKind::Anthropic { model: None }),
+                "anthropic" => {
+                    provider_given = Some(repair::ProviderKind::Anthropic { model: None })
+                }
                 "faux" => provider_given = Some(repair::ProviderKind::Faux),
                 "zai" => {
-                    provider_given =
-                        Some(repair::ProviderKind::Zai { base_url: None, model: None })
+                    provider_given = Some(repair::ProviderKind::Zai {
+                        base_url: None,
+                        model: None,
+                    })
                 }
                 other => bail!("unknown provider {other}"),
             },
@@ -680,8 +691,7 @@ fn classify_failure(error: &anyhow::Error) -> FailureClass {
     if text.contains("401")
         || text.contains("403")
         || text.contains("unauthorized")
-        || (text.contains("not set")
-            && (text.contains("api_key") || text.contains("api key")))
+        || (text.contains("not set") && (text.contains("api_key") || text.contains("api key")))
     {
         return FailureClass::ProviderConfig;
     }
@@ -750,7 +760,11 @@ fn sanitize_runner_id(raw: &str) -> String {
         })
         .collect();
     let trimmed = cleaned.trim_matches('-');
-    let value = if trimmed.is_empty() { "runner" } else { trimmed };
+    let value = if trimmed.is_empty() {
+        "runner"
+    } else {
+        trimmed
+    };
     value.chars().take(128).collect()
 }
 
@@ -803,13 +817,7 @@ fn effective_config_json(
 
 async fn live_snapshot(
     live: &SharedLive,
-) -> (
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    i64,
-) {
+) -> (String, Option<String>, Option<String>, Option<String>, i64) {
     let state = live.lock().await;
     (
         state.status.clone(),
@@ -988,7 +996,10 @@ async fn preflight_repo(repo_dir: &Path, fetch: bool) -> anyhow::Result<&'static
         } else {
             git_ops::git(repo_dir, &["reset", "--hard", "HEAD"])?;
         }
-        let _ = git_ops::git(repo_dir, &["clean", "-fd", "--", ":(exclude)nuwa.repo.json"]);
+        let _ = git_ops::git(
+            repo_dir,
+            &["clean", "-fd", "--", ":(exclude)nuwa.repo.json"],
+        );
         let still = git_ops::git(
             repo_dir,
             &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
@@ -1161,7 +1172,11 @@ async fn cleanup_terminal_branches(
 
 /// Delete the deterministic branch left by a previous delivery for this
 /// fingerprint. Remote deletion only matters when the runner pushes.
-async fn remove_stale_branch(repo_dir: &Path, fingerprint: &str, push: bool) -> anyhow::Result<bool> {
+async fn remove_stale_branch(
+    repo_dir: &Path,
+    fingerprint: &str,
+    push: bool,
+) -> anyhow::Result<bool> {
     let branch = format!("agent/fix/{}", issue::short_fingerprint(fingerprint));
     let mut removed = false;
     if git_ops::branch_exists(repo_dir, &branch)? {
@@ -1233,10 +1248,12 @@ fn build_prior_context(
         for memory in memories {
             let cause = secrets.redact(&memory.root_cause);
             // Provenance first: a memory without a commit/PR cannot be checked.
-            let source = memory
-                .pr_url
-                .clone()
-                .unwrap_or_else(|| format!("commit {}", &memory.commit_sha[..12.min(memory.commit_sha.len())]));
+            let source = memory.pr_url.clone().unwrap_or_else(|| {
+                format!(
+                    "commit {}",
+                    &memory.commit_sha[..12.min(memory.commit_sha.len())]
+                )
+            });
             out.push_str(&format!(
                 "- {} — root_cause={} change={}\n",
                 source,
@@ -1294,10 +1311,7 @@ async fn work_once(
     // 活性必须在任何早退之前可见：配额待定/预检失败都不是"进程死了"。
     store.heartbeat(now)?;
     if let Some(remaining) = stand_down_remaining(&live, now).await {
-        let detail = format!(
-            "provider/environment stand-down for {}s",
-            remaining / 1_000
-        );
+        let detail = format!("provider/environment stand-down for {}s", remaining / 1_000);
         live_update(&live, "standing_down", None, None, Some(detail)).await;
         return Ok(false);
     }
@@ -1394,7 +1408,10 @@ async fn work_once(
             Some(&message),
             "runner",
         );
-        println!("mismatch   : {} escalated (belongs to `{}`)", snapshot.fingerprint, snapshot.repo);
+        println!(
+            "mismatch   : {} escalated (belongs to `{}`)",
+            snapshot.fingerprint, snapshot.repo
+        );
         emit_webhook(
             "escalated",
             &snapshot.fingerprint,
@@ -1870,9 +1887,8 @@ async fn work_once(
     // is the spend ceiling — an over-budget run never reaches delivery.
     let spent = report.uncached_tokens + report.cached_tokens;
     if spent > max_tokens {
-        let detail = bounded_text(&secrets.redact(&format!(
-            "budget_exceeded: {spent} > {max_tokens}"
-        )));
+        let detail =
+            bounded_text(&secrets.redact(&format!("budget_exceeded: {spent} > {max_tokens}")));
         let _ = store.finish_run(
             &run_id,
             &shanhaijing::RunFinish {
@@ -1884,7 +1900,13 @@ async fn work_once(
         );
         live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
         let _ = store.increment_attempts(&fp);
-        store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
+        store.set_state_as(
+            &fp,
+            shanhaijing::State::Escalated,
+            now_ms(),
+            Some(detail.as_str()),
+            "runner",
+        )?;
         emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
         trace::record(
             store,
@@ -1947,7 +1969,13 @@ async fn work_once(
             );
             live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
             let _ = store.increment_attempts(&fp);
-            store.set_state_as(&fp, shanhaijing::State::Escalated, now_ms(), Some(detail.as_str()), "runner")?;
+            store.set_state_as(
+                &fp,
+                shanhaijing::State::Escalated,
+                now_ms(),
+                Some(detail.as_str()),
+                "runner",
+            )?;
             emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
             trace::record(
                 store,
@@ -1997,12 +2025,16 @@ async fn work_once(
         &fp,
         shanhaijing::State::PrOpen,
         now_ms(),
-        Some(delivered.pr_url.as_deref().unwrap_or("branch pushed, no PR")),
+        Some(
+            delivered
+                .pr_url
+                .as_deref()
+                .unwrap_or("branch pushed, no PR"),
+        ),
         "runner",
     ) {
-        let detail = bounded_text(&secrets.redact(&format!(
-            "delivery_failed: state update: {e:#}"
-        )));
+        let detail =
+            bounded_text(&secrets.redact(&format!("delivery_failed: state update: {e:#}")));
         let _ = store.finish_run(
             &run_id,
             &shanhaijing::RunFinish {
@@ -2076,7 +2108,13 @@ async fn work_once(
             },
         );
         if push {
-            remember_verified_fix(store, &repo_config.repo, &fp, &delivered, &redacted_root_cause);
+            remember_verified_fix(
+                store,
+                &repo_config.repo,
+                &fp,
+                &delivered,
+                &redacted_root_cause,
+            );
         }
         let _ = store.finish_run(
             &run_id,
@@ -2171,7 +2209,10 @@ async fn work_once(
                     Some(&repo_config.repo),
                     "runner",
                     "ci_green",
-                    &format!("head {}", &delivered.commit[..12.min(delivered.commit.len())]),
+                    &format!(
+                        "head {}",
+                        &delivered.commit[..12.min(delivered.commit.len())]
+                    ),
                 );
                 trace::record(
                     store,
@@ -2247,7 +2288,10 @@ async fn work_once(
                     Some(&repo_config.repo),
                     "runner",
                     "ci_red",
-                    &format!("head {} — PR #{number} closed", &delivered.commit[..12.min(delivered.commit.len())]),
+                    &format!(
+                        "head {} — PR #{number} closed",
+                        &delivered.commit[..12.min(delivered.commit.len())]
+                    ),
                 );
                 trace::record(
                     store,
@@ -2269,7 +2313,9 @@ async fn work_once(
                     &fp,
                     shanhaijing::State::Rejected,
                     now_ms(),
-                    Some(&format!("ci_red: CI red — PR #{number} closed, back to owner")),
+                    Some(&format!(
+                        "ci_red: CI red — PR #{number} closed, back to owner"
+                    )),
                     "runner",
                 )?;
                 emit_webhook(
@@ -2303,7 +2349,14 @@ async fn work_once(
                 return Ok(true);
             }
             Ok(ci::Verdict::TimedOut) => {
-                let _ = store.record_event(&fp, now_ms(), Some(&repo_config.repo), "runner", "ci_timeout", slug);
+                let _ = store.record_event(
+                    &fp,
+                    now_ms(),
+                    Some(&repo_config.repo),
+                    "runner",
+                    "ci_timeout",
+                    slug,
+                );
                 trace::record(
                     store,
                     &fp,
@@ -2426,8 +2479,8 @@ async fn run_sync(args: Vec<String>) -> anyhow::Result<()> {
     let token = std::env::var("NUWA_GITHUB_TOKEN")
         .or_else(|_| std::env::var("GITHUB_TOKEN"))
         .context("NUWA_GITHUB_TOKEN not set — sync needs to read PR state")?;
-    let store =
-        shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    let store = shanhaijing::Store::open(&db_path)
+        .with_context(|| format!("open db {}", db_path.display()))?;
     let now = now_ms();
     for line in ci::reconcile_all(&store, &token, now).await? {
         println!("{line}");
@@ -2454,7 +2507,9 @@ fn env_d(name: &str, default: &str) -> String {
 pub(crate) fn env_provider_default() -> repair::ProviderKind {
     match env_d("NUWA_PROVIDER", "anthropic").as_str() {
         "zai" => repair::ProviderKind::Zai {
-            base_url: std::env::var("NUWA_BASE_URL").ok().filter(|s| !s.is_empty()),
+            base_url: std::env::var("NUWA_BASE_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
             model: std::env::var("NUWA_MODEL").ok().filter(|s| !s.is_empty()),
         },
         "faux" => repair::ProviderKind::Faux,
@@ -2474,8 +2529,8 @@ fn run_status(args: Vec<String>) -> anyhow::Result<()> {
             other => bail!("unknown status flag {other}"),
         }
     }
-    let store =
-        shanhaijing::Store::open(&db_path).with_context(|| format!("open db {}", db_path.display()))?;
+    let store = shanhaijing::Store::open(&db_path)
+        .with_context(|| format!("open db {}", db_path.display()))?;
     println!(
         "{:<34} {:<10} {:<8} {:>4}  title / pr",
         "fingerprint", "state", "sev", "seen"
@@ -2658,8 +2713,7 @@ mod tests {
     fn relative_sessions_root_becomes_absolute() {
         // The default `spike/sessions` is relative; the transcript endpoint
         // rejects relative run paths, so run_work resolves the root once.
-        let absolute =
-            absolute_sessions_dir(PathBuf::from("spike/sessions")).expect("absolutize");
+        let absolute = absolute_sessions_dir(PathBuf::from("spike/sessions")).expect("absolutize");
         assert!(absolute.is_absolute(), "{absolute:?}");
         assert!(
             absolute.ends_with(Path::new("spike").join("sessions")),
@@ -2675,7 +2729,9 @@ mod tests {
     #[test]
     fn runner_id_is_sanitized_and_stable() {
         let id = sanitize_runner_id("host/repo name:日本");
-        assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')));
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')));
         assert!(id.len() <= 128);
         assert!(!id.is_empty());
         assert_eq!(sanitize_runner_id("---"), "runner");
@@ -2689,9 +2745,15 @@ mod tests {
 
     #[test]
     fn provider_labels_are_stable() {
-        assert_eq!(provider_meta(&repair::ProviderKind::Faux), ("faux".into(), "faux".into()));
         assert_eq!(
-            provider_meta(&repair::ProviderKind::Zai { base_url: None, model: None }),
+            provider_meta(&repair::ProviderKind::Faux),
+            ("faux".into(), "faux".into())
+        );
+        assert_eq!(
+            provider_meta(&repair::ProviderKind::Zai {
+                base_url: None,
+                model: None
+            }),
             ("zai".into(), "glm-5.3-flash".into())
         );
         assert_eq!(
@@ -2738,11 +2800,19 @@ mod tests {
             severity: "high".into(),
             message: None,
             log_window: Vec::new(),
-            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.F()\n\t/app/a.go:1 +0x1".into(),
+            stack_trace:
+                "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.F()\n\t/app/a.go:1 +0x1"
+                    .into(),
         };
         store.report_signal(&signal, now).expect("report");
-        let fp = store.ready_issue(now).expect("ready").expect("issue").fingerprint;
-        store.set_pr(&fp, "https://github.com/acme/spike/pull/1", now).expect("pr");
+        let fp = store
+            .ready_issue(now)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        store
+            .set_pr(&fp, "https://github.com/acme/spike/pull/1", now)
+            .expect("pr");
 
         let cfg = RepoInstructions {
             repo: "example.com/spike".into(),
@@ -2780,7 +2850,10 @@ mod tests {
         .expect("work_once");
 
         assert!(!worked, "quota must stand down");
-        let hb = store.last_heartbeat().expect("heartbeat").expect("some heartbeat");
+        let hb = store
+            .last_heartbeat()
+            .expect("heartbeat")
+            .expect("some heartbeat");
         assert!((now_ms() - hb).abs() < 5_000, "heartbeat must be fresh");
     }
 
@@ -2800,13 +2873,28 @@ mod tests {
             severity: "high".into(),
             message: None,
             log_window: Vec::new(),
-            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/other.F()\n\t/app/a.go:1 +0x1".into(),
+            stack_trace:
+                "panic: boom\ngoroutine 1 [running]:\nexample.com/other.F()\n\t/app/a.go:1 +0x1"
+                    .into(),
         };
         store.report_signal(&signal, now).expect("report");
 
         // preflight 要求一个干净的 main checkout（claim 之前检查）。
         git(repo_dir.path(), &["init", "-q", "-b", "main"]);
-        git(repo_dir.path(), &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-q", "-m", "init"]);
+        git(
+            repo_dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
 
         let cfg = RepoInstructions {
             repo: "example.com/spike".into(),
@@ -2843,7 +2931,10 @@ mod tests {
         .await
         .expect("work_once must not fail on a mismatched issue");
 
-        assert!(!worked, "a repo-filtered claim leaves another repo's issue alone");
+        assert!(
+            !worked,
+            "a repo-filtered claim leaves another repo's issue alone"
+        );
         let fp = fp_of(&store, now);
         let row = store
             .list_issues()
@@ -2914,7 +3005,10 @@ mod tests {
 
         let base = preflight_repo(&repo, true).await.expect("preflight");
         assert_eq!(base, "main");
-        assert_eq!(git_output(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "main");
+        assert_eq!(
+            git_output(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "main"
+        );
     }
 
     #[tokio::test]
@@ -2926,7 +3020,10 @@ mod tests {
 
         let work = dir.path().join("work");
         std::fs::create_dir_all(&work).expect("work");
-        git(&work, &["clone", origin.to_str().expect("origin path"), "."]);
+        git(
+            &work,
+            &["clone", origin.to_str().expect("origin path"), "."],
+        );
         git(&work, &["checkout", "-b", "main"]);
         git(&work, &["config", "user.name", "test"]);
         git(&work, &["config", "user.email", "test@example.com"]);
@@ -2937,7 +3034,10 @@ mod tests {
 
         let other = dir.path().join("other");
         std::fs::create_dir_all(&other).expect("other");
-        git(&other, &["clone", origin.to_str().expect("origin path"), "."]);
+        git(
+            &other,
+            &["clone", origin.to_str().expect("origin path"), "."],
+        );
         git(&other, &["config", "user.name", "test"]);
         git(&other, &["config", "user.email", "test@example.com"]);
         std::fs::write(other.join("g.txt"), "two\n").expect("write");
@@ -2946,7 +3046,10 @@ mod tests {
         git(&other, &["push", "origin", "main"]);
 
         preflight_repo(&work, true).await.expect("preflight");
-        assert!(work.join("g.txt").exists(), "preflight must fetch origin/main");
+        assert!(
+            work.join("g.txt").exists(),
+            "preflight must fetch origin/main"
+        );
         assert_eq!(
             git_output(&work, &["rev-parse", "HEAD"]).trim(),
             git_output(&work, &["rev-parse", "origin/main"]).trim()
@@ -3000,9 +3103,15 @@ mod tests {
 
         let removed = cleanup_sessions(&root, &store, now, 1).expect("cleanup");
         assert_eq!(removed, 1);
-        assert!(!root.join(&fps[0]).exists(), "old session dir must be removed");
+        assert!(
+            !root.join(&fps[0]).exists(),
+            "old session dir must be removed"
+        );
         assert!(root.join(&fps[1]).exists(), "new session dir must remain");
-        assert!(root.join("_trusted").exists(), "trusted config must survive");
+        assert!(
+            root.join("_trusted").exists(),
+            "trusted config must survive"
+        );
     }
 
     #[tokio::test]
@@ -3016,7 +3125,10 @@ mod tests {
         let now = now_ms();
 
         let mut states = Vec::new();
-        for (i, target) in ["merged", "rejected", "escalated", "new"].iter().enumerate() {
+        for (i, target) in ["merged", "rejected", "escalated", "new"]
+            .iter()
+            .enumerate()
+        {
             let title = format!("cleanup {i}");
             let signal = shanhaijing::Signal {
                 repo: "example.com/spike".into(),
@@ -3039,20 +3151,40 @@ mod tests {
                 .fingerprint;
             match *target {
                 "merged" => {
-                    store.set_state(&fp, State::Triggered, now, None).expect("triggered");
-                    store.set_state(&fp, State::Fixing, now, None).expect("fixing");
-                    store.set_state(&fp, State::PrOpen, now, None).expect("pr_open");
-                    store.set_state(&fp, State::Merged, now, None).expect("merged");
+                    store
+                        .set_state(&fp, State::Triggered, now, None)
+                        .expect("triggered");
+                    store
+                        .set_state(&fp, State::Fixing, now, None)
+                        .expect("fixing");
+                    store
+                        .set_state(&fp, State::PrOpen, now, None)
+                        .expect("pr_open");
+                    store
+                        .set_state(&fp, State::Merged, now, None)
+                        .expect("merged");
                 }
                 "rejected" => {
-                    store.set_state(&fp, State::Triggered, now, None).expect("triggered");
-                    store.set_state(&fp, State::Fixing, now, None).expect("fixing");
-                    store.set_state(&fp, State::PrOpen, now, None).expect("pr_open");
-                    store.set_state(&fp, State::Rejected, now, None).expect("rejected");
+                    store
+                        .set_state(&fp, State::Triggered, now, None)
+                        .expect("triggered");
+                    store
+                        .set_state(&fp, State::Fixing, now, None)
+                        .expect("fixing");
+                    store
+                        .set_state(&fp, State::PrOpen, now, None)
+                        .expect("pr_open");
+                    store
+                        .set_state(&fp, State::Rejected, now, None)
+                        .expect("rejected");
                 }
                 "escalated" => {
-                    store.set_state(&fp, State::Triggered, now, None).expect("triggered");
-                    store.set_state(&fp, State::Escalated, now, None).expect("escalated");
+                    store
+                        .set_state(&fp, State::Triggered, now, None)
+                        .expect("triggered");
+                    store
+                        .set_state(&fp, State::Escalated, now, None)
+                        .expect("escalated");
                 }
                 _ => {}
             }
@@ -3078,7 +3210,9 @@ mod tests {
         init_git_repo(&repo);
         git(&repo, &["branch", "agent/fix/fp"]);
         assert!(git_ops::branch_exists(&repo, "agent/fix/fp").expect("exists"));
-        let removed = remove_stale_branch(&repo, "fp", false).await.expect("remove");
+        let removed = remove_stale_branch(&repo, "fp", false)
+            .await
+            .expect("remove");
         assert!(removed);
         assert!(!git_ops::branch_exists(&repo, "agent/fix/fp").expect("gone"));
     }
@@ -3105,12 +3239,18 @@ mod tests {
         git(&repo, &["add", "."]);
         git(
             &repo,
-            &["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
         );
 
-        let store = Arc::new(
-            shanhaijing::Store::open(dir.path().join("s.db")).expect("open"),
-        );
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
         let now = now_ms();
         let signal = shanhaijing::Signal {
             repo: "example.com/spike".into(),
@@ -3161,7 +3301,10 @@ mod tests {
         assert!(worked);
 
         let issue = store.list_issues().expect("issues").pop().expect("issue");
-        let run = store.latest_run(&issue.fingerprint).expect("latest").expect("run");
+        let run = store
+            .latest_run(&issue.fingerprint)
+            .expect("latest")
+            .expect("run");
         assert_eq!(run.phase, "done");
         assert_eq!(run.outcome.as_deref(), Some("success"));
         assert!(run.turns >= 1, "faux run must record at least one turn");
@@ -3181,7 +3324,11 @@ mod tests {
             "diff stat must land on the run"
         );
         assert!(run.verification_ok == Some(true));
-        assert!(run.branch.as_deref().unwrap_or("").starts_with("agent/fix/"));
+        assert!(run
+            .branch
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("agent/fix/"));
         assert_eq!(run.runner_id, "test:runner");
         // 交付后工作树已切回 main；修复内容在 agent 分支上取证。
         let branch = run.branch.clone().expect("branch");
@@ -3349,7 +3496,10 @@ mod tests {
         assert!(context.contains("PRIOR ATTEMPTS"), "{context}");
         assert!(context.contains("ROOT CAUSE: off-by-one loop"), "{context}");
         assert!(context.contains("VERIFIED FIXES IN THIS REPO"), "{context}");
-        assert!(context.contains("https://github.com/acme/spike/pull/7"), "{context}");
+        assert!(
+            context.contains("https://github.com/acme/spike/pull/7"),
+            "{context}"
+        );
         assert!(
             !context.contains("current issue memory must be excluded"),
             "the issue's own memory duplicates PRIOR ATTEMPTS: {context}"
@@ -3390,7 +3540,15 @@ mod tests {
         git(&repo, &["add", "."]);
         git(
             &repo,
-            &["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
         );
 
         let db = dir.path().join("m1b.db");
@@ -3414,7 +3572,11 @@ mod tests {
         };
         store.report_signal(&sig_a, now).expect("a");
         store.report_signal(&sig_b, now + 1).expect("b");
-        let fp_a = store.ready_issue(now).expect("ready").expect("a").fingerprint;
+        let fp_a = store
+            .ready_issue(now)
+            .expect("ready")
+            .expect("a")
+            .fingerprint;
         // B is newer; A is picked first by last_seen ASC. Identify B separately.
         let fp_b = store
             .list_issues()
@@ -3446,11 +3608,16 @@ mod tests {
             ]
         };
 
-        run_work(args(&db, &repo, &sessions)).await.expect("first run");
+        run_work(args(&db, &repo, &sessions))
+            .await
+            .expect("first run");
 
         let store = Store::open(&db).expect("reopen");
         let runners = store.list_runners().expect("runners");
-        assert!(runners.iter().any(|r| r.id == "test:runner"), "runner must be registered");
+        assert!(
+            runners.iter().any(|r| r.id == "test:runner"),
+            "runner must be registered"
+        );
         let run_a = store.latest_run(&fp_a).expect("latest a").expect("run a");
         assert_eq!(run_a.outcome.as_deref(), Some("success"));
         assert_eq!(run_a.runner_id, "test:runner");
@@ -3461,9 +3628,15 @@ mod tests {
         );
 
         // Simulate a crashed in-flight run for B, owned by the same runner.
-        store.set_state(&fp_b, State::Triggered, now + 2, None).expect("t");
-        store.set_state(&fp_b, State::Fixing, now + 3, None).expect("f");
-        store.set_state(&fp_b, State::Escalated, now + 4, None).expect("e");
+        store
+            .set_state(&fp_b, State::Triggered, now + 2, None)
+            .expect("t");
+        store
+            .set_state(&fp_b, State::Fixing, now + 3, None)
+            .expect("f");
+        store
+            .set_state(&fp_b, State::Escalated, now + 4, None)
+            .expect("e");
         store
             .start_run(&shanhaijing::RunStart {
                 id: "open-run".into(),
@@ -3477,7 +3650,9 @@ mod tests {
             .expect("open run");
         drop(store);
 
-        run_work(args(&db, &repo, &sessions)).await.expect("second run");
+        run_work(args(&db, &repo, &sessions))
+            .await
+            .expect("second run");
 
         let store = Store::open(&db).expect("reopen2");
         let run_b = store.latest_run(&fp_b).expect("latest b").expect("run b");

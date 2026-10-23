@@ -197,15 +197,27 @@ impl Issue {
              \n\
              {}",
             self.fingerprint,
-            if self.severity.is_empty() { "n/a" } else { &self.severity },
+            if self.severity.is_empty() {
+                "n/a"
+            } else {
+                &self.severity
+            },
             self.occurrences,
             self.first_seen,
             self.last_seen,
             self.title,
-            if self.stack_trace.is_empty() { "(none)" } else { &self.stack_trace },
+            if self.stack_trace.is_empty() {
+                "(none)"
+            } else {
+                &self.stack_trace
+            },
             logs,
             self.failing_check.command,
-            self.failing_check.target.as_deref().map(|t| format!(" (failing: {t})")).unwrap_or_default(),
+            self.failing_check
+                .target
+                .as_deref()
+                .map(|t| format!(" (failing: {t})"))
+                .unwrap_or_default(),
             self.reproduce_check
                 .as_ref()
                 .map(|check| format!("REPRODUCE CHECK: {}\n", check.command))
@@ -299,7 +311,10 @@ mod tests {
             timeout_secs: 300,
         });
         let prompt = issue.user_prompt();
-        assert!(prompt.contains("REPRODUCE CHECK: sh .nuwa/repro.sh"), "{prompt}");
+        assert!(
+            prompt.contains("REPRODUCE CHECK: sh .nuwa/repro.sh"),
+            "{prompt}"
+        );
         assert!(prompt.contains("must fail before your change"), "{prompt}");
         let system = issue.system_prompt("/repo");
         assert!(system.contains("must fail before your change"), "{system}");

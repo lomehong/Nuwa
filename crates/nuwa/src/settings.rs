@@ -507,7 +507,9 @@ pub fn parse_env(text: &str) -> BTreeMap<String, String> {
 }
 
 /// 把历史小写键并入规范大写键；大写优先，删除小写重复项。
-pub fn normalize_known_keys(map: &BTreeMap<String, String>) -> (BTreeMap<String, String>, Vec<String>) {
+pub fn normalize_known_keys(
+    map: &BTreeMap<String, String>,
+) -> (BTreeMap<String, String>, Vec<String>) {
     let mut out = map.clone();
     let mut changed = BTreeSet::new();
     for key in ENV_KEYS {
@@ -692,7 +694,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
     }
 
     #[test]
@@ -823,7 +828,11 @@ mod tests {
     fn migrate_env_file_is_idempotent_and_keeps_uppercase_value() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nuwa.env");
-        std::fs::write(&path, "NUWA_INTERVAL=60\nnuwa_interval=30\nnuwa_provider=zai\n").expect("write");
+        std::fs::write(
+            &path,
+            "NUWA_INTERVAL=60\nnuwa_interval=30\nnuwa_provider=zai\n",
+        )
+        .expect("write");
 
         let changed = migrate_env_file_at(&path).expect("migrate");
         assert!(changed.contains(&"NUWA_INTERVAL".to_string()));

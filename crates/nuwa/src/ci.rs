@@ -88,7 +88,10 @@ pub async fn wait_for_ci(
         let status = resp.status();
         let payload: serde_json::Value = resp.json().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("actions runs {status}: {}", payload["message"].as_str().unwrap_or("(no message)"));
+            bail!(
+                "actions runs {status}: {}",
+                payload["message"].as_str().unwrap_or("(no message)")
+            );
         }
         let total = payload["total_count"].as_u64().unwrap_or(0);
         let runs: Vec<(bool, Option<&str>)> = payload["workflow_runs"]
@@ -117,7 +120,9 @@ pub async fn wait_for_ci(
 /// Close a PR (rejected path). Needs the same token's pulls:write.
 pub async fn close_pr(token: &str, slug: &str, number: u64) -> anyhow::Result<()> {
     let resp = github_http_client()?
-        .patch(format!("https://api.github.com/repos/{slug}/pulls/{number}"))
+        .patch(format!(
+            "https://api.github.com/repos/{slug}/pulls/{number}"
+        ))
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "nuwa")
@@ -151,7 +156,9 @@ pub fn parse_pr_url(url: &str) -> Option<(String, u64)> {
 /// PR 的合并态：merged / open / closed(未合并).
 pub async fn pr_merge_state(token: &str, slug: &str, number: u64) -> anyhow::Result<String> {
     let resp = github_http_client()?
-        .get(format!("https://api.github.com/repos/{slug}/pulls/{number}"))
+        .get(format!(
+            "https://api.github.com/repos/{slug}/pulls/{number}"
+        ))
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "nuwa")
@@ -161,7 +168,10 @@ pub async fn pr_merge_state(token: &str, slug: &str, number: u64) -> anyhow::Res
     let status = resp.status();
     let payload: serde_json::Value = resp.json().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("pulls/{number} {status}: {}", payload["message"].as_str().unwrap_or("(no message)"));
+        bail!(
+            "pulls/{number} {status}: {}",
+            payload["message"].as_str().unwrap_or("(no message)")
+        );
     }
     if payload["merged"].as_bool() == Some(true) {
         return Ok("merged".to_string());
@@ -232,7 +242,10 @@ pub fn summarize_lines(lines: &[String]) -> SyncSummary {
                     .split_once(" — ")
                     .map(|(fp, message)| (fp.trim().to_string(), message.trim().to_string()))
                     .unwrap_or_else(|| (String::new(), rest.to_string()));
-                summary.errors.push(SyncError { fingerprint, message });
+                summary.errors.push(SyncError {
+                    fingerprint,
+                    message,
+                });
             }
             _ => summary.errors.push(SyncError {
                 fingerprint: String::new(),
@@ -283,7 +296,10 @@ pub async fn reconcile_all(
             continue;
         };
         let Some((slug, number)) = parse_pr_url(url) else {
-            out.push(format!("skip       : {} — unparsable PR url {url}", row.fingerprint));
+            out.push(format!(
+                "skip       : {} — unparsable PR url {url}",
+                row.fingerprint
+            ));
             continue;
         };
         match pr_merge_state(token, &slug, number).await {
@@ -363,20 +379,31 @@ mod tests {
             severity: "high".into(),
             message: None,
             log_window: Vec::new(),
-            stack_trace: "panic: no pr\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/a.go:1 +0x1".into(),
+            stack_trace:
+                "panic: no pr\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/a.go:1 +0x1"
+                    .into(),
         };
         let fp = match store.report_signal(&signal, t).expect("report") {
             shanhaijing::ReportOutcome::NewIssue { fingerprint } => fingerprint,
             other => panic!("expected new, got {other:?}"),
         };
-        store.set_state(&fp, State::Triggered, t, None).expect("triggered");
-        store.set_state(&fp, State::Fixing, t, None).expect("fixing");
-        store.set_state(&fp, State::PrOpen, t, None).expect("pr_open");
+        store
+            .set_state(&fp, State::Triggered, t, None)
+            .expect("triggered");
+        store
+            .set_state(&fp, State::Fixing, t, None)
+            .expect("fixing");
+        store
+            .set_state(&fp, State::PrOpen, t, None)
+            .expect("pr_open");
 
         let lines = crate::ci::reconcile_all(&store, "unused-token", t + 1)
             .await
             .expect("reconcile");
-        assert!(lines.iter().any(|line| line.contains("no PR URL")), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line.contains("no PR URL")),
+            "{lines:?}"
+        );
         let row = store
             .list_issues()
             .expect("issues")
@@ -532,8 +559,16 @@ mod tests {
         let fp = "fp-terminal";
         let repo = "example.com/app";
 
-        journal_terminal(&store, fp, repo, "system", "merged", "https://example.com/pull/1", 100)
-            .expect("merged event");
+        journal_terminal(
+            &store,
+            fp,
+            repo,
+            "system",
+            "merged",
+            "https://example.com/pull/1",
+            100,
+        )
+        .expect("merged event");
         journal_terminal(
             &store,
             fp,
@@ -552,10 +587,7 @@ mod tests {
         assert_eq!(events[0].actor.as_deref(), Some("runner"));
         assert_eq!(events[0].repo, repo);
         assert_eq!(events[0].ts, 200);
-        assert_eq!(
-            events[0].detail,
-            "ci_red: PR #2 closed without merge"
-        );
+        assert_eq!(events[0].detail, "ci_red: PR #2 closed without merge");
         assert_eq!(events[1].kind, "merged");
         assert_eq!(events[1].actor.as_deref(), Some("system"));
         assert_eq!(events[1].repo, repo);

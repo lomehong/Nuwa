@@ -336,7 +336,11 @@ mod tests {
         let fp_a = report(&state.store, "alpha", APP, now - 50_000);
         state
             .store
-            .set_pr(&fp_a, "https://github.com/acme/app/pull/1", day_start + 1_000)
+            .set_pr(
+                &fp_a,
+                "https://github.com/acme/app/pull/1",
+                day_start + 1_000,
+            )
             .expect("issue pr");
         let fp_b = report(&state.store, "beta", APP, now - 40_000);
         state
@@ -365,7 +369,11 @@ mod tests {
         let fp_c = report(&state.store, "gamma", OTHER, now - 20_000);
         state
             .store
-            .set_pr(&fp_c, "https://github.com/acme/other/pull/3", day_start + 3_000)
+            .set_pr(
+                &fp_c,
+                "https://github.com/acme/other/pull/3",
+                day_start + 3_000,
+            )
             .expect("other pr");
 
         upsert_runner(

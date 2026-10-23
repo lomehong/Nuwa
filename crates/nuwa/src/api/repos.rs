@@ -137,7 +137,13 @@ pub async fn create(
     };
     let store = Arc::clone(&state.store);
     match tokio::task::spawn_blocking(move || {
-        store.insert_repo(&input.repo, &input.name, &input.url, &input.description, now)
+        store.insert_repo(
+            &input.repo,
+            &input.name,
+            &input.url,
+            &input.description,
+            now,
+        )
     })
     .await
     {
@@ -173,13 +179,8 @@ pub async fn update(
     let now = crate::now_ms();
     let store = Arc::clone(&state.store);
     match tokio::task::spawn_blocking(move || -> Result<Option<RepoRow>, ShanError> {
-        let changed = store.update_repo(
-            &repo,
-            &fields.name,
-            &fields.url,
-            &fields.description,
-            now,
-        )?;
+        let changed =
+            store.update_repo(&repo, &fields.name, &fields.url, &fields.description, now)?;
         if !changed {
             return Ok(None);
         }
@@ -201,10 +202,7 @@ pub async fn update(
 }
 
 /// `DELETE /api/v1/repos/{repo}` — unregister a repository.
-pub async fn delete(
-    State(state): State<AppState>,
-    Path(repo): Path<String>,
-) -> Response {
+pub async fn delete(State(state): State<AppState>, Path(repo): Path<String>) -> Response {
     let store = Arc::clone(&state.store);
     match tokio::task::spawn_blocking(move || store.delete_repo(&repo)).await {
         Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
@@ -263,11 +261,14 @@ fn validate_update(request: UpdateRepoRequest) -> Result<RepoFields, ApiError> {
     let mut fields = BTreeMap::new();
     let (name, url, description) =
         validate_fields(request.name, request.url, request.description, &mut fields);
-    finish(fields, RepoFields {
-        name,
-        url,
-        description,
-    })
+    finish(
+        fields,
+        RepoFields {
+            name,
+            url,
+            description,
+        },
+    )
 }
 
 fn finish<T>(fields: BTreeMap<String, String>, value: T) -> Result<T, ApiError> {
