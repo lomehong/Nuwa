@@ -146,6 +146,7 @@ export function makeIssue(overrides: Partial<IssueListItem> = {}): IssueListItem
     severity: "medium",
     state: "new",
     occurrences: 1,
+    attempts: 0,
     pr_url: null,
     first_seen_ms: 1_700_000_000_000,
     last_seen_ms: 1_700_000_000_000,

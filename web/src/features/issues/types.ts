@@ -7,39 +7,22 @@
  */
 
 import type { IssueState, Severity } from "../../components/ui";
+import type { IssueListItem as ApiIssueListItem } from "../../lib/api-types/IssueListItem";
+import type { IssueListResponse as ApiIssueListResponse } from "../../lib/api-types/IssueListResponse";
+import type { PageMeta } from "../../lib/api-types/PageMeta";
 
-/** One row of `GET /api/v1/issues`. */
-export interface IssueListItem {
-  fingerprint: string;
-  title: string;
-  language: string;
-  repo: string;
+/** One row of `GET /api/v1/issues`. Fields come from the Rust DTO; the
+ * `state`/`severity` strings are narrowed to the UI unions. */
+export type IssueListItem = Omit<ApiIssueListItem, "state" | "severity"> & {
   severity: Severity;
   state: IssueState;
-  occurrences: number;
-  /** Issue-level repair attempts (provider/environment faults excluded). */
-  attempts?: number;
-  pr_url: string | null;
-  first_seen_ms: number;
-  last_seen_ms: number;
-  state_changed_at_ms: number;
-  owner_runner_id: string | null;
-  /** Newest run verdict: success|failure|timeout|unavailable (null = no run). */
-  ci_verdict: string | null;
-  /** Server-side per-owner stuck detection (heartbeat expired). */
-  stuck: boolean;
-}
+};
 
-export interface IssueListMeta {
-  page: number;
-  page_size: number;
-  total: number;
-}
+export type IssueListMeta = PageMeta;
 
-export interface IssueListResponse {
+export type IssueListResponse = Omit<ApiIssueListResponse, "data"> & {
   data: IssueListItem[];
-  meta: IssueListMeta;
-}
+};
 
 export const ISSUE_SORT_VALUES = [
   "last_seen",
