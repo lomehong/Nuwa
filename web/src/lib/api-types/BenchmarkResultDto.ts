@@ -5,4 +5,4 @@ export type BenchmarkResultDto = { scenario: string, language: string, expected_
  * `repaired == expected_fixed`; false marks a benchmark signal that needs
  * attention (an unexpected repair or a missed positive scenario).
  */
-matches_expectation: boolean, turns: bigint, tokens_uncached: bigint, tokens_cached: bigint, duration_ms: bigint, root_cause: string | null, final_report: string | null, error: string | null, };
+matches_expectation: boolean, turns: number, tokens_uncached: number, tokens_cached: number, duration_ms: number, root_cause: string | null, final_report: string | null, error: string | null, };

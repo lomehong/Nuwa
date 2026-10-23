@@ -3,4 +3,4 @@
 /**
  * `{page, page_size, total}` meta shared by the paginated list endpoints.
  */
-export type PageMeta = { page: bigint, page_size: bigint, total: number, };
+export type PageMeta = { page: number, page_size: number, total: number, };

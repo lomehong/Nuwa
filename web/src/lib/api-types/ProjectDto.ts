@@ -16,16 +16,16 @@ registered: boolean,
 /**
  * Open issue counts by lifecycle state.
  */
-states: { [key in string]?: bigint }, 
+states: { [key in string]?: number }, 
 /**
  * Needs a human: escalated, rejected, stuck, or a CI timeout.
  */
-attention: bigint, 
+attention: number, 
 /**
  * Highest severity among the project's open issues — the stone mark.
  */
-worst_severity: string | null, queued: bigint, running: bigint, pr_open: bigint, escalated: bigint, ignored: bigint, merged: bigint, rejected: bigint, runners: bigint, runners_online: bigint, prs_today: bigint, 
+worst_severity: string | null, queued: number, running: number, pr_open: number, escalated: number, ignored: number, merged: number, rejected: number, runners: number, runners_online: number, prs_today: number, 
 /**
  * Daily PR quota shared by the project's runners.
  */
-pr_limit: bigint, ci_green: bigint, ci_red: bigint, reports_24h: bigint, tokens_24h: bigint, last_signal_ms: bigint, last_delivery_ms: bigint | null, last_pr_url: string | null, };
+pr_limit: number, ci_green: number, ci_red: number, reports_24h: number, tokens_24h: number, last_signal_ms: number, last_delivery_ms: number | null, last_pr_url: string | null, };

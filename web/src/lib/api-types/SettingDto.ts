@@ -5,4 +5,4 @@ export type SettingDto = { key: string, label: string, group: string, type: stri
  * Inclusive numeric bounds for `int` keys; the console echoes them so the
  * browser can reject an out-of-range value before the PUT (docs/09 §9.2).
  */
-min: bigint | null, max: bigint | null, };
+min: number | null, max: number | null, };

@@ -5,8 +5,8 @@
  * the issue fingerprint/runner id are already implied by the response
  * (docs/09 §9.2).
  */
-export type RunDto = { id: string, started_at_ms: bigint, finished_at_ms: bigint | null, phase: string, outcome: string | null, ci_verdict: string | null, turns: bigint, tokens_uncached: bigint, tokens_cached: bigint, 
+export type RunDto = { id: string, started_at_ms: number, finished_at_ms: number | null, phase: string, outcome: string | null, ci_verdict: string | null, turns: number, tokens_uncached: number, tokens_cached: number, 
 /**
  * 上下文预算：自动压缩次数、模型窗口、最终消息数。
  */
-compactions: bigint, context_window: bigint, messages: bigint, provider: string | null, model: string | null, root_cause: string | null, change_stat: string | null, branch: string | null, commit_sha: string | null, pr_url: string | null, pr_opened_at_ms: bigint | null, verification_ok: boolean | null, verification_detail: string | null, error: string | null, };
+compactions: number, context_window: number, messages: number, provider: string | null, model: string | null, root_cause: string | null, change_stat: string | null, branch: string | null, commit_sha: string | null, pr_url: string | null, pr_opened_at_ms: number | null, verification_ok: boolean | null, verification_detail: string | null, error: string | null, };

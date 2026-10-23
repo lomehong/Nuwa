@@ -4,4 +4,4 @@
  * One feed row. Raw rows carry `count=1` and `first_ts_ms = last_ts_ms =
  * ts_ms`; aggregated `reported` rows carry the group size and hour bounds.
  */
-export type EventItem = { fingerprint: string, kind: string, detail: string, ts_ms: bigint, repo: string, actor: string | null, count: bigint, first_ts_ms: bigint, last_ts_ms: bigint, };
+export type EventItem = { fingerprint: string, kind: string, detail: string, ts_ms: number, repo: string, actor: string | null, count: number, first_ts_ms: number, last_ts_ms: number, };

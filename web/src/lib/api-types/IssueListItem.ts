@@ -4,7 +4,7 @@
  * The list/detail issue shape: `IssueRow` (already ms-suffixed) plus the
  * per-owner `stuck` flag.
  */
-export type IssueListItem = { stuck: boolean, fingerprint: string, title: string, language: string, repo: string, severity: string, state: string, occurrences: bigint, attempts: bigint, pr_url: string | null, first_seen_ms: bigint, last_seen_ms: bigint, state_changed_at_ms: bigint, owner_runner_id: string | null, 
+export type IssueListItem = { stuck: boolean, fingerprint: string, title: string, language: string, repo: string, severity: string, state: string, occurrences: number, attempts: number, pr_url: string | null, first_seen_ms: number, last_seen_ms: number, state_changed_at_ms: number, owner_runner_id: string | null, 
 /**
  * Verdict of the newest run for this fingerprint, if any.
  */

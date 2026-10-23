@@ -4,4 +4,4 @@
  * One UTC day of the console trends chart. Aggregates are window-scoped by
  * the optional repo filter; days without data are zero-filled.
  */
-export type TrendBucket = { day: string, reports: bigint, new_issues: bigint, prs_opened: bigint, merged: bigint, rejected: bigint, tokens: bigint, ci_green: bigint, ci_red: bigint, };
+export type TrendBucket = { day: string, reports: number, new_issues: number, prs_opened: number, merged: number, rejected: number, tokens: number, ci_green: number, ci_red: number, };
