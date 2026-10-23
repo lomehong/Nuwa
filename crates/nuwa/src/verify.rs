@@ -244,6 +244,19 @@ pub async fn probe_check(
     run_check(worktree.path(), check, &env, secrets).await
 }
 
+/// Run a configured check in the runner's own checkout. The work preflight
+/// leaves that checkout at the base commit, so this is the cheap way to learn
+/// the verification mode before the agent starts — no base worktree, no extra
+/// git traffic. The delivery gate still re-runs everything independently.
+pub async fn probe_working_tree(
+    repo: &Path,
+    check: &FailingCheck,
+    secrets: &Secrets,
+) -> anyhow::Result<CheckOutput> {
+    let env = crate::secrets::agent_env_allowlist();
+    run_check(repo, check, &env, secrets).await
+}
+
 /// Validate forbidden-path globs without running a delivery.
 pub fn validate_forbidden_paths(paths: &[String]) -> anyhow::Result<()> {
     compile_forbidden(paths).map(|_| ())
@@ -561,6 +574,7 @@ mod tests {
             },
             reproduce_check: None,
             forbidden_paths: Vec::new(),
+            verification_mode: Default::default(),
         }
     }
 

@@ -164,6 +164,7 @@ pub fn issue_from_snapshot(
             failing_check: repo_config.failing_check.clone(),
             reproduce_check: repo_config.reproduce_check.clone(),
             forbidden_paths: repo_config.forbidden_paths.clone(),
+            verification_mode: Default::default(),
         },
         secrets,
     )
@@ -221,6 +222,7 @@ mod tests {
             },
             reproduce_check: None,
             forbidden_paths: Vec::new(),
+            verification_mode: Default::default(),
         }
     }
 

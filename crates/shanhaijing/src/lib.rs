@@ -743,6 +743,21 @@ impl Store {
         Ok(count as u64)
     }
 
+    /// Size of this repo's pickable queue (same predicate as the repo-scoped
+    /// claim). The runner uses it to decide whether it is worth reaching for
+    /// the network: an idle runner polls every 30–60s and a fetch per poll
+    /// was a pointless round trip to GitHub.
+    pub fn count_ready_for_repo(&self, now_ms: i64, repo: &str) -> ShanResult<u64> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM issues
+             WHERE state = 'new' AND cooldown_until <= ?1 AND repo = ?2",
+            rusqlite::params![now_ms, repo],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     fn snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IssueSnapshot> {
         Ok(IssueSnapshot {
             fingerprint: row.get(0)?,

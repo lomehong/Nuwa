@@ -440,6 +440,7 @@ async fn run_one_inner(
         failing_check: check.clone(),
         reproduce_check: None,
         forbidden_paths: Vec::new(),
+        verification_mode: Default::default(),
     };
     let faux_script = matches!(provider, ProviderKind::Faux).then(|| scenario_script(scenario));
     let prepared = pipeline::prepare_repair(pipeline::RepairRequest {

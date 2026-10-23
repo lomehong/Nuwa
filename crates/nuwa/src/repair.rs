@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use rpi_agent::events::{AgentEvent, BroadcastEmitter};
@@ -98,6 +99,46 @@ pub struct ContextBudget {
     pub compactions: u32,
     /// run 结束时会话里的消息数。
     pub messages: u64,
+}
+
+/// A failure that came from the model provider, not from the issue.
+///
+/// The runner must tell the two apart: a provider outage is nobody's fault
+/// and must not consume an attempt, while a failing check is the issue's
+/// fault and must. Classifying by error text alone could not — the target
+/// repository's own test output ("connection refused") ends up in the same
+/// message and used to be read as a provider outage.
+#[derive(Debug)]
+pub struct ProviderFailure(pub String);
+
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "provider failure: {}", self.0)
+    }
+}
+
+impl std::error::Error for ProviderFailure {}
+
+/// Give the event drain a bounded window to pick up the events that are
+/// still in flight — the final `TurnEnd` usually is — so the last turn's
+/// token usage is not lost when the drain is aborted.
+async fn settle_drain(turns: &Arc<AtomicU32>) {
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let mut previous = turns.load(Ordering::Relaxed);
+    let mut stable = 0;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let current = turns.load(Ordering::Relaxed);
+        if current == previous {
+            stable += 1;
+            if stable >= 2 {
+                return;
+            }
+        } else {
+            stable = 0;
+            previous = current;
+        }
+    }
 }
 
 /// Resolve the requested Anthropic model. A typo must fail loudly instead of
@@ -381,14 +422,19 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
                         let turns = turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
                         if let rpi_agent::AgentMessage::Assistant(assistant) = message {
                             let usage = assistant.usage.clone();
-                            let uncached_total = uncached.fetch_add(
-                                (usage.input + usage.cache_write).max(0) as u64,
-                                Ordering::Relaxed,
-                            ) + (usage.input + usage.cache_write).max(0) as u64;
-                            let cached_total = cached.fetch_add(
-                                usage.cache_read.max(0) as u64,
-                                Ordering::Relaxed,
-                            ) + usage.cache_read.max(0) as u64;
+                            // Output tokens are billable and belong to the
+                            // uncached bucket: a repair run spends most of its
+                            // tokens writing the patch, and leaving them out
+                            // made every budget gate (per issue, per day, per
+                            // month) undercount the real spend.
+                            let uncached_delta =
+                                (usage.input + usage.cache_write + usage.output).max(0) as u64;
+                            let cached_delta = usage.cache_read.max(0) as u64;
+                            let uncached_total =
+                                uncached.fetch_add(uncached_delta, Ordering::Relaxed)
+                                    + uncached_delta;
+                            let cached_total =
+                                cached.fetch_add(cached_delta, Ordering::Relaxed) + cached_delta;
                             let _ = drain_harness.record_usage(usage, None, None).await;
                             if let Some(cb) = &progress {
                                 cb(RepairProgress {
@@ -412,13 +458,24 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
         }
     });
 
-    let result = harness
-        .prompt_text(&job.issue.user_prompt(), vec![])
-        .await
-        .context("repair run")?;
+    let result = harness.prompt_text(&job.issue.user_prompt(), vec![]).await;
     let stats = harness.get_stats().await.ok();
+    // The drain task holds an Arc of the harness and the harness holds the
+    // event emitter, so neither ends on its own: every exit path has to
+    // abort it, or each failed run leaks a task (and its harness) for the
+    // lifetime of the runner process.
+    settle_drain(&turns).await;
     harness.close().await.ok();
     drain.abort();
+    let result = match result {
+        Ok(result) => result,
+        // The prompt call is the provider call: a failure here is the
+        // provider's, not the issue's.
+        Err(e) => {
+            return Err(anyhow::Error::new(ProviderFailure(format!("{e:#}")))
+                .context("repair run"));
+        }
+    };
 
     let root_cause_text = match result.outcome {
         HarnessRunOutcome::Completed { final_message, .. } => {
@@ -431,8 +488,18 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {    // Turn b
             text
         }
         HarnessRunOutcome::Aborted { .. } => bail!("run aborted (budget or abort)"),
-        HarnessRunOutcome::Failed { error, .. } => bail!("run failed: {error:?}"),
-        HarnessRunOutcome::Suspended { .. } => bail!("run suspended on a provider deferred handle"),
+        // The harness only fails on a provider-side error (tool failures are
+        // recorded as tool results, they do not fail the run).
+        HarnessRunOutcome::Failed { error, .. } => {
+            return Err(anyhow::Error::new(ProviderFailure(format!(
+                "run failed: {error:?}"
+            ))));
+        }
+        HarnessRunOutcome::Suspended { .. } => {
+            return Err(anyhow::Error::new(ProviderFailure(
+                "run suspended on a provider deferred handle".to_string(),
+            )));
+        }
     };
 
     Ok(RepairReport {
@@ -474,6 +541,7 @@ mod tests {
             },
             reproduce_check: None,
             forbidden_paths: Vec::new(),
+            verification_mode: Default::default(),
         }
     }
 

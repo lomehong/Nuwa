@@ -372,6 +372,7 @@ mod tests {
             },
             reproduce_check: None,
             forbidden_paths: Vec::new(),
+            verification_mode: Default::default(),
         }
     }
 

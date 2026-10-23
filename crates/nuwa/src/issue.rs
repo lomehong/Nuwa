@@ -9,6 +9,38 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+/// How the delivery gate will prove the bug is real and fixed.
+///
+/// The runner probes the base before the repair starts, so the prompt tells
+/// the agent what the gate will actually require. Without this the agent was
+/// always told "the check currently fails" — false in the common production
+/// case (tests green, panic at runtime), where the only way through the gate
+/// is to write a reproducer, and the agent was never told to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationMode {
+    /// `reproduce_check` is configured: it must be red on base, green on the
+    /// branch.
+    Configured,
+    /// No reproducer configured and `failing_check` is red on the base: the
+    /// check doubles as the reproducer.
+    #[default]
+    FailingCheck,
+    /// No reproducer configured and `failing_check` is green on the base: the
+    /// branch must add `.nuwa/repro.sh` (`.nuwa/repro.cmd` on Windows).
+    Reproducer,
+}
+
+impl VerificationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VerificationMode::Configured => "configured",
+            VerificationMode::FailingCheck => "failing_check",
+            VerificationMode::Reproducer => "reproducer",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Issue {
     /// Stable problem identity (normalized stack + module + error class).
@@ -42,6 +74,10 @@ pub struct Issue {
     /// Enforced by a `before_tool_call` veto, not by prompt instructions only.
     #[serde(default)]
     pub forbidden_paths: Vec<String>,
+    /// What the delivery gate will require; decided by probing the base before
+    /// the repair run.
+    #[serde(default)]
+    pub verification_mode: VerificationMode,
 }
 
 fn default_check_timeout() -> u64 {
@@ -78,19 +114,37 @@ impl Issue {
     }
 
     pub fn system_prompt(&self, repo_display: &str) -> String {
+        let verify_rule = match self.verification_mode {
+            VerificationMode::Reproducer => format!(
+                "3. `{check}` already PASSES on the base commit — the bug only shows up at runtime. \
+                 Add a self-contained reproducer at `.nuwa/repro.sh` (Windows: `.nuwa/repro.cmd`) \
+                 that exits non-zero on the unfixed code and zero after your fix. The delivery \
+                 gate copies it onto a clean base commit and requires red→green. Do not edit the check itself.",
+                check = self.failing_check.command
+            ),
+            VerificationMode::Configured | VerificationMode::FailingCheck => format!(
+                "3. Verify yourself: run `{check}` and keep iterating until it passes. \
+                 Do not weaken or delete the check{extra}.",
+                check = self.failing_check.command,
+                extra = if self.reproduce_check.is_some() {
+                    "; a REPRODUCE CHECK is provided and must fail before your change and pass after it"
+                } else {
+                    ""
+                }
+            ),
+        };
         format!(
             "You are 应龙 (Yinglong), Nuwa's repair runner. Exactly one issue is assigned to you in the repository at {repo_display}. Stack: {lang}.\n\
              \n\
              Rules:\n\
              1. Investigate first: read the code named in the stack trace before changing anything.\n\
              2. Make the smallest correct change that fixes the root cause. No drive-by refactors, no formatting churn.\n\
-             3. Verify yourself: run `{check}` and keep iterating until it passes. Do not finish while it fails. If a REPRODUCE CHECK is provided, it must fail before your change and pass after it.\n\
-             4. These paths are hard-vetoed (attempts are blocked before execution): {forbidden}. Never run `git push`, `git checkout`, `git switch`, `git reset`, `git branch`, `git tag`, or any `gh` command — Nuwa's delivery step owns git and PRs.\n\
+             {verify_rule}\n\
+             4. These paths are blocked by a tool guard and re-checked against the delivered diff: {forbidden}. Never run `git push`, `git commit`, `git checkout`, `git switch`, `git reset`, `git branch`, `git tag`, `git remote`, `git config`, or any `gh` command — Nuwa's delivery step owns git and PRs.\n\
              5. Your final message must end with exactly three lines:\n\
              ROOT CAUSE: <one sentence>\n\
              CHANGE: <what you changed and why>\n\
              VERIFICATION: <command> — <result>\n",
-            check = self.failing_check.command,
             forbidden = self.forbidden_paths.join(", "),
             lang = self.language,
         )
@@ -110,6 +164,25 @@ impl Issue {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let closing = match self.verification_mode {
+            VerificationMode::Reproducer => format!(
+                "`{check}` passes on this base commit, so it cannot prove the bug. Write a self-contained reproducer at `.nuwa/repro.sh` (`.nuwa/repro.cmd` on Windows) that fails before your change and passes after it, fix the root cause, and keep iterating until both the reproducer and `{check}` are green.\n",
+                check = self.failing_check.command
+            ),
+            VerificationMode::Configured => format!(
+                "The bug is reproducible in this working copy: `{check}` currently fails{extra}. Locate the root cause, fix it, verify both checks.\n",
+                check = self.failing_check.command,
+                extra = self
+                    .reproduce_check
+                    .as_ref()
+                    .map(|c| format!(" and `{}` must fail before your change and pass after it", c.command))
+                    .unwrap_or_default()
+            ),
+            VerificationMode::FailingCheck => format!(
+                "The bug is reproducible in this working copy: `{check}` currently fails. Locate the root cause, fix it, and keep iterating until it passes.\n",
+                check = self.failing_check.command
+            ),
+        };
         format!(
             "ISSUE {} (severity {}, seen {}x, first {}, last {})\n\
              TITLE: {}\n\
@@ -122,7 +195,7 @@ impl Issue {
              {}\
              {}\
              \n\
-             The bug is reproducible in this working copy: `{}` currently fails. Locate the root cause, fix it, verify.\n",
+             {}",
             self.fingerprint,
             if self.severity.is_empty() { "n/a" } else { &self.severity },
             self.occurrences,
@@ -142,7 +215,7 @@ impl Issue {
             } else {
                 format!("\n{}\n", self.prior_context.trim())
             },
-            self.failing_check.command,
+            closing,
         )
     }
 }
@@ -170,6 +243,7 @@ mod tests {
             },
             reproduce_check: None,
             forbidden_paths: Vec::new(),
+            verification_mode: Default::default(),
         }
     }
 
@@ -185,5 +259,49 @@ mod tests {
         let prompt = issue("").user_prompt();
         assert!(!prompt.contains("PRIOR ATTEMPTS"));
         assert!(!prompt.contains("OWNER NOTE"));
+    }
+
+    /// 复现模式必须对 agent 可见：base 上 failing_check 是绿的，唯一能通过
+    /// 交付门的做法是写 `.nuwa/repro.sh`；prompt 说"check 当前失败"会让它
+    /// 必然踩空（曾经所有 base 绿的单都在交付门硬失败）。
+    #[test]
+    fn reproducer_mode_tells_the_agent_to_write_a_reproducer() {
+        let mut issue = issue("");
+        issue.verification_mode = VerificationMode::Reproducer;
+        let prompt = issue.user_prompt();
+        assert!(prompt.contains(".nuwa/repro.sh"), "{prompt}");
+        assert!(prompt.contains("passes on this base commit"), "{prompt}");
+        assert!(
+            !prompt.contains("currently fails"),
+            "reproducer mode must not claim the check fails: {prompt}"
+        );
+        let system = issue.system_prompt("/repo");
+        assert!(system.contains(".nuwa/repro.sh"), "{system}");
+        assert!(system.contains("PASSES on the base commit"), "{system}");
+    }
+
+    #[test]
+    fn failing_check_mode_states_the_check_currently_fails() {
+        let mut issue = issue("");
+        issue.verification_mode = VerificationMode::FailingCheck;
+        let prompt = issue.user_prompt();
+        assert!(prompt.contains("currently fails"), "{prompt}");
+        assert!(!prompt.contains(".nuwa/repro.sh"), "{prompt}");
+    }
+
+    #[test]
+    fn configured_mode_mentions_the_reproduce_check() {
+        let mut issue = issue("");
+        issue.verification_mode = VerificationMode::Configured;
+        issue.reproduce_check = Some(FailingCheck {
+            command: "sh .nuwa/repro.sh".into(),
+            target: None,
+            timeout_secs: 300,
+        });
+        let prompt = issue.user_prompt();
+        assert!(prompt.contains("REPRODUCE CHECK: sh .nuwa/repro.sh"), "{prompt}");
+        assert!(prompt.contains("must fail before your change"), "{prompt}");
+        let system = issue.system_prompt("/repo");
+        assert!(system.contains("must fail before your change"), "{system}");
     }
 }

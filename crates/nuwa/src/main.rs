@@ -101,6 +101,16 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<Cli> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let result = run_command().await;
+    // Webhook delivery runs in a detached task. The events that matter most
+    // (escalated, ci_red) are emitted right before the runner gives up on an
+    // issue, and the process may exit immediately afterwards — without this
+    // drain they die with the runtime.
+    let _ = webhook::flush(std::time::Duration::from_secs(10)).await;
+    result
+}
+
+async fn run_command() -> anyhow::Result<()> {
     let mut argv = std::env::args().skip(1);
     match argv.next().as_deref() {
         Some("fix") => run_fix().await,
@@ -530,7 +540,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
                     "nuwa.repo.json restored from trusted source",
                 );
             }
-            let worked = work_once(
+            let worked = match work_once(
                 &store,
                 &trusted.instructions,
                 &repo_dir,
@@ -548,7 +558,29 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
                 Arc::clone(&live),
                 &secrets,
             )
-            .await?;
+            .await
+            {
+                Ok(worked) => worked,
+                Err(e) => {
+                    // A failed attempt is not a dead runner. Business outcomes
+                    // (repair failed, budget exceeded, CI red) are values, not
+                    // errors; what is left here is a real fault (db, checkout).
+                    // Log it, keep polling, and let the next cycle retry.
+                    let detail = bounded_text(&secrets.redact(&format!("work_failed: {e:#}")));
+                    eprintln!("work       : {detail}");
+                    live_update(&live, "error", None, None, Some(detail.clone())).await;
+                    webhook::emit(webhook::WebhookEvent::new(
+                        "runner_error",
+                        None,
+                        Some(trusted.instructions.repo.clone()),
+                        detail,
+                    ));
+                    if !loop_run {
+                        return Err(e);
+                    }
+                    false
+                }
+            };
             if worked {
                 if let Ok(n) = cleanup_terminal_branches(&store, &repo_dir, push).await {
                     if n > 0 {
@@ -616,6 +648,23 @@ enum FailureClass {
 }
 
 fn classify_failure(error: &anyhow::Error) -> FailureClass {
+    // Origin first: a failure that came from the model provider is tagged as
+    // such by the repair runner. Classifying by message text alone let the
+    // target repository's own output ("connection refused" from a test) be
+    // read as a provider outage — the issue was then retried forever
+    // without ever consuming an attempt.
+    if let Some(provider) = error.downcast_ref::<repair::ProviderFailure>() {
+        let text = provider.0.to_ascii_lowercase();
+        if text.contains("401")
+            || text.contains("403")
+            || text.contains("unauthorized")
+            || text.contains("invalid api key")
+            || (text.contains("not set") && (text.contains("api_key") || text.contains("api key")))
+        {
+            return FailureClass::ProviderConfig;
+        }
+        return FailureClass::ProviderTransient;
+    }
     let text = format!("{error:#}").to_ascii_lowercase();
     // Tool/verification failures belong to the issue, even when the text says
     // "timed out" (a hung test or a 300s bash timeout).
@@ -899,7 +948,7 @@ fn resolve_base(repo_dir: &Path) -> anyhow::Result<&'static str> {
 /// Refresh the runner's base and recover a checkout left behind by an
 /// interrupted delivery. Fetch/reset failures are environment faults: the
 /// caller stands down and retries on the next poll instead of crashing.
-async fn preflight_repo(repo_dir: &Path) -> anyhow::Result<&'static str> {
+async fn preflight_repo(repo_dir: &Path, fetch: bool) -> anyhow::Result<&'static str> {
     let base = resolve_base(repo_dir)?;
     let head = git_ops::current_branch(repo_dir)?;
     if head != base {
@@ -919,7 +968,9 @@ async fn preflight_repo(repo_dir: &Path) -> anyhow::Result<&'static str> {
 
     let has_origin = git_ops::git(repo_dir, &["remote", "get-url", "origin"]).is_ok();
     if has_origin {
-        git_ops::fetch_base(repo_dir, base, Duration::from_secs(120)).await?;
+        if fetch {
+            git_ops::fetch_base(repo_dir, base, Duration::from_secs(120)).await?;
+        }
         git_ops::reset_to_base(repo_dir, base)?;
     }
 
@@ -1025,12 +1076,51 @@ async fn cleanup_terminal_branches(
             "refs/heads/agent/fix/",
         ],
     )?;
-    if listing.trim().is_empty() {
+    // The remote branches count too. A delivery that pushed but failed to
+    // open its PR leaves a branch on GitHub with no local copy — invisible
+    // to `for-each-ref`, and it would block the next push for that
+    // fingerprint as a non-fast-forward.
+    let mut branches: Vec<String> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+        .collect();
+    if push {
+        match git_ops::git_with_timeout(
+            repo_dir,
+            &["ls-remote", "--heads", "origin", "agent/fix/*"],
+            Duration::from_secs(60),
+        )
+        .await
+        {
+            Ok(out) if out.success => {
+                for line in out.stdout.lines() {
+                    if let Some((_, refname)) = line.split_once('\t') {
+                        if let Some(short) = refname.strip_prefix("refs/heads/") {
+                            if !short.is_empty() && !branches.iter().any(|b| b == short) {
+                                branches.push(short.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(out) if out.timed_out => {
+                eprintln!("cleanup     : remote branch listing timed out");
+            }
+            Ok(out) => eprintln!(
+                "cleanup     : remote branch listing failed: {}",
+                out.stderr.trim()
+            ),
+            Err(e) => eprintln!("cleanup     : remote branch listing failed: {e:#}"),
+        }
+    }
+    if branches.is_empty() {
         return Ok(0);
     }
     let issues = store.list_issues()?;
     let mut removed = 0usize;
-    for branch in listing.lines().map(str::trim).filter(|b| !b.is_empty()) {
+    for branch in branches {
         let Some(short) = branch.strip_prefix("agent/fix/") else {
             continue;
         };
@@ -1049,12 +1139,14 @@ async fn cleanup_terminal_branches(
         if !terminal || (row.state == "escalated" && row.pr_url.is_some()) {
             continue;
         }
-        git_ops::delete_local_branch(repo_dir, branch)?;
+        if git_ops::branch_exists(repo_dir, &branch)? {
+            git_ops::delete_local_branch(repo_dir, &branch)?;
+        }
         if push {
             // Best effort: a stale remote branch is not a reason to fail the
             // startup path; the next claim precheck retries it.
             if let Err(e) =
-                git_ops::delete_remote_branch(repo_dir, branch, Duration::from_secs(120)).await
+                git_ops::delete_remote_branch(repo_dir, &branch, Duration::from_secs(120)).await
             {
                 eprintln!("cleanup     : could not delete remote {branch}: {e:#}");
             }
@@ -1068,14 +1160,21 @@ async fn cleanup_terminal_branches(
 /// fingerprint. Remote deletion only matters when the runner pushes.
 async fn remove_stale_branch(repo_dir: &Path, fingerprint: &str, push: bool) -> anyhow::Result<bool> {
     let branch = format!("agent/fix/{}", issue::short_fingerprint(fingerprint));
-    if !git_ops::branch_exists(repo_dir, &branch)? {
-        return Ok(false);
+    let mut removed = false;
+    if git_ops::branch_exists(repo_dir, &branch)? {
+        git_ops::delete_local_branch(repo_dir, &branch)?;
+        removed = true;
     }
-    git_ops::delete_local_branch(repo_dir, &branch)?;
     if push {
-        git_ops::delete_remote_branch(repo_dir, &branch, Duration::from_secs(120)).await?;
+        // The remote copy can outlive the local one: a delivery that pushed
+        // but failed to open its PR leaves the branch on GitHub. It would
+        // block the next push for this fingerprint as a non-fast-forward.
+        if git_ops::remote_branch_exists(repo_dir, &branch, Duration::from_secs(60)).await? {
+            git_ops::delete_remote_branch(repo_dir, &branch, Duration::from_secs(120)).await?;
+            removed = true;
+        }
     }
-    Ok(true)
+    Ok(removed)
 }
 
 fn context_excerpt(text: &str, max_chars: usize) -> String {
@@ -1244,7 +1343,12 @@ async fn work_once(
     // A previous delivery may have failed after `checkout -b` and left the
     // runner on the agent branch. The runner owns this checkout, so a clean
     // `agent/fix/*` branch is recovered automatically instead of crash-looping.
-    let base = match preflight_repo(repo_dir).await {
+    //
+    // The remote base is only fetched when this repo actually has work
+    // waiting: an idle runner polls every 30–60s, and a fetch per poll was a
+    // pointless round trip to GitHub.
+    let pickable = store.count_ready_for_repo(now, &repo_config.repo)? > 0;
+    let base = match preflight_repo(repo_dir, pickable).await {
         Ok(base) => base,
         Err(e) => {
             live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
@@ -1346,7 +1450,16 @@ async fn work_once(
     // still present when the same fingerprint comes back, the old code only
     // discovered that in `deliver` after burning a full repair run.
     let stale_branch = format!("agent/fix/{}", issue::short_fingerprint(&fp));
-    if git_ops::branch_exists(repo_dir, &stale_branch)? {
+    // The remote branch counts too: a delivery that pushed but failed to open
+    // its PR leaves the branch on GitHub while the local copy is gone. The
+    // next push would be rejected as non-fast-forward, and nothing would
+    // ever clean it up.
+    let local_stale = git_ops::branch_exists(repo_dir, &stale_branch)?;
+    let remote_stale = push
+        && git_ops::remote_branch_exists(repo_dir, &stale_branch, Duration::from_secs(60))
+            .await
+            .unwrap_or(false);
+    if local_stale || remote_stale {
         let recorded_pr = store
             .list_issues()?
             .into_iter()
@@ -1412,7 +1525,27 @@ async fn work_once(
     let prior_context = build_prior_context(store, &repo_config.repo, &fp, secrets);
     // 问题单在 `start_run` 之前构建：确定性会话目录要在第一次生命周期写入时
     // 就已知。
-    let prob = pipeline::issue_from_snapshot(&snapshot, repo_config, prior_context, secrets);
+    let mut prob = pipeline::issue_from_snapshot(&snapshot, repo_config, prior_context, secrets);
+    // What will the delivery gate accept? Decided before the agent starts:
+    // when `failing_check` is already green on the base (the common
+    // production case — tests pass, the panic happens at runtime) the only
+    // way through the gate is a reproducer, and the agent has to be told.
+    // A repo that configures `reproduce_check` skips the probe entirely.
+    prob.verification_mode = if repo_config.reproduce_check.is_some() {
+        issue::VerificationMode::Configured
+    } else {
+        match verify::probe_working_tree(repo_dir, &repo_config.failing_check, secrets).await {
+            Ok(out) if out.ok => issue::VerificationMode::Reproducer,
+            Ok(_) => issue::VerificationMode::FailingCheck,
+            Err(e) => {
+                // The probe is advisory; the delivery gate re-runs it. A
+                // failed probe means "assume the check reproduces".
+                eprintln!("probe      : base check could not run: {e:#}");
+                issue::VerificationMode::FailingCheck
+            }
+        }
+    };
+    println!("verify     : mode {}", prob.verification_mode.as_str());
     let _ = store.start_run(&shanhaijing::RunStart {
         id: run_id.clone(),
         fingerprint: fp.clone(),
@@ -1665,7 +1798,12 @@ async fn work_once(
                             details: serde_json::json!({"error": detail}),
                         },
                     );
-                    bail!("repair failed — issue escalated: {e:#}");
+                    // The issue is escalated and the owner has been notified —
+                    // that is a completed business outcome, not a runner
+                    // failure. Returning Err here used to kill the `--loop`
+                    // process and restart it via systemd.
+                    println!("repair     : failed — issue escalated: {e:#}");
+                    return Ok(true);
                 }
             }
         }
@@ -1756,7 +1894,8 @@ async fn work_once(
                 details: serde_json::json!({"spent_tokens": spent, "cap_tokens": max_tokens}),
             },
         );
-        bail!("{detail} — issue escalated");
+        println!("budget     : {detail} — issue escalated");
+        return Ok(true);
     }
     println!(
         "tokens     : {spent} (per-issue cap {max_tokens}, daily cap {daily_token_limit}, monthly cap {monthly_token_limit})"
@@ -1818,7 +1957,8 @@ async fn work_once(
                     details: serde_json::json!({"error": detail}),
                 },
             );
-            bail!("delivery failed — issue escalated: {e:#}");
+            println!("delivery   : failed — issue escalated: {e:#}");
+            return Ok(true);
         }
     };
 
@@ -1991,7 +2131,11 @@ async fn work_once(
                         details: serde_json::json!({"pr": number}),
                     },
                 );
-                return Err(anyhow::anyhow!(detail));
+                // The PR is open and the run is closed. A missing token only
+                // means the CI gate cannot be polled — it is not a runner
+                // failure, so the loop keeps running.
+                println!("ci gate    : {detail}");
+                return Ok(true);
             }
         };
         println!(
@@ -2061,9 +2205,22 @@ async fn work_once(
                             error: Some(detail.clone()),
                         },
                     );
-                    live_update(&live, "error", Some(&fp), None, Some(detail)).await;
+                    live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
                     let _ = store.increment_attempts(&fp);
-                    return Err(e);
+                    // The PR could not be closed — the issue must not stay in
+                    // `pr_open` pretending the gate is still pending. Hand it
+                    // to the owner as escalated.
+                    let message = format!("ci_red: close PR failed: {e:#} — escalated");
+                    let _ = store.set_state_as(
+                        &fp,
+                        shanhaijing::State::Escalated,
+                        now_ms(),
+                        Some(&message),
+                        "runner",
+                    );
+                    emit_webhook("escalated", &fp, &repo_config.repo, message.clone());
+                    println!("ci gate    : {message}");
+                    return Ok(true);
                 }
                 let _ = store.update_run(
                     &run_id,
@@ -2137,7 +2294,10 @@ async fn work_once(
                     Some(format!("CI red — PR #{number} closed")),
                 )
                 .await;
-                bail!("CI red — PR #{number} closed, issue rejected (regression signal will reopen it)");
+                // CI red is a business outcome: the PR is closed and the issue
+                // is back with the owner. The runner keeps running.
+                println!("ci gate    : CI red — PR #{number} closed, issue rejected");
+                return Ok(true);
             }
             Ok(ci::Verdict::TimedOut) => {
                 let _ = store.record_event(&fp, now_ms(), Some(&repo_config.repo), "runner", "ci_timeout", slug);
@@ -2452,6 +2612,33 @@ mod tests {
         );
     }
 
+    /// 目标仓的测试输出（"connection refused"）不得被当成 provider 故障：
+    /// provider 故障由 repair runner 按来源打标，文本猜测只在这一层做。
+    #[test]
+    fn target_repo_output_is_not_mistaken_for_a_provider_outage() {
+        let error = anyhow::Error::new(repair::ProviderFailure(
+            "connection refused: dial tcp 127.0.0.1:5432".to_string(),
+        ))
+        .context("verification gate failed: go test ./... connection refused");
+        assert_eq!(
+            classify_failure(&error),
+            FailureClass::Issue,
+            "a failing check in the target repo is the issue's fault"
+        );
+
+        let provider = anyhow::Error::new(repair::ProviderFailure(
+            "429 rate limit exceeded".to_string(),
+        ))
+        .context("repair run");
+        assert_eq!(classify_failure(&provider), FailureClass::ProviderTransient);
+
+        let auth = anyhow::Error::new(repair::ProviderFailure(
+            "401 unauthorized: invalid x-api-key".to_string(),
+        ))
+        .context("repair run");
+        assert_eq!(classify_failure(&auth), FailureClass::ProviderConfig);
+    }
+
     #[test]
     fn relative_sessions_root_becomes_absolute() {
         // The default `spike/sessions` is relative; the transcript endpoint
@@ -2708,7 +2895,7 @@ mod tests {
         init_git_repo(&repo);
         git(&repo, &["checkout", "-b", "agent/fix/abc"]);
 
-        let base = preflight_repo(&repo).await.expect("preflight");
+        let base = preflight_repo(&repo, true).await.expect("preflight");
         assert_eq!(base, "main");
         assert_eq!(git_output(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "main");
     }
@@ -2741,7 +2928,7 @@ mod tests {
         git(&other, &["commit", "-m", "second"]);
         git(&other, &["push", "origin", "main"]);
 
-        preflight_repo(&work).await.expect("preflight");
+        preflight_repo(&work, true).await.expect("preflight");
         assert!(work.join("g.txt").exists(), "preflight must fetch origin/main");
         assert_eq!(
             git_output(&work, &["rev-parse", "HEAD"]).trim(),
