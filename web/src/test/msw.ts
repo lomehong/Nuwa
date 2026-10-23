@@ -86,7 +86,7 @@ export function mockOverview(overrides: Partial<OverviewResponse> = {}) {
 }
 
 export function makeTrends(overrides: Partial<TrendsResponse> = {}): TrendsResponse {
-  return {
+  const base: TrendsResponse = {
     range: "14d",
     buckets: [],
     totals: {
@@ -103,7 +103,14 @@ export function makeTrends(overrides: Partial<TrendsResponse> = {}): TrendsRespo
       review_latency_p50_secs: null,
       ci_red_rate: null,
     },
+  };
+  // Deep-merge totals: call sites usually override a few counters only, and
+  // the generated type keeps every field required (they are always present in
+  // the API response).
+  return {
+    ...base,
     ...overrides,
+    totals: { ...base.totals, ...(overrides.totals ?? {}) },
   };
 }
 
