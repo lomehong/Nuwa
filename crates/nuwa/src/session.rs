@@ -18,6 +18,14 @@ pub const LOGIN_WINDOW_MS: i64 = 10 * 60 * 1000;
 pub struct SessionManager {
     key: [u8; 32],
     ttl_ms: i64,
+    /// Session ids revoked by an explicit logout, with the moment they would
+    /// have expired anyway. Without this, logging out only cleared the cookie:
+    /// a copied cookie stayed valid until its TTL.
+    ///
+    /// In memory on purpose: a restart forgets the list, but a restart also
+    /// re-reads `NUWA_UI_TOKEN`, and rotating the token invalidates every
+    /// session immediately.
+    revoked: Mutex<HashMap<String, i64>>,
 }
 
 pub struct IssuedSession {
@@ -28,7 +36,11 @@ pub struct IssuedSession {
 impl SessionManager {
     pub fn new(ui_token: &str, ttl_ms: i64) -> Self {
         let key: [u8; 32] = Sha256::digest(ui_token.as_bytes()).into();
-        Self { key, ttl_ms }
+        Self {
+            key,
+            ttl_ms,
+            revoked: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn issue(&self, now_ms: i64) -> IssuedSession {
@@ -61,7 +73,29 @@ impl SessionManager {
         if !Self::token_eq(&expected, parts[3]) {
             return None;
         }
+        {
+            let mut revoked = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
+            revoked.retain(|_, expires_at| *expires_at > now_ms);
+            if revoked.contains_key(parts[2]) {
+                return None;
+            }
+        }
         Some(expires_at_ms)
+    }
+
+    /// Revoke the session a token belongs to (explicit logout). The token is
+    /// verified first, so an attacker cannot use logout to fill the list.
+    pub fn revoke(&self, token: &str, now_ms: i64) -> bool {
+        let Some(expires_at_ms) = self.verify(token, now_ms) else {
+            return false;
+        };
+        let Some(nonce) = token.split('.').nth(2) else {
+            return false;
+        };
+        let mut revoked = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
+        revoked.retain(|_, expires_at| *expires_at > now_ms);
+        revoked.insert(nonce.to_string(), expires_at_ms);
+        true
     }
 
     pub fn token_eq(got: &str, expected: &str) -> bool {
@@ -217,6 +251,28 @@ mod tests {
         let mut tampered = issued.token.clone();
         tampered.push('x');
         assert!(m.verify(&tampered, 1_001).is_none());
+    }
+
+    /// 登出必须让会话立即失效：只清 cookie 的话，被复制的 cookie 在 TTL
+    /// 内仍然有效。
+    #[test]
+    fn logout_revokes_the_session_immediately() {
+        let m = SessionManager::new("ui-secret", 60_000);
+        let first = m.issue(1_000);
+        let second = m.issue(1_000);
+        assert!(m.verify(&first.token, 1_001).is_some());
+
+        assert!(m.revoke(&first.token, 1_002));
+        assert!(
+            m.verify(&first.token, 1_003).is_none(),
+            "a revoked session must not verify"
+        );
+        assert!(
+            m.verify(&second.token, 1_003).is_some(),
+            "other sessions stay valid"
+        );
+        // Revoking a forged token is a no-op and must not poison the list.
+        assert!(!m.revoke("v1.9999999999.forged.sig", 1_004));
     }
 
     #[test]

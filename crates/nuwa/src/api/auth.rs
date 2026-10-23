@@ -136,6 +136,11 @@ pub async fn logout(
     jar: CookieJar,
 ) -> Response {
     let secure = secure_cookie(&state, &headers);
+    // Revoke server-side before clearing the cookie: a copied cookie must
+    // stop working now, not when its TTL runs out.
+    if let Some(cookie) = jar.get(SESSION_COOKIE) {
+        let _ = state.session.revoke(cookie.value(), now_ms());
+    }
     let jar = jar
         .remove(clear_cookie(SESSION_COOKIE, secure))
         .remove(clear_cookie(CSRF_COOKIE, secure));

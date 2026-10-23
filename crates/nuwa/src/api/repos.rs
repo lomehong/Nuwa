@@ -333,6 +333,11 @@ fn validate_fields(
             "url".to_string(),
             "must not contain whitespace or control characters".to_string(),
         );
+    } else if !valid_repo_url(&url) {
+        fields.insert(
+            "url".to_string(),
+            "must be an http(s), ssh or git URL".to_string(),
+        );
     }
 
     let description = description.unwrap_or_default().trim().to_string();
@@ -344,6 +349,26 @@ fn validate_fields(
     }
 
     (name, url, description)
+}
+
+/// Link schemes a repo card may carry.
+///
+/// The console renders this URL as an anchor, so `javascript:` / `data:` /
+/// `file:` must never reach the store — the frontend validates too, but the
+/// API is the trust boundary. The scp-like `git@host:owner/repo.git` form has
+/// no scheme and is accepted as-is.
+fn valid_repo_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    match lower.find(':') {
+        Some(index) if !lower[..index].contains('/') => {
+            let head = &lower[..index];
+            if head.contains('@') {
+                return true;
+            }
+            matches!(head, "http" | "https" | "ssh" | "git")
+        }
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -626,6 +651,20 @@ mod tests {
             ),
             (
                 json!({"repo": "ok/repo", "name": "n", "url": "u".repeat(513)}),
+                "url",
+            ),
+            // The console renders the URL as an anchor: only link schemes a
+            // browser can safely follow are stored.
+            (
+                json!({"repo": "ok/repo", "name": "n", "url": "javascript:alert(1)"}),
+                "url",
+            ),
+            (
+                json!({"repo": "ok/repo", "name": "n", "url": "data:text/html,<script>x</script>"}),
+                "url",
+            ),
+            (
+                json!({"repo": "ok/repo", "name": "n", "url": "file:///etc/passwd"}),
                 "url",
             ),
             (

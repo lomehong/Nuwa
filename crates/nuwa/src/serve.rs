@@ -245,18 +245,9 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
     spawn_reconciler(Arc::clone(&store), sync_token, sync_interval_from_env());
     spawn_heartbeat_monitor(Arc::clone(&store));
     let env_path = crate::settings::env_file_path();
-    // Shared collector token (NUWA_INGEST_TOKEN). Set it when serving beyond
-    // localhost: without it anyone can spam the issue store. This is a
-    // report-only token — leak consequence is junk signals, rotate freely;
-    // it is NOT an LLM key or repo credential (ADR: 现场无密钥红线不破).
-    let ingest_token = Arc::new(std::env::var("NUWA_INGEST_TOKEN").ok().filter(|t| !t.is_empty()));
-    // 控制台鉴权与上报令牌分离（设置页可改密钥）：未设 NUWA_UI_TOKEN 时
-    // fallback 到上报令牌，兼容既有部署。
-    let ui_token = std::env::var("NUWA_UI_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .map(|t| Arc::new(Some(t)) as Arc<Option<String>>)
-        .unwrap_or_else(|| Arc::clone(&ingest_token));
+    let tokens = serve_tokens(&std::env::vars().collect());
+    let ingest_token = tokens.ingest;
+    let ui_token = tokens.console;
     let ttl_ms = session_ttl_ms(std::env::var("NUWA_SESSION_TTL_SECS").ok().as_deref());
     let cookie_mode = std::env::var("NUWA_COOKIE_SECURE").ok();
     let cookie_secure = cookie_mode.as_deref() == Some("always");
@@ -297,14 +288,45 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         if local_mode { "LOCAL MODE" } else { "session" }
     );
     if local_mode && !listen_is_local(&listen) {
-        eprintln!(
-            "warning    : API auth is in LOCAL MODE while listening on {listen}; anyone who can reach the port has full console API access"
+        bail!(
+            "API auth is in LOCAL MODE (no NUWA_UI_TOKEN) while listening on {listen} — \
+             anyone who can reach the port would have full console API access. \
+             Set NUWA_UI_TOKEN (a console token, not the collector token) or listen on loopback."
         );
     }
     // ConnectInfo is required by the Task 4 login rate limiter (peer IP).
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .context("serve")
+}
+
+/// The two server credentials.
+///
+/// `NUWA_INGEST_TOKEN` is the shared collector token: it is deployed on every
+/// instrumented service, so its leak consequence is junk signals and it can
+/// be rotated freely. It is NOT an LLM key or a repo credential.
+///
+/// `NUWA_UI_TOKEN` is the console token. It never falls back to the
+/// collector token: the console can read the settings page, and the settings
+/// page can talk to the model provider — falling back would turn "can post
+/// signals" into "can read the LLM key". Without a console token the console
+/// runs in local mode, which `run_serve` refuses to expose on a non-loopback
+/// listener.
+struct ServeTokens {
+    ingest: Arc<Option<String>>,
+    console: Arc<Option<String>>,
+}
+
+fn serve_tokens(env: &std::collections::BTreeMap<String, String>) -> ServeTokens {
+    let token = |key: &str| {
+        env.get(key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    ServeTokens {
+        ingest: Arc::new(token("NUWA_INGEST_TOKEN")),
+        console: Arc::new(token("NUWA_UI_TOKEN")),
+    }
 }
 
 /// Parse `NUWA_SESSION_TTL_SECS`, clamp it to the documented 5 min – 30 day
@@ -564,7 +586,9 @@ async fn check_auth(
             .get("x-nuwa-token")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if got != expected {
+        // Constant-time: the collector token is a shared secret and this runs
+        // on every reported signal.
+        if !crate::session::SessionManager::token_eq(got, expected) {
             return (
                 StatusCode::UNAUTHORIZED,
                 "missing or wrong X-NUWA-Token header".to_string(),
@@ -1822,6 +1846,33 @@ mod tests {
         for listen in ["0.0.0.0:7321", "192.168.1.10:7321", "example.com:7321"] {
             assert!(!listen_is_local(listen), "{listen}");
         }
+    }
+
+    /// 上报令牌不得升格为控制台令牌：它部署在每个被采集的服务上，回退等于
+    /// 把"能造垃圾信号"的凭据变成"能读设置页 LLM key"的凭据。
+    #[test]
+    fn console_token_never_falls_back_to_the_collector_token() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "NUWA_INGEST_TOKEN".to_string(),
+            "collector-secret".to_string(),
+        );
+        let tokens = serve_tokens(&env);
+        assert_eq!(
+            tokens.ingest.as_deref(),
+            Some("collector-secret"),
+            "the collector token is used for /ingest"
+        );
+        assert!(
+            tokens.console.is_none(),
+            "without NUWA_UI_TOKEN the console must be in local mode, not \
+             authenticated by the collector token"
+        );
+
+        env.insert("NUWA_UI_TOKEN".to_string(), " console-secret ".to_string());
+        let tokens = serve_tokens(&env);
+        assert_eq!(tokens.console.as_deref(), Some("console-secret"));
+        assert_eq!(tokens.ingest.as_deref(), Some("collector-secret"));
     }
 
     // ---- M2b Task 3: GET /api/v1/overview ----

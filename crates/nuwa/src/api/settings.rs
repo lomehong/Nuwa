@@ -456,6 +456,37 @@ fn llm_base(values: &BTreeMap<String, Value>, default: &str) -> Result<String, A
     Ok(base.trim_end_matches('/').to_string())
 }
 
+/// The credential a probe sends, and the host it may be sent to.
+///
+/// The running process's key may only travel to the base URL the process is
+/// configured with. As soon as the request names a different host, the key
+/// has to be supplied on screen — otherwise a console user could point the
+/// probe at their own host and read the running key off the wire.
+fn probe_credential(
+    values: &BTreeMap<String, Value>,
+    key: &str,
+    requested_base: Option<&str>,
+    process_base: &str,
+) -> Result<String, ApiError> {
+    if let Some(value) = provided_value(values, key)?.filter(|value| !value.is_empty()) {
+        return Ok(value);
+    }
+    let process_base = process_base.trim_end_matches('/');
+    if let Some(requested) = requested_base {
+        if requested.trim_end_matches('/') != process_base {
+            return Err(field_error(
+                key,
+                "required when probing another base URL — the running process's key is never sent to a different host",
+            ));
+        }
+    }
+    let value = env_value(key).unwrap_or_default();
+    if value.is_empty() {
+        return Err(field_error(key, "API key is required"));
+    }
+    Ok(value)
+}
+
 /// Resolve the anthropic probe target exactly like `repair::run`: the public
 /// API host is fixed (the runtime ignores `NUWA_BASE_URL` for anthropic), and
 /// the model must come from the vendored catalog — an absent or unknown id
@@ -478,9 +509,14 @@ fn resolve_anthropic_probe(
 /// Minimal non-streaming completion (`max_tokens = 1`) — the cheapest proof
 /// the key, base URL and model work together (docs/09 §9.2).
 async fn probe_zai(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
-    let key = llm_key(values, "ZAI_API_KEY")?;
     let model = llm_model(values, ZAI_DEFAULT_MODEL)?;
     let base = llm_base(values, ZAI_DEFAULT_BASE_URL)?;
+    let process_base =
+        env_value("NUWA_BASE_URL").unwrap_or_else(|| ZAI_DEFAULT_BASE_URL.to_string());
+    let requested_base = provided_value(values, "NUWA_BASE_URL")?
+        .map(|value| value.trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty());
+    let key = probe_credential(values, "ZAI_API_KEY", requested_base.as_deref(), &process_base)?;
     let request = test_http_client()?
         .post(format!("{base}/chat/completions"))
         .bearer_auth(key)
@@ -1095,8 +1131,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        audit_then_schedule, last_four, llm_key, resolve_anthropic_probe, resolve_llm_setting,
-        restart_unavailable_message,
+        audit_then_schedule, last_four, llm_key, probe_credential, resolve_anthropic_probe,
+        resolve_llm_setting, restart_unavailable_message,
     };
     use crate::api::common::restart_test_guard;
     use crate::serve::{build_app, AppState};
@@ -1901,6 +1937,50 @@ mod tests {
                 .map(String::as_str),
             Some("API key is required")
         );
+    }
+
+    #[test]
+    fn probe_credential_refuses_the_process_key_for_another_host() {
+        // No key on screen, but the request names another host: the running
+        // process's key must not be used — that is the exfiltration path.
+        let mut values = BTreeMap::new();
+        values.insert(
+            "NUWA_BASE_URL".to_string(),
+            Value::String("https://attacker.example.test".to_string()),
+        );
+        let error = probe_credential(
+            &values,
+            "ZAI_API_KEY",
+            Some("https://attacker.example.test"),
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+        )
+        .expect_err("another host must not borrow the process key");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            error
+                .fields
+                .as_ref()
+                .and_then(|fields| fields.get("ZAI_API_KEY"))
+                .map(String::as_str)
+                .unwrap_or_default()
+                .contains("never sent to a different host"),
+            "{error:?}"
+        );
+
+        // A key typed on screen always wins, whatever the host.
+        let mut values = BTreeMap::new();
+        values.insert(
+            "ZAI_API_KEY".to_string(),
+            Value::String("pasted-key".to_string()),
+        );
+        let key = probe_credential(
+            &values,
+            "ZAI_API_KEY",
+            Some("https://attacker.example.test"),
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+        )
+        .expect("pasted key");
+        assert_eq!(key, "pasted-key");
     }
 
     #[test]
