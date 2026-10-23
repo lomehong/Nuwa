@@ -32,6 +32,24 @@ cd web && npm ci && npm run typecheck && npm run lint && npm test && npm run bui
 
 冒烟/演示命令见 docs/08 与 README 快速上手。
 
+## 发版
+
+升版要同时改 **4 处**，漏任何一处都会让 `cargo metadata --locked`（`scripts/check-arch.py` 与 release.yml 都会调）直接失败：
+
+1. `crates/nuwa/Cargo.toml` 的 `version`
+2. `crates/shanhaijing/Cargo.toml` 的 `version`
+3. 根 `Cargo.toml` 的 `[workspace.dependencies] shanhaijing = { path = ..., version = ... }`（最容易漏）
+4. `Cargo.lock` 里 `nuwa` / `shanhaijing` 两个 package 的 `version`
+
+然后：
+
+```bash
+git tag -a vX.Y.Z -m "vX.Y.Z — <一句话>"
+git push origin main && git push origin vX.Y.Z   # tag 触发 release.yml
+```
+
+tag 打错（指向坏提交、未产出 Release）时：`git tag -d vX.Y.Z` → 在正确提交上重打 → `git push origin :refs/tags/vX.Y.Z` 删除远端旧 tag → 再推送新 tag。
+
 ## 硬规则
 
 1. **vendored 纪律**：`crates/rpi-*` 保持原名、原风格、原注释。不美化、不重构、不"顺手清理"；需要上游修复 → `git remote add upstream https://github.com/bigfish1913/pi-rust` + cherry-pick。vendored 代码里 `unwrap_used=warn` 是削减中的可见性手段（基线见 docs/07 §E），不是放行——不要批量改掉。
