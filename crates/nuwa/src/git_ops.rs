@@ -510,12 +510,23 @@ fn descendant_pids(root: u32) -> Vec<u32> {
 
 /// 对 `root` 的每个后代发 SIGKILL（libc 原生 kill——外部 `kill` 命令在
 /// 部分 CI runner 上不可靠）。
+///
+/// 多轮枚举：`/proc/<pid>/task/<pid>/children` 的单次读取存在内核竞态
+///（可能漏列正在 fork 的后代），且后台任务在首轮 SIGKILL 与枚举之间
+/// 还可能再 fork。循环至连续两轮无新后代；SIGKILL 对已死进程无害。
 #[cfg(unix)]
 fn kill_descendants_recursive(root: u32) {
-    for pid in descendant_pids(root) {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
+    for _ in 0..4 {
+        let descendants = descendant_pids(root);
+        if descendants.is_empty() {
+            break;
         }
+        for pid in &descendants {
+            unsafe {
+                libc::kill(*pid as i32, libc::SIGKILL);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
