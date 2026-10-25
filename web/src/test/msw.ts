@@ -219,6 +219,7 @@ export function makeIssueDetail(
     ],
     runs: [makeRun()],
     similar: { count: 0, items: [] },
+    ci_watch: null,
     ...overrides,
   };
 }

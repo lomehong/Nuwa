@@ -244,6 +244,7 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         .filter(|token| !token.is_empty());
     spawn_reconciler(Arc::clone(&store), sync_token, sync_interval_from_env());
     spawn_heartbeat_monitor(Arc::clone(&store));
+    crate::ci_watch::spawn(Arc::clone(&store));
     let env_path = crate::settings::env_file_path();
     let tokens = serve_tokens(&std::env::vars().collect());
     let ingest_token = tokens.ingest;
@@ -872,6 +873,9 @@ mod tests {
             public_base_url: None,
             draft: false,
             secrets: &secrets,
+            store: None,
+            run_id: None,
+            repo_id: "",
         })
         .await
         .expect("a successful repair must remain deliverable");

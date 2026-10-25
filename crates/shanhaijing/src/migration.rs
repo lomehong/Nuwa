@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::ShanResult;
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub fn apply(conn: &mut Connection) -> ShanResult<()> {
     conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
@@ -63,9 +63,16 @@ pub fn apply(conn: &mut Connection) -> ShanResult<()> {
         tx.pragma_update(None, "user_version", 7)?;
         tx.commit()?;
     }
-    if version < SCHEMA_VERSION {
+    if version < 8 {
         let tx = conn.transaction()?;
         migrate_v8(&tx)?;
+        tx.pragma_update(None, "user_version", 8)?;
+        tx.commit()?;
+        version = 8;
+    }
+    if version < SCHEMA_VERSION {
+        let tx = conn.transaction()?;
+        migrate_v9(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
     }
@@ -287,6 +294,63 @@ fn migrate_v8(conn: &Connection) -> ShanResult<()> {
     Ok(())
 }
 
+/// v9：交付 intent 与持续 CI 观察。交付记录让“远端已成功、本地未落库”的
+/// 断点可恢复；CI watch 让观察生命周期脱离一次修复进程，serve 重启后继续。
+fn migrate_v9(conn: &Connection) -> ShanResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS deliveries (
+            id          TEXT PRIMARY KEY,
+            run_id      TEXT,
+            fingerprint TEXT NOT NULL,
+            repo        TEXT NOT NULL,
+            branch      TEXT NOT NULL,
+            base        TEXT NOT NULL,
+            head_sha    TEXT NOT NULL,
+            state       TEXT NOT NULL,
+            pr_url      TEXT,
+            pr_number   INTEGER,
+            detail      TEXT,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL,
+            UNIQUE(repo, branch, head_sha)
+        );
+        CREATE INDEX IF NOT EXISTS idx_deliveries_pending
+            ON deliveries(state, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_deliveries_issue
+            ON deliveries(fingerprint, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS ci_watches (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id          TEXT,
+            fingerprint     TEXT NOT NULL,
+            repo            TEXT NOT NULL,
+            pr_url          TEXT NOT NULL,
+            slug            TEXT NOT NULL,
+            pr_number       INTEGER NOT NULL,
+            head_sha        TEXT NOT NULL,
+            state           TEXT NOT NULL DEFAULT 'pending',
+            last_verdict    TEXT,
+            last_checked_at INTEGER,
+            next_check_at   INTEGER NOT NULL,
+            check_attempts  INTEGER NOT NULL DEFAULT 0,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            terminal_at     INTEGER,
+            last_error      TEXT,
+            root_cause      TEXT,
+            change_stat     TEXT,
+            memory_written  INTEGER NOT NULL DEFAULT 0,
+            max_attempts    INTEGER NOT NULL DEFAULT 3,
+            UNIQUE(repo, pr_url, head_sha)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ci_watches_due
+            ON ci_watches(state, next_check_at);
+        CREATE INDEX IF NOT EXISTS idx_ci_watches_issue
+            ON ci_watches(fingerprint, created_at DESC);",
+    )?;
+    Ok(())
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -331,6 +395,60 @@ mod tests {
             .expect("collect")
             .iter()
             .any(|c| c == column)
+    }
+
+    #[test]
+    fn v9_adds_deliveries_and_ci_watches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        drop(store);
+        let conn = Connection::open(dir.path().join("s.db")).expect("reopen");
+        assert!(table_exists(&conn, "deliveries"));
+        assert!(table_exists(&conn, "ci_watches"));
+        for column in [
+            "run_id",
+            "fingerprint",
+            "repo",
+            "branch",
+            "base",
+            "head_sha",
+            "state",
+            "pr_url",
+            "pr_number",
+            "detail",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(column_exists(&conn, "deliveries", column), "{column}");
+        }
+        for column in [
+            "run_id",
+            "fingerprint",
+            "repo",
+            "pr_url",
+            "slug",
+            "pr_number",
+            "head_sha",
+            "state",
+            "last_verdict",
+            "last_checked_at",
+            "next_check_at",
+            "check_attempts",
+            "created_at",
+            "updated_at",
+            "terminal_at",
+            "last_error",
+            "root_cause",
+            "change_stat",
+            "memory_written",
+            "max_attempts",
+        ] {
+            assert!(column_exists(&conn, "ci_watches", column), "{column}");
+        }
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     fn v0_schema(conn: &Connection) {

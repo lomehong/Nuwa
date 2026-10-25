@@ -79,6 +79,19 @@ export function runPhaseVariant(phase: string): BadgeVariant {
   return phase === "done" ? "neutral" : "info";
 }
 
+const CI_WATCH_STATE_LABELS: Record<string, string> = {
+  pending: "等待 CI",
+  green: "CI 通过，继续观察",
+  red: "CI 未通过，已处置",
+  merged: "PR 已合并",
+  closed: "PR 已关闭",
+  expired: "观察已过期",
+};
+
+export function ciWatchStateLabel(state: string): string {
+  return CI_WATCH_STATE_LABELS[state] ?? state;
+}
+
 /** Finished or still-running elapsed time. */
 export function runDurationMs(run: RunDto, now: number = Date.now()): number {
   const end = run.finished_at_ms ?? now;

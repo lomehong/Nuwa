@@ -215,3 +215,18 @@
   6. 修复最终报告新增 `OUTCOME: fixed|not_fixed|unverified`，与 ROOT CAUSE、CHANGE、VERIFICATION 构成四行契约。基准只把唯一且合法的 `OUTCOME: fixed` 视为成功声明；实际 repaired 仍由独立检查决定，缺失、冲突或未知声明不猜测为成功。
 - 取舍：转录不再承诺实时展示原始内容，重启增加一次登录；换取不跨进程传播密钥、不新增会话数据库迁移。现有单二进制、SQLite 与人工合并边界不变。
 - 指纹兼容性：修正 Rust 标准 backtrace 函数帧解析后，受影响信号会得到新指纹；不重写已有问题单、PR 与审计身份。历史记录保留，Rust 客户端若固定了对应 golden 值需同步更新；Go golden 不变。
+
+---
+
+## ADR-020 · 无人值守闭环：失败收敛、交付幂等与持续 CI
+
+- 状态：已接受（2026-10-24）
+- 背景：修复进程只在一个有限窗口内消费 CI；PR 创建响应丢失时可能误删远端分支；issue-level 失败一律升级、attempt cap 等下一次领取才生效，无法形成稳定的无人值守策略。所有者的 token 套餐不要求新增预算控制，现有预算闸保留但不在本决策范围内扩展。
+- 决策：
+  1. **失败策略统一入口**：issue-level 修复/验证失败原子累加 attempts；低于 `max_attempts` 时回 `new` 并设置冷却，达到上限立即 `ignored`。provider 瞬时故障、环境故障不计数；人工关闭 PR 仍进入 `rejected` 且不自动重试；provider 配置错误仍升级。状态、attempts、冷却与审计同事务。
+  2. **交付 intent 与恢复**：推送前持久化 `delivery`（repo/branch/base/head SHA/run），依次记录 pushed、pr_requested、pr_created。PR 创建失败时先按 head 分支查 GitHub；找到则采用，找不到才清理孤儿分支；查询不确定则保留分支并标记 ambiguous。`nuwa work` 启动及每轮领单前对账，恢复“GitHub 已成功、本地未落库”的断点，同一分支/提交不重复创建 PR。
+  3. **持续 CI**：新增 `ci_watches`，由 serve 单实例后台调度；watch 持久化 head SHA、CLI 结论、下次检查、退避与记忆来源，重启后继续。green 不是终态，继续观察重跑。PR 仍 open 且 head 未变转红时关 PR 并按失败策略计数/重试/忽略；PR 已 merged 或已关闭时只记录 `ci_red` 告警，不自动重开、不自动回滚。CI 不可读/未完成不是终态，指数退避并保留 watch；超过 30 天过期。
+  4. **控制台**：问题详情透出 watch 状态、最近检查、下次检查和错误；只读，不提供手工推进 watch 的按钮。
+  5. schema v9 新增 `deliveries`、`ci_watches`；所有恢复/收敛写操作走 Store 事务。
+- 取舍：持续 CI 依赖部署中的 serve 常驻；不做外部队列、分布式锁、自动回滚或自动重开已合并问题。CI 重跑导致已合并后转红只能告警，根因/部署版本关联仍是后续能力。
+- 被否决备选：把 CI 观察绑在修复进程（超时即失明）；PR 创建失败一律删远端分支（会丢失已存在 PR）；issue-level 失败一律人工升级（无法无人值守）；自动重开已合并问题（无法回滚已合入代码）。

@@ -532,6 +532,166 @@ pub struct RunRow {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    Retry,
+    Ignored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailureOutcome {
+    pub disposition: FailureDisposition,
+    pub state: State,
+    pub attempts: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryState {
+    Intent,
+    Pushed,
+    PrRequested,
+    PrCreated,
+    Ambiguous,
+    Failed,
+}
+
+impl DeliveryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intent => "intent",
+            Self::Pushed => "pushed",
+            Self::PrRequested => "pr_requested",
+            Self::PrCreated => "pr_created",
+            Self::Ambiguous => "ambiguous",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "intent" => Self::Intent,
+            "pushed" => Self::Pushed,
+            "pr_requested" => Self::PrRequested,
+            "pr_created" => Self::PrCreated,
+            "ambiguous" => Self::Ambiguous,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeliveryStart {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub fingerprint: String,
+    pub repo: String,
+    pub branch: String,
+    pub base: String,
+    pub head_sha: String,
+    pub now: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeliveryRow {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub fingerprint: String,
+    pub repo: String,
+    pub branch: String,
+    pub base: String,
+    pub head_sha: String,
+    pub state: DeliveryState,
+    pub pr_url: Option<String>,
+    pub pr_number: Option<u64>,
+    pub detail: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiWatchState {
+    Pending,
+    Green,
+    Red,
+    Merged,
+    Closed,
+    Expired,
+}
+
+impl CiWatchState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Green => "green",
+            Self::Red => "red",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "pending" => Self::Pending,
+            "green" => Self::Green,
+            "red" => Self::Red,
+            "merged" => Self::Merged,
+            "closed" => Self::Closed,
+            "expired" => Self::Expired,
+            _ => return None,
+        })
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Red | Self::Merged | Self::Closed | Self::Expired
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CiWatchInput {
+    pub run_id: Option<String>,
+    pub fingerprint: String,
+    pub repo: String,
+    pub pr_url: String,
+    pub slug: String,
+    pub pr_number: u64,
+    pub head_sha: String,
+    pub root_cause: Option<String>,
+    pub change_stat: Option<String>,
+    pub now: i64,
+    pub next_check_at: i64,
+    pub max_attempts: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CiWatchRow {
+    pub id: i64,
+    pub run_id: Option<String>,
+    pub fingerprint: String,
+    pub repo: String,
+    pub pr_url: String,
+    pub slug: String,
+    pub pr_number: u64,
+    pub head_sha: String,
+    pub state: CiWatchState,
+    pub last_verdict: Option<String>,
+    pub last_checked_at: Option<i64>,
+    pub next_check_at: i64,
+    pub check_attempts: u32,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub terminal_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub root_cause: Option<String>,
+    pub change_stat: Option<String>,
+    pub memory_written: bool,
+    pub max_attempts: u64,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -1293,6 +1453,374 @@ impl Store {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Atomically count one issue-level failure and converge immediately:
+    /// below the cap the issue returns to `new` with a cooldown; at the cap it
+    /// becomes `ignored`. Provider/environment failures never call this.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_issue_failure(
+        &self,
+        fingerprint: &str,
+        now_ms: i64,
+        max_attempts: u64,
+        cooldown_until_ms: i64,
+        detail: &str,
+        actor: &str,
+    ) -> ShanResult<FailureOutcome> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (state, repo, attempts): (String, String, u64) = tx.query_row(
+            "SELECT state, repo, attempts FROM issues WHERE fingerprint=?1",
+            [fingerprint],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state.clone()))?;
+        if !matches!(from, State::Triggered | State::Fixing) {
+            return Err(ShanError::InvalidTransition {
+                from,
+                to: State::New,
+            });
+        }
+        let attempts = attempts + 1;
+        let (to, kind, cooldown) = if attempts >= max_attempts {
+            (State::Ignored, "ignored", 0)
+        } else {
+            (State::New, "state_changed", cooldown_until_ms)
+        };
+        let changed = tx.execute(
+            "UPDATE issues SET state=?2, attempts=?3, cooldown_until=?4,
+                owner_runner_id=NULL, state_changed_at=?5
+             WHERE fingerprint=?1 AND state=?6",
+            rusqlite::params![fingerprint, to.as_str(), attempts, cooldown, now_ms, state],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::InvalidTransition { from, to });
+        }
+        record_event_on(&tx, fingerprint, now_ms, Some(&repo), actor, kind, detail)?;
+        tx.commit()?;
+        Ok(FailureOutcome {
+            disposition: if to == State::Ignored {
+                FailureDisposition::Ignored
+            } else {
+                FailureDisposition::Retry
+            },
+            state: to,
+            attempts,
+        })
+    }
+
+    /// CI red belongs to one delivered PR. Close that delivery's issue (and
+    /// count the attempt) atomically, then either schedule a retry or ignore at
+    /// the cap. A stale PR URL is a no-op, never a reason to reject a new cycle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_ci_rejection(
+        &self,
+        fingerprint: &str,
+        expected_pr_url: &str,
+        now_ms: i64,
+        max_attempts: u64,
+        cooldown_until_ms: i64,
+        detail: &str,
+        actor: &str,
+    ) -> ShanResult<FailureOutcome> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (repo, attempts): (String, u64) = tx.query_row(
+            "SELECT repo, attempts FROM issues
+             WHERE fingerprint=?1 AND state='pr_open' AND pr_url=?2",
+            rusqlite::params![fingerprint, expected_pr_url],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        record_event_on(
+            &tx,
+            fingerprint,
+            now_ms,
+            Some(&repo),
+            actor,
+            "rejected",
+            detail,
+        )?;
+        let attempts = attempts + 1;
+        let (to, kind, cooldown) = if attempts >= max_attempts {
+            (State::Ignored, "ignored", 0)
+        } else {
+            (State::New, "state_changed", cooldown_until_ms)
+        };
+        tx.execute(
+            "UPDATE issues SET state=?2, attempts=?3, cooldown_until=?4,
+                owner_runner_id=NULL, state_changed_at=?5, pr_url=NULL, pr_opened_at=NULL
+             WHERE fingerprint=?1 AND state='pr_open' AND pr_url=?6",
+            rusqlite::params![
+                fingerprint,
+                to.as_str(),
+                attempts,
+                cooldown,
+                now_ms,
+                expected_pr_url
+            ],
+        )?;
+        record_event_on(&tx, fingerprint, now_ms, Some(&repo), actor, kind, detail)?;
+        tx.commit()?;
+        Ok(FailureOutcome {
+            disposition: if to == State::Ignored {
+                FailureDisposition::Ignored
+            } else {
+                FailureDisposition::Retry
+            },
+            state: to,
+            attempts,
+        })
+    }
+
+    /// Record a delivery intent before any network side effect. Repeated calls
+    /// for the same (repo, branch, head_sha) return the existing record, so a
+    /// crash cannot create a second delivery identity.
+    pub fn begin_delivery(&self, start: &DeliveryStart) -> ShanResult<DeliveryRow> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO deliveries
+                (id, run_id, fingerprint, repo, branch, base, head_sha, state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'intent', ?8, ?8)
+             ON CONFLICT(repo, branch, head_sha) DO UPDATE SET
+                updated_at=excluded.updated_at,
+                run_id=COALESCE(deliveries.run_id, excluded.run_id)",
+            rusqlite::params![
+                start.id,
+                start.run_id,
+                start.fingerprint,
+                start.repo,
+                start.branch,
+                start.base,
+                start.head_sha,
+                start.now,
+            ],
+        )?;
+        let row = conn.query_row(
+            "SELECT id, run_id, fingerprint, repo, branch, base, head_sha, state,
+                    pr_url, pr_number, detail, created_at, updated_at
+             FROM deliveries WHERE repo=?1 AND branch=?2 AND head_sha=?3",
+            rusqlite::params![start.repo, start.branch, start.head_sha],
+            delivery_from_row,
+        )?;
+        Ok(row)
+    }
+
+    pub fn update_delivery_head(&self, id: &str, head_sha: &str, now_ms: i64) -> ShanResult<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE deliveries SET head_sha=?2, updated_at=?3 WHERE id=?1",
+            rusqlite::params![id, head_sha, now_ms],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownIssue(id.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn mark_delivery(
+        &self,
+        id: &str,
+        state: DeliveryState,
+        pr_url: Option<&str>,
+        pr_number: Option<u64>,
+        detail: Option<&str>,
+        now_ms: i64,
+    ) -> ShanResult<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE deliveries SET state=?2,
+                pr_url=COALESCE(?3, pr_url), pr_number=COALESCE(?4, pr_number),
+                detail=COALESCE(?5, detail), updated_at=?6
+             WHERE id=?1",
+            rusqlite::params![id, state.as_str(), pr_url, pr_number, detail, now_ms],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownIssue(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Unfinished deliveries for one repo, oldest first. The runner uses this
+    /// at startup to adopt a PR that GitHub created before the process died.
+    pub fn pending_deliveries(&self, repo: &str) -> ShanResult<Vec<DeliveryRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, fingerprint, repo, branch, base, head_sha, state,
+                    pr_url, pr_number, detail, created_at, updated_at
+             FROM deliveries
+             WHERE repo=?1 AND state IN ('intent','pushed','pr_requested','ambiguous')
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([repo], delivery_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Recovery path: a PR was found for an unfinished delivery. Move the
+    /// issue to `pr_open` without requiring the normal fixing→pr_open sequence,
+    /// because the process may have died before the fixing transition landed.
+    pub fn adopt_delivered_pr(
+        &self,
+        fingerprint: &str,
+        pr_url: &str,
+        now_ms: i64,
+    ) -> ShanResult<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some((state, repo)): Option<(String, String)> = tx
+            .query_row(
+                "SELECT state, repo FROM issues WHERE fingerprint=?1",
+                [fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+        else {
+            return Err(ShanError::UnknownIssue(fingerprint.to_string()));
+        };
+        let state = State::parse(&state).ok_or(ShanError::UnknownState(state))?;
+        if matches!(
+            state,
+            State::Merged | State::Rejected | State::Escalated | State::Ignored
+        ) {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE issues SET state='pr_open', pr_url=?2, pr_opened_at=?3,
+                state_changed_at=?3, owner_runner_id=NULL
+             WHERE fingerprint=?1",
+            rusqlite::params![fingerprint, pr_url, now_ms],
+        )?;
+        record_event_on(
+            &tx,
+            fingerprint,
+            now_ms,
+            Some(&repo),
+            "runner",
+            "state_changed",
+            "delivery recovered: PR adopted from GitHub",
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn upsert_ci_watch(&self, input: &CiWatchInput) -> ShanResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO ci_watches
+                (run_id, fingerprint, repo, pr_url, slug, pr_number, head_sha,
+                 state, next_check_at, created_at, updated_at, root_cause, change_stat,
+                 max_attempts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9, ?10, ?11, ?12)
+             ON CONFLICT(repo, pr_url, head_sha) DO UPDATE SET
+                updated_at=excluded.updated_at,
+                next_check_at=MIN(ci_watches.next_check_at, excluded.next_check_at),
+                run_id=COALESCE(ci_watches.run_id, excluded.run_id),
+                root_cause=COALESCE(ci_watches.root_cause, excluded.root_cause),
+                change_stat=COALESCE(ci_watches.change_stat, excluded.change_stat)",
+            rusqlite::params![
+                input.run_id,
+                input.fingerprint,
+                input.repo,
+                input.pr_url,
+                input.slug,
+                input.pr_number,
+                input.head_sha,
+                input.next_check_at,
+                input.now,
+                input.root_cause,
+                input.change_stat,
+                input.max_attempts,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically claim due watches by pushing their next check out. A second
+    /// serve process cannot poll the same watch concurrently.
+    pub fn claim_due_ci_watches(
+        &self,
+        now_ms: i64,
+        limit: u32,
+        lease_ms: i64,
+    ) -> ShanResult<Vec<CiWatchRow>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM ci_watches
+                 WHERE state IN ('pending','green') AND next_check_at <= ?1
+                 ORDER BY next_check_at ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![now_ms, limit], |row| row.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            tx.execute(
+                "UPDATE ci_watches SET next_check_at=?2, updated_at=?1 WHERE id=?3",
+                rusqlite::params![now_ms, now_ms + lease_ms, id],
+            )?;
+            let row = tx.query_row(
+                "SELECT id, run_id, fingerprint, repo, pr_url, slug, pr_number, head_sha,
+                        state, last_verdict, last_checked_at, next_check_at, check_attempts,
+                        created_at, updated_at, terminal_at, last_error, root_cause,
+                        change_stat, memory_written, max_attempts
+                 FROM ci_watches WHERE id=?1",
+                [id],
+                ci_watch_from_row,
+            )?;
+            out.push(row);
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_ci_watch(
+        &self,
+        id: i64,
+        state: CiWatchState,
+        last_verdict: Option<&str>,
+        next_check_at: i64,
+        last_error: Option<&str>,
+        memory_written: bool,
+        terminal_at: Option<i64>,
+        now_ms: i64,
+    ) -> ShanResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE ci_watches SET state=?2, last_verdict=COALESCE(?3, last_verdict),
+                last_checked_at=?8, next_check_at=?4, last_error=?5,
+                memory_written=?6, terminal_at=COALESCE(?7, terminal_at), updated_at=?8
+             WHERE id=?1",
+            rusqlite::params![
+                id,
+                state.as_str(),
+                last_verdict,
+                next_check_at,
+                last_error,
+                memory_written,
+                terminal_at,
+                now_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn ci_watch_for(&self, fingerprint: &str) -> ShanResult<Option<CiWatchRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, run_id, fingerprint, repo, pr_url, slug, pr_number, head_sha,
+                    state, last_verdict, last_checked_at, next_check_at, check_attempts,
+                    created_at, updated_at, terminal_at, last_error, root_cause,
+                    change_stat, memory_written, max_attempts
+             FROM ci_watches WHERE fingerprint=?1
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            [fingerprint],
+            ci_watch_from_row,
+        )
+        .optional()
+        .map_err(ShanError::from)
     }
 
     /// Increment the issue-level attempt counter and return the new value.
@@ -2654,6 +3182,20 @@ impl Store {
         Ok(())
     }
 
+    /// A late CI observation belongs to a run that already finished; the
+    /// normal `update_run` guard rejects finished rows on purpose.
+    pub fn set_run_ci_verdict(&self, id: &str, verdict: &str) -> ShanResult<()> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE runs SET ci_verdict=?2 WHERE id=?1",
+            rusqlite::params![id, verdict],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownRun(id.to_string()));
+        }
+        Ok(())
+    }
+
     pub fn mark_interrupted(&self, runner_id: &str, now_ms: i64) -> ShanResult<u64> {
         let conn = self.lock();
         let changed = conn.execute(
@@ -2828,6 +3370,56 @@ impl Store {
     ) -> ShanResult<()> {
         record_event_on(&self.lock(), fingerprint, now_ms, repo, actor, kind, detail)
     }
+}
+
+fn delivery_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRow> {
+    let state: String = row.get(7)?;
+    Ok(DeliveryRow {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        fingerprint: row.get(2)?,
+        repo: row.get(3)?,
+        branch: row.get(4)?,
+        base: row.get(5)?,
+        head_sha: row.get(6)?,
+        state: DeliveryState::parse(&state).ok_or_else(|| {
+            rusqlite::Error::InvalidColumnType(7, state, rusqlite::types::Type::Text)
+        })?,
+        pr_url: row.get(8)?,
+        pr_number: row.get(9)?,
+        detail: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn ci_watch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CiWatchRow> {
+    let state: String = row.get(8)?;
+    Ok(CiWatchRow {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        fingerprint: row.get(2)?,
+        repo: row.get(3)?,
+        pr_url: row.get(4)?,
+        slug: row.get(5)?,
+        pr_number: row.get(6)?,
+        head_sha: row.get(7)?,
+        state: CiWatchState::parse(&state).ok_or_else(|| {
+            rusqlite::Error::InvalidColumnType(8, state, rusqlite::types::Type::Text)
+        })?,
+        last_verdict: row.get(9)?,
+        last_checked_at: row.get(10)?,
+        next_check_at: row.get(11)?,
+        check_attempts: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        terminal_at: row.get(15)?,
+        last_error: row.get(16)?,
+        root_cause: row.get(17)?,
+        change_stat: row.get(18)?,
+        memory_written: row.get(19)?,
+        max_attempts: row.get(20)?,
+    })
 }
 
 /// Append using the caller's connection so state changes and their audit can
@@ -3129,6 +3721,227 @@ mod tests {
                 .expect("retry"));
             assert_eq!(store.attempts_for(&fp).expect("attempts"), 1);
         }
+    }
+
+    #[test]
+    fn issue_failure_retries_then_converges_to_ignored() {
+        let store = Store::open(":memory:").expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        store
+            .set_state(&fp, State::Triggered, 2, None)
+            .expect("triggered");
+        store
+            .set_state(&fp, State::Fixing, 2, None)
+            .expect("fixing");
+        let first = store
+            .record_issue_failure(&fp, 10, 2, 500, "repair_failed: boom", "runner")
+            .expect("first");
+        assert_eq!(first.disposition, FailureDisposition::Retry);
+        assert_eq!(first.state, State::New);
+        assert_eq!(first.attempts, 1);
+        let row = store.list_issues().expect("issues").remove(0);
+        assert_eq!((row.state.as_str(), row.attempts), ("new", 1));
+        assert!(store
+            .events_for(&fp, 10)
+            .expect("events")
+            .iter()
+            .any(|event| event.kind == "state_changed" && event.detail.contains("repair_failed")));
+        store
+            .set_state(&fp, State::Triggered, 20, None)
+            .expect("triggered");
+        store
+            .set_state(&fp, State::Fixing, 20, None)
+            .expect("fixing");
+        let second = store
+            .record_issue_failure(&fp, 30, 2, 500, "repair_failed: boom", "runner")
+            .expect("second");
+        assert_eq!(second.disposition, FailureDisposition::Ignored);
+        assert_eq!(second.state, State::Ignored);
+        assert_eq!(second.attempts, 2);
+        let row = store.list_issues().expect("issues").remove(0);
+        assert_eq!((row.state.as_str(), row.attempts), ("ignored", 2));
+    }
+
+    #[test]
+    fn ci_rejection_binds_pr_and_retries_or_ignores_at_cap() {
+        let store = Store::open(":memory:").expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        advance_to_pr(&store, &fp);
+        store.set_pr(&fp, TEST_PR_URL, 2).expect("pr");
+        let first = store
+            .record_ci_rejection(&fp, TEST_PR_URL, 10, 2, 500, "ci_red", "runner")
+            .expect("first");
+        assert_eq!(first.disposition, FailureDisposition::Retry);
+        assert_eq!(first.state, State::New);
+        assert_eq!(first.attempts, 1);
+        let row = store.list_issues().expect("issues").remove(0);
+        assert!(
+            row.pr_url.is_none(),
+            "a retry must not keep the old PR URL: the next claim sees an orphan branch"
+        );
+        assert!(store
+            .events_for(&fp, 100)
+            .expect("events")
+            .iter()
+            .any(|event| event.kind == "rejected" && event.detail == "ci_red"));
+
+        advance_to_pr(&store, &fp);
+        store.set_pr(&fp, TEST_PR_URL, 20).expect("pr");
+        let second = store
+            .record_ci_rejection(&fp, TEST_PR_URL, 30, 2, 500, "ci_red", "runner")
+            .expect("second");
+        assert_eq!(second.disposition, FailureDisposition::Ignored);
+        assert_eq!(second.attempts, 2);
+        assert_eq!(store.list_issues().expect("issues")[0].state, "ignored");
+    }
+
+    #[test]
+    fn delivery_intent_is_idempotent_and_pending_until_pr_created() {
+        let store = Store::open(":memory:").expect("open");
+        let start = DeliveryStart {
+            id: "delivery-1".into(),
+            run_id: Some("run-1".into()),
+            fingerprint: "fp-delivery".into(),
+            repo: "example.com/app".into(),
+            branch: "agent/fix/fp".into(),
+            base: "main".into(),
+            head_sha: "abc123".into(),
+            now: 10,
+        };
+        let first = store.begin_delivery(&start).expect("first");
+        let second = store
+            .begin_delivery(&DeliveryStart {
+                id: "delivery-2".into(),
+                now: 11,
+                ..start
+            })
+            .expect("second");
+        assert_eq!(first.id, second.id, "same branch/head keeps the identity");
+        assert_eq!(
+            store
+                .pending_deliveries("example.com/app")
+                .expect("pending")
+                .len(),
+            1
+        );
+        store
+            .mark_delivery(
+                &first.id,
+                DeliveryState::PrCreated,
+                Some("https://github.com/o/r/pull/1"),
+                Some(1),
+                None,
+                20,
+            )
+            .expect("created");
+        assert!(store
+            .pending_deliveries("example.com/app")
+            .expect("pending")
+            .is_empty());
+    }
+
+    #[test]
+    fn recovered_delivery_adopts_pr_without_replaying_fixing_transition() {
+        let store = Store::open(":memory:").expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        store
+            .set_state(&fp, State::Triggered, 2, None)
+            .expect("triggered");
+        store
+            .set_state(&fp, State::Fixing, 2, None)
+            .expect("fixing");
+        assert!(store
+            .adopt_delivered_pr(&fp, "https://github.com/o/r/pull/5", 10)
+            .expect("adopt"));
+        let row = store.list_issues().expect("issues").remove(0);
+        assert_eq!(row.state, "pr_open");
+        assert_eq!(row.pr_url.as_deref(), Some("https://github.com/o/r/pull/5"));
+        assert!(store
+            .events_for(&fp, 20)
+            .expect("events")
+            .iter()
+            .any(|event| event.detail.contains("PR adopted from GitHub")));
+        store
+            .set_state(&fp, State::Merged, 30, None)
+            .expect("merged");
+        assert!(!store
+            .adopt_delivered_pr(&fp, "https://github.com/o/r/pull/6", 40)
+            .expect("terminal no-op"));
+    }
+
+    #[test]
+    fn due_ci_watches_are_claimed_once_and_keep_their_identity() {
+        let store = Store::open(":memory:").expect("open");
+        store.report_signal(&signal(), 1).expect("report");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        store
+            .start_run(&RunStart {
+                id: "run-ci".into(),
+                fingerprint: fp.clone(),
+                runner_id: "runner".into(),
+                repo: "example.com/app".into(),
+                started_at: 1,
+                provider: None,
+                model: None,
+            })
+            .expect("run");
+        store
+            .upsert_ci_watch(&CiWatchInput {
+                run_id: Some("run-ci".into()),
+                fingerprint: fp.clone(),
+                repo: "example.com/app".into(),
+                pr_url: "https://github.com/o/r/pull/9".into(),
+                slug: "o/r".into(),
+                pr_number: 9,
+                head_sha: "deadbeef".into(),
+                root_cause: None,
+                change_stat: None,
+                now: 10,
+                next_check_at: 10,
+                max_attempts: 3,
+            })
+            .expect("watch");
+        let claimed = store.claim_due_ci_watches(10, 10, 60).expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].state, CiWatchState::Pending);
+        assert!(store
+            .claim_due_ci_watches(11, 10, 60)
+            .expect("second claim")
+            .is_empty());
+        store
+            .update_ci_watch(
+                claimed[0].id,
+                CiWatchState::Green,
+                Some("green"),
+                100,
+                None,
+                true,
+                None,
+                20,
+            )
+            .expect("green");
+        let row = store.ci_watch_for(&fp).expect("read").expect("watch");
+        assert_eq!(row.state, CiWatchState::Green);
+        assert!(row.memory_written);
     }
 
     #[test]

@@ -825,7 +825,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 侧栏：
 
-- **本页内容**：主列五个区块的锚点导航（时间线/证据/堆栈/运行记录/会话转录）。
+- **本页内容**：主列五个区块的锚点导航（时间线/证据/堆栈/运行记录/会话转录）。问题详情读取 `ci_watch`（state/最近检查/下次检查/错误）并显示一行“CI 持续观察”；watch 由 serve 调度，页面只读。
 - 最近 run 摘要：状态、耗时、tokens、turns、provider/model、runner。
 - 相似问题：同 title 的指纹列表与状态。
 - 原始元数据：完整指纹、state_changed_at、owner runner。

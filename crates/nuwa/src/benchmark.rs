@@ -487,6 +487,9 @@ async fn run_one_inner(
         public_base_url: None,
         draft: false,
         secrets,
+        store: None,
+        run_id: None,
+        repo_id: "",
     })
     .await;
     match delivery {

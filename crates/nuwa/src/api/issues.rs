@@ -254,6 +254,21 @@ pub struct IssueDetailResponse {
     pub timeline: Vec<TimelineItem>,
     pub runs: Vec<RunDto>,
     pub similar: SimilarIssues,
+    pub ci_watch: Option<CiWatchDto>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub struct CiWatchDto {
+    pub state: String,
+    pub last_verdict: Option<String>,
+    #[serde(rename = "last_checked_at_ms")]
+    pub last_checked_at: Option<i64>,
+    #[serde(rename = "next_check_at_ms")]
+    pub next_check_at: i64,
+    pub check_attempts: u32,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -529,6 +544,14 @@ fn build_detail(
         .collect();
     let similar_count = store.similar_count(&issue.title, fingerprint)?;
     let similar = store.similar_issues(&issue.title, fingerprint, SIMILAR_LIMIT)?;
+    let ci_watch = store.ci_watch_for(fingerprint)?.map(|watch| CiWatchDto {
+        state: watch.state.as_str().to_string(),
+        last_verdict: watch.last_verdict,
+        last_checked_at: watch.last_checked_at,
+        next_check_at: watch.next_check_at,
+        check_attempts: watch.check_attempts,
+        last_error: watch.last_error,
+    });
     Ok(Some(IssueDetailResponse {
         stack_sample: snapshot.stack_sample,
         issue: IssueListItem { issue, stuck },
@@ -538,6 +561,7 @@ fn build_detail(
             count: usize::try_from(similar_count).unwrap_or(usize::MAX),
             items: similar.into_iter().map(SimilarItem::from).collect(),
         },
+        ci_watch,
     }))
 }
 

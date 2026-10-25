@@ -2,6 +2,7 @@ mod api;
 mod benchmark;
 mod check;
 mod ci;
+mod ci_watch;
 mod deliver;
 mod git_ops;
 mod guard;
@@ -549,10 +550,39 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         Ok(n) => println!("cleanup     : removed {n} expired session dir(s) at startup"),
         Err(e) => eprintln!("warning : session cleanup failed: {e:#}"),
     }
+    match reconcile_deliveries(
+        &store,
+        &repo_dir,
+        &repo_config.repo,
+        push,
+        u64::from(repo_config.max_attempts.max(1)),
+        &secrets,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => println!("delivery    : reconciled {n} unfinished delivery record(s)"),
+        Err(e) => eprintln!("warning : delivery reconciliation failed: {e:#}"),
+    }
 
     let mut cycles: u64 = 0;
     let result: anyhow::Result<()> = async {
         loop {
+            // A delivery can become ambiguous after a crash mid-process, not
+            // only at startup. Reconcile before claiming so the next cycle
+            // adopts an already-created PR instead of opening a second one.
+            if let Err(error) = reconcile_deliveries(
+                &store,
+                &repo_dir,
+                &trusted.instructions.repo,
+                push,
+                u64::from(trusted.instructions.max_attempts.max(1)),
+                &secrets,
+            )
+            .await
+            {
+                eprintln!("delivery    : reconciliation failed: {error:#}");
+            }
             let worked = match work_once(
                 &store,
                 &mut trusted,
@@ -986,6 +1016,116 @@ fn spawn_heartbeat(
             tokio::time::sleep(interval).await;
         }
     })
+}
+
+/// Recover deliveries whose process died after GitHub created the PR but
+/// before the local issue/run was updated. A definitive "no PR" allows the
+/// orphan branch to be removed; an inconclusive lookup keeps it for a later
+/// attempt rather than destroying evidence.
+async fn reconcile_deliveries(
+    store: &shanhaijing::Store,
+    repo_dir: &Path,
+    repo_id: &str,
+    push: bool,
+    max_attempts: u64,
+    secrets: &secrets::Secrets,
+) -> anyhow::Result<usize> {
+    let pending = store.pending_deliveries(repo_id)?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let token = secrets
+        .github_token
+        .as_deref()
+        .context("cannot reconcile deliveries without NUWA_GITHUB_TOKEN")?;
+    let origin = git_ops::git(repo_dir, &["remote", "get-url", "origin"])?;
+    let slug = deliver::parse_github_slug(&origin)
+        .with_context(|| format!("parse GitHub owner/repo from origin `{origin}`"))?;
+    let now = now_ms();
+    let mut reconciled = 0usize;
+    for delivery in pending {
+        match deliver::find_pr_by_head(token, &slug, &delivery.branch).await {
+            Ok(Some((url, number))) => {
+                let adopted = store.adopt_delivered_pr(&delivery.fingerprint, &url, now)?;
+                store.mark_delivery(
+                    &delivery.id,
+                    shanhaijing::DeliveryState::PrCreated,
+                    Some(&url),
+                    Some(number),
+                    Some("recovered from GitHub by head branch"),
+                    now,
+                )?;
+                if adopted {
+                    let run = delivery
+                        .run_id
+                        .as_deref()
+                        .and_then(|id| store.run_for(&delivery.fingerprint, id).ok().flatten());
+                    let _ = store.upsert_ci_watch(&shanhaijing::CiWatchInput {
+                        run_id: delivery.run_id.clone(),
+                        fingerprint: delivery.fingerprint.clone(),
+                        repo: delivery.repo.clone(),
+                        pr_url: url,
+                        slug: slug.clone(),
+                        pr_number: number,
+                        head_sha: delivery.head_sha.clone(),
+                        root_cause: run.as_ref().and_then(|run| run.root_cause.clone()),
+                        change_stat: run.as_ref().and_then(|run| run.change_stat.clone()),
+                        now,
+                        next_check_at: now,
+                        max_attempts,
+                    });
+                }
+                reconciled += 1;
+            }
+            Ok(None) => {
+                if push {
+                    let _ = git_ops::delete_remote_branch(
+                        repo_dir,
+                        &delivery.branch,
+                        Duration::from_secs(60),
+                    )
+                    .await;
+                }
+                store.mark_delivery(
+                    &delivery.id,
+                    shanhaijing::DeliveryState::Failed,
+                    None,
+                    None,
+                    Some("recovery found no PR; branch removed"),
+                    now,
+                )?;
+                let state = store
+                    .list_issues()?
+                    .into_iter()
+                    .find(|row| row.fingerprint == delivery.fingerprint)
+                    .map(|row| row.state);
+                if matches!(state.as_deref(), Some("triggered") | Some("fixing")) {
+                    let _ = store.release_issue(
+                        &delivery.fingerprint,
+                        "delivery recovery: no PR found",
+                        now + 5 * 60_000,
+                        now,
+                    );
+                }
+                reconciled += 1;
+            }
+            Err(error) => {
+                store.mark_delivery(
+                    &delivery.id,
+                    shanhaijing::DeliveryState::Ambiguous,
+                    None,
+                    None,
+                    Some(&format!("head lookup failed: {error:#}")),
+                    now,
+                )?;
+                eprintln!(
+                    "delivery    : {} reconciliation inconclusive: {error:#}",
+                    delivery.fingerprint
+                );
+            }
+        }
+    }
+    Ok(reconciled)
 }
 
 /// Resolve the base branch from local refs. The runner only supports the
@@ -1890,31 +2030,39 @@ async fn work_once(
                 }
                 FailureClass::Issue => {
                     live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
-                    let _ = store.increment_attempts(&fp);
-                    store.set_state_as(
+                    let outcome = store.record_issue_failure(
                         &fp,
-                        shanhaijing::State::Escalated,
-                        now_ms(),
-                        Some(detail.as_str()),
+                        now,
+                        u64::from(repo_config.max_attempts.max(1)),
+                        now + 30 * 60_000,
+                        &detail,
                         "runner",
                     )?;
-                    emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
+                    let retry = outcome.disposition == shanhaijing::FailureDisposition::Retry;
                     trace::record(
                         store,
                         &fp,
                         &repo_config.repo,
                         trace::Decision {
                             stage: "repair",
-                            decision: "escalated",
+                            decision: if retry { "retry_scheduled" } else { "ignored" },
                             reason: "repair failed on an issue-level fault",
-                            details: serde_json::json!({"error": detail}),
+                            details: serde_json::json!({
+                                "error": detail,
+                                "attempts": outcome.attempts,
+                                "max_attempts": repo_config.max_attempts,
+                            }),
                         },
                     );
-                    // The issue is escalated and the owner has been notified —
-                    // that is a completed business outcome, not a runner
-                    // failure. Returning Err here used to kill the `--loop`
-                    // process and restart it via systemd.
-                    println!("repair     : failed — issue escalated: {e:#}");
+                    if retry {
+                        println!(
+                            "repair     : failed — retry scheduled (attempt {}/{}): {e:#}",
+                            outcome.attempts, repo_config.max_attempts
+                        );
+                    } else {
+                        emit_webhook("ignored", &fp, &repo_config.repo, detail.clone());
+                        println!("repair     : failed — attempt cap reached, issue ignored: {e:#}");
+                    }
                     return Ok(true);
                 }
             }
@@ -2042,43 +2190,75 @@ async fn work_once(
         public_base_url: public_base_url.as_deref(),
         draft,
         secrets,
+        store: Some(store),
+        run_id: Some(&run_id),
+        repo_id: &repo_config.repo,
     })
     .await
     {
         Ok(d) => d,
         Err(e) => {
+            let failed_at = now_ms();
             let detail = bounded_text(&secrets.redact(&format!("delivery_failed: {e:#}")));
             let _ = store.finish_run(
                 &run_id,
                 &shanhaijing::RunFinish {
-                    finished_at: now_ms(),
+                    finished_at: failed_at,
                     outcome: "delivery_failed".into(),
                     ci_verdict: None,
                     error: Some(detail.clone()),
                 },
             );
             live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
-            let _ = store.increment_attempts(&fp);
-            store.set_state_as(
+            if deliver::is_transient_delivery_error(&e) {
+                store.release_issue(&fp, &detail, failed_at + 5 * 60_000, failed_at)?;
+                trace::record(
+                    store,
+                    &fp,
+                    &repo_config.repo,
+                    trace::Decision {
+                        stage: "deliver",
+                        decision: "released",
+                        reason: "transient delivery/network failure; attempt not consumed",
+                        details: serde_json::json!({"error": detail}),
+                    },
+                );
+                println!("delivery   : transient failure — released for retry: {e:#}");
+                return Ok(false);
+            }
+            let outcome = store.record_issue_failure(
                 &fp,
-                shanhaijing::State::Escalated,
-                now_ms(),
-                Some(detail.as_str()),
+                failed_at,
+                u64::from(repo_config.max_attempts.max(1)),
+                failed_at + 30 * 60_000,
+                &detail,
                 "runner",
             )?;
-            emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
+            let retry = outcome.disposition == shanhaijing::FailureDisposition::Retry;
             trace::record(
                 store,
                 &fp,
                 &repo_config.repo,
                 trace::Decision {
                     stage: "deliver",
-                    decision: "escalated",
-                    reason: "delivery failed",
-                    details: serde_json::json!({"error": detail}),
+                    decision: if retry { "retry_scheduled" } else { "ignored" },
+                    reason: "delivery failed on an issue-level fault",
+                    details: serde_json::json!({
+                        "error": detail,
+                        "attempts": outcome.attempts,
+                        "max_attempts": repo_config.max_attempts,
+                    }),
                 },
             );
-            println!("delivery   : failed — issue escalated: {e:#}");
+            if retry {
+                println!(
+                    "delivery   : failed — retry scheduled (attempt {}/{}): {e:#}",
+                    outcome.attempts, repo_config.max_attempts
+                );
+            } else {
+                emit_webhook("ignored", &fp, &repo_config.repo, detail.clone());
+                println!("delivery   : failed — attempt cap reached, issue ignored: {e:#}");
+            }
             return Ok(true);
         }
     };
@@ -2156,6 +2336,25 @@ async fn work_once(
             return Err(e.into());
         }
         emit_webhook("pr_opened", &fp, &repo_config.repo, url.clone());
+    }
+    if let (Some(slug), Some(number)) = (&delivered.slug, delivered.pr_number) {
+        let _ = store.upsert_ci_watch(&shanhaijing::CiWatchInput {
+            run_id: Some(run_id.clone()),
+            fingerprint: fp.clone(),
+            repo: repo_config.repo.clone(),
+            pr_url: delivered
+                .pr_url
+                .clone()
+                .unwrap_or_else(|| format!("https://github.com/{slug}/pull/{number}")),
+            slug: slug.clone(),
+            pr_number: number,
+            head_sha: delivered.commit.clone(),
+            root_cause: Some(redacted_root_cause.clone()),
+            change_stat: Some(delivered.change_stat.clone()),
+            now: now_ms(),
+            next_check_at: now_ms(),
+            max_attempts: u64::from(repo_config.max_attempts.max(1)),
+        });
     }
     trace::record(
         store,
@@ -2326,6 +2525,18 @@ async fn work_once(
                     &delivered,
                     &redacted_root_cause,
                 );
+                if let Ok(Some(watch)) = store.ci_watch_for(&fp) {
+                    let _ = store.update_ci_watch(
+                        watch.id,
+                        shanhaijing::CiWatchState::Green,
+                        Some("green"),
+                        now_ms() + 5 * 60_000,
+                        None,
+                        true,
+                        None,
+                        now_ms(),
+                    );
+                }
             }
             Ok(ci::Verdict::Failure) => {
                 if let Err(e) = ci::close_pr(&token, slug, number).await {
@@ -2372,16 +2583,19 @@ async fn work_once(
                         error: Some(bounded_text(&format!("CI red — PR #{number} closed"))),
                     },
                 );
-                let rejected = store.reject_pr(
+                let failure = store.record_ci_rejection(
                     &fp,
                     delivered
                         .pr_url
                         .as_deref()
                         .context("delivered PR URL missing")?,
                     now_ms(),
+                    u64::from(repo_config.max_attempts.max(1)),
+                    now_ms() + 30 * 60_000,
                     &format!("ci_red: PR #{number} closed without merge"),
                     "runner",
                 )?;
+                let retry = failure.disposition == shanhaijing::FailureDisposition::Retry;
                 let _ = store.record_event(
                     &fp,
                     now_ms(),
@@ -2399,17 +2613,14 @@ async fn work_once(
                     &repo_config.repo,
                     trace::Decision {
                         stage: "ci",
-                        decision: "ci_red",
-                        reason: if rejected {
-                            "CI failed; PR closed and issue rejected"
-                        } else {
-                            "CI failed and PR closed; issue state changed concurrently, not rejected"
-                        },
+                        decision: if retry { "retry_scheduled" } else { "ignored" },
+                        reason: "CI failed; PR closed and the failure policy advanced",
                         details: serde_json::json!({
                             "pr": number,
                             "slug": slug,
                             "commit": delivered.commit,
-                            "issue_rejected": rejected,
+                            "attempts": failure.attempts,
+                            "max_attempts": repo_config.max_attempts,
                         }),
                     },
                 );
@@ -2417,18 +2628,36 @@ async fn work_once(
                     "ci_red",
                     &fp,
                     &repo_config.repo,
-                    if rejected {
-                        format!("PR #{number} closed after CI failure; issue rejected")
+                    if retry {
+                        format!(
+                            "PR #{number} closed after CI failure; retry scheduled (attempt {}/{})",
+                            failure.attempts, repo_config.max_attempts
+                        )
                     } else {
                         format!(
-                            "PR #{number} closed after CI failure; issue state changed, left unchanged"
+                            "PR #{number} closed after CI failure; attempt cap reached, issue ignored"
                         )
                     },
                 );
-                let note = if rejected {
-                    format!("CI red — PR #{number} closed, issue rejected")
+                if let Ok(Some(watch)) = store.ci_watch_for(&fp) {
+                    let _ = store.update_ci_watch(
+                        watch.id,
+                        shanhaijing::CiWatchState::Red,
+                        Some("red"),
+                        now_ms() + 5 * 60_000,
+                        None,
+                        watch.memory_written,
+                        Some(now_ms()),
+                        now_ms(),
+                    );
+                }
+                let note = if retry {
+                    format!(
+                        "CI red — PR #{number} closed; retry scheduled (attempt {}/{})",
+                        failure.attempts, repo_config.max_attempts
+                    )
                 } else {
-                    format!("CI red — PR #{number} closed; issue state changed, left unchanged")
+                    format!("CI red — PR #{number} closed; attempt cap reached, issue ignored")
                 };
                 live_update(&live, "error", Some(&fp), None, Some(note.clone())).await;
                 // CI red is a business outcome: the runner keeps running even
@@ -2712,6 +2941,9 @@ async fn run_fix() -> anyhow::Result<()> {
         public_base_url: None,
         draft: false,
         secrets: &secrets,
+        store: None,
+        run_id: None,
+        repo_id: "",
     })
     .await?;
     println!(
@@ -3266,9 +3498,10 @@ mod tests {
         );
         let row = store.list_issues().expect("issues").remove(0);
         assert_eq!(
-            row.state, "escalated",
-            "the first run must enforce the fetched base's forbidden paths"
+            row.state, "new",
+            "the first run must enforce the fetched base's forbidden paths and schedule a retry"
         );
+        assert_eq!(row.attempts, 1);
         assert!(!repo.join("fixed.marker").exists());
     }
 

@@ -46,7 +46,8 @@ flowchart TB
   → 修改（五色石：补丁 + 修改说明）
   → 验证（base 红 / 分支绿；reproduce_check 或 .nuwa/repro.sh；failing_check 回归门；diff glob 禁改终检）
   → 开分支 agent/fix/<issue-fingerprint> → 直接开 PR（正文含 issue 链接、根因、风险画像、前序尝试、验证证据、堆栈）
-  → CI 闸门：不过测试 → 自动关 PR，问题单 rejected 并累计 attempt
+  → CI 闸门：有限窗口内红 → 自动关 PR；超时/不可读转入 serve 的持久 CI watch，重启后继续
+  → CI 首次绿后仍观察重跑；open PR 转红按失败策略重试/忽略，已合并转红只告警
   → 合入/关闭由人工决定；serve 定期 reconcile pr_open，终态分支清理
   → 状态变更通过窄范围 HMAC webhook 推给所有者
 ```
@@ -61,3 +62,6 @@ flowchart TB
 6. 密钥隔离：work 启动清秘、bash/验证子进程 env 白名单、PR/证据/转录脱敏
 7. 指令文件完整性：tracked 配置读 base commit，untracked 用 runner 私有副本，每轮校验恢复
 8. 挂死可观测：心跳（liveness）与 progress_at（真实进度）分离；15 分钟无进度触发 webhook
+9. 失败收敛：issue-level 失败原子累计 attempts，未到上限回 `new` 冷却重试、到上限立即 `ignored`；provider/环境故障不计数；人工关闭 PR 不自动重试
+10. 交付幂等：推送前写 delivery intent；PR 创建结果不确定时按 head 找回已有 PR，查询不确定保留分支，不盲目删除
+11. 持续 CI：serve 单实例消费持久 `ci_watches`，重启继续；green 后继续观察重跑，已合并后转红只告警

@@ -11,7 +11,14 @@ import { IssueSection } from "./IssueSection";
 import { IssueSidebar } from "./IssueSidebar";
 import { IssueTimeline } from "./IssueTimeline";
 import { StackSample } from "./StackSample";
-import { isNotFoundError, runOutcomeLabel, runPhaseLabel, shortRunId } from "./format";
+import {
+  ciWatchStateLabel,
+  formatDateTime,
+  isNotFoundError,
+  runOutcomeLabel,
+  runPhaseLabel,
+  shortRunId,
+} from "./format";
 import { useIssueDetailQuery } from "./queries";
 
 /** Positive 1-based page; anything malformed falls back to 1. */
@@ -125,6 +132,16 @@ export function IssueDetailPage() {
       <p className="text-caption text-text-muted">
         详情每 15 秒自动刷新，标签页隐藏时暂停；窗口重新聚焦时立即更新。
       </p>
+
+      {data.ci_watch ? (
+        <p className="text-caption text-text-muted" aria-live="polite">
+          CI 持续观察：{ciWatchStateLabel(data.ci_watch.state)}
+          {data.ci_watch.last_checked_at_ms
+            ? ` · 最近检查 ${formatDateTime(data.ci_watch.last_checked_at_ms)}`
+            : " · 等待首次检查"}
+          {data.ci_watch.last_error ? ` · ${data.ci_watch.last_error}` : ""}
+        </p>
+      ) : null}
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] lg:items-start">
         <div className="min-w-0 space-y-6">

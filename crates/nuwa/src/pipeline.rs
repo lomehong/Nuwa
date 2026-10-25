@@ -131,6 +131,10 @@ pub struct DeliveryRequest<'a> {
     pub public_base_url: Option<&'a str>,
     pub draft: bool,
     pub secrets: &'a secrets::Secrets,
+    /// Durable delivery journal for the work loop. CLI/benchmark pass `None`.
+    pub store: Option<&'a shanhaijing::Store>,
+    pub run_id: Option<&'a str>,
+    pub repo_id: &'a str,
 }
 
 pub async fn deliver(req: DeliveryRequest<'_>) -> anyhow::Result<deliver::DeliverReport> {
@@ -144,6 +148,9 @@ pub async fn deliver(req: DeliveryRequest<'_>) -> anyhow::Result<deliver::Delive
         req.secrets,
         req.public_base_url,
         req.draft,
+        req.store,
+        req.run_id,
+        req.repo_id,
     )
     .await
 }

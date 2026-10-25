@@ -73,41 +73,8 @@ pub async fn wait_for_ci(
     timeout_secs: u64,
 ) -> anyhow::Result<Verdict> {
     let start = std::time::Instant::now();
-    let http = github_http_client()?;
     loop {
-        let resp = http
-            .get(format!(
-                "https://api.github.com/repos/{slug}/actions/runs?head_sha={sha}"
-            ))
-            .bearer_auth(token)
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "nuwa")
-            .send()
-            .await
-            .context("poll actions runs")?;
-        let status = resp.status();
-        let payload: serde_json::Value = resp.json().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!(
-                "actions runs {status}: {}",
-                payload["message"].as_str().unwrap_or("(no message)")
-            );
-        }
-        let total = payload["total_count"].as_u64().unwrap_or(0);
-        let runs: Vec<(bool, Option<&str>)> = payload["workflow_runs"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|r| {
-                        (
-                            r["status"].as_str() == Some("completed"),
-                            r["conclusion"].as_str(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(verdict) = aggregate(total, &runs) {
+        if let Some(verdict) = poll_ci_once(token, slug, sha).await? {
             return Ok(verdict);
         }
         if start.elapsed().as_secs() >= timeout_secs {
@@ -115,6 +82,45 @@ pub async fn wait_for_ci(
         }
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     }
+}
+
+/// One Actions poll. `None` means the runs are registered but not finished;
+/// callers that outlive a repair run use this instead of a blocking wait.
+pub async fn poll_ci_once(token: &str, slug: &str, sha: &str) -> anyhow::Result<Option<Verdict>> {
+    let http = github_http_client()?;
+    let resp = http
+        .get(format!(
+            "https://api.github.com/repos/{slug}/actions/runs?head_sha={sha}"
+        ))
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "nuwa")
+        .send()
+        .await
+        .context("poll actions runs")?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "actions runs {status}: {}",
+            payload["message"].as_str().unwrap_or("(no message)")
+        );
+    }
+    let total = payload["total_count"].as_u64().unwrap_or(0);
+    let runs: Vec<(bool, Option<&str>)> = payload["workflow_runs"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|r| {
+                    (
+                        r["status"].as_str() == Some("completed"),
+                        r["conclusion"].as_str(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(aggregate(total, &runs))
 }
 
 /// Close a PR (rejected path). Needs the same token's pulls:write.

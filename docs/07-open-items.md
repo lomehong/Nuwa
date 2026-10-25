@@ -126,6 +126,8 @@
   ③ **证据与指标**：最终报告新增 `OUTCOME: fixed|not_fixed|unverified`，仅唯一合法 `fixed` 计入 claimed_fixed，实际 repaired 仍由独立检查决定；Rust 标准 backtrace 函数帧（含有无源码位置）参与指纹；转录只发布/读取脱敏快照，绝不回退原始 JSONL，数字凭证也脱敏，发布失败仅告警不否决修复。
   ④ **控制台**：会话密钥绑定 serve 启动代际，重启后旧 Cookie 失效；配置保存拒绝单/双引号与反斜杠；仓库 URL 前后端统一协议契约。
   验证证据：Nuwa **339**、山海经 **107**、前端 **400/52 文件**全绿，typecheck/lint/build 通过；自建 crate `clippy --no-deps --all-targets -D warnings` 零警告；架构契约（17 模块）与 vendored 清单（14 文件）通过；Edge 本地走查 HTTP/git 登记改名、危险协议拦截、单引号校验与转录空态，0 console error。全 workspace（vendored 测试）与全量构建按 ADR-017 交由 CI。
+- **无人值守闭环（2026-10-24，schema v9）**：① **失败收敛**：issue-level 修复/验证失败原子累计 attempts，未到 `max_attempts` 回 `new` 并冷却，到上限立即 `ignored`；provider/环境故障不计数；人工关闭 PR 仍 rejected 且不自动重试。② **交付幂等**：推送前持久化 delivery intent，PR 创建失败先按 head 找 GitHub 已有 PR，找到就采用；查询不确定保留分支标记 ambiguous；work 启动及每轮领单前对账，恢复“PR 已创建、本地未落库”的断点。③ **持续 CI**：serve 单实例调度 `ci_watches`，green 后继续观察重跑；open PR 转红按失败策略关闭/重试/忽略，已合并只告警；支持重启恢复、指数退避与 30 天过期；问题详情展示 watch 状态。ADR-020。token 预算不新增策略（所有者使用套餐）。
+  验证证据：Nuwa **343**、山海经 **113**、前端 **400/52 文件**全绿；自建 crate `clippy --no-deps --all-targets -D warnings` 零警告；架构契约与 vendored 清单通过；Edge 隔离库走查问题详情显示“CI 持续观察：CI 通过，继续观察”，0 console error。全 workspace/真实 GitHub 路径交由 CI/部署验证。
 - 下一步：验证门对 `internal/` 可复现性的盲区（本例 go test 无法触发 main 运行时 panic，靠 CI 深跑兜底——补充 `go vet`+`go build`+单测三角）→ 并发池/镜像矩阵（A-3）→ musl 静态构建 → 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）

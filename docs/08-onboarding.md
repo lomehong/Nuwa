@@ -331,6 +331,8 @@ escalated 只能人工 reopen → new
 ## 已知边界（v0.2 hardening）
 
 - runner 串行；并发池与 runner 镜像矩阵（A-3 后半）未做
+- 持续 CI 观察由 **serve 单实例** 调度（`ci_watches`，schema v9）；只运行 `work` 不运行 `serve` 时，CI 观察不会推进。PR 已合并后 CI 转红只告警，不自动回滚
+- issue-level 修复/验证失败自动重试到 `max_attempts` 后 ignored；provider/环境故障不计数；人工关闭 PR 不自动重试
 - 真实 LLM / PR 已闭环（spike #3/#5/#6；mindloop #7 已合并）
 - 验证探针协议（A-4）按设计推迟到第一个环境特定 bug 出现
 - ingest HTTP 服务端已建（`nuwa serve` + `POST /ingest`）

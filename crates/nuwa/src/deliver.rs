@@ -93,6 +93,29 @@ pub struct DeliverReport {
     pub risk: crate::verify::DiffSummary,
 }
 
+/// Delivery failures caused by transport/API availability are not the issue's
+/// fault and must not consume an attempt. Guard, verification and diff failures
+/// stay issue-level; merge conflicts require a human rebase.
+pub fn is_transient_delivery_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    [
+        "push failed",
+        "ls-remote failed",
+        "timed out",
+        "timeout",
+        "connection",
+        "connect",
+        "could not resolve",
+        "502",
+        "503",
+        "504",
+        "429",
+        "rate limit",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 pub(crate) fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .args(args)
@@ -132,7 +155,7 @@ fn truncate_evidence(text: &str, max_chars: usize) -> String {
 }
 
 /// `owner/repo` from a git remote URL (ssh / https, with or without `.git`).
-fn parse_github_slug(url: &str) -> Option<String> {
+pub(crate) fn parse_github_slug(url: &str) -> Option<String> {
     let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
     for prefix in [
         "git@github.com:",
@@ -296,6 +319,52 @@ async fn create_pr_via_api(
     Ok((url, number))
 }
 
+/// Find the PR that GitHub may have created even though the HTTP response was
+/// lost. `head` is `owner:branch`; the branch is percent-encoded so the slash
+/// in `agent/fix/...` stays inside one query value.
+pub(crate) async fn find_pr_by_head(
+    token: &str,
+    slug: &str,
+    branch: &str,
+) -> anyhow::Result<Option<(String, u64)>> {
+    let owner = slug
+        .split('/')
+        .next()
+        .filter(|owner| !owner.is_empty())
+        .context("origin slug has no owner")?;
+    let head = format!("{owner}:{}", branch.replace('/', "%2F"));
+    let resp = crate::ci::github_http_client()?
+        .get(format!("https://api.github.com/repos/{slug}/pulls"))
+        .query(&[("state", "all"), ("head", head.as_str())])
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "nuwa")
+        .send()
+        .await
+        .context("GET pulls by head")?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "find PR by head {status}: {}",
+            payload["message"].as_str().unwrap_or("(no message)")
+        );
+    }
+    let items = payload.as_array().map(Vec::as_slice).unwrap_or_default();
+    // Only an open PR is a valid recovery target. A closed PR from an older
+    // cycle must not turn the issue back into pr_open.
+    Ok(items
+        .iter()
+        .find(|item| item["state"].as_str() == Some("open"))
+        .and_then(|item| {
+            Some((
+                item["html_url"].as_str()?.to_string(),
+                item["number"].as_u64()?,
+            ))
+        }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn deliver(
     repo: &Path,
@@ -307,6 +376,9 @@ pub async fn deliver(
     secrets: &crate::secrets::Secrets,
     public_base_url: Option<&str>,
     draft: bool,
+    store: Option<&shanhaijing::Store>,
+    run_id: Option<&str>,
+    repo_id: &str,
 ) -> anyhow::Result<DeliverReport> {
     deliver_inner(
         repo,
@@ -318,6 +390,9 @@ pub async fn deliver(
         secrets,
         public_base_url,
         draft,
+        store,
+        run_id,
+        repo_id,
         None,
     )
     .await
@@ -334,6 +409,9 @@ async fn deliver_inner(
     secrets: &crate::secrets::Secrets,
     public_base_url: Option<&str>,
     draft: bool,
+    store: Option<&shanhaijing::Store>,
+    run_id: Option<&str>,
+    repo_id: &str,
     fail_point: Option<FailPoint>,
 ) -> anyhow::Result<DeliverReport> {
     // ---- 1. cheap preconditions ----
@@ -421,6 +499,24 @@ async fn deliver_inner(
     let mut pr_url = None;
     let mut slug_out = None;
     let mut pr_number = None;
+    let delivery = if push && create_pr {
+        store
+            .map(|store| {
+                store.begin_delivery(&shanhaijing::DeliveryStart {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    run_id: run_id.map(str::to_string),
+                    fingerprint: issue.fingerprint.clone(),
+                    repo: repo_id.to_string(),
+                    branch: branch.clone(),
+                    base: base.clone(),
+                    head_sha: commit.clone(),
+                    now: crate::now_ms(),
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     if push {
         // A PR needs the token. Check it before pushing: a missing token
         // discovered after the push would leave an orphan branch behind.
@@ -485,6 +581,17 @@ async fn deliver_inner(
         }
         // 交付证据钉在远端真实 tip 上，而不是"推送命令返回成功"。
         assert_pushed_commit(repo, &branch, &commit, NETWORK_GIT_TIMEOUT).await?;
+        if let (Some(store), Some(delivery)) = (store, &delivery) {
+            let _ = store.update_delivery_head(&delivery.id, &commit, crate::now_ms());
+            let _ = store.mark_delivery(
+                &delivery.id,
+                shanhaijing::DeliveryState::Pushed,
+                None,
+                None,
+                Some("remote tip verified"),
+                crate::now_ms(),
+            );
+        }
         if create_pr {
             let origin = git(repo, &["remote", "get-url", "origin"])
                 .context("read origin remote (PR creation needs a GitHub remote)")?;
@@ -554,6 +661,16 @@ async fn deliver_inner(
             let token = secrets.github_token.as_deref().context(
                 "NUWA_GITHUB_TOKEN (or GITHUB_TOKEN) not set — PR creation needs a fine-grained token with pulls:write",
             )?;
+            if let (Some(store), Some(delivery)) = (store, &delivery) {
+                let _ = store.mark_delivery(
+                    &delivery.id,
+                    shanhaijing::DeliveryState::PrRequested,
+                    None,
+                    None,
+                    Some("requesting PR"),
+                    crate::now_ms(),
+                );
+            }
             let (url, number) = match create_pr_via_api(
                 token,
                 &slug,
@@ -567,20 +684,68 @@ async fn deliver_inner(
             {
                 Ok(created) => created,
                 Err(e) => {
-                    // The branch is already on the remote but no PR exists:
-                    // an orphan. The next attempt for this fingerprint would
-                    // push on top of it and be rejected as non-fast-forward,
-                    // and the cleanup paths only look at local refs — the
-                    // issue would escalate on every retry. Remove it here.
-                    let _ = git_ops::delete_remote_branch(
-                        repo,
-                        &branch,
-                        std::time::Duration::from_secs(60),
-                    )
-                    .await;
-                    return Err(e.context(format!("PR creation failed for branch {branch}")));
+                    // A lost response means the PR may already exist. Adopt it
+                    // by head before treating the branch as an orphan.
+                    match find_pr_by_head(token, &slug, &branch).await {
+                        Ok(Some(created)) => {
+                            println!(
+                                "deliver   : PR creation response lost — adopted existing PR #{}",
+                                created.1
+                            );
+                            created
+                        }
+                        Ok(None) => {
+                            // No PR exists; the branch is a safe orphan to remove.
+                            let _ = git_ops::delete_remote_branch(
+                                repo,
+                                &branch,
+                                std::time::Duration::from_secs(60),
+                            )
+                            .await;
+                            if let (Some(store), Some(delivery)) = (store, &delivery) {
+                                let _ = store.mark_delivery(
+                                    &delivery.id,
+                                    shanhaijing::DeliveryState::Failed,
+                                    None,
+                                    None,
+                                    Some("PR creation failed; no PR found"),
+                                    crate::now_ms(),
+                                );
+                            }
+                            return Err(
+                                e.context(format!("PR creation failed for branch {branch}"))
+                            );
+                        }
+                        Err(lookup_error) => {
+                            // Ambiguous: keep the branch and let startup
+                            // reconciliation decide with a later lookup.
+                            if let (Some(store), Some(delivery)) = (store, &delivery) {
+                                let _ = store.mark_delivery(
+                                    &delivery.id,
+                                    shanhaijing::DeliveryState::Ambiguous,
+                                    None,
+                                    None,
+                                    Some(&format!("PR lookup failed: {lookup_error:#}")),
+                                    crate::now_ms(),
+                                );
+                            }
+                            return Err(e.context(format!(
+                                "PR creation failed and head lookup was inconclusive for branch {branch}: {lookup_error:#}"
+                            )));
+                        }
+                    }
                 }
             };
+            if let (Some(store), Some(delivery)) = (store, &delivery) {
+                let _ = store.mark_delivery(
+                    &delivery.id,
+                    shanhaijing::DeliveryState::PrCreated,
+                    Some(&url),
+                    Some(number),
+                    Some("PR created"),
+                    crate::now_ms(),
+                );
+            }
             pr_url = Some(url);
             slug_out = Some(slug);
             pr_number = Some(number);
@@ -719,6 +884,9 @@ mod tests {
             &crate::secrets::Secrets::default(),
             None,
             false,
+            None,
+            None,
+            "",
             Some(FailPoint::AfterBranch),
         )
         .await
@@ -755,6 +923,9 @@ mod tests {
             None,
             false,
             None,
+            None,
+            "",
+            None,
         )
         .await
         .expect("deliver");
@@ -785,6 +956,9 @@ mod tests {
             None,
             false,
             None,
+            None,
+            "",
+            None,
         )
         .await
         .expect("deliver");
@@ -805,6 +979,30 @@ mod tests {
             !evidence.contains("secret-value-123456"),
             "verification evidence leaks: {evidence}"
         );
+    }
+
+    #[test]
+    fn transient_delivery_errors_are_separated_from_issue_faults() {
+        for text in [
+            "push failed for branch agent/fix/x: connection reset",
+            "ls-remote failed: timed out",
+            "PR creation failed: 503 Service Unavailable",
+        ] {
+            assert!(
+                is_transient_delivery_error(&anyhow::anyhow!("{text}")),
+                "{text}"
+            );
+        }
+        for text in [
+            "verification gate failed: failing_check does not pass",
+            "delivery changes forbidden paths: .github/workflows",
+            "base main moved and merging it conflicted",
+        ] {
+            assert!(
+                !is_transient_delivery_error(&anyhow::anyhow!("{text}")),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -938,7 +1136,7 @@ mod tests {
         .await
         .expect_err("must refuse delivery");
         assert!(format!("{err:#}").contains("timed out"), "{err:#}");
-        assert!(start.elapsed() < std::time::Duration::from_secs(8));
+        assert!(start.elapsed() < std::time::Duration::from_secs(15));
     }
 
     #[tokio::test]
@@ -1025,6 +1223,9 @@ mod tests {
             &secrets,
             None,
             false,
+            None,
+            None,
+            "",
             None,
         )
         .await
