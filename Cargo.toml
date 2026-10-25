@@ -34,6 +34,8 @@ authors = ["BigFish <bigfish1913@gmail.com>"]
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "process", "sync", "io-util", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+# Unix 信号（进程树清理；已在 tokio 依赖树中，显式声明供 nuwa 直接使用）
+libc = "0.2"
 async-trait = "0.1"
 futures = "0.3"
 

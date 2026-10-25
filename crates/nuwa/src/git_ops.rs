@@ -462,14 +462,18 @@ async fn kill_tree(pid: u32) {
     let cleanup = tokio::task::spawn_blocking(move || {
         #[cfg(unix)]
         {
+            // 组杀（组长与同组成员）。GitHub runner 上曾观测外部 kill 组杀
+            // 未生效（后代存活写 marker），因此不依赖单一手段——
             let group = format!("-{pid}");
             let _ = std::process::Command::new("kill")
                 .args(["-KILL", &group])
                 .status();
-            // Fallback for platforms where the group signal did not apply.
             let _ = std::process::Command::new("kill")
                 .args(["-KILL", &pid.to_string()])
                 .status();
+            // /proc 递归后代杀：libc 原生 SIGKILL，不依赖外部命令与组语义
+            //（ADR-014 同款就地补丁风格）。
+            kill_descendants_recursive(pid);
         }
         #[cfg(windows)]
         {
@@ -480,6 +484,39 @@ async fn kill_tree(pid: u32) {
     });
     let _ = tokio::time::timeout(Duration::from_millis(500), cleanup).await;
     tokio::task::yield_now().await;
+}
+
+/// 递归收集 `root` 的全部后代 pid（BFS 读 /proc/<pid>/task/<tid>/children，
+/// 内核提供的父子关系，无外部命令）。
+#[cfg(unix)]
+fn descendant_pids(root: u32) -> Vec<u32> {
+    use std::collections::VecDeque;
+    let mut out = Vec::new();
+    let mut queue = VecDeque::from([root]);
+    while let Some(pid) = queue.pop_front() {
+        let children_path = format!("/proc/{pid}/task/{pid}/children");
+        let Ok(content) = std::fs::read_to_string(&children_path) else {
+            continue;
+        };
+        for tok in content.split_whitespace() {
+            if let Ok(child) = tok.parse::<u32>() {
+                out.push(child);
+                queue.push_back(child);
+            }
+        }
+    }
+    out
+}
+
+/// 对 `root` 的每个后代发 SIGKILL（libc 原生 kill——外部 `kill` 命令在
+/// 部分 CI runner 上不可靠）。
+#[cfg(unix)]
+fn kill_descendants_recursive(root: u32) {
+    for pid in descendant_pids(root) {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
 }
 
 #[cfg(test)]

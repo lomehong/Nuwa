@@ -1717,6 +1717,7 @@ dependencies = [
  "globset",
  "hmac",
  "http-body-util",
+ "libc",
  "mime_guess",
  "regex",
  "reqwest",
