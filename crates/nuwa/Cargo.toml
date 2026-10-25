@@ -27,6 +27,13 @@ base64 = { workspace = true }
 anyhow = "1"
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 regex = { workspace = true }
 uuid = { workspace = true }
 hmac = { workspace = true }

@@ -319,6 +319,41 @@ async fn create_pr_via_api(
     Ok((url, number))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredPullRequest {
+    pub url: String,
+    pub number: u64,
+    pub head_sha: String,
+    pub base_ref: String,
+}
+
+impl RecoveredPullRequest {
+    fn from_json(item: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            url: item["html_url"].as_str()?.to_string(),
+            number: item["number"].as_u64()?,
+            head_sha: item["head"]["sha"].as_str()?.to_string(),
+            base_ref: item["base"]["ref"].as_str()?.to_string(),
+        })
+    }
+
+    pub(crate) fn matches(&self, head_sha: &str, base_ref: &str) -> bool {
+        self.head_sha == head_sha && self.base_ref == base_ref
+    }
+}
+
+fn select_recovered_pr(
+    items: &[serde_json::Value],
+    expected_head_sha: &str,
+    expected_base_ref: &str,
+) -> Option<RecoveredPullRequest> {
+    items
+        .iter()
+        .filter(|item| item["state"].as_str() == Some("open"))
+        .filter_map(RecoveredPullRequest::from_json)
+        .find(|item| item.matches(expected_head_sha, expected_base_ref))
+}
+
 /// Find the PR that GitHub may have created even though the HTTP response was
 /// lost. `head` is `owner:branch`; the branch is percent-encoded so the slash
 /// in `agent/fix/...` stays inside one query value.
@@ -326,7 +361,9 @@ pub(crate) async fn find_pr_by_head(
     token: &str,
     slug: &str,
     branch: &str,
-) -> anyhow::Result<Option<(String, u64)>> {
+    expected_head_sha: &str,
+    expected_base_ref: &str,
+) -> anyhow::Result<Option<RecoveredPullRequest>> {
     let owner = slug
         .split('/')
         .next()
@@ -352,17 +389,13 @@ pub(crate) async fn find_pr_by_head(
         );
     }
     let items = payload.as_array().map(Vec::as_slice).unwrap_or_default();
-    // Only an open PR is a valid recovery target. A closed PR from an older
-    // cycle must not turn the issue back into pr_open.
-    Ok(items
-        .iter()
-        .find(|item| item["state"].as_str() == Some("open"))
-        .and_then(|item| {
-            Some((
-                item["html_url"].as_str()?.to_string(),
-                item["number"].as_u64()?,
-            ))
-        }))
+    // Only an open PR for the exact verified head/base is a valid recovery
+    // target; another base or an updated head stays ambiguous.
+    Ok(select_recovered_pr(
+        items,
+        expected_head_sha,
+        expected_base_ref,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -682,17 +715,39 @@ async fn deliver_inner(
             )
             .await
             {
-                Ok(created) => created,
+                Ok((url, number)) => (url, number),
                 Err(e) => {
                     // A lost response means the PR may already exist. Adopt it
-                    // by head before treating the branch as an orphan.
-                    match find_pr_by_head(token, &slug, &branch).await {
-                        Ok(Some(created)) => {
+                    // only when it still identifies the exact verified delivery.
+                    match find_pr_by_head(token, &slug, &branch, &commit, &base).await {
+                        Ok(Some(recovered)) if recovered.matches(&commit, &base) => {
                             println!(
                                 "deliver   : PR creation response lost — adopted existing PR #{}",
-                                created.1
+                                recovered.number
                             );
-                            created
+                            (recovered.url, recovered.number)
+                        }
+                        Ok(Some(recovered)) => {
+                            if let (Some(store), Some(delivery)) = (store, &delivery) {
+                                let _ = store.mark_delivery(
+                                    &delivery.id,
+                                    shanhaijing::DeliveryState::Ambiguous,
+                                    Some(&recovered.url),
+                                    Some(recovered.number),
+                                    Some(
+                                        "recovered PR head/base differs from the verified delivery",
+                                    ),
+                                    crate::now_ms(),
+                                );
+                            }
+                            return Err(anyhow::anyhow!(
+                                "PR #{} head/base {}/{} does not match verified {}/{}",
+                                recovered.number,
+                                recovered.head_sha,
+                                recovered.base_ref,
+                                commit,
+                                base
+                            ));
                         }
                         Ok(None) => {
                             // No PR exists; the branch is a safe orphan to remove.
@@ -1076,6 +1131,47 @@ mod tests {
                 .expect("ls-remote"),
             None
         );
+    }
+
+    #[test]
+    fn recovery_requires_the_verified_head_and_expected_base() {
+        let item = serde_json::json!({
+            "state": "open",
+            "html_url": "https://github.com/acme/app/pull/7",
+            "number": 7,
+            "head": { "sha": "verified-sha" },
+            "base": { "ref": "main" }
+        });
+        let recovered = RecoveredPullRequest::from_json(&item).expect("open PR");
+        assert!(recovered.matches("verified-sha", "main"));
+        assert!(!recovered.matches("new-unverified-sha", "main"));
+        assert!(!recovered.matches("verified-sha", "release"));
+    }
+
+    #[test]
+    fn recovery_selects_the_exact_pr_across_multiple_bases() {
+        let items = serde_json::json!([
+            {
+                "state": "open",
+                "html_url": "https://github.com/acme/app/pull/7",
+                "number": 7,
+                "head": { "sha": "verified-sha" },
+                "base": { "ref": "release" }
+            },
+            {
+                "state": "open",
+                "html_url": "https://github.com/acme/app/pull/8",
+                "number": 8,
+                "head": { "sha": "verified-sha" },
+                "base": { "ref": "main" }
+            }
+        ]);
+
+        let selected =
+            select_recovered_pr(items.as_array().expect("array"), "verified-sha", "main")
+                .expect("matching PR");
+        assert_eq!(selected.number, 8);
+        assert_eq!(selected.url, "https://github.com/acme/app/pull/8");
     }
 
     fn stalled_local_transport(repo: &Path) {

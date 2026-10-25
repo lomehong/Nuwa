@@ -105,6 +105,14 @@ function fixtureDetail(): IssueDetailResponse {
       },
     ],
     runs: fixtureRuns(),
+    ci_watch: {
+      state: "pending",
+      last_verdict: null,
+      last_checked_at_ms: NOW - 30_000,
+      next_check_at_ms: NOW + 30_000,
+      check_attempts: 0,
+      last_error: null,
+    },
     similar: {
       count: 2,
       items: [
@@ -167,6 +175,17 @@ function useDetail(detail: IssueDetailResponse) {
 }
 
 describe("IssueDetailPage", () => {
+  it("shows the last and next continuous CI check times", async () => {
+    const detail = fixtureDetail();
+    useDetail(detail);
+    renderDetail();
+
+    const watch = await screen.findByText(/CI 持续观察/);
+    expect(watch.textContent).toContain("最近检查");
+    expect(watch.textContent).toContain("下次检查");
+    expect(watch.textContent).toContain(formatDateTime(NOW + 30_000));
+  });
+
   it("renders the header, timeline, evidence, runs, stack and similar issues", async () => {
     const detail = fixtureDetail();
     useDetail(detail);

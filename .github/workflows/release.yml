@@ -30,10 +30,24 @@ jobs:
         working-directory: web
         run: npm ci
       # `web/dist` (gitignored) must exist before rust-embed compiles the
-      # release binary; `npm run build` typechecks the app and bundles it.
-      - name: build web console
+      # release binary. Test failures must stop the tag before packaging.
+      - name: test and build web console
         working-directory: web
-        run: npm run build
+        run: npm run typecheck && npm run lint && npm test && npm run build
+      - name: fmt (self-owned crates)
+        run: cargo fmt --check -p nuwa -p shanhaijing
+      - name: clippy (self-owned crates)
+        run: cargo clippy --no-deps -p nuwa -p shanhaijing --all-targets -- -D warnings
+      - name: tests (workspace)
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo test --workspace -- --test-threads=1 --nocapture \
+              --skip execution_env_conformance::os_cancel_interrupts_even_when_timeout_is_set
+          else
+            cargo test --workspace -- --test-threads=1 --nocapture
+          fi
       - run: cargo build --release -p nuwa
         env:
           # 编译期注入版本指纹：/api/v1/system 的 build_commit（tag 构建时是

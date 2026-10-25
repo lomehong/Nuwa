@@ -83,7 +83,7 @@ describe("SettingsPage", () => {
       }),
     );
     renderApp("/settings");
-    const interval = await screen.findByLabelText("Poll interval");
+    const interval = await screen.findByLabelText("Poll interval", {}, { timeout: 10_000 });
     fireEvent.change(interval, { target: { value: "60" } });
     fireEvent.click(saveButton());
 

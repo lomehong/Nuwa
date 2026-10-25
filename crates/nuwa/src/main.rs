@@ -1018,6 +1018,22 @@ fn spawn_heartbeat(
     })
 }
 
+fn record_delivery_recovery_failure(
+    store: &shanhaijing::Store,
+    fingerprint: &str,
+    max_attempts: u64,
+    now: i64,
+) -> shanhaijing::ShanResult<shanhaijing::FailureOutcome> {
+    store.record_issue_failure(
+        fingerprint,
+        now,
+        max_attempts,
+        now + 30 * 60_000,
+        "delivery recovery: no PR found",
+        "runner",
+    )
+}
+
 /// Recover deliveries whose process died after GitHub created the PR but
 /// before the local issue/run was updated. A definitive "no PR" allows the
 /// orphan branch to be removed; an inconclusive lookup keeps it for a later
@@ -1044,15 +1060,24 @@ async fn reconcile_deliveries(
     let now = now_ms();
     let mut reconciled = 0usize;
     for delivery in pending {
-        match deliver::find_pr_by_head(token, &slug, &delivery.branch).await {
-            Ok(Some((url, number))) => {
-                let adopted = store.adopt_delivered_pr(&delivery.fingerprint, &url, now)?;
+        match deliver::find_pr_by_head(
+            token,
+            &slug,
+            &delivery.branch,
+            &delivery.head_sha,
+            &delivery.base,
+        )
+        .await
+        {
+            Ok(Some(recovered)) if recovered.matches(&delivery.head_sha, &delivery.base) => {
+                let adopted =
+                    store.adopt_delivered_pr(&delivery.fingerprint, &recovered.url, now)?;
                 store.mark_delivery(
                     &delivery.id,
                     shanhaijing::DeliveryState::PrCreated,
-                    Some(&url),
-                    Some(number),
-                    Some("recovered from GitHub by head branch"),
+                    Some(&recovered.url),
+                    Some(recovered.number),
+                    Some("recovered the exact verified PR head/base"),
                     now,
                 )?;
                 if adopted {
@@ -1064,9 +1089,9 @@ async fn reconcile_deliveries(
                         run_id: delivery.run_id.clone(),
                         fingerprint: delivery.fingerprint.clone(),
                         repo: delivery.repo.clone(),
-                        pr_url: url,
+                        pr_url: recovered.url,
                         slug: slug.clone(),
-                        pr_number: number,
+                        pr_number: recovered.number,
                         head_sha: delivery.head_sha.clone(),
                         root_cause: run.as_ref().and_then(|run| run.root_cause.clone()),
                         change_stat: run.as_ref().and_then(|run| run.change_stat.clone()),
@@ -1076,6 +1101,25 @@ async fn reconcile_deliveries(
                     });
                 }
                 reconciled += 1;
+            }
+            Ok(Some(recovered)) => {
+                store.mark_delivery(
+                    &delivery.id,
+                    shanhaijing::DeliveryState::Ambiguous,
+                    Some(&recovered.url),
+                    Some(recovered.number),
+                    Some("recovered PR head/base differs from the verified delivery"),
+                    now,
+                )?;
+                eprintln!(
+                    "delivery    : {} recovery left ambiguous: PR #{} head/base {}/{} != verified {}/{}",
+                    delivery.fingerprint,
+                    recovered.number,
+                    recovered.head_sha,
+                    recovered.base_ref,
+                    delivery.head_sha,
+                    delivery.base
+                );
             }
             Ok(None) => {
                 if push {
@@ -1100,10 +1144,10 @@ async fn reconcile_deliveries(
                     .find(|row| row.fingerprint == delivery.fingerprint)
                     .map(|row| row.state);
                 if matches!(state.as_deref(), Some("triggered") | Some("fixing")) {
-                    let _ = store.release_issue(
+                    let _ = record_delivery_recovery_failure(
+                        store,
                         &delivery.fingerprint,
-                        "delivery recovery: no PR found",
-                        now + 5 * 60_000,
+                        max_attempts,
                         now,
                     );
                 }
@@ -2137,27 +2181,41 @@ async fn work_once(
             },
         );
         live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
-        let _ = store.increment_attempts(&fp);
-        store.set_state_as(
+        let failed_at = now_ms();
+        let outcome = store.record_issue_failure(
             &fp,
-            shanhaijing::State::Escalated,
-            now_ms(),
-            Some(detail.as_str()),
+            failed_at,
+            u64::from(repo_config.max_attempts.max(1)),
+            failed_at + 30 * 60_000,
+            &detail,
             "runner",
         )?;
-        emit_webhook("escalated", &fp, &repo_config.repo, detail.clone());
+        let retry = outcome.disposition == shanhaijing::FailureDisposition::Retry;
         trace::record(
             store,
             &fp,
             &repo_config.repo,
             trace::Decision {
                 stage: "budget",
-                decision: "escalated",
+                decision: if retry { "retry_scheduled" } else { "ignored" },
                 reason: "per-issue token cap exceeded",
-                details: serde_json::json!({"spent_tokens": spent, "cap_tokens": max_tokens}),
+                details: serde_json::json!({
+                    "spent_tokens": spent,
+                    "cap_tokens": max_tokens,
+                    "attempts": outcome.attempts,
+                    "max_attempts": repo_config.max_attempts,
+                }),
             },
         );
-        println!("budget     : {detail} — issue escalated");
+        if retry {
+            println!(
+                "budget     : {detail} — retry scheduled (attempt {}/{})",
+                outcome.attempts, repo_config.max_attempts
+            );
+        } else {
+            emit_webhook("ignored", &fp, &repo_config.repo, detail.clone());
+            println!("budget     : {detail} — attempt cap reached, issue ignored");
+        }
         return Ok(true);
     }
     println!(
@@ -2314,8 +2372,16 @@ async fn work_once(
                 error: Some(detail.clone()),
             },
         );
-        live_update(&live, "error", Some(&fp), None, Some(detail)).await;
-        let _ = store.increment_attempts(&fp);
+        live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
+        let failed_at = now_ms();
+        let _ = store.record_issue_failure(
+            &fp,
+            failed_at,
+            u64::from(repo_config.max_attempts.max(1)),
+            failed_at + 30 * 60_000,
+            &detail,
+            "runner",
+        );
         return Err(e.into());
     }
     if let Some(url) = &delivered.pr_url {
@@ -2332,7 +2398,6 @@ async fn work_once(
             );
             live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
             emit_webhook("escalated", &fp, &repo_config.repo, detail);
-            let _ = store.increment_attempts(&fp);
             return Err(e.into());
         }
         emit_webhook("pr_opened", &fp, &repo_config.repo, url.clone());
@@ -2551,7 +2616,6 @@ async fn work_once(
                         },
                     );
                     live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
-                    let _ = store.increment_attempts(&fp);
                     // The PR could not be closed — the issue must not stay in
                     // `pr_open` pretending the gate is still pending. Hand it
                     // to the owner as escalated.
@@ -3854,6 +3918,128 @@ mod tests {
         let branch = run.branch.clone().expect("branch");
         let fixed = git_output(&repo, &["show", &format!("{branch}:calc.go")]);
         assert!(fixed.contains("i < len(xs)"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failure_budget_retries_then_ignores_at_the_attempt_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::write(
+            repo.join("calc.go"),
+            "package main\n\nfunc Average(xs []float64) float64 {\n\
+             \tvar sum float64\n\
+             \tfor i := 0; i <= len(xs); i++ {\n\
+             \t\tsum += xs[i]\n\
+             \t}\n\
+             \treturn sum / float64(len(xs))\n\
+             }\n",
+        )
+        .expect("write");
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+
+        let store = Arc::new(shanhaijing::Store::open(dir.path().join("s.db")).expect("open"));
+        let now = now_ms();
+        let signal = shanhaijing::Signal {
+            repo: "example.com/spike".into(),
+            language: "go".into(),
+            title: "panic in Average".into(),
+            severity: "high".into(),
+            message: None,
+            log_window: Vec::new(),
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+        };
+        store.report_signal(&signal, now).expect("report");
+        let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
+        let cfg = RepoInstructions {
+            repo: "example.com/spike".into(),
+            failing_check: FailingCheck {
+                command: fixed_loop_check(),
+                target: None,
+                timeout_secs: 600,
+            },
+            forbidden_paths: Vec::new(),
+            notes: String::new(),
+            skills: Vec::new(),
+            reproduce_check: None,
+            max_attempts: 2,
+            draft_first_n: 0,
+        };
+        let live: SharedLive = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
+
+        for expected in ["new", "ignored"] {
+            work_once(
+                &store,
+                &mut test_trusted_instructions(&repo, &cfg),
+                &repo,
+                dir.path().join("sessions"),
+                repair::ProviderKind::Faux,
+                5,
+                false,
+                false,
+                5,
+                0,
+                5_000_000,
+                50_000_000,
+                600,
+                "test:runner",
+                Arc::clone(&live),
+                &Arc::new(secrets::Secrets::default()),
+            )
+            .await
+            .expect("work");
+            let issue = store.list_issues().expect("issues").pop().expect("issue");
+            assert_eq!(issue.state, expected);
+            store
+                .set_cooldown(&fp, 0)
+                .expect("retry immediately in test");
+        }
+        assert_eq!(store.attempts_for(&fp).expect("attempts"), 2);
+    }
+
+    #[test]
+    fn failure_recovery_without_pr_consumes_an_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = shanhaijing::Store::open(dir.path().join("s.db")).expect("open");
+        let now = now_ms();
+        store
+            .report_signal(
+                &shanhaijing::Signal {
+                    repo: "example.com/spike".into(),
+                    language: "go".into(),
+                    title: "panic in Average".into(),
+                    severity: "high".into(),
+                    message: None,
+                    log_window: Vec::new(),
+                    stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+                },
+                now,
+            )
+            .expect("report");
+        let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
+        store
+            .set_state(&fp, shanhaijing::State::Triggered, now, None)
+            .expect("triggered");
+
+        record_delivery_recovery_failure(&store, &fp, 2, now).expect("failure outcome");
+
+        let issue = store.list_issues().expect("issues").pop().expect("issue");
+        assert_eq!(issue.state, "new");
+        assert_eq!(issue.attempts, 1);
+        assert!(store.ready_issue(now).expect("cooldown").is_none());
     }
 
     #[tokio::test]

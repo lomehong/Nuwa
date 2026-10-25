@@ -22,6 +22,8 @@ jobs:
       # check-arch 调用 cargo metadata，必须在上面的 toolchain 之后。
       - name: 架构契约（crate/模块依赖方向）
         run: python3 scripts/check-arch.py
+      - name: 需求—设计—实现追溯
+        run: python3 scripts/check-traceability.py
       - name: vendored 补丁清单
         run: python3 scripts/check-vendored.py
       - uses: Swatinem/rust-cache@v2

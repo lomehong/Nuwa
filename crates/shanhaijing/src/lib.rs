@@ -1791,7 +1791,8 @@ impl Store {
         conn.execute(
             "UPDATE ci_watches SET state=?2, last_verdict=COALESCE(?3, last_verdict),
                 last_checked_at=?8, next_check_at=?4, last_error=?5,
-                memory_written=?6, terminal_at=COALESCE(?7, terminal_at), updated_at=?8
+                memory_written=?6, terminal_at=COALESCE(?7, terminal_at), updated_at=?8,
+                check_attempts=0
              WHERE id=?1",
             rusqlite::params![
                 id,
@@ -1803,6 +1804,24 @@ impl Store {
                 terminal_at,
                 now_ms
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_ci_watch_error(
+        &self,
+        id: i64,
+        state: CiWatchState,
+        next_check_at: i64,
+        last_error: &str,
+        now_ms: i64,
+    ) -> ShanResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE ci_watches SET state=?2, next_check_at=?3, last_error=?4,
+                last_checked_at=?5, updated_at=?5, check_attempts=check_attempts+1
+             WHERE id=?1",
+            rusqlite::params![id, state.as_str(), next_check_at, last_error, now_ms],
         )?;
         Ok(())
     }

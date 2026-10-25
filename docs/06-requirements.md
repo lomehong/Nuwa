@@ -35,3 +35,14 @@
 - vendor/锁定 pi-rust 衍生代码版本；上游（≈0.85 版/天）只做选择性 cherry-pick
 - 上下文包与上报日志脱敏：密钥、敏感数据不进 LLM 上下文（2026-10-20 落地：work 启动清秘 + stack/title/prior context 已知 secret/常见 token pattern redaction；owner-authored `notes` 仍是自由文本）
 - 服务端 LLM key 只存在于运行器池一处；现场组件不含任何密钥
+
+## 需求标识索引
+
+- `REQ-001`：目标仓库均为所有者私有仓库，源码对服务端可达。
+- `REQ-002`：修复在服务端完成，现场只采集、上报和执行预定义验证脚本。
+- `REQ-003`：直接开 PR，CI 通过和所有者人工合并是唯一合入路径。
+- `REQ-004`：触发前按指纹聚合并去重，遵守冷却窗口。
+- `NFR-001`：保留 crate 必须有工作区 lints，Clippy 进入 CI。
+- `NFR-002`：vendored 版本锁定，本地补丁必须登记并接受上游对账。
+- `NFR-003`：上下文、日志、证据和转录必须脱敏。
+- `NFR-004`：LLM key 集中在 runner，现场组件不得持有密钥。

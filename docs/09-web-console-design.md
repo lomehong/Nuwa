@@ -169,17 +169,17 @@ web/
 
 ### 6.1 登录态
 
-- `POST /api/v1/auth/login { "token": "…" }`：与生效的 UI 令牌比较（`NUWA_UI_TOKEN`，未设则 fallback `NUWA_INGEST_TOKEN`）。
+- `POST /api/v1/auth/login { "token": "…" }`：只与 `NUWA_UI_TOKEN` 比较，绝不回退到部署在各采集服务上的 `NUWA_INGEST_TOKEN`。
 - 成功返回 `204` 并设置：
   - `nuwa_session`：`HttpOnly; SameSite=Strict; Path=/; Max-Age=<NUWA_SESSION_TTL_SECS>`（默认 86400）；`NUWA_COOKIE_SECURE=always`，或 `auto` 且请求带可信 `X-Forwarded-Proto: https` 时加 `Secure`。直接 HTTP 部署使用 `auto` 不会加 Secure；生产建议 TLS 代理 + `always`。
   - `nuwa_csrf`：非 HttpOnly，供双提交读取；`SameSite=Strict; Path=/; Max-Age=<NUWA_SESSION_TTL_SECS>`。
 - 会话值：`v1.<exp_ms>.<nonce>.<hmac_sha256(key, "v1.<exp_ms>.<nonce>")>`，base64url。`key = SHA256(startup_generation || ui_token)`；每次 serve 启动生成随机代际，重启或改 UI 令牌都会使旧会话失效，避免内存撤销表清空后已登出的 Cookie 恢复有效（ADR-019）。
 - `GET /api/v1/auth/me`：返回 `{ authenticated, local_mode, expires_at_ms }`；若 CSRF Cookie 缺失则补发。
-- `POST /api/v1/auth/logout`：清除两个 Cookie。
+- `POST /api/v1/auth/logout`：清除两个 Cookie，并在当前 serve 代际内撤销该会话。
 
 ### 6.2 本地模式
 
-- `NUWA_UI_TOKEN` 与 `NUWA_INGEST_TOKEN` 均为空时进入本地模式：API 视为已认证（`local_mode=true`），不显示登录页，但**仍下发 CSRF Cookie 并要求写操作携带令牌**，防止本机浏览器被跨站写。
+- 仅 `NUWA_UI_TOKEN` 为空时进入本地模式：API 视为已认证（`local_mode=true`），不显示登录页，但**仍下发 CSRF Cookie 并要求写操作携带令牌**，防止本机浏览器被跨站写。是否配置 `NUWA_INGEST_TOKEN` 不影响控制台本地模式；非回环监听且无 UI 令牌时 serve 拒绝启动。
 - 生产必须设置 UI 令牌；`/api/v1/system` 在本地模式下给出醒目警告。
 
 ### 6.3 CSRF 与同源
@@ -425,7 +425,7 @@ floor = NUWA_STUCK_AFTER_SECS（默认 300s，范围 60–86400）
 
 | 动作 | 允许的起始状态 | 结果 | 附加 |
 |---|---|---|---|
-| `reopen` | `escalated`、`rejected` | → `new` | 清冷却、清 owner、事件 `state_changed` detail=`reopened by owner` |
+| `reopen` | `escalated`、`rejected`、`ignored` | → `new` | 清冷却、清 owner、重置 attempts；`reason` 写入 owner 审计并进入下一轮 OWNER NOTE |
 | `requeue` | `triggered`、`fixing` | → `new` | 仅当 `stuck`；body 的 `force` 为 JSON 布尔（`true` 才生效，`"1"` 字符串不是合法布尔）可跳过卡单检查；清冷却/owner；事件 `requeued` detail=`stuck requeued by owner` |
 | 非法状态 | 其他 | `409 invalid_state` | 不改变数据 |
 
@@ -1166,12 +1166,12 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 ### 16.1 CI
 
 - `ci.yml` 增加 `web` job：Node 24 → `npm ci` → `npm run typecheck` → `npm run lint` → `npm test` → `npm run build`。
-- 保留 rust/go job；rust 仍只对自建 crate 零警告。
+- 保留 rust/go job；rust 仍只对自建 crate 零警告，并执行需求—设计—实现追溯校验。
 - 可选：main 分支 Playwright 冒烟 job；发布前本地必须跑通。
 
 ### 16.2 Release
 
-- `release.yml` 两个平台都先构建前端，再 `cargo build --release`。
+- `release.yml` 两个平台都先完成前端 typecheck/lint/test/build，以及自建 crate fmt/Clippy 和全 workspace 串行测试，再执行 `cargo build --release`；任一失败都不会产出 Release。Windows 仅跳过 `AGENTS.md` 已登记的上游预存失败 `os_cancel_interrupts_even_when_timeout_is_set`，其他失败仍阻断发布。
 - 注入构建 commit（`NUWA_BUILD_COMMIT`）；`/api/v1/system` 展示。
 - 产物仍是单文件；`web/dist` 除 `.gitkeep` 外不入库。
 

@@ -87,39 +87,92 @@ pub async fn wait_for_ci(
 /// One Actions poll. `None` means the runs are registered but not finished;
 /// callers that outlive a repair run use this instead of a blocking wait.
 pub async fn poll_ci_once(token: &str, slug: &str, sha: &str) -> anyhow::Result<Option<Verdict>> {
-    let http = github_http_client()?;
-    let resp = http
-        .get(format!(
-            "https://api.github.com/repos/{slug}/actions/runs?head_sha={sha}"
-        ))
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "nuwa")
-        .send()
-        .await
-        .context("poll actions runs")?;
-    let status = resp.status();
-    let payload: serde_json::Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!(
-            "actions runs {status}: {}",
-            payload["message"].as_str().unwrap_or("(no message)")
-        );
+    poll_ci_once_at("https://api.github.com", token, slug, sha).await
+}
+
+async fn poll_ci_once_at(
+    api_base: &str,
+    token: &str,
+    slug: &str,
+    sha: &str,
+) -> anyhow::Result<Option<Verdict>> {
+    poll_ci_once_with_timeout(
+        api_base,
+        token,
+        slug,
+        sha,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+}
+
+async fn poll_ci_once_with_timeout(
+    api_base: &str,
+    token: &str,
+    slug: &str,
+    sha: &str,
+    total_timeout: std::time::Duration,
+) -> anyhow::Result<Option<Verdict>> {
+    match tokio::time::timeout(
+        total_timeout,
+        poll_ci_once_pages(api_base, token, slug, sha),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => bail!("poll actions runs timed out after {total_timeout:?}"),
     }
-    let total = payload["total_count"].as_u64().unwrap_or(0);
-    let runs: Vec<(bool, Option<&str>)> = payload["workflow_runs"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|r| {
-                    (
-                        r["status"].as_str() == Some("completed"),
-                        r["conclusion"].as_str(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+}
+
+async fn poll_ci_once_pages(
+    api_base: &str,
+    token: &str,
+    slug: &str,
+    sha: &str,
+) -> anyhow::Result<Option<Verdict>> {
+    let http = github_http_client()?;
+    let mut page = 1_u32;
+    let mut runs: Vec<(bool, Option<String>)> = Vec::new();
+    let total = loop {
+        let page_text = page.to_string();
+        let resp = http
+            .get(format!("{api_base}/repos/{slug}/actions/runs"))
+            .query(&[("head_sha", sha), ("per_page", "100"), ("page", &page_text)])
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "nuwa")
+            .send()
+            .await
+            .context("poll actions runs")?;
+        let status = resp.status();
+        let payload: serde_json::Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "actions runs {status}: {}",
+                payload["message"].as_str().unwrap_or("(no message)")
+            );
+        }
+        let total = payload["total_count"].as_u64().unwrap_or(0);
+        let items = payload["workflow_runs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let page_len = items.len();
+        runs.extend(items.iter().map(|r| {
+            (
+                r["status"].as_str() == Some("completed"),
+                r["conclusion"].as_str().map(str::to_string),
+            )
+        }));
+        if page_len < 100 || runs.len() as u64 >= total {
+            break total;
+        }
+        page += 1;
+    };
+    let runs: Vec<(bool, Option<&str>)> = runs
+        .iter()
+        .map(|(completed, conclusion)| (*completed, conclusion.as_deref()))
+        .collect();
     Ok(aggregate(total, &runs))
 }
 
@@ -360,6 +413,8 @@ pub async fn reconcile_all(
 mod tests {
     use super::aggregate;
     use super::journal_terminal;
+    use super::poll_ci_once_at;
+    use super::poll_ci_once_with_timeout;
     use super::summarize_lines;
     use super::SyncError;
     use super::Verdict;
@@ -517,6 +572,87 @@ mod tests {
                 "errors": [{ "fingerprint": "fp-d", "message": "unparsable PR url nope" }],
             })
         );
+    }
+
+    #[tokio::test]
+    async fn poll_ci_reads_every_actions_page() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut request = [0_u8; 4096];
+                let read = socket.read(&mut request).await.expect("read");
+                let request = String::from_utf8_lossy(&request[..read]);
+                let second_page = request.contains("page=2");
+                let runs = if second_page { 1 } else { 100 };
+                let body = serde_json::json!({
+                    "total_count": 101,
+                    "workflow_runs": (0..runs)
+                        .map(|_| serde_json::json!({"status":"completed","conclusion":"success"}))
+                        .collect::<Vec<_>>()
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.expect("write");
+            }
+        });
+
+        let verdict = poll_ci_once_at(
+            &format!("http://{address}"),
+            "unused",
+            "acme/app",
+            "verified-sha",
+        )
+        .await
+        .expect("poll");
+        server.await.expect("server");
+        assert_eq!(verdict, Some(Verdict::Success));
+    }
+
+    #[tokio::test]
+    async fn poll_ci_has_a_total_timeout_across_pages() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let body = r#"{"total_count":0,"workflow_runs":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let started = std::time::Instant::now();
+        let error = poll_ci_once_with_timeout(
+            &format!("http://{address}"),
+            "unused",
+            "acme/app",
+            "verified-sha",
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("total timeout");
+        server.await.expect("server");
+        assert!(format!("{error:#}").contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     fn run(completed: bool, conclusion: Option<&str>) -> (bool, Option<&str>) {

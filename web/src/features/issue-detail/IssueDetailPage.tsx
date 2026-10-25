@@ -139,6 +139,9 @@ export function IssueDetailPage() {
           {data.ci_watch.last_checked_at_ms
             ? ` · 最近检查 ${formatDateTime(data.ci_watch.last_checked_at_ms)}`
             : " · 等待首次检查"}
+          {data.ci_watch.next_check_at_ms > 0
+            ? ` · 下次检查 ${formatDateTime(data.ci_watch.next_check_at_ms)}`
+            : " · 未排程"}
           {data.ci_watch.last_error ? ` · ${data.ci_watch.last_error}` : ""}
         </p>
       ) : null}

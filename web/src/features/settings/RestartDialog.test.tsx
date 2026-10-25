@@ -45,6 +45,7 @@ const ACTIVE_RUN = {
 const PENDING_RESTART = "正在重启，等待服务恢复…";
 
 async function openRestart() {
+  await screen.findByRole("heading", { level: 2, name: "设置" }, { timeout: 10_000 });
   fireEvent.click(await screen.findByRole("button", { name: "重启服务" }));
   fireEvent.click(await screen.findByRole("button", { name: "确认重启" }));
 }

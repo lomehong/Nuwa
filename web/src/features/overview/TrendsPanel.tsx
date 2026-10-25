@@ -218,21 +218,21 @@ export function TrendsPanel({
                   <dd className="mt-0.5 font-mono text-body text-text">
                     {formatPercent(trends.totals.false_positive_rate)}
                   </dd>
-                  <p className="text-caption text-text-muted">拒绝 /（合并 + 拒绝）</p>
+                  <dd className="text-caption text-text-muted">拒绝 /（合并 + 拒绝）</dd>
                 </div>
                 <div>
                   <dt className="text-text-muted">Review 延迟中位数</dt>
                   <dd className="mt-0.5 font-mono text-body text-text">
                     {formatSeconds(trends.totals.review_latency_p50_secs)}
                   </dd>
-                  <p className="text-caption text-text-muted">PR 打开 → 合并/拒绝</p>
+                  <dd className="text-caption text-text-muted">PR 打开 → 合并/拒绝</dd>
                 </div>
                 <div>
                   <dt className="text-text-muted">CI 红率</dt>
                   <dd className="mt-0.5 font-mono text-body text-text">
                     {formatPercent(trends.totals.ci_red_rate)}
                   </dd>
-                  <p className="text-caption text-text-muted">红 /（绿 + 红）</p>
+                  <dd className="text-caption text-text-muted">红 /（绿 + 红）</dd>
                 </div>
               </dl>
             </>

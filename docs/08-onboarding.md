@@ -58,7 +58,7 @@ defer q.Capture(func() { run() })
 // 信号 2：goroutine panic——安全包装（上报后重抛）
 q.Go(func() { watchTick() })
 
-// 信号 3：显式错误——异步队列（medium）
+// 信号 3：显式错误——异步队列（high）
 q.Error("cache warmup failed", err)
 
 // 信号 4：错误日志——挂进任何已有 slog.Logger（Warn 级起成为信号）
@@ -174,7 +174,7 @@ nuwa work --db shanhaijing.db \
 - `--service-unit`：记录 systemd 单元名（默认 `nuwa-work`）。控制台的「重启 unit」动作会消费它（缺失/非法时该动作禁用或 422）
 - `--daily-token-limit` / `--monthly-token-limit`：每仓库每日 / 滚动 30 天 token 上限（默认 5M / 50M；失败尝试也计入）
 - 密钥隔离：work 启动时把 `NUWA_GITHUB_TOKEN`/`GITHUB_TOKEN`/`ZAI_API_KEY`/`ANTHROPIC_API_KEY` 读入内存并从 env 移除；bash/验证子进程只收到白名单（PATH/HOME/GOCACHE 等）。非敏感的额外变量用 `NUWA_AGENT_ENV_ALLOW` 逗号追加。ssh-agent / credential store 仍需部署侧隔离（建议 runner 专用用户）。
-- 指令文件：tracked 配置以 `origin/<base>:nuwa.repo.json` 为权威；untracked 配置首次启动复制到 `<sessions>/_trusted/`。每轮领单前校验并恢复被改写的文件，`nuwa.repo.json` 本身也在隐式禁改名单。合并到 main 的新配置会在下一轮恢复文件，但 runner 进程内的配置对象要重启后再生效。
+- 指令文件：tracked 配置以 `origin/<base>:nuwa.repo.json` 为权威；untracked 配置首次启动复制到 `<sessions>/_trusted/`。每轮 fetch/reset 后、领单前刷新权威配置并校验恢复被改写的文件，`nuwa.repo.json` 本身也在隐式禁改名单。合并到 main 的新配置在下一轮生效，无需重启 runner；若新 base 开始跟踪指令文件，解析成功的 tracked 配置优先于旧私有副本。
 - pr_open 自动对账：serve 每 `NUWA_SYNC_INTERVAL` 秒（默认 600）对账一次，与手动 `nuwa sync` 共用锁。
 - 通知（可选）：`NUWA_WEBHOOK_URL`、`NUWA_WEBHOOK_SECRET`、`NUWA_WEBHOOK_EVENTS`；事件 JSON 带 `id`（每个事件唯一）、`ts_ms` 与 `X-Nuwa-Signature: sha256=<HMAC>`（签名覆盖整个 body，含 `id`/`ts_ms`）。默认订阅 `escalated,ignored,provider_stand_down,heartbeat_stale,ci_red,sync_error,pr_opened,runner_error`。进程退出前会等待队列清空（最多 10s），`escalated` 不再随退出丢失；**接收方必须校验 `ts_ms` 新鲜度并按 `id` 去重**，否则捕获的 body 可被重放。
 - 会话保留：work 启动及运行中定期清理超过 365 天无新 run 的 `sessions/<fp>` 目录；`_trusted` 永不清理。
@@ -192,7 +192,7 @@ nuwa work --db shanhaijing.db \
 
 **Web 控制台（v3 SPA，0.2.0 起是唯一控制台）**：`http://<server>:7321/`，在 `/login` 用 `NUWA_UI_TOKEN` 换取 HttpOnly 会话（**不再使用 Basic 头**）。`/` 就是 SPA 控制台；`/ui*` 308 永久重定向到 `/`，`/issue/{fp}` 重定向到 `/issues/{fp}`，`/settings` 直接由 SPA 提供；`/ingest` 与 `/health` 的路径和鉴权不变。SPA 提供总览、问题单列表/详情（含会话转录）、运行器、活动与设置。
 
-> **控制台令牌与上报令牌完全分离**：`NUWA_UI_TOKEN` 缺失时控制台进入本地模式，且**非回环监听会拒绝启动**。`NUWA_INGEST_TOKEN` 部署在每个被采集的服务上（泄露后果只是垃圾信号），绝不能当控制台凭据用——控制台能读设置页里的 LLM key。升级后只设了上报令牌的公网部署会启动失败，需补 `NUWA_UI_TOKEN`。`/api/v1/auth/logout` 会服务端撤销会话（复制走的 cookie 立即失效）；撤销表在内存中，重启清空——要强制所有设备下线就轮换 `NUWA_UI_TOKEN`。
+> **控制台令牌与上报令牌完全分离**：`NUWA_UI_TOKEN` 缺失时控制台进入本地模式，且**非回环监听会拒绝启动**。`NUWA_INGEST_TOKEN` 部署在每个被采集的服务上（泄露后果只是垃圾信号），绝不能当控制台凭据用——控制台能读设置页里的 LLM key。升级后只设了上报令牌的公网部署会启动失败，需补 `NUWA_UI_TOKEN`。`/api/v1/auth/logout` 会服务端撤销会话（复制走的 cookie 立即失效）；撤销表在内存中，但每次 serve 重启都会更换会话签名代际，因此所有旧 Cookie 都会失效并要求重新登录。
 
 - **问题单动作**：escalated/rejected/ignored 可 `重新打开`（回到 `new`、清冷却并重置 attempts）；new/escalated/rejected 可 `忽略`（填写原因；ignored 后同指纹报告只计数，不再自动修复）；卡单（`triggered`/`fixing` 且超过卡单窗口）可 `重排`。动作出现在详情头部、列表与总览待处理队列；成功 toast、失败逐条显示服务端错误。CLI 对应 `nuwa reopen --reason` / `nuwa ignore --reason`，理由会写入事件并在下一轮 prompt 中作为 OWNER NOTE。
 - **对账与重启**：`GitHub 对账` 汇总 checked/merged/rejected/still_open，并逐条展示 `errors[]`；runner `重启 unit` 先确认影响（显示当前修复指纹，提示同一 unit 承载的多个 runner 会一起重启）。409 表示已有重启在排程，422 指出 `service_unit` 缺失/非法，501 直接给出手动 `systemctl restart <unit>` 命令。
@@ -242,7 +242,7 @@ cd web && NUWA_E2E_BASE_URL=http://127.0.0.1:7404 NUWA_E2E_TOKEN=dummy npm run t
 | `GET /api/v1/events?kind=&repo=&fingerprint=&from_ms=&to_ms=&aggregate=1&page=&page_size=` | 活动流（`aggregate=1` 按 fingerprint+UTC 小时聚合 `reported`） |
 | `GET /api/v1/metrics/trends?range=7d\|14d\|30d\|90d&repo=` | UTC 日桶趋势与区间合计 |
 
-- token 模式下 GET 也要求有效 `nuwa_session` cookie（先 `POST /api/v1/auth/login`）；本地模式（未设 `NUWA_UI_TOKEN`/`NUWA_INGEST_TOKEN`）免会话。
+- token 模式下 GET 也要求有效 `nuwa_session` cookie（先 `POST /api/v1/auth/login`）；本地模式（未设 `NUWA_UI_TOKEN`）免会话，`NUWA_INGEST_TOKEN` 是否配置不影响控制台鉴权。
 - 非 GET 请求另需 `X-NUWA-CSRF` 头，其值须与 `nuwa_csrf` cookie 一致（双提交校验）；GET 不要求 CSRF 头。**本地模式同样强制 CSRF**（防止浏览器跨站驱动本机控制台），前端必须先 `GET /api/v1/auth/me` 拿到可读的 `nuwa_csrf` cookie。
 
 ## 6 · 动作、设置、系统与转录 API（v3 控制台 M2c）
@@ -253,10 +253,10 @@ cd web && NUWA_E2E_BASE_URL=http://127.0.0.1:7404 NUWA_E2E_TOKEN=dummy npm run t
 
 | 端点 | body | 成功 | 失败 |
 |---|---|---|---|
-| `POST /api/v1/issues/{fp}/reopen` | `{"reason":"…"}`（可选） | 204，状态回到 `new` 并清 owner | 404 未知单；409 非 `escalated`/`rejected`；422 body 类型错误 |
+| `POST /api/v1/issues/{fp}/reopen` | `{"reason":"…"}`（可选） | 204，状态回到 `new` 并清 owner | 404 未知单；409 非 `escalated`/`rejected`/`ignored`；422 body 类型错误 |
 | `POST /api/v1/issues/{fp}/requeue` | `{"force":true,"reason":"…"}`（可选） | 204，卡单回到 `new` 并清 owner | 404；409 非 `triggered`/`fixing` 或未卡单；422 |
 
-- `reason` 为前端契约字段，当前**不落库**；审计事件固定为 `state_changed`（detail `reopened by owner`）与 `requeued`（detail `stuck requeued by owner`），actor 均为 `owner`。
+- `reopen` 的 `reason` 写入 owner 审计事件并进入下一轮 OWNER NOTE；`requeue` 的 `reason` 当前仅接受、不落库。事件分别为 `state_changed` 与 `requeued`，actor 均为 `owner`。
 - 卡单窗口 = `max(3 × owner runner interval_secs, NUWA_STUCK_AFTER_SECS)`；没有 owner 时按默认 30s interval、300s floor。`force=true` 跳过卡单判定，仍要求状态为 `triggered`/`fixing`。
 
 ### 6.2 对账与重启

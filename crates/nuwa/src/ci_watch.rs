@@ -67,16 +67,7 @@ pub async fn tick(store: &Store, api: &dyn CiWatchApi, now: i64) -> Result<usize
             eprintln!("ci watch   : {} — {detail}", watch.fingerprint);
             let retries = watch.check_attempts.saturating_add(1);
             let backoff = (PENDING_RECHECK_MS * (1_i64 << retries.min(6))).min(3_600_000);
-            let _ = store.update_ci_watch(
-                watch.id,
-                watch.state,
-                watch.last_verdict.as_deref(),
-                now + backoff,
-                Some(&detail),
-                watch.memory_written,
-                None,
-                now,
-            );
+            let _ = store.record_ci_watch_error(watch.id, watch.state, now + backoff, &detail, now);
         }
     }
     Ok(count)
@@ -117,35 +108,6 @@ async fn advance(store: &Store, api: &dyn CiWatchApi, watch: &CiWatchRow, now: i
         }
         Some(Verdict::Success) => {
             let pr = api.pr_state(&watch.slug, watch.pr_number).await?;
-            match pr.as_str() {
-                "merged" => {
-                    store.update_ci_watch(
-                        watch.id,
-                        CiWatchState::Merged,
-                        Some("green"),
-                        now + GREEN_RECHECK_MS,
-                        None,
-                        watch.memory_written,
-                        Some(now),
-                        now,
-                    )?;
-                    return Ok(());
-                }
-                "closed" => {
-                    store.update_ci_watch(
-                        watch.id,
-                        CiWatchState::Closed,
-                        Some("green"),
-                        now + GREEN_RECHECK_MS,
-                        None,
-                        watch.memory_written,
-                        Some(now),
-                        now,
-                    )?;
-                    return Ok(());
-                }
-                _ => {}
-            }
             if watch.last_verdict.as_deref() != Some("green") {
                 let _ = store.record_event(
                     &watch.fingerprint,
@@ -178,15 +140,20 @@ async fn advance(store: &Store, api: &dyn CiWatchApi, watch: &CiWatchRow, now: i
                         .is_ok();
                 }
             }
+            let (state, terminal_at) = match pr.as_str() {
+                "merged" => (CiWatchState::Merged, Some(now)),
+                "closed" => (CiWatchState::Closed, Some(now)),
+                _ => (CiWatchState::Green, None),
+            };
             store
                 .update_ci_watch(
                     watch.id,
-                    CiWatchState::Green,
+                    state,
                     Some("green"),
                     now + GREEN_RECHECK_MS,
                     None,
                     memory_written,
-                    None,
+                    terminal_at,
                     now,
                 )
                 .context("record green CI watch")?;
@@ -194,6 +161,29 @@ async fn advance(store: &Store, api: &dyn CiWatchApi, watch: &CiWatchRow, now: i
         Some(Verdict::Failure) => {
             let pr = api.pr_state(&watch.slug, watch.pr_number).await?;
             if pr == "closed" {
+                let _ = store.record_event(
+                    &watch.fingerprint,
+                    now,
+                    Some(&watch.repo),
+                    "runner",
+                    "ci_red",
+                    &format!(
+                        "head {} — PR closed without merge; no automatic reopen",
+                        short(&watch.head_sha)
+                    ),
+                );
+                if let Some(run_id) = &watch.run_id {
+                    let _ = store.set_run_ci_verdict(run_id, "failure");
+                }
+                webhook::emit(webhook::WebhookEvent::new(
+                    "ci_red",
+                    Some(watch.fingerprint.clone()),
+                    Some(watch.repo.clone()),
+                    format!(
+                        "PR #{} is closed without merge and CI is red — manual follow-up required",
+                        watch.pr_number
+                    ),
+                ));
                 store.update_ci_watch(
                     watch.id,
                     CiWatchState::Closed,
@@ -444,6 +434,88 @@ mod tests {
             .expect("pr");
     }
 
+    struct FlakyApi {
+        failures: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl CiWatchApi for FlakyApi {
+        async fn verdict(&self, _slug: &str, _sha: &str) -> Result<Option<Verdict>> {
+            let mut failures = self.failures.lock().expect("failures");
+            if *failures > 0 {
+                *failures -= 1;
+                anyhow::bail!("GitHub unavailable")
+            }
+            Ok(Some(Verdict::Success))
+        }
+
+        async fn pr_state(&self, _slug: &str, _number: u64) -> Result<String> {
+            Ok("open".into())
+        }
+
+        async fn close_pr(&self, _slug: &str, _number: u64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn error_backoff_grows_and_resets_after_success() {
+        let store = Store::open(":memory:").expect("store");
+        let fp = issue(&store, 1);
+        to_pr_open(&store, &fp, 2);
+        watch(&store, &fp, 3);
+        let api = FlakyApi {
+            failures: Mutex::new(2),
+        };
+
+        tick(&store, &api, 10).await.expect("first failure");
+        let row = store.ci_watch_for(&fp).expect("watch").expect("row");
+        assert_eq!(row.check_attempts, 1);
+        assert_eq!(row.next_check_at, 10 + 60_000);
+
+        tick(&store, &api, 60_010).await.expect("second failure");
+        let row = store.ci_watch_for(&fp).expect("watch").expect("row");
+        assert_eq!(row.check_attempts, 2);
+        assert_eq!(row.next_check_at, 60_010 + 120_000);
+
+        tick(&store, &api, 180_010).await.expect("recovery");
+        let row = store.ci_watch_for(&fp).expect("watch").expect("row");
+        assert_eq!(row.state, CiWatchState::Green);
+        assert_eq!(row.check_attempts, 0);
+    }
+
+    struct PrStateErrorApi;
+
+    #[async_trait]
+    impl CiWatchApi for PrStateErrorApi {
+        async fn verdict(&self, _slug: &str, _sha: &str) -> Result<Option<Verdict>> {
+            Ok(Some(Verdict::Success))
+        }
+
+        async fn pr_state(&self, _slug: &str, _number: u64) -> Result<String> {
+            anyhow::bail!("PR state unavailable")
+        }
+
+        async fn close_pr(&self, _slug: &str, _number: u64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn green_pr_state_error_does_not_publish_evidence_early() {
+        let store = Store::open(":memory:").expect("store");
+        let fp = issue(&store, 1);
+        to_pr_open(&store, &fp, 2);
+        watch(&store, &fp, 3);
+
+        assert!(tick(&store, &PrStateErrorApi, 10).await.is_ok());
+        assert!(!store
+            .events_for(&fp, 20)
+            .expect("events")
+            .iter()
+            .any(|event| event.kind == "ci_green"));
+    }
+
     #[tokio::test]
     async fn green_is_not_terminal_and_records_memory_once() {
         let store = Store::open(":memory:").expect("store");
@@ -503,6 +575,57 @@ mod tests {
         let issue_row = &store.list_issues().expect("issues")[0];
         assert_eq!(issue_row.state, "ignored");
         assert_eq!(issue_row.attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn terminal_green_after_merge_still_records_memory() {
+        let store = Store::open(":memory:").expect("store");
+        let fp = issue(&store, 1);
+        to_pr_open(&store, &fp, 2);
+        watch(&store, &fp, 3);
+        let api = FakeApi {
+            verdicts: Mutex::new(vec![Some(Verdict::Success)]),
+            pr_state: Mutex::new("merged".into()),
+            closed: Mutex::new(Vec::new()),
+        };
+        tick(&store, &api, 10).await.expect("tick");
+
+        let row = store.ci_watch_for(&fp).expect("watch").expect("row");
+        assert_eq!(row.state, CiWatchState::Merged);
+        assert!(row.memory_written);
+        assert_eq!(
+            store
+                .recent_repair_memory("example.com/ci-watch", "", 10)
+                .expect("memory")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn red_after_external_close_alerts_without_reopening() {
+        let store = Store::open(":memory:").expect("store");
+        let fp = issue(&store, 1);
+        to_pr_open(&store, &fp, 2);
+        watch(&store, &fp, 3);
+        let api = FakeApi {
+            verdicts: Mutex::new(vec![Some(Verdict::Failure)]),
+            pr_state: Mutex::new("closed".into()),
+            closed: Mutex::new(Vec::new()),
+        };
+        tick(&store, &api, 10).await.expect("tick");
+
+        assert!(api.closed.lock().expect("closed").is_empty());
+        assert_eq!(store.list_issues().expect("issues")[0].state, "pr_open");
+        assert!(store
+            .events_for(&fp, 20)
+            .expect("events")
+            .iter()
+            .any(|event| event.kind == "ci_red"));
+        assert_eq!(
+            store.ci_watch_for(&fp).expect("watch").expect("row").state,
+            CiWatchState::Closed
+        );
     }
 
     #[tokio::test]

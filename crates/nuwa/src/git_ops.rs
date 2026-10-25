@@ -13,6 +13,142 @@ use anyhow::{bail, Context};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+#[cfg(windows)]
+mod windows_job {
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+
+    use anyhow::bail;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenThread, ResumeThread, CREATE_SUSPENDED, PROCESS_SET_QUOTA,
+        PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
+    };
+
+    pub const SUSPENDED: u32 = CREATE_SUSPENDED;
+
+    pub struct Job(HANDLE);
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    pub fn create() -> anyhow::Result<Job> {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job == 0 {
+                bail!(
+                    "CreateJobObjectW failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let job = Job(job);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const c_void,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                bail!(
+                    "SetInformationJobObject failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            Ok(job)
+        }
+    }
+
+    pub fn assign(job: &Job, pid: u32) -> anyhow::Result<()> {
+        unsafe {
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if process == 0 {
+                bail!(
+                    "OpenProcess({pid}) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let process = OwnedHandle(process);
+            if AssignProcessToJobObject(job.0, process.0) == 0 {
+                bail!(
+                    "AssignProcessToJobObject({pid}) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        resume_main_thread(pid)
+    }
+
+    fn resume_main_thread(pid: u32) -> anyhow::Result<()> {
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                bail!(
+                    "CreateToolhelp32Snapshot failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let snapshot = OwnedHandle(snapshot);
+            let mut entry: THREADENTRY32 = zeroed();
+            entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            let mut found = Thread32First(snapshot.0, &mut entry);
+            loop {
+                if found == 0 {
+                    bail!("no thread found for child process {pid}");
+                }
+                if entry.th32OwnerProcessID == pid {
+                    let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                    if thread == 0 {
+                        bail!(
+                            "OpenThread({pid}) failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                    let thread = OwnedHandle(thread);
+                    if ResumeThread(thread.0) == u32::MAX {
+                        bail!(
+                            "ResumeThread({pid}) failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                    return Ok(());
+                }
+                found = Thread32Next(snapshot.0, &mut entry);
+            }
+        }
+    }
+
+    pub fn terminate(job: &Job) {
+        unsafe {
+            let _ = TerminateJobObject(job.0, 0);
+        }
+    }
+}
+
 pub struct ProcessOutput {
     pub success: bool,
     pub stdout: String,
@@ -59,11 +195,19 @@ pub async fn run_process(
     {
         command.process_group(0);
     }
+    #[cfg(windows)]
+    let job = {
+        let job = windows_job::create()?;
+        command.creation_flags(windows_job::SUSPENDED);
+        job
+    };
 
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn {program} {}", args.join(" ")))?;
     let pid = child.id().context("child has no pid")?;
+    #[cfg(windows)]
+    windows_job::assign(&job, pid)?;
     let mut stdout = child.stdout.take().context("stdout")?;
     let mut stderr = child.stderr.take().context("stderr")?;
     let stdout_task = tokio::spawn(async move {
@@ -88,12 +232,14 @@ pub async fn run_process(
             // 组杀尽力覆盖孙进程；`start_kill` 是内核级 SIGKILL，不依赖
             // 外部 kill 命令的 PATH/权限——CI runner 上外部 kill 曾失效，
             // sleep 30 跑满全程才返回（2026-10-20）。
+            #[cfg(windows)]
+            windows_job::terminate(&job);
             kill_tree(pid).await;
             let _ = child.start_kill();
-            match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
                 Ok(status) => break status.context("wait after timeout")?,
                 Err(_) => {
-                    bail!("child {pid} still alive 5s after SIGKILL — sandbox refused the kill")
+                    bail!("child {pid} still alive 1s after SIGKILL — sandbox refused the kill")
                 }
             }
         }
@@ -124,6 +270,8 @@ pub async fn run_process(
             // tasks finish harmlessly once EOF arrives. Report a timeout: the
             // overall operation exceeded its budget.
             timed_out = true;
+            #[cfg(windows)]
+            windows_job::terminate(&job);
             kill_tree(pid).await;
             (Vec::new(), Vec::new())
         }
@@ -311,23 +459,26 @@ pub fn reset_to_base(repo: &Path, base: &str) -> anyhow::Result<()> {
 /// Kill a child and its descendants. Unix uses the process group created by
 /// `process_group(0)`; Windows uses `taskkill /T`.
 async fn kill_tree(pid: u32) {
-    #[cfg(unix)]
-    {
-        let group = format!("-{pid}");
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &group])
-            .status();
-        // Fallback for platforms where the group signal did not apply.
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .output();
-    }
+    let cleanup = tokio::task::spawn_blocking(move || {
+        #[cfg(unix)]
+        {
+            let group = format!("-{pid}");
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &group])
+                .status();
+            // Fallback for platforms where the group signal did not apply.
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .output();
+        }
+    });
+    let _ = tokio::time::timeout(Duration::from_millis(500), cleanup).await;
     tokio::task::yield_now().await;
 }
 
@@ -403,6 +554,64 @@ mod tests {
         };
         assert!(!status.success());
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn run_process_timeout_is_bounded_even_when_tree_cleanup_stalls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        let (program, args): (&str, &[&str]) = ("sh", &["-c", "sleep 30"]);
+        #[cfg(windows)]
+        let (program, args): (&str, &[&str]) = ("cmd", &["/C", "ping -n 30 127.0.0.1 >NUL"]);
+
+        let start = Instant::now();
+        let out = run_process(program, args, dir.path(), Duration::from_millis(100), None)
+            .await
+            .expect("run_process");
+        let elapsed = start.elapsed();
+        assert!(out.timed_out);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "run_process cleanup exceeded its budget: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_process_timeout_kills_descendants_not_only_the_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("survived.txt");
+        #[cfg(unix)]
+        let (program, args) = (
+            "sh",
+            vec![
+                "-c".to_string(),
+                "(sleep 2; echo survived > survived.txt) & sleep 30".to_string(),
+            ],
+        );
+        #[cfg(windows)]
+        let (program, args) = {
+            let script = dir.path().join("tree.cmd");
+            std::fs::write(
+                &script,
+                "@echo off\r\nstart /B cmd /C \"ping -n 3 127.0.0.1 >NUL & echo survived > survived.txt\"\r\nping -n 30 127.0.0.1 >NUL\r\n",
+            )
+            .expect("write tree script");
+            (
+                "cmd",
+                vec!["/C".to_string(), script.to_string_lossy().into_owned()],
+            )
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+        let out = run_process(program, &args, dir.path(), Duration::from_secs(1), None)
+            .await
+            .expect("run_process");
+        assert!(out.timed_out);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "a descendant survived the process-tree cleanup"
+        );
     }
 
     #[tokio::test]
