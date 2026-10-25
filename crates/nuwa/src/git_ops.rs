@@ -628,12 +628,15 @@ mod tests {
     async fn run_process_timeout_kills_descendants_not_only_the_parent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = dir.path().join("survived.txt");
+        // 后代在 10s 时写 marker（远晚于 1s 超时），给 CI 双核 runner 上
+        // 357 个并行测试的 CPU 竞争留足调度余量——杀树即使被饿到 5-8s
+        // 执行也仍在窗口内；若杀树完全失效，marker 在 10s 出现即失败。
         #[cfg(unix)]
         let (program, args) = (
             "sh",
             vec![
                 "-c".to_string(),
-                "(sleep 2; echo survived > survived.txt) & sleep 30".to_string(),
+                "(sleep 10; echo survived > survived.txt) & sleep 30".to_string(),
             ],
         );
         #[cfg(windows)]
@@ -641,7 +644,7 @@ mod tests {
             let script = dir.path().join("tree.cmd");
             std::fs::write(
                 &script,
-                "@echo off\r\nstart /B cmd /C \"ping -n 3 127.0.0.1 >NUL & echo survived > survived.txt\"\r\nping -n 30 127.0.0.1 >NUL\r\n",
+                "@echo off\r\nstart /B cmd /C \"ping -n 11 127.0.0.1 >NUL & echo survived > survived.txt\"\r\nping -n 30 127.0.0.1 >NUL\r\n",
             )
             .expect("write tree script");
             (
@@ -655,7 +658,8 @@ mod tests {
             .await
             .expect("run_process");
         assert!(out.timed_out);
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // 覆盖后代写入点（10s）：杀树生效则 marker 永不出现。
+        tokio::time::sleep(Duration::from_secs(12)).await;
         assert!(
             !marker.exists(),
             "a descendant survived the process-tree cleanup"
