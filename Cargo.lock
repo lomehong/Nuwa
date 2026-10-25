@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "nuwa"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "shanhaijing"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "rusqlite",
  "serde",
