@@ -20,6 +20,7 @@ mod verify;
 mod web;
 mod webhook;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -671,10 +672,18 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
 }
 
 #[derive(Debug)]
+/// One active repair in this process. The single-run loop has at most one; a
+/// future in-process pool has several.
+struct RunLive {
+    phase: Option<String>,
+}
+
 struct RunnerLive {
     status: String,
-    current_fingerprint: Option<String>,
-    phase: Option<String>,
+    /// Active repairs keyed by fingerprint. The runner row stays single-valued,
+    /// so with more than one active run the heartbeat reports neither a
+    /// fingerprint nor a phase instead of arbitrarily picking one.
+    runs: BTreeMap<String, RunLive>,
     last_error: Option<String>,
     /// Real progress (phase/turn), not the independent liveness heartbeat.
     progress_at_ms: i64,
@@ -688,8 +697,7 @@ impl RunnerLive {
     fn new() -> Self {
         Self {
             status: "starting".into(),
-            current_fingerprint: None,
-            phase: None,
+            runs: BTreeMap::new(),
             last_error: None,
             progress_at_ms: 0,
             consecutive_provider_failures: 0,
@@ -867,10 +875,16 @@ async fn live_snapshot(
     live: &SharedLive,
 ) -> (String, Option<String>, Option<String>, Option<String>, i64) {
     let state = live.lock().await;
+    let (fingerprint, phase) = if state.runs.len() == 1 {
+        let (fingerprint, run) = state.runs.first_key_value().expect("one active run");
+        (Some(fingerprint.clone()), run.phase.clone())
+    } else {
+        (None, None)
+    };
     (
         state.status.clone(),
-        state.current_fingerprint.clone(),
-        state.phase.clone(),
+        fingerprint,
+        phase,
         state.last_error.clone(),
         state.progress_at_ms,
     )
@@ -928,9 +942,32 @@ async fn live_update(
 ) {
     let mut state = live.lock().await;
     state.status = status.to_string();
-    state.current_fingerprint = fp.map(str::to_string);
-    state.phase = phase.map(str::to_string);
+    match fp {
+        Some(fingerprint) => {
+            state.runs.insert(
+                fingerprint.to_string(),
+                RunLive {
+                    phase: phase.map(str::to_string),
+                },
+            );
+        }
+        None => {
+            // The single-run loop uses a glob update to mean "no run is
+            // active"; a pool finishes one run via `live_end` instead so the
+            // other runs stay visible.
+            state.runs.clear();
+        }
+    }
     state.last_error = error;
+    state.progress_at_ms = now_ms();
+}
+
+/// Remove one finished run without clearing the others. The single-run loop
+/// clears via `live_update(None, "idle", …)`; a pool calls this per run.
+#[allow(dead_code)]
+async fn live_end(live: &SharedLive, fingerprint: &str) {
+    let mut state = live.lock().await;
+    state.runs.remove(fingerprint);
     state.progress_at_ms = now_ms();
 }
 
@@ -4377,5 +4414,35 @@ mod tests {
         let run_b = store.latest_run(&fp_b).expect("latest b").expect("run b");
         assert_eq!(run_b.outcome.as_deref(), Some("interrupted"));
         assert!(run_b.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn runner_live_aggregates_multiple_runs_without_picking_one() {
+        let live: SharedLive = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
+        live_update(&live, "working", Some("fp1"), Some("repair"), None).await;
+        let (status, fingerprint, phase, _, _) = live_snapshot(&live).await;
+        assert_eq!(status, "working");
+        assert_eq!(fingerprint.as_deref(), Some("fp1"));
+        assert_eq!(phase.as_deref(), Some("repair"));
+
+        live_update(&live, "working", Some("fp2"), Some("deliver"), None).await;
+        let (status, fingerprint, phase, _, _) = live_snapshot(&live).await;
+        assert_eq!(status, "working");
+        assert!(
+            fingerprint.is_none(),
+            "two active runs must not arbitrarily pick one"
+        );
+        assert!(phase.is_none());
+
+        live_end(&live, "fp1").await;
+        let (_, fingerprint, phase, _, _) = live_snapshot(&live).await;
+        assert_eq!(fingerprint.as_deref(), Some("fp2"));
+        assert_eq!(phase.as_deref(), Some("deliver"));
+
+        live_update(&live, "idle", None, None, None).await;
+        let (status, fingerprint, phase, _, _) = live_snapshot(&live).await;
+        assert_eq!(status, "idle");
+        assert!(fingerprint.is_none());
+        assert!(phase.is_none());
     }
 }
