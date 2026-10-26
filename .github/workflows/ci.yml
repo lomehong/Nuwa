@@ -89,6 +89,46 @@ jobs:
       - name: cargo audit (RUSTSEC advisories)
         run: cargo audit
 
+  musl:
+    # 静态产物：部署到旧 glibc 或无 libc 的容器时不依赖运行时。
+    # 只构建 + 冒烟，不重复跑全量测试（gnu/windows 的 CI 已覆盖）。
+    runs-on: ubuntu-latest
+    env:
+      NUWA_BUILD_COMMIT: ${{ github.sha }}
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: build web console (embedded)
+        working-directory: web
+        run: npm ci && npm run build
+      - name: build static binary
+        run: cargo build --release -p nuwa --target x86_64-unknown-linux-musl
+      - name: verify static + smoke
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/nuwa
+          file "$bin"
+          # static-pie 的 file 文案是 "static-pie linked"；用 PT_INTERP 判定
+          # 更可靠：静态产物不应有动态加载器。
+          if readelf -l "$bin" | grep -q "INTERP"; then
+            echo "::error::musl build has a dynamic interpreter"
+            exit 1
+          fi
+          db="$(mktemp -d)/smoke.db"
+          "$bin" status --db "$db" > /dev/null
+          test -s "$db"
+
   types:
     # API DTO → 前端 TypeScript 类型的单一来源：ts-rs 只在 `ts-export` feature
     # 下编译（生产构建零负担）。main 上生成并自动提交基线；PR 上只校验

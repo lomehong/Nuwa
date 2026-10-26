@@ -13,14 +13,24 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
             artifact: nuwa-linux-x64
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
             artifact: nuwa-windows-x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: nuwa-linux-x64-musl
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -37,8 +47,11 @@ jobs:
       - name: fmt (self-owned crates)
         run: cargo fmt --check -p nuwa -p shanhaijing
       - name: clippy (self-owned crates)
+        # musl 变体只负责静态构建与冒烟；host 编译门已由 gnu/msvc 覆盖。
+        if: matrix.target != 'x86_64-unknown-linux-musl'
         run: cargo clippy --no-deps -p nuwa -p shanhaijing --all-targets -- -D warnings
       - name: tests (workspace)
+        if: matrix.target != 'x86_64-unknown-linux-musl'
         timeout-minutes: 20
         shell: bash
         run: |
@@ -48,20 +61,37 @@ jobs:
           else
             cargo test --workspace -- --test-threads=1 --nocapture
           fi
-      - run: cargo build --release -p nuwa
+      - run: cargo build --release -p nuwa --target ${{ matrix.target }}
         env:
           # 编译期注入版本指纹：/api/v1/system 的 build_commit（tag 构建时是
           # tag 指向的提交）。
           NUWA_BUILD_COMMIT: ${{ github.sha }}
+          # 只对 musl 目标生效；其他目标忽略这两个变量。
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      - name: static smoke (musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/nuwa"
+          file "$bin"
+          # static-pie 的 file 文案是 "static-pie linked"；用 PT_INTERP 判定
+          # 更可靠：静态产物不应有动态加载器。
+          if readelf -l "$bin" | grep -q "INTERP"; then
+            echo "::error::musl build has a dynamic interpreter"
+            exit 1
+          fi
+          "$bin" status --db "$(mktemp -d)/smoke.db" > /dev/null
       - name: package
         shell: bash
         run: |
           test -f web/dist/index.html
           mkdir -p dist
-          if [ -f target/release/nuwa.exe ]; then
-            cp target/release/nuwa.exe "dist/${{ matrix.artifact }}.exe"
+          bin="target/${{ matrix.target }}/release/nuwa"
+          if [ -f "$bin.exe" ]; then
+            cp "$bin.exe" "dist/${{ matrix.artifact }}.exe"
           else
-            cp target/release/nuwa "dist/${{ matrix.artifact }}"
+            cp "$bin" "dist/${{ matrix.artifact }}"
           fi
       - uses: actions/upload-artifact@v4
         with:

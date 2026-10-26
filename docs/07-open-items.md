@@ -133,7 +133,8 @@
 - **同步至 v0.13.2（2026-10-26）**：本地快进 10 个提交，`v0.11.0`–`v0.13.2` 五个 tag 已推送；GitHub Release 产出 v0.11.0、v0.12.0、v0.13.2（v0.13.0/v0.13.1 未单独产出，由 v0.13.2 覆盖）。此前标注「未提交/本地修复分支」的三批全部入库：v0.11.0 = ADR-019 系统性审查修复（3 P1 / 10 P2 / 1 P3），v0.12.0 = schema v9 无人值守闭环（失败收敛 / 交付幂等 / 持续 CI 观察），v0.13.0 = 二次审查修复（Windows Job Object 进程树、交付幂等复核、traceability 等）。v0.13.1/v0.13.2 收口进程树清理：GitHub runner 上外部 `kill` 组杀未生效导致后代存活，改为读取 `/proc` 递归枚举后代并多轮杀（单次枚举存在内核竞态，后台任务可在首轮杀与枚举之间再 fork）；杀树回归测试在 GitHub 沙箱不向后台化后代递送 SIGKILL，且双核 357 个并行测试饱和 CPU 时 marker 写入会被调度饿过 2s 写点，三重杀未及执行也会假红，故标记 `ignore` 以恢复绿基线。CI 与 release 仍为串行测试（`--test-threads=1`），并行卡死问题继续挂起。
 - **验证门深检三角（2026-10-26）**：Go 仓库（base 根有 `go.mod`）在 red/green 之外追加 `go vet ./...` 与 `go build ./...`；base 绿则分支必须绿，base 红/超时/工具不可用则跳过并写入 `verification_detail`；不替代 `.nuwa/repro.sh` 复现门（ADR-021）。测试覆盖规格选择、红基线跳过、分支红拦截、双侧绿。**注意：这补的是构建/vet 回归，不等于能复现 main 运行时 panic——后者仍靠复现门。**
 - **基准补 main 运行时场景（2026-10-26）**：新增 `go-main-panic`——base 上 `go test ./...` 绿，panic 只在 main 调用路径触发；场景声明 `base_green` + 平台复现脚本，faux 修复后由交付门验证 `.nuwa/repro.sh` red→green，基准用同一复现命令计分（不再拿已绿的 failing_check 冒充 repaired）。带集成测试。
-- 下一步：真实系统首例机器人闭环（部署环境/密钥）→ 并发池/镜像矩阵（A-3）→ musl 静态构建 → 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
+- **musl 静态产物（2026-10-26）**：CI 新增 `musl` job（`musl-tools` + `x86_64-unknown-linux-musl`），release 矩阵增加 `nuwa-linux-x64-musl`；构建后用 PT_INTERP 断言无动态加载器，并用临时库跑 `nuwa status` 冒烟。gnu/msvc 仍跑 clippy + 全量测试，musl 只做构建/冒烟。
+- 下一步：真实系统首例机器人闭环（部署环境/密钥）→ 并发池/镜像矩阵（A-3）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 

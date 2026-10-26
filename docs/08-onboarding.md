@@ -18,7 +18,7 @@
 ```
 
 - systemd 单元：`nuwa-serve`（`serve --listen 0.0.0.0:7321`）+ `nuwa-work`（`work --loop --interval 60 --pr --runner-id <host:repo> --service-unit nuwa-work --sessions /opt/nuwa/sessions`），均 `Restart=on-failure`。**`--sessions` 必须传绝对路径**：相对路径写入 `runs.session_dir` 后，转录接口（只接受绝对路径）读不到失败/中断 run 的会话。相对路径在启动时也会被解析为绝对路径，但显式传入可避免依赖进程 cwd。
-- 已知噪音：ubuntu 构建的产物在旧 glibc 上有 weak-version 警告（不致命）——待办：musl 静态构建
+- 已知噪音：ubuntu 构建的产物在旧 glibc 上有 weak-version 警告（不致命）——release 另提供 `nuwa-linux-x64-musl` 静态产物，无 libc 依赖
 - 腾讯云控制台安全组：放行 **TCP 7321**（来源限采集器网段）
 - 传输注意：CN→GitHub 大文件（>12MB）下载会被掐断——release 产物下载用**分块 Range 循环**，或本机经 SSH 直传（SSH 隧道稳定）
 
