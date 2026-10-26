@@ -1,0 +1,25 @@
+{
+  "name": "go-main-panic",
+  "title": "Go main 运行时 panic（单测不覆盖）",
+  "description": "Average 越界只在 main 的调用路径触发；go test 在 base 上为绿，必须写复现脚本证明 red→green。",
+  "language": "go",
+  "failing_check": {
+    "command": "go test ./...",
+    "timeout_secs": 180
+  },
+  "base_green": true,
+  "writes": [
+    {
+      "path": "main.go",
+      "content": "package main\n\nimport \"fmt\"\n\nfunc Average(xs []int) float64 {\n\tif len(xs) == 0 {\n\t\treturn 0\n\t}\n\tsum := 0\n\tfor i := 0; i < len(xs); i++ {\n\t\tsum += xs[i]\n\t}\n\treturn float64(sum) / float64(len(xs))\n}\n\nfunc Greeting() string { return \"hello\" }\n\nfunc main() {\n\tfmt.Println(Average([]int{1, 2, 3}))\n}\n"
+    }
+  ],
+  "reproducer": {
+    "unix_path": ".nuwa/repro.sh",
+    "unix_content": "#!/bin/sh\nset -e\ngo run .\n",
+    "windows_path": ".nuwa/repro.cmd",
+    "windows_content": "@go run .\r\n@if errorlevel 1 exit /b 1\r\n"
+  },
+  "final": "ROOT CAUSE: Average 的循环边界 i <= len(xs) 在 main 的非空输入路径越界 panic，单测未覆盖。\nCHANGE: 边界改为 i < len(xs)，空切片返回 0。\nVERIFICATION: go test ./... 绿；.nuwa/repro.sh 在 base 红、修复后绿。\nOUTCOME: fixed",
+  "expect_fixed": true
+}

@@ -314,6 +314,18 @@ pub(crate) async fn check_working_tree(
     run_check(repo, check, &env, secrets).await
 }
 
+/// Score a base-green benchmark scenario with the same reproducer command the
+/// delivery gate runs, instead of the configured check that was already green.
+pub(crate) async fn check_reproducer_working_tree(
+    repo: &Path,
+    secrets: &Secrets,
+) -> anyhow::Result<CheckOutput> {
+    let (path, _) = find_reproducer(repo)?;
+    let check = reproducer_check(&path);
+    let env = crate::secrets::agent_env_allowlist();
+    run_check(repo, &check, &env, secrets).await
+}
+
 /// Go repos get a vet/build triangle alongside the configured test check.
 /// Repos without a root `go.mod` (or other languages) are left alone: the
 /// runner cannot derive a meaningful command for them.

@@ -301,6 +301,7 @@ nuwa benchmark run --provider faux --scenario node-empty-average,go-off-by-one -
 ```
 
 - `faux` 只证明流水线与门禁，不证明模型修复质量；`live` 才衡量模型，比较时固定 provider/model/场景集。
+- 场景可声明 `base_green: true` + 平台复现脚本：configured check 在 base 已绿、bug 只在运行时触发；基准用与交付门相同的 reproducer 计分（内置 `go-main-panic` 即此路径），不再拿已绿的 failing_check 冒充 repaired。
 - 最终报告的 `OUTCOME: fixed|not_fixed|unverified` 是明确声明；仅唯一合法的 `OUTCOME: fixed` 计入 `claimed_fixed`。`VERIFICATION:` 的存在不代表成功，实际 `repaired` 由独立检查决定。
 - 每次运行写 `benchmark_runs` / `benchmark_results`；控制台 `/benchmarks` 看趋势、误报与逐场景证据。
 - 负对照（`expect_fixed=false`）必须保持“未修复”，否则说明门禁退化。

@@ -15,7 +15,7 @@ use anyhow::{bail, Context};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 
-use crate::issue::{FailingCheck, Issue};
+use crate::issue::{FailingCheck, Issue, VerificationMode};
 use crate::repair::ProviderKind;
 use crate::{git_ops, pipeline, provider_meta, secrets, verify};
 use rpi_ai::providers::faux::FauxScript;
@@ -37,10 +37,25 @@ pub struct Scenario {
     pub command_windows: Option<String>,
     #[serde(default)]
     pub writes: Vec<ScenarioWrite>,
+    /// The configured check already passes on the base commit: the bug is only
+    /// reachable at runtime, so the reproducer carries the proof.
+    #[serde(default)]
+    pub base_green: bool,
+    /// Platform-specific reproducer the faux agent writes alongside the fix.
+    #[serde(default)]
+    pub reproducer: Option<ScenarioReproducer>,
     #[serde(default, rename = "final")]
     pub final_message: String,
     #[serde(default)]
     pub expect_fixed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScenarioReproducer {
+    pub unix_path: String,
+    pub unix_content: String,
+    pub windows_path: String,
+    pub windows_content: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -424,7 +439,11 @@ async fn run_one_inner(
     let base = verify::probe_check(&repo, "main", &check, secrets)
         .await
         .context("run failing check on base")?;
-    if base.ok {
+    if scenario.base_green {
+        if !base.ok {
+            bail!("scenario invalid: base_green requires failing_check to pass on the base commit");
+        }
+    } else if base.ok {
         bail!("scenario invalid: failing_check is green on the base commit");
     }
 
@@ -442,7 +461,11 @@ async fn run_one_inner(
         failing_check: check.clone(),
         reproduce_check: None,
         forbidden_paths: Vec::new(),
-        verification_mode: Default::default(),
+        verification_mode: if scenario.base_green {
+            VerificationMode::Reproducer
+        } else {
+            VerificationMode::default()
+        },
     };
     let faux_script = matches!(provider, ProviderKind::Faux).then(|| scenario_script(scenario));
     let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
@@ -465,7 +488,15 @@ async fn run_one_inner(
     result.final_report = Some(bounded(&secrets.redact(&report.root_cause_text), 8_000));
     result.claimed_fixed = claimed_fixed(&report.root_cause_text);
 
-    match verify::check_working_tree(&repo, &check, secrets).await {
+    // A base-green scenario is already green on the configured check; only the
+    // reproducer can prove the runtime bug was fixed. Use the same helper the
+    // delivery gate uses so scoring and gating cannot drift.
+    let post = if scenario.base_green {
+        verify::check_reproducer_working_tree(&repo, secrets).await
+    } else {
+        verify::check_working_tree(&repo, &check, secrets).await
+    };
+    match post {
         Ok(output) => result.repaired = output.ok,
         Err(error) => {
             result.error = Some(bounded(
@@ -531,6 +562,17 @@ fn scenario_script(scenario: &Scenario) -> FauxScript {
         script = script.with_tool_call(
             "write",
             serde_json::json!({"path": write.path, "content": write.content}),
+        );
+    }
+    if let Some(reproducer) = &scenario.reproducer {
+        let (path, content) = if cfg!(windows) {
+            (&reproducer.windows_path, &reproducer.windows_content)
+        } else {
+            (&reproducer.unix_path, &reproducer.unix_content)
+        };
+        script = script.with_tool_call(
+            "write",
+            serde_json::json!({"path": path, "content": content}),
         );
     }
     if !scenario.final_message.trim().is_empty() {
@@ -634,6 +676,17 @@ mod tests {
             scenarios.iter().any(|scenario| !scenario.expect_fixed),
             "negative control is required to measure false positives"
         );
+        assert!(
+            scenarios.iter().any(|scenario| scenario.base_green),
+            "a runtime-only scenario is required to exercise the reproducer path"
+        );
+        for scenario in scenarios.iter().filter(|scenario| scenario.base_green) {
+            assert!(
+                scenario.reproducer.is_some(),
+                "{} needs a platform reproducer",
+                scenario.name
+            );
+        }
         for scenario in &scenarios {
             assert!(
                 claimed_fixed(&scenario.final_message),
@@ -697,6 +750,54 @@ mod tests {
         assert!(
             result.delivery_ok,
             "green branch must pass the delivery gate"
+        );
+        assert!(result.error.is_none(), "{:?}", result.error);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn faux_runtime_only_scenario_uses_reproducer() {
+        let scenario = load_scenarios()
+            .expect("scenarios")
+            .into_iter()
+            .find(|scenario| scenario.name == "go-main-panic")
+            .expect("runtime-only scenario");
+        let secrets = secrets::Secrets::default();
+        let mut result = BenchmarkResultInput {
+            run_id: "test-runtime-only".into(),
+            scenario: scenario.name.clone(),
+            language: scenario.language.clone(),
+            expected_fixed: scenario.expect_fixed,
+            repaired: false,
+            claimed_fixed: false,
+            delivery_ok: false,
+            turns: 0,
+            tokens_uncached: 0,
+            tokens_cached: 0,
+            duration_ms: 0,
+            root_cause: None,
+            final_report: None,
+            error: None,
+        };
+        run_one_inner(
+            "test",
+            &scenario,
+            &ProviderKind::Faux,
+            12,
+            &secrets,
+            &mut result,
+        )
+        .await
+        .expect("scenario run");
+        assert!(
+            result.repaired,
+            "reproducer must be green after the fix: {:?}",
+            result.error
+        );
+        assert!(result.claimed_fixed);
+        assert!(
+            result.delivery_ok,
+            "red→green reproducer must pass the gate: {:?}",
+            result.error
         );
         assert!(result.error.is_none(), "{:?}", result.error);
     }
