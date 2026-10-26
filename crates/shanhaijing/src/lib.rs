@@ -404,6 +404,19 @@ pub struct RunnerUpsert {
     pub config_json: String,
 }
 
+/// Result of trying to become the single live process for a runner id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerLeaseOutcome {
+    /// This process now owns the id and the checkout.
+    Acquired,
+    /// Another live process owns this runner id.
+    HeldByRunner,
+    /// A different runner id is using the same checkout path. Two processes
+    /// sharing one working tree would reset each other mid-repair, so this is
+    /// a configuration error rather than something to wait for.
+    CheckoutInUse(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct RunnerHeartbeat {
     pub heartbeat_at: i64,
@@ -2895,7 +2908,7 @@ impl Store {
         instance_id: &str,
         now_ms: i64,
         ttl_ms: i64,
-    ) -> ShanResult<bool> {
+    ) -> ShanResult<RunnerLeaseOutcome> {
         let mut conn = self.lock();
         // IMMEDIATE takes the write lock before the lease check: two processes
         // starting together must serialize here, not both read "free" and race
@@ -2909,7 +2922,21 @@ impl Store {
             )
             .optional()?;
         if free == Some(false) {
-            return Ok(false);
+            return Ok(RunnerLeaseOutcome::HeldByRunner);
+        }
+        // One working tree per live runner: two ids sharing a checkout would
+        // both reset/fetch it and corrupt each other's repair.
+        let checkout_holder: Option<String> = tx
+            .query_row(
+                "SELECT id FROM runners
+                 WHERE id != ?1 AND repo_path = ?2 AND lease_until > ?3
+                 LIMIT 1",
+                rusqlite::params![r.id, r.repo_path, now_ms],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(holder) = checkout_holder {
+            return Ok(RunnerLeaseOutcome::CheckoutInUse(holder));
         }
         upsert_runner_on(&tx, r)?;
         tx.execute(
@@ -2917,7 +2944,7 @@ impl Store {
             rusqlite::params![r.id, instance_id, now_ms.saturating_add(ttl_ms)],
         )?;
         tx.commit()?;
-        Ok(true)
+        Ok(RunnerLeaseOutcome::Acquired)
     }
 
     /// Extend the lease while this process is alive. False means another
@@ -6883,14 +6910,20 @@ mod runner_tests {
         let at = 1_000;
         let ttl = 60;
 
-        assert!(store
-            .try_acquire_runner_lease(&registration(1, at), "a", at, ttl)
-            .expect("acquire a"));
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&registration(1, at), "a", at, ttl)
+                .expect("acquire a"),
+            RunnerLeaseOutcome::Acquired
+        );
 
         // A contender must neither take the lease nor overwrite the live row.
-        assert!(!store
-            .try_acquire_runner_lease(&registration(2, at + 10), "b", at + 10, ttl)
-            .expect("contend b"));
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&registration(2, at + 10), "b", at + 10, ttl)
+                .expect("contend b"),
+            RunnerLeaseOutcome::HeldByRunner
+        );
         let runner = store.list_runners().expect("list").pop().expect("runner");
         assert_eq!(
             runner.pid,
@@ -6905,15 +6938,21 @@ mod runner_tests {
         assert!(!store
             .renew_runner_lease("host:repo", "b", at + 50, ttl)
             .expect("renew b"));
-        assert!(!store
-            .try_acquire_runner_lease(&registration(2, at + 60), "b", at + 60, ttl)
-            .expect("still held"));
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&registration(2, at + 60), "b", at + 60, ttl)
+                .expect("still held"),
+            RunnerLeaseOutcome::HeldByRunner
+        );
 
         // A crashed holder stops renewing; after the TTL another process takes over.
         let expired = at + 50 + ttl + 1;
-        assert!(store
-            .try_acquire_runner_lease(&registration(2, expired), "b", expired, ttl)
-            .expect("takeover"));
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&registration(2, expired), "b", expired, ttl)
+                .expect("takeover"),
+            RunnerLeaseOutcome::Acquired
+        );
         assert!(!store
             .renew_runner_lease("host:repo", "a", expired + 1, ttl)
             .expect("stale holder"));
@@ -6922,9 +6961,54 @@ mod runner_tests {
         store
             .release_runner_lease("host:repo", "b")
             .expect("release");
-        assert!(store
-            .try_acquire_runner_lease(&registration(3, expired + 2), "c", expired + 2, ttl)
-            .expect("after release"));
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&registration(3, expired + 2), "c", expired + 2, ttl)
+                .expect("after release"),
+            RunnerLeaseOutcome::Acquired
+        );
+    }
+
+    #[test]
+    fn a_checkout_can_only_have_one_live_runner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("s.db")).expect("open");
+        let at = 1_000;
+        let ttl = 60;
+        let mut first = registration(1, at);
+        first.id = "host:repo-a".into();
+        let mut second = registration(2, at);
+        second.id = "host:repo-b".into();
+
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&first, "a", at, ttl)
+                .expect("first"),
+            RunnerLeaseOutcome::Acquired
+        );
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&second, "b", at + 1, ttl)
+                .expect("second"),
+            RunnerLeaseOutcome::CheckoutInUse("host:repo-a".into())
+        );
+
+        // A distinct checkout is fine; an expired holder no longer blocks.
+        second.repo_path = Some("/opt/nuwa/repo-b".into());
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&second, "b", at + 2, ttl)
+                .expect("distinct checkout"),
+            RunnerLeaseOutcome::Acquired
+        );
+        let mut third = registration(3, at);
+        third.id = "host:repo-c".into();
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&third, "c", at + ttl + 3, ttl)
+                .expect("expired checkout"),
+            RunnerLeaseOutcome::Acquired
+        );
     }
 }
 

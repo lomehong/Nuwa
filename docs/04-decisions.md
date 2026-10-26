@@ -196,7 +196,7 @@
 
 - 状态：已接受（2026-10-23）
 - 背景：`revive_orphaned_fixing` 按 `owner_runner_id` 复活启动前的在途单；两个**同 id** 的活进程会在各自启动时把对方的活单当孤儿回收，重复修复并双推同一 `agent/fix/*` 分支。claim 的原子 owner 只能挡住异 id 抢占，挡不住同 id 复活。
-- 决策：schema v8 在 `runners` 增加 `instance_id` / `lease_until`。`nuwa work` 启动时以随机实例 id 在同一事务内完成「租约检查 + runner 注册」：租约被其他实例持有则等待至多 TTL+10s（覆盖崩溃重启），仍失败则拒绝启动；心跳每 5–15s 续租；续租失败（被接管）以退出码 0 终止，让新持有者继续而不是让 systemd 再起第三个竞争者；正常退出或收到 SIGTERM 时释放租约（否则 systemd 重启要等满 TTL）。`revive_orphaned_fixing` 语义不变，由租约保证它只在独占时运行。
+- 决策：schema v8 在 `runners` 增加 `instance_id` / `lease_until`。`nuwa work` 启动时以随机实例 id 在同一事务内完成「租约检查 + checkout 占用检查 + runner 注册」：租约被其他实例持有则等待至多 TTL+10s（覆盖崩溃重启），仍失败则拒绝启动；**不同 runner id 也不能共用同一份 canonical checkout**（两个进程会互相 reset/fetch），直接拒绝并给出占用者 id。心跳每 5–15s 续租；续租失败（被接管）以退出码 0 终止，让新持有者继续而不是让 systemd 再起第三个竞争者；正常退出或收到 SIGTERM 时释放租约（否则 systemd 重启要等满 TTL）。`revive_orphaned_fixing` 语义不变，由租约保证它只在独占时运行。
 - 边界：这是单写者**前置条件**，不是分布式锁——不做 fencing token；进程长时间暂停/分区后可能出现短暂重叠，由续租失败退出收敛。租约 TTL 60s，崩溃后最迟一个 TTL 可被接管。
 - 被否决备选：仅比较 heartbeat 新鲜度（启动时刚写入的心跳无法区分死进程与新进程）；见到同 id 直接失败不等待（崩溃重启会与自己的旧租约冲突，systemd 反复失败）；引入外部锁服务（单机单库部署，超出边界）。
 

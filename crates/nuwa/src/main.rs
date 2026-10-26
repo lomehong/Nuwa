@@ -464,6 +464,13 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         monthly_token_limit,
     );
     let instance_id = uuid::Uuid::new_v4().to_string();
+    // Compare checkouts by canonical path: `--repo a/../repo` and a symlinked
+    // alias must not sneak two workers onto the same working tree.
+    let repo_path = std::fs::canonicalize(&repo_dir)
+        .or_else(|_| std::path::absolute(&repo_dir))
+        .unwrap_or_else(|_| repo_dir.clone())
+        .display()
+        .to_string();
     let make_registration = |at: i64| shanhaijing::RunnerUpsert {
         id: runner_id.clone(),
         repo: repo_config.repo.clone(),
@@ -477,7 +484,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         provider: Some(provider_name.clone()),
         model: Some(model_name.clone()),
         daily_pr_limit: Some(daily_pr_limit as i64),
-        repo_path: Some(repo_dir.display().to_string()),
+        repo_path: Some(repo_path.clone()),
         service_unit: Some(service_unit.clone()),
         config_json: config_json.clone(),
     };
@@ -495,8 +502,10 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             at,
             RUNNER_LEASE_TTL_MS,
         ) {
-            Ok(true) => break,
-            Ok(false) if std::time::Instant::now() < lease_deadline => {
+            Ok(shanhaijing::RunnerLeaseOutcome::Acquired) => break,
+            Ok(shanhaijing::RunnerLeaseOutcome::HeldByRunner)
+                if std::time::Instant::now() < lease_deadline =>
+            {
                 if !lease_wait_announced {
                     eprintln!(
                         "lease       : runner id `{runner_id}` is held by another process; \
@@ -507,9 +516,13 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
-            Ok(false) => bail!(
+            Ok(shanhaijing::RunnerLeaseOutcome::HeldByRunner) => bail!(
                 "runner id `{runner_id}` is already active — stop the other process \
                  or pass a distinct --runner-id"
+            ),
+            Ok(shanhaijing::RunnerLeaseOutcome::CheckoutInUse(holder)) => bail!(
+                "checkout `{repo_path}` is already used by live runner `{holder}` — \
+                 give each worker its own clone"
             ),
             Err(e) => return Err(e).context("acquire runner lease"),
         }

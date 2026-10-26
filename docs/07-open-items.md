@@ -134,7 +134,8 @@
 - **验证门深检三角（2026-10-26）**：Go 仓库（base 根有 `go.mod`）在 red/green 之外追加 `go vet ./...` 与 `go build ./...`；base 绿则分支必须绿，base 红/超时/工具不可用则跳过并写入 `verification_detail`；不替代 `.nuwa/repro.sh` 复现门（ADR-021）。测试覆盖规格选择、红基线跳过、分支红拦截、双侧绿。**注意：这补的是构建/vet 回归，不等于能复现 main 运行时 panic——后者仍靠复现门。**
 - **基准补 main 运行时场景（2026-10-26）**：新增 `go-main-panic`——base 上 `go test ./...` 绿，panic 只在 main 调用路径触发；场景声明 `base_green` + 平台复现脚本，faux 修复后由交付门验证 `.nuwa/repro.sh` red→green，基准用同一复现命令计分（不再拿已绿的 failing_check 冒充 repaired）。带集成测试。
 - **musl 静态产物（2026-10-26）**：CI 新增 `musl` job（`musl-tools` + `x86_64-unknown-linux-musl`），release 矩阵增加 `nuwa-linux-x64-musl`；构建后用 PT_INTERP 断言无动态加载器，并用临时库跑 `nuwa status` 冒烟。gnu/msvc 仍跑 clippy + 全量测试，musl 只做构建/冒烟。
-- 下一步：真实系统首例机器人闭环（部署环境/密钥）→ 并发池/镜像矩阵（A-3）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
+- **多 worker checkout 互斥（2026-10-26，A-3 拓扑）**：runner 租约在同一事务内新增 checkout 占用检查——不同 runner id 不能共用同一份 canonical 仓库路径（否则两个进程会互相 reset/fetch）。配合同 id 互斥与 claim 原子 owner，支持“同库多 worker、各自 clone”的并发拓扑；docs/08 补部署说明。**仍未做**：单进程内多工作树池与预构建 runner 镜像矩阵（ops 产物）。
+- 下一步：真实系统首例机器人闭环（部署环境/密钥）→ runner 镜像矩阵/单进程池（A-3 剩余）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 
