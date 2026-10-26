@@ -110,7 +110,7 @@ fn main() -> anyhow::Result<()> {
     // Snapshot + scrub before any runtime thread exists: setenv/unsetenv racing
     // getenv/environ/fork is unsafe, and the snapshot is what later reads use.
     env_store::init_from_process_env();
-    secrets::scrub_os_env();
+    secrets::Secrets::scrub_os_env();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
