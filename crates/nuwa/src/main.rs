@@ -131,7 +131,7 @@ async fn run_command() -> anyhow::Result<()> {
         Some("benchmark") => benchmark::run(argv.collect()).await,
         Some("migrate-env") => run_migrate_env(argv.collect()),
         other => bail!(
-            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--runner-id <id>] [--service-unit <unit>] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp> [--reason <text>]   (owner reviewed an escalation)\n            nuwa ignore --db <path> --fingerprint <fp> [--reason <text>]   (owner mute / not a bug)\n            nuwa check --instructions <path> [--repo <path>] [--base main] [--json]   (preflight a repo config)\n            nuwa benchmark [run] [--db <path>] [--provider faux|zai|anthropic] [--model <id>] [--scenario <name,...>] [--max-turns N] [--json]   (repair benchmark; `benchmark list` prints scenarios)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
+            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--runner-id <id>] [--service-unit <unit>] [--pool N] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp> [--reason <text>]   (owner reviewed an escalation)\n            nuwa ignore --db <path> --fingerprint <fp> [--reason <text>]   (owner mute / not a bug)\n            nuwa check --instructions <path> [--repo <path>] [--base main] [--json]   (preflight a repo config)\n            nuwa benchmark [run] [--db <path>] [--provider faux|zai|anthropic] [--model <id>] [--scenario <name,...>] [--max-turns N] [--json]   (repair benchmark; `benchmark list` prints scenarios)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
         ),
     }
 }
@@ -338,6 +338,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let mut create_pr = false;
     let mut loop_run = false;
     let mut interval_secs: u64 = env_d("NUWA_INTERVAL", "30").parse().unwrap_or(30);
+    let mut pool: u32 = env_d("NUWA_POOL", "1").parse().unwrap_or(1);
     let mut daily_pr_limit: u64 = env_d("NUWA_DAILY_PR_LIMIT", "5").parse().unwrap_or(5);
     let mut max_tokens: u64 = env_d("NUWA_MAX_TOKENS", "1500000")
         .parse()
@@ -405,6 +406,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             }
             "--loop" => loop_run = true,
             "--interval" => interval_secs = value("--interval")?.parse()?,
+            "--pool" => pool = value("--pool")?.parse()?,
             "--daily-pr-limit" => daily_pr_limit = value("--daily-pr-limit")?.parse()?,
             "--max-tokens" => max_tokens = value("--max-tokens")?.parse()?,
             "--daily-token-limit" => daily_token_limit = value("--daily-token-limit")?.parse()?,
@@ -416,6 +418,9 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             "--service-unit" => service_unit = value("--service-unit")?,
             other => bail!("unknown work flag {other}"),
         }
+    }
+    if !(1..=16).contains(&pool) {
+        bail!("--pool must be between 1 and 16");
     }
     let secrets = Arc::new(secrets::Secrets::load_and_scrub_env());
     let provider = provider_given.unwrap_or_else(env_provider_default);
@@ -459,32 +464,121 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let shared_repo = Arc::new(tokio::sync::Mutex::new(()));
     #[cfg(unix)]
     spawn_sigterm_lease_release(Arc::clone(&store), Arc::clone(&leases));
-    run_runner(RunnerRun {
-        store,
-        trusted,
-        repo_dir: repo_dir.clone(),
-        config_root: repo_dir,
-        sessions_dir,
-        provider,
-        max_turns,
-        push,
-        create_pr,
-        loop_run,
-        interval_secs,
-        daily_pr_limit,
-        max_tokens,
-        daily_token_limit,
-        monthly_token_limit,
-        ci_timeout_secs,
-        runner_id,
-        service_unit,
-        secrets,
-        event_retention_days,
-        maintenance: true,
-        leases,
-        shared_repo,
-    })
-    .await
+    if pool == 1 {
+        return run_runner(RunnerRun {
+            store,
+            trusted,
+            repo_dir: repo_dir.clone(),
+            config_root: repo_dir,
+            sessions_dir,
+            provider,
+            max_turns,
+            push,
+            create_pr,
+            loop_run,
+            interval_secs,
+            daily_pr_limit,
+            max_tokens,
+            daily_token_limit,
+            monthly_token_limit,
+            ci_timeout_secs,
+            runner_id,
+            service_unit,
+            secrets,
+            event_retention_days,
+            maintenance: true,
+            leases,
+            shared_repo,
+        })
+        .await;
+    }
+
+    // In-process pool: worker #1 edits the primary checkout; #2..N get
+    // detached worktrees. Each worker owns its runner id, lease, heartbeat and
+    // trusted-instruction copy; the DB queue stays shared.
+    let mut worktrees = Vec::new();
+    for i in 2..=pool {
+        worktrees.push(
+            workspace::RunWorkspace::worktree(&repo_dir, base, &format!("{runner_id}-{i}"))
+                .with_context(|| format!("provision pool worktree {i}"))?,
+        );
+    }
+    let mut specs = Vec::with_capacity(pool as usize);
+    let mut primary_trusted = Some(trusted);
+    for i in 1..=pool {
+        let (worker_repo, worker_trusted, worker_id, maintenance) = if i == 1 {
+            (
+                repo_dir.clone(),
+                primary_trusted
+                    .take()
+                    .context("primary trusted instructions")?,
+                runner_id.clone(),
+                true,
+            )
+        } else {
+            let worker_trusted = instructions::TrustedInstructions::load(
+                &repo_dir,
+                &instructions_path,
+                base,
+                &sessions_dir.join("_trusted").join(format!("worker-{i}")),
+            )
+            .with_context(|| format!("load trusted instructions for worker {i}"))?;
+            if worker_trusted.verify_and_restore()? {
+                eprintln!(
+                    "preflight   : worker {i} restored {} from the trusted instruction source",
+                    worker_trusted.path().display()
+                );
+            }
+            (
+                worktrees[(i - 2) as usize].path().to_path_buf(),
+                worker_trusted,
+                sanitize_runner_id(&format!("{runner_id}-{i}")),
+                false,
+            )
+        };
+        specs.push(RunnerRun {
+            store: Arc::clone(&store),
+            trusted: worker_trusted,
+            repo_dir: worker_repo,
+            config_root: repo_dir.clone(),
+            sessions_dir: sessions_dir.clone(),
+            provider: provider.clone(),
+            max_turns,
+            push,
+            create_pr,
+            loop_run,
+            interval_secs,
+            daily_pr_limit,
+            max_tokens,
+            daily_token_limit,
+            monthly_token_limit,
+            ci_timeout_secs,
+            runner_id: worker_id,
+            service_unit: service_unit.clone(),
+            secrets: Arc::clone(&secrets),
+            event_retention_days,
+            maintenance,
+            leases: Arc::clone(&leases),
+            shared_repo: Arc::clone(&shared_repo),
+        });
+    }
+    // Keep the worktrees (and their Drop cleanup) alive until every worker exits.
+    let _worktrees = worktrees;
+    let results = futures::future::join_all(specs.into_iter().map(|spec| {
+        let id = spec.runner_id.clone();
+        async move {
+            let result = run_runner(spec).await;
+            if let Err(error) = &result {
+                eprintln!("worker {id}: {error:#}");
+            }
+            result
+        }
+    }))
+    .await;
+    if let Some(error) = results.into_iter().find_map(Result::err) {
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Everything one runner needs. A pool builds several of these with distinct
@@ -703,6 +797,7 @@ async fn run_runner(spec: RunnerRun) -> anyhow::Result<()> {
                 &mut trusted,
                 &repo_dir,
                 &config_root,
+                shared_repo.as_ref(),
                 sessions_dir.clone(),
                 provider.clone(),
                 max_turns,
@@ -1355,6 +1450,25 @@ fn resolve_base(repo_dir: &Path) -> anyhow::Result<&'static str> {
 async fn preflight_repo(repo_dir: &Path, fetch: bool) -> anyhow::Result<&'static str> {
     let base = resolve_base(repo_dir)?;
     let head = git_ops::current_branch(repo_dir)?;
+    if head == "HEAD" {
+        // Detached per-run worktree: the primary checkout owns the base
+        // branch, so never `checkout` it here. Fetch and hard-reset the
+        // worktree to the current base instead.
+        let has_origin = git_ops::git(repo_dir, &["remote", "get-url", "origin"]).is_ok();
+        if has_origin {
+            if fetch {
+                git_ops::fetch_base(repo_dir, base, Duration::from_secs(120)).await?;
+            }
+            git_ops::reset_to_base(repo_dir, base)?;
+        } else {
+            git_ops::git(repo_dir, &["reset", "--hard", base])?;
+        }
+        let _ = git_ops::git(
+            repo_dir,
+            &["clean", "-fd", "--", ":(exclude)nuwa.repo.json"],
+        );
+        return Ok(base);
+    }
     if head != base {
         if head.starts_with("agent/fix/") {
             // The runner owns this checkout. The interrupted branch keeps its
@@ -1704,11 +1818,13 @@ async fn work_once(
     live: SharedLive,
     secrets: &Arc<secrets::Secrets>,
 ) -> anyhow::Result<bool> {
+    let shared_repo = tokio::sync::Mutex::new(());
     work_once_in(
         store,
         trusted,
         repo_dir,
         repo_dir,
+        &shared_repo,
         sessions_dir,
         provider,
         max_turns,
@@ -1736,6 +1852,7 @@ async fn work_once_in(
     trusted: &mut instructions::TrustedInstructions,
     repo_dir: &Path,
     config_root: &Path,
+    shared_repo: &tokio::sync::Mutex<()>,
     sessions_dir: PathBuf,
     provider: repair::ProviderKind,
     max_turns: u32,
@@ -1809,7 +1926,10 @@ async fn work_once_in(
     // waiting: an idle runner polls every 30–60s, and a fetch per poll was a
     // pointless round trip to GitHub.
     let pickable = store.count_ready_for_repo(now, &repo_config.repo)? > 0;
-    let base = match preflight_repo(repo_dir, pickable).await {
+    let base = match {
+        let _guard = shared_repo.lock().await;
+        preflight_repo(repo_dir, pickable).await
+    } {
         Ok(base) => base,
         Err(e) => {
             live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
@@ -4578,6 +4698,118 @@ mod tests {
         let run_b = store.latest_run(&fp_b).expect("latest b").expect("run b");
         assert_eq!(run_b.outcome.as_deref(), Some("interrupted"));
         assert!(run_b.finished_at.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pool_runs_two_issues_in_one_process() {
+        use shanhaijing::Store;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::write(
+            repo.join("calc.go"),
+            "package main\n\nfunc Average(xs []float64) float64 {\n\
+             \tvar sum float64\n\
+             \tfor i := 0; i <= len(xs); i++ {\n\
+             \t\tsum += xs[i]\n\
+             \t}\n\
+             \treturn sum / float64(len(xs))\n\
+             }\n",
+        )
+        .expect("calc");
+        let instructions = serde_json::json!({
+            "repo": "example.com/spike",
+            "failing_check": { "command": fixed_loop_check() },
+            "forbidden_paths": [],
+            "notes": ""
+        });
+        std::fs::write(repo.join("nuwa.repo.json"), instructions.to_string())
+            .expect("instructions");
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+
+        let db = dir.path().join("pool.db");
+        let sessions = dir.path().join("sessions");
+        let now = now_ms();
+        let store = Store::open(&db).expect("open");
+        let sig_a = shanhaijing::Signal {
+            repo: "example.com/spike".into(),
+            language: "go".into(),
+            title: "panic in Average".into(),
+            severity: "high".into(),
+            message: None,
+            log_window: Vec::new(),
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+        };
+        let sig_b = shanhaijing::Signal {
+            title: "panic in Pipeline".into(),
+            log_window: Vec::new(),
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Pipeline()\n\t/app/calc.go:25 +0x1".into(),
+            ..sig_a.clone()
+        };
+        store.report_signal(&sig_a, now).expect("a");
+        store.report_signal(&sig_b, now + 1).expect("b");
+        let fingerprints: Vec<String> = store
+            .list_issues()
+            .expect("issues")
+            .into_iter()
+            .map(|issue| issue.fingerprint)
+            .collect();
+        assert_eq!(fingerprints.len(), 2);
+        drop(store);
+
+        run_work(vec![
+            "--db".into(),
+            db.display().to_string(),
+            "--instructions".into(),
+            repo.join("nuwa.repo.json").display().to_string(),
+            "--sessions".into(),
+            sessions.display().to_string(),
+            "--provider".into(),
+            "faux".into(),
+            "--runner-id".into(),
+            "test:runner".into(),
+            "--pool".into(),
+            "2".into(),
+            "--interval".into(),
+            "5".into(),
+            "--max-turns".into(),
+            "5".into(),
+            "--max-tokens".into(),
+            "1000000".into(),
+        ])
+        .await
+        .expect("pool run");
+
+        let store = Store::open(&db).expect("reopen");
+        let ids: std::collections::BTreeSet<String> = store
+            .list_runners()
+            .expect("runners")
+            .into_iter()
+            .map(|runner| runner.id)
+            .collect();
+        assert!(ids.contains("test:runner"), "{ids:?}");
+        assert!(ids.contains("test:runner-2"), "{ids:?}");
+        for fingerprint in fingerprints {
+            let run = store
+                .latest_run(&fingerprint)
+                .expect("latest")
+                .expect("run");
+            assert_eq!(run.outcome.as_deref(), Some("success"), "{fingerprint}");
+        }
     }
 
     #[tokio::test]
