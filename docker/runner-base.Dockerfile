@@ -5,9 +5,9 @@
 # job) copies the musl binary to `docker/nuwa` first.
 FROM alpine:3.20
 
+# Controllers often bind-mount a checkout owned by another uid; the container
+# is single-purpose and already unprivileged.
 RUN apk add --no-cache ca-certificates git openssh-client bash tzdata \
-    # Controllers often bind-mount a checkout owned by another uid; the
-    # container is single-purpose and already unprivileged.
     && git config --system --add safe.directory '*'
 
 COPY docker/nuwa /usr/local/bin/nuwa
