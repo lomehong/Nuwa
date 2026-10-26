@@ -32,14 +32,14 @@ jobs:
       - name: build web console (embedded fixtures)
         working-directory: web
         run: npm ci && npm run build
-      - name: compile nuwa lib tests
-        run: cargo test -p nuwa --lib --no-run
-      - name: nuwa lib parallel probe
+      - name: compile nuwa bin tests
+        run: cargo test -p nuwa --bin nuwa --no-run
+      - name: nuwa bin parallel probe
         timeout-minutes: 20
         run: |
           for i in $(seq 1 "${{ inputs.iterations }}"); do
             echo "=== parallel iteration $i/${{ inputs.iterations }} ==="
-            timeout -k 10 180 cargo test -p nuwa --lib -- --test-threads=2 --nocapture
+            timeout -k 10 180 cargo test -p nuwa --bin nuwa -- --test-threads=2 --nocapture
           done
       - name: full workspace parallel probe (one pass)
         continue-on-error: true
