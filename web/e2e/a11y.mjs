@@ -113,7 +113,7 @@ try {
         ...(issue ? [["detail", `/issues/${issue}`]] : []),
         ["runners", "/runners"],
         ["events", "/events"],
-        ["settings", "/settings"],
+        ["settings", "/settings/execution"],
       ];
       for (const [name, path] of routes) {
         await page.goto(`${BASE}${path}`, { waitUntil: "networkidle" });

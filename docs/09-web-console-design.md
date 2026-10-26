@@ -441,7 +441,7 @@ floor = NUWA_STUCK_AFTER_SECS（默认 300s，范围 60–86400）
 
 ### 8.7 多仓库展示
 
-- 2026-10-18 起后端引入 `repos` 注册表（schema v2；仅展示身份：repo/name/url/description），通过 `/api/v1/repos` 增删改查；仓库内容（`failing_check`/`forbidden_paths`/`notes`）仍来自目标仓 `nuwa.repo.json` 与 runner 心跳，只读。前端在设置页「仓库」区合并展示注册表与 runner 心跳：已登记仓库可编辑展示字段或移除登记（不停止 runner、不改目标仓），仅有心跳的仓库标记「未登记」并可从身份预填登记。
+- 2026-10-18 起后端引入 `repos` 注册表（schema v2；仅展示身份：repo/name/url/description），通过 `/api/v1/repos` 增删改查；仓库内容（`failing_check`/`forbidden_paths`/`notes`）仍来自目标仓 `nuwa.repo.json` 与 runner 心跳，只读。前端在项目台账合并展示注册表与心跳：已登记但未上报的仓库列在台账底部「已登记 · 等待首个心跳」，已上报项目在工位编辑/取消登记（不停止 runner、不改目标仓）；仅有心跳的仓库标记「未登记」并可从身份预填登记。
 - 每仓库展示：runner 在线状态、当前单、配额、最近错误、checkout 路径、`failing_check`（由 runner 心跳写入 `config_json` 上报）。
 - 同一仓库多 runner 的情况允许显示，但本期部署约定一仓一进程；UI 不假设唯一。
 - 总览、问题单、趋势均支持 repo 过滤。
@@ -773,18 +773,18 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 ### 10.1 全局外壳
 
-- 左侧 232px 导航：女娲标志 + 版本；总览、问题单、运行器、活动、基准、设置、架构图；本地模式下底部显示"本地模式 · API 无鉴权"。
+- 左侧 232px 导航：女娲标志 + 版本；总览、问题单、运行器、活动、基准、设置、服务、架构图；设置展开连接/执行/治理/环境四个视图；本地模式下底部显示"本地模式 · API 无鉴权"。
 - 顶栏：页面标题/面包屑、⌘K 全局搜索、主题切换、会话菜单。
 - 健康条：serve、runner 在线/总数、队列待领、运行中、今日 PR 配额；「需处理 N」（attention 计数）置首、danger 色、链接 `?attention=1`，计数增长时向屏幕阅读器礼貌播报。异常项可点击跳转。
 - <1024px：导航收为抽屉 + 底部四项主导航；健康条横向滚动。
 - 全局状态：离线横幅（API 不可达）、401 自动跳登录、错误边界、toast、骨架屏。
-- 路由：`/` 即 SPA 控制台；旧书签 `/ui*` 308 到 `/`、`/issue/{fp}` 308 到 `/issues/{fp}`；`/settings` 直接由 SPA 提供；`/architecture` 为架构图页（内嵌 `/architecture.html`，见 §10.10）。
+- 路由：`/` 即 SPA 控制台；旧书签 `/ui*` 308 到 `/`、`/issue/{fp}` 308 到 `/issues/{fp}`；`/settings` 重定向到 `/settings/connection`（连接/执行/治理/环境四区，各自一个视图）；`/system` 为服务页；`/architecture` 为架构图页（内嵌 `/architecture.html`，见 §10.10）。
 
 ### 10.2 登录页
 
 - 居中卡片：标志、标题"女娲 · 补天"、密码输入（UI 令牌）、进入按钮。
 - 错误文案：令牌错误、限速、网络不可达；不区分"令牌不存在"与"令牌错误"。
-- 本地模式跳过登录，直接进入并在设置/系统页显示"本地模式，无鉴权"警告。
+- 本地模式跳过登录，直接进入并在系统页与各设置视图显示"本地模式，无鉴权"警告。
 
 ### 10.3 总览
 
@@ -857,15 +857,14 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 ### 10.8 设置
 
-- 分区：凭据、模型、Runner、仓库、服务控制、关于。
-- 字段按 schema 渲染：label、当前值/来源、默认值、帮助、单位、校验、需重启标记。
-- 密钥：已设置 + 末 4 位；"更新"后出现输入框；空值保持。
-- 脏状态保存栏；保存后显示变更 key 与"需重启"；`effective_diff` 提示运行中 runner 仍用旧值。
-- 重启对话框：活动 run 列表；force 需勾选确认；重启后轮询 `/health` 与 `/auth/me`，恢复后自动返回。
-- 仓库区：只读展示 runner 上报的 repo/checkout/failing_check/禁改路径数量。
-- 服务控制：unit 状态、版本、构建、DB 路径/大小、uptime；非 systemd 显示 n/a。
-- 高级：env 路径、权限、未知键名、迁移提示。
-- 关于：版本、License、文档链接（外部链接 `rel="noreferrer"`）。
+- 四个视图：`/settings/connection`（凭据、模型）、`/settings/execution`（runner）、`/settings/governance`（安全、事件与通知）、`/settings/environment`（服务编排、env 文件）；`/settings` 重定向到连接。一个视图只编辑本区字段，各自一个保存。
+- 布局：标签列 + 面板。标签列给出保存后的运行行为、将改变的键、将写入的 env 行，以及运行中值与重启提示；面板按 schema 渲染字段（label、env key、帮助、单位、校验），宽屏两列。
+- 保存模型：每个视图一个保存，按钮放在页头右侧、仅在存在未保存更改时出现（长面板下仍保证首屏可点）；只提交本区变更键；保存后显示 changed 与 restart_required；`effective_diff` 在字段与标签列同时提示运行中仍用旧值。离开未保存视图走统一确认。
+- 密钥：已设置 + 末 4 位；"更换"后出现输入框；空值保持；连接视图提供 GitHub token 与模型配置探测。更改控制台令牌并重启会使当前会话失效，连接视图明确提示。
+- 读取：env 文件路径、权限、未知键名、最近变更在环境视图只读展示；迁移提示保留。
+- 服务动作与运行时状态移出设置：`/system` 展示版本/构建/uptime/DB/鉴权模式、unit 状态、GitHub 对账、重启与关于。重启对话框：活动 run 列表；force 需勾选确认；恢复后轮询 `/health` 与 `/auth/me`。
+- 仓库登记：设置页不再承载；项目台账提供"登记仓库"与"已登记 · 等待首个心跳"列表，项目工位编辑/取消登记；仓库内容仍只读。
+- 关于：`/system` 底部。
 
 ### 10.9 通用状态
 
@@ -1024,7 +1023,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 | `NUWA_EVENT_RETENTION_DAYS` | 运维 | int | `90` | serve | 否 | 1–3650 |
 | `NUWA_ENV_FILE` | 高级 | path | `/opt/nuwa/nuwa.env` | both | 否 | 只读展示；改动需重启 |
 
-> 数据库路径仍由 `--db` 传入；设置页只在"系统"页展示实际路径，不提供编辑，避免路径注入与热切换复杂度。
+> 数据库路径仍由 `--db` 传入；`/system` 展示实际路径，设置环境视图只读展示 env 文件路径，不提供编辑，避免路径注入与热切换复杂度。
 
 ### 13.2 读取、迁移与写回
 
@@ -1042,7 +1041,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - 密钥空值 = 保持；非密钥空值按类型处理（字符串允许空，数值不允许）。
 - 保存成功后写 `config_changed`（每个 key 一条，detail=key，actor=owner）。
 - `restart_pending` 由「最近一次 config_changed 之后是否重启过」判断；`effective_diff` 由 runner 心跳的实际配置对比文件值。
-- 更改 `NUWA_UI_TOKEN` 并重启会使当前会话失效，设置页明确提示"重启后需重新登录"；密钥不参与 `effective_diff`，统一显示"重启后生效"。
+- 更改 `NUWA_UI_TOKEN` 并重启会使当前会话失效，连接视图明确提示"重启后需重新登录"；密钥不参与 `effective_diff`，统一显示"重启后生效"。
 - env 文件不存在时保存将创建它；迁移时文件不存在或不可写只记警告，不阻止 serve/work 启动。
 
 ### 13.3 重启编排
@@ -1161,7 +1160,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 ## 16 · CI、发布、部署与回滚
 
-**切流状态（2026-10-18，0.2.0）**：旧服务端渲染控制台已移除（`ui.rs` 删除、Basic 鉴权移除、全站严格 CSP）。`/` 是唯一控制台；`/ui*` 308 到 `/`，`/issue/{fp}` 308 到 `/issues/{fp}`，`/settings` 是 SPA 设置页；`/ingest` 与 `/health` 不变。crate 版本已升至 0.2.0；发布（tag/push/部署）仍需所有者明确批准。
+**切流状态（2026-10-18，0.2.0）**：旧服务端渲染控制台已移除（`ui.rs` 删除、Basic 鉴权移除、全站严格 CSP）。`/` 是唯一控制台；`/ui*` 308 到 `/`，`/issue/{fp}` 308 到 `/issues/{fp}`，`/settings/*` 是 SPA 设置四区（`/settings` 重定向到连接），`/system` 是服务页；`/ingest` 与 `/health` 不变。crate 版本已升至 0.2.0；发布（tag/push/部署）仍需所有者明确批准。
 
 ### 16.1 CI
 
@@ -1302,7 +1301,7 @@ v3 的实现把「仓库」做成了**字段**（表格里的一列、卡片里�
 
 ### 21.6 项目页登记编辑（2026-10-21）
 
-项目是轴，登记就是这条轴上的**展示身份**。改身份却要绕到设置页，等于把轴的编辑权留在轴外，所以登记编辑前移到项目工位。
+项目是轴，登记就是这条轴上的**展示身份**。2026-10-26 起设置页不再承载登记：台账提供"登记仓库"与"已登记 · 等待首个心跳"列表，项目工位编辑/取消登记，身份编辑始终在项目维度。
 
 **入口**：项目工位铭牌头右侧。
 
@@ -1311,8 +1310,8 @@ v3 的实现把「仓库」做成了**字段**（表格里的一列、卡片里�
 | 已登记 | 编辑登记 / 取消登记 | 改 name / url / description；或删掉控制台这一行 |
 | 未登记 | 登记此项目 | 给已上报信号的项目补一条登记 |
 
-- **身份锁定**：项目已存在（它上报过信号），登记时标识只读展示（`lockIdentity`），不许改写成"另一个项目"；这与设置页新建登记可自由填写标识的行为不同。
+- **身份锁定**：项目已存在（它上报过信号），登记时标识只读展示（`lockIdentity`），不许改写成"另一个项目"；这与台账"登记仓库"可自由填写标识的行为不同。
 - **取消登记**走确认对话框，文案写明影响面：**只删控制台登记行**，不停止 runner、不修改目标仓 `nuwa.repo.json`，仓库内容（failing_check / forbidden_paths / notes）保持不变。
 - **仓库内容只读**：项目工位右栏新增「仓库内容」卡片，来源是 runner 心跳上报的 effective 配置（验证命令 / 复现命令 / 禁改路径数 / 最大尝试），卡片角标标「只读」并注明来自目标仓 `nuwa.repo.json`。控制台能改的只有展示身份，不能改的只有这一类——两者在同一个页面里说清楚。
-- **共用一套表单**：登记表单与登记表 API 从 `features/settings` 迁到 `features/projects`（`registry.ts` + `RepoFormDialog.tsx`），项目页与设置页用同一份数据与同一套校验；对话框支持 `title` / `submitLabel` 覆盖措辞（设置页"添加仓库"、项目页"登记此项目"），避免一个对话框说两种话。
+- **共用一套表单**：登记表单与登记表 API 从 `features/settings` 迁到 `features/projects`（`registry.ts` + `RepoFormDialog.tsx`），台账、等待心跳列表与项目页用同一份数据与同一套校验；对话框支持 `title` / `submitLabel` 覆盖措辞（台账"登记仓库"、项目页"登记此项目"），避免一个对话框说两种话。
 - 登记写入后同时失效 `repos` 与 `projects` 两个查询键：台账行的"未登记"标记与项目页的操作按钮立即跟着变。

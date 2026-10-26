@@ -1,6 +1,12 @@
-import { useState } from "react";
+import { clsx } from "clsx";
+import { useId, useState } from "react";
 
-import { Badge, Button, Input, Select } from "../../components/ui";
+import {
+  formatDiffValue,
+  isFullWidthKey,
+  secretLabel,
+  unitForSpec,
+} from "./areas";
 import {
   isPlainValue,
   isSecretValue,
@@ -20,115 +26,132 @@ interface SettingFieldProps {
   onChange: (raw: string) => void;
 }
 
-/** Read-only text, never an input: the env path is shown but not editable. */
-function ReadOnlyField({ spec, current }: { spec: SettingDto; current: string }) {
-  return (
-    <>
-      <p className="text-caption font-medium text-text-secondary">{spec.label}</p>
-      <p className="overflow-x-auto rounded-card border border-border bg-raised px-3 py-2 font-mono text-body-sm break-all text-text">
-        {current || "—"}
-      </p>
-    </>
-  );
-}
-
-/** Where the displayed plain value comes from (`env` file or the default). */
-function sourceLabel(source: string): string {
-  if (source === "default") {
-    return "默认值";
+function placeholderFor(spec: SettingDto): string {
+  if (spec.key === "NUWA_MODEL") {
+    return "provider 默认";
   }
-  return source === "env" ? "env 文件" : source;
+  if (spec.key === "NUWA_BASE_URL" || spec.key === "NUWA_PUBLIC_BASE_URL") {
+    return "默认";
+  }
+  return "未设置";
 }
 
 /**
- * One schema row (docs/09 §10.8). The control follows `spec.type`; secrets
- * only ever show presence and the last four characters, and the value is
- * rendered by a password input after an explicit "更新" click.
+ * One schema row in the settings panel. The env key stays visible (operators
+ * match it against the file) but the label, control and metadata carry the
+ * hierarchy; secrets only ever show presence and the last four characters.
  */
-export function SettingField({ spec, value, diff, draft, error, onChange }: SettingFieldProps) {
-  // Revealing the password input is per-field state; the parent keys each
-  // field by `spec.key`, so a schema refresh cannot leak it across keys.
+export function SettingField({
+  spec,
+  value,
+  diff,
+  draft,
+  error,
+  onChange,
+}: SettingFieldProps) {
+  const id = useId();
   const [revealed, setRevealed] = useState(false);
-
-  const secret = isSecretValue(value) ? value : null;
   const current = isPlainValue(value) ? value.value : "";
+  const secret = isSecretValue(value) ? value : null;
   const shown = draft ?? current;
-  const help = spec.help;
+  const changed = draft !== undefined;
+  const unit = unitForSpec(spec);
+  const helpId = spec.help ? `${id}-help` : undefined;
+  const errorId = error ? `${id}-error` : undefined;
+  const describedBy = [helpId, errorId].filter(Boolean).join(" ") || undefined;
+
+  const help = spec.help ? (
+    <p id={helpId} className="st-help">
+      {spec.help}
+    </p>
+  ) : null;
+
   const meta = (
-    <div className="flex flex-wrap items-center gap-1.5">
-      {spec.requires_restart ? <Badge variant="warning">需重启</Badge> : null}
-      <Badge>作用域 {spec.scope}</Badge>
-      {isPlainValue(value) ? (
-        <span className="text-caption text-text-muted">
-          来源 {sourceLabel(value.source)}
-        </span>
+    <>
+      {changed ? (
+        <p className="st-meta">
+          <span className="old">{spec.secret ? "已更新" : current || "空"}</span>
+          {spec.requires_restart ? <span className="restart">重启后生效</span> : null}
+        </p>
       ) : null}
-      {!spec.secret && !spec.read_only && spec.default !== null && spec.default !== "" ? (
-        <span className="text-caption text-text-muted">
-          默认值 <code>{spec.default}</code>
-        </span>
+      {diff ? (
+        <p className="st-meta">
+          文件值 {formatDiffValue(spec, diff.file)} · 运行中{" "}
+          {formatDiffValue(spec, diff.runtime)}
+        </p>
       ) : null}
-    </div>
+    </>
   );
-  const diffLine = diff ? (
-    <p className="text-caption text-warning">
-      文件值 {diff.file} · 运行中 {diff.runtime}
-      {diff.source === "default" ? "（默认值）" : ""}
+
+  const errorLine = error ? (
+    <p id={errorId} role="alert" className="st-error">
+      {error}
     </p>
   ) : null;
 
   if (spec.read_only) {
     return (
-      <div className="space-y-1.5">
-        <ReadOnlyField spec={spec} current={shown} />
-        {help ? <p className="text-caption text-text-secondary">{help}</p> : null}
-        {meta}
-        {diffLine}
+      <div className={clsx("st-field", isFullWidthKey(spec.key) && "is-full")}>
+        <span className="st-field-label">{spec.label}</span>
+        <code className="st-field-key">{spec.key}</code>
+        <div className="st-control">
+          <div className="st-readonly">{shown || "—"}</div>
+        </div>
+        {help}
       </div>
     );
   }
 
   if (spec.secret) {
-    const secretText = !secret || !secret.set
-      ? "未设置"
-      : secret.last4
-        ? `已设置 · 末 4 位 ${secret.last4}`
-        : "已设置 · 末 4 位不可显示";
+    const secretSet = secret?.set ?? false;
     return (
-      <div className="space-y-1.5">
-        <p className="text-caption font-medium text-text-secondary">{spec.label}</p>
-        <div className="flex flex-wrap items-center gap-2">
-          <p className="font-mono text-body-sm text-text">{secretText}</p>
-          <Button
-            variant="secondary"
-            size="sm"
-            aria-expanded={revealed}
-            aria-label={revealed ? `取消更新 ${spec.label}` : `更新 ${spec.label}`}
-            onClick={() => {
-              if (revealed) {
-                // Hiding the input discards a typed candidate: an unseen draft
-                // must never be submitted by a later save.
-                onChange("");
+      <div className={clsx("st-field", changed && "is-changed")}>
+        <span className="st-field-label">{spec.label}</span>
+        <code className="st-field-key">{spec.key}</code>
+        <div className="st-control">
+          <div className="st-secret">
+            <i className={clsx("st-dot", secret?.set ? "ok" : "off")} aria-hidden="true" />
+            <span>{secretLabel(value)}</span>
+            <button
+              type="button"
+              aria-expanded={revealed}
+              aria-label={
+                revealed
+                  ? `取消更新 ${spec.label}`
+                  : secretSet
+                    ? `更新 ${spec.label}`
+                    : `设置 ${spec.label}`
               }
-              setRevealed(!revealed);
-            }}
-          >
-            {revealed ? "取消" : "更新"}
-          </Button>
+              onClick={() => {
+                if (revealed) {
+                  // Hiding the input discards a typed candidate: an unseen
+                  // draft must never be submitted by a later save.
+                  onChange("");
+                }
+                setRevealed(!revealed);
+              }}
+            >
+              {revealed ? "取消" : secretSet ? "更换" : "设置"}
+            </button>
+          </div>
+          {revealed ? (
+            <input
+              id={id}
+              className="st-input mono st-secret-input"
+              type="password"
+              autoComplete="new-password"
+              placeholder="留空保持不变"
+              value={draft ?? ""}
+              aria-label={`${spec.label} 新值`}
+              aria-invalid={error ? true : undefined}
+              aria-describedby={describedBy}
+              onChange={(event) => onChange(event.target.value)}
+            />
+          ) : null}
         </div>
-        {revealed ? (
-          <Input
-            label={`${spec.label} 新值`}
-            type="password"
-            autoComplete="new-password"
-            placeholder="留空保持不变"
-            value={draft ?? ""}
-            error={error}
-            onChange={(event) => onChange(event.target.value)}
-          />
-        ) : null}
-        {help ? <p className="text-caption text-text-secondary">{help}</p> : null}
+        {help}
         {meta}
+        {errorLine}
       </div>
     );
   }
@@ -136,48 +159,80 @@ export function SettingField({ spec, value, diff, draft, error, onChange }: Sett
   let control;
   if (spec.type === "enum") {
     control = (
-      <Select
-        label={spec.label}
-        value={shown}
-        options={spec.options.map((option) => ({ value: option, label: option }))}
-        error={error}
-        onChange={(event) => onChange(event.target.value)}
-      />
+      <div className="st-control">
+        <select
+          id={id}
+          className="st-select mono"
+          value={shown}
+          aria-label={spec.label}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={describedBy}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          {spec.options.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+      </div>
     );
   } else if (spec.type === "int") {
     control = (
-      <Input
-        label={spec.label}
-        type="number"
-        inputMode="numeric"
-        min={spec.min ?? undefined}
-        max={spec.max ?? undefined}
-        value={shown}
-        error={error}
-        onChange={(event) => onChange(event.target.value)}
-      />
+      <div className="st-control">
+        <input
+          id={id}
+          className={clsx("st-input mono", unit && "has-unit")}
+          type="number"
+          inputMode="numeric"
+          min={spec.min ?? undefined}
+          max={spec.max ?? undefined}
+          value={shown}
+          aria-label={spec.label}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={describedBy}
+          onChange={(event) => onChange(event.target.value)}
+        />
+        {unit ? <span className="st-unit">{unit}</span> : null}
+      </div>
     );
   } else {
     control = (
-      <Input
-        label={spec.label}
-        type={spec.type === "url" ? "url" : "text"}
-        value={shown}
-        error={error}
-        onChange={(event) => onChange(event.target.value)}
-      />
+      <div className="st-control">
+        <input
+          id={id}
+          className={clsx("st-input", spec.type === "url" && "mono")}
+          type={spec.type === "url" ? "url" : "text"}
+          value={shown}
+          placeholder={placeholderFor(spec)}
+          spellCheck={false}
+          autoComplete="off"
+          aria-label={spec.label}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={describedBy}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      </div>
     );
   }
 
   return (
-    <div className="space-y-1.5">
+    <div
+      className={clsx(
+        "st-field",
+        changed && "is-changed",
+        isFullWidthKey(spec.key) && "is-full",
+      )}
+    >
+      <span className="st-field-label">{spec.label}</span>
+      <code className="st-field-key">{spec.key}</code>
       {control}
       {spec.type === "csv" ? (
-        <p className="text-caption text-text-secondary">逗号分隔，逐个 unit 校验。</p>
+        <p className="st-help">逗号分隔。</p>
       ) : null}
-      {help ? <p className="text-caption text-text-secondary">{help}</p> : null}
+      {help}
       {meta}
-      {diffLine}
+      {errorLine}
     </div>
   );
 }

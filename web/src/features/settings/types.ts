@@ -8,10 +8,8 @@
 
 import type { DiffDto } from "../../lib/api-types/DiffDto";
 import type { LastChangeDto } from "../../lib/api-types/LastChangeDto";
-import type { ServiceState } from "../../lib/api-types/ServiceState";
 import type { SettingDto as ApiSettingDto } from "../../lib/api-types/SettingDto";
 import type { SettingsResponse as ApiSettingsResponse } from "../../lib/api-types/SettingsResponse";
-import type { SystemResponse } from "../../lib/api-types/SystemResponse";
 
 export type SettingGroup =
   | "credentials"
@@ -56,7 +54,7 @@ export function isPlainValue(value: SettingValueDto | undefined): value is Plain
   return value !== undefined && "value" in value;
 }
 
-export type { DiffDto, LastChangeDto, ServiceState, SystemResponse };
+export type { DiffDto, LastChangeDto };
 
 export type SettingsResponse = Omit<
   ApiSettingsResponse,
@@ -91,27 +89,4 @@ export interface TestSettingsRequest {
 export interface TestSettingsResponse {
   ok: boolean;
   detail: string;
-}
-
-export interface RestartServicesRequest {
-  force?: boolean;
-}
-
-/** A guarded restart (409) lists the runs that would be interrupted. */
-export interface ActiveRunSummary {
-  id: string;
-  fingerprint: string;
-  runner_id: string;
-  repo: string;
-  phase: string;
-  started_at_ms: number;
-}
-
-export interface RestartConflictBody {
-  error: {
-    code: string;
-    message: string;
-    fields?: Record<string, string>;
-  };
-  active_runs: ActiveRunSummary[];
 }

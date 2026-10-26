@@ -42,6 +42,15 @@
 
 ## D · 进度快照（2026-10-15 · 阶段 0+1 完成）
 
+### 2026-10-26 · 设置页四区重构
+
+- 设置拆成 **连接 / 执行 / 治理 / 环境** 四个视图（`/settings/:area`，`/settings` 重定向到连接）。一个视图只编辑本区字段，各自一个保存；旧的单页长表单、全局保存栏、侧栏锚点与折叠分区全部移除。
+- 每个视图是"标签列 + 面板"：标签列直接给出保存后的运行行为、将改变的键、将写入的 env 行、运行中值（`effective_diff`）与重启提示；面板按 schema 渲染字段，宽屏两列，密钥仍只显示末 4 位。
+- 服务状态、unit、GitHub 对账、重启与关于迁到新 `/system` 页；重启对话框随之迁出设置，设置视图不再拥有重启动作。
+- 仓库登记移出设置页：项目台账新增"登记仓库"与"已登记 · 等待首个心跳"列表；已上报项目仍在工位编辑/取消登记；仓库内容继续只读。
+- 保留：env 唯一事实源、只提交变更键、字段错误映射、pending 保留草稿、离开未保存确认、`NUWA_UI_TOKEN` 重启失效提示、迁移/本地模式告警。
+- 验证：`npm run typecheck` / `lint` / `test`（55 文件、396 测试）/ `build` 全绿；Playwright 冒烟（登录、四页、设置保存、390/1024/1440 无横向溢出/无内联样式）通过；axe 亮/暗 × 390/1440 的设置页 0 serious/critical。
+
 **骨架（B1-B3 落地）**
 - vendored 五 crate：rpi-telemetry/ai/agent/tools/harness @ pi-rust 0.3.24（7210550），commit `3446a82`，tag `vendored/pi-rust-0.3.24`。ADR-008 清单两处修正：rpi-telemetry 是三个保留 crate 的硬依赖（593 行，一并保留）；rpi-tools 硬依赖 rpi-plugin-sdk 的两个 env 常量，SDK 整体砍除、常量内联进 `crates/rpi-tools/src/os_env.rs`（`tests/host_private_env.rs` 钉住拼写）。
 - `[workspace.lints]` + clippy 全绿（0 error）；上游 ≈730 unwrap 以 `unwrap_used=warn` 保持可见，削减未动。

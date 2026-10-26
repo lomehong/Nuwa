@@ -79,13 +79,13 @@ async function login(page) {
 }
 
 /**
- * `/settings` is a plain SPA route since the legacy console was removed, so a
- * direct navigation (the operator's bookmark/refresh path) must render the
- * settings page like any other route.
+ * Settings are four routes (one view per area). A direct navigation to the
+ * execution view (the operator's bookmark/refresh path) must render it like
+ * any other SPA route.
  */
 async function openSettings(page) {
-  await page.goto(`${BASE}/settings`, { waitUntil: "domcontentloaded" });
-  await page.getByRole("heading", { level: 2, name: "设置" }).waitFor({ timeout: 15_000 });
+  await page.goto(`${BASE}/settings/execution`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { level: 1, name: "执行" }).waitFor({ timeout: 15_000 });
 }
 
 /** Layout invariants for one page at the current viewport. */
@@ -167,18 +167,16 @@ async function runFlow(page) {
   await openSettings(page);
   const interval = page.getByLabel("Poll interval");
   await interval.waitFor({ timeout: 15_000 });
-  await interval.fill("60");
-  const saveBar = page.getByTestId("settings-save-bar");
-  await saveBar.waitFor({ timeout: 10_000 });
-  // The page also renders a header save action; click the sticky bar's one.
-  await saveBar.getByRole("button", { name: "保存更改" }).click();
+  // Repeated smoke runs share one env file; always pick a value that differs
+  // from the current one so the per-view save action appears.
+  const currentInterval = await interval.inputValue();
+  await interval.fill(currentInterval === "60" ? "90" : "60");
+  const save = page.getByTestId("settings-save");
+  await save.waitFor({ timeout: 10_000 });
+  await save.click();
   await page.getByText("设置已保存", { exact: true }).waitFor({ timeout: 15_000 });
-  await saveBar.waitFor({ state: "detached", timeout: 15_000 });
-  if ((await page.getByText(/未保存/).count()) > 0) {
-    fail("dirty badge still visible after saving settings");
-  } else {
-    pass("settings saved (toast 设置已保存, dirty bar gone)");
-  }
+  await page.getByText("没有未保存的更改", { exact: true }).waitFor({ timeout: 15_000 });
+  pass("settings saved (toast 设置已保存, no dirty drafts)");
   if (writeRequests.some((path) => path.endsWith("/settings/restart"))) {
     fail("settings flow POSTed /settings/restart");
   } else {

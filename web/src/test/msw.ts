@@ -15,8 +15,8 @@ import type { RepoDto, RepoListResponse } from "../features/projects/registry";
 import type {
   SettingDto,
   SettingsResponse,
-  SystemResponse,
 } from "../features/settings/types";
+import type { SystemResponse } from "../features/system/types";
 import type { TranscriptResponse } from "../features/transcript/types";
 import type { MeResponse } from "../lib/auth";
 import type { ProjectSkillsResponse, SkillDto } from "../features/skills/types";
