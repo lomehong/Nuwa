@@ -1572,8 +1572,9 @@ fn remember_verified_fix(
     });
 }
 
-/// Single-run entry: the config root and the editable checkout are the same
-/// directory. A pool calls [`work_once_in`] with a separate edit checkout.
+/// Test-only single-run entry: the config root and editable checkout are the
+/// same directory. Production calls [`work_once_in`] directly.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn work_once(
     store: &Arc<shanhaijing::Store>,
