@@ -1,6 +1,6 @@
 # 10 · 需求—设计—实现—验证追溯
 
-状态：当前基线（v0.12.0）。需求正文见 `01-vision.md` 与 `06-requirements.md`；设计决策见 `04-decisions.md`。每行是一个唯一设计，需求可在多行复用。`scripts/check-traceability.py` 校验编号、ADR 覆盖、孤立设计和证据字段。
+状态：当前基线（v0.13.2，2026-10-26）。需求正文见 `01-vision.md` 与 `06-requirements.md`；设计决策见 `04-decisions.md`。每行是一个唯一设计，需求可在多行复用。`scripts/check-traceability.py` 校验编号、ADR 覆盖、孤立设计和证据字段。
 
 ## 追溯矩阵
 
@@ -26,6 +26,7 @@
 | REQ-008 | DES-018 / ADR-018 | `shanhaijing` runner lease；`main.rs` 心跳续租 | 互斥、过期接管、释放与迁移测试 |
 | NFR-003 | DES-019 / ADR-019 | `pipeline.rs`、`repair.rs`、`session.rs`、`api/transcript.rs` | usage 排水、快照脱敏、会话代际与失败原子性测试 |
 | REQ-005 | DES-020 / ADR-020 | `main.rs`、`deliver.rs`、`ci_watch.rs`、`shanhaijing` deliveries/ci_watches | 失败收敛、恢复 head/base、退避、终态和分页测试 |
+| NFR-007 | DES-021 / ADR-021 | `nuwa/src/verify.rs` Go 深检三角 | 规格选择、红基线跳过、分支红拦截、双侧绿测试 |
 
 ## 尚未实现／明确延期
 
