@@ -6,9 +6,46 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
+  gate:
+    # 发版不重复跑测试（冷缓存 runner 曾两次挂死），但必须证明 tag 指向的
+    # 提交已有绿色 ci.yml。tag 前应先等 main CI 绿；这里再用 API 兜底。
+    runs-on: ubuntu-latest
+    steps:
+      - name: require green ci.yml for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          for attempt in $(seq 1 10); do
+            body=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=20")
+            state=$(printf '%s' "$body" | jq -r --arg sha "$SHA" '
+              [.workflow_runs[] | select(.head_sha == $sha)] as $runs
+              | if any($runs[]; .conclusion == "success") then "success"
+                elif any($runs[]; .status == "in_progress" or .status == "queued"
+                       or .status == "waiting" or .status == "requested") then "pending"
+                elif ($runs | length) == 0 then "none"
+                else "failed" end')
+            case "$state" in
+              success)
+                echo "ci.yml is green for ${SHA}"
+                exit 0
+                ;;
+              failed)
+                echo "::error::ci.yml for ${SHA} did not succeed"
+                exit 1
+                ;;
+            esac
+            echo "waiting for ci.yml on ${SHA} (${state}, attempt ${attempt}/10)"
+            sleep 30
+          done
+          echo "::error::no green ci.yml run found for ${SHA}"
+          exit 1
+
   build:
+    needs: gate
     strategy:
       matrix:
         include:

@@ -50,6 +50,8 @@ git push origin main && git push origin vX.Y.Z   # tag 触发 release.yml
 
 tag 打错（指向坏提交、未产出 Release）时：`git tag -d vX.Y.Z` → 在正确提交上重打 → `git push origin :refs/tags/vX.Y.Z` 删除远端旧 tag → 再推送新 tag。
 
+`v*` tag 必须指向 main 上 **ci.yml 已绿**的提交：release 不重跑 Rust 测试，`gate` job 会用 Actions API 校验该提交的 ci.yml 结论；未绿（或只打 tag、没走过 main CI）会在 gate 失败。
+
 ## 硬规则
 
 1. **vendored 纪律**：`crates/rpi-*` 保持原名、原风格、原注释。不美化、不重构、不"顺手清理"；需要上游修复 → `git remote add upstream https://github.com/bigfish1913/pi-rust` + cherry-pick。vendored 代码里 `unwrap_used=warn` 是削减中的可见性手段（基线见 docs/07 §E），不是放行——不要批量改掉。
