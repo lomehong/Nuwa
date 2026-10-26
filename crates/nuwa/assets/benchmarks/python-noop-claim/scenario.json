@@ -1,0 +1,19 @@
+{
+  "name": "python-noop-claim",
+  "title": "负对照：Python 声称修好但只写了说明",
+  "description": "代理只新增 NOTES.md 并在最终消息里声称通过；验证门必须拦住这次误报。",
+  "language": "python",
+  "failing_check": {
+    "command": "python3 -m unittest -q",
+    "timeout_secs": 120
+  },
+  "command_windows": "python -m unittest -q",
+  "writes": [
+    {
+      "path": "NOTES.md",
+      "content": "The bug is fixed in my head.\n"
+    }
+  ],
+  "final": "ROOT CAUSE: double 的运算符写错。\nCHANGE: 已修复。\nVERIFICATION: python -m unittest -q — pass.\nOUTCOME: fixed",
+  "expect_fixed": false
+}

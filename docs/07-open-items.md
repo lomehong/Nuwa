@@ -148,7 +148,8 @@
 - **A-3 前置重构③：RunWorkspace + 配置根/编辑根拆分（2026-10-26）**：新增 workspace 模块：`Direct` 借用主 checkout（现状），`Worktree` 从 `origin/<base>` 创建 detached git worktree 并在 Drop 时移除；`work_once` 的 repair/deliver 改走 `workspace.path()`。`RepairRequest` 增加 `workspace`（`None` = 编辑 `repo`），skills/config 仍从 `repo` 读取，修复写入 workspace；`work_once_in` 同步区分 `config_root` 与编辑目录。测试：worktree 独立、编辑不泄漏、Drop 后目录与注册项消失；配置根与编辑根分离。
 - **A-3 单进程池（2026-10-26）**：`nuwa work --pool N`（1–16）在一个进程内起 N 个逻辑 runner；#1 用主 checkout，#2..N 用 detached worktree；每 worker 独立 id/租约/心跳/TrustedInstructions，共享 DB 队列与 fetch 锁；SIGTERM 释放全部租约。`preflight_repo` 对 detached worktree 采用 fetch+reset（不 checkout base）。测试：2 张 ready 单 + faux，同一进程两 worker 各完成一单。边界：异步并发而非 OS 进程隔离；崩溃残留 worktree 需 prune；镜像矩阵仍是 ops。
 - **Runner 镜像矩阵（2026-10-26）**：`docker/` 新增 base + go/rust/node/python 五个镜像；静态 musl 二进制 + 每栈工具链；非 root、安全目录、/data /sessions 卷、缓存卷说明。CI `docker` job 用 musl artifact 构建全部镜像并跑 base 冒烟；registry 推送保持所有者动作。单容器多 worker 时 checkout 需挂不同路径（checkout 互斥按 `repo_path`）。
-- 下一步：真实系统首例机器人闭环（部署环境/密钥）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。（并行挂死保持串行缓解；根因需本地复现/进程栈，见上。）
+- **基准场景扩充（2026-10-26）**：从 6 个扩到 **14 个**，新增 `go-build-failure`（编译）、`go-vet-failure`（静态检查）、`go-multi-file`（未定义符号 + 多文件修复）、`rust-build-failure`（类型错误）、`rust-main-panic`（base 绿 + 复现门）、`python-syntax-error`（语法）、`node-import-error`（缺失模块）、`python-noop-claim`（负对照）。CI 新增 `benchmark (faux scenarios)`：全场景跑 faux，并用 jq 断言 expect_fixed 必须 repaired+delivered、负对照必须两者皆否且无 error；集成测试覆盖 build-failure / multi-file / rust 复现门。
+- 下一步：真实系统首例机器人闭环（部署环境/密钥）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准 live 基线（真实仓库故障）。（并行挂死保持串行缓解；根因需本地复现/进程栈，见上。）
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 

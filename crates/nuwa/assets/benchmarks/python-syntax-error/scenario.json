@@ -1,0 +1,19 @@
+{
+  "name": "python-syntax-error",
+  "title": "Python 语法错误（def 缺冒号）",
+  "description": "app.py 的 def 缺少冒号；py_compile 在 base 上失败，修复应恢复语法。",
+  "language": "python",
+  "failing_check": {
+    "command": "python3 -m py_compile app.py",
+    "timeout_secs": 120
+  },
+  "command_windows": "python -m py_compile app.py",
+  "writes": [
+    {
+      "path": "app.py",
+      "content": "def greet(name):\n    return \"hello \" + name\n\n\nif __name__ == \"__main__\":\n    print(greet(\"world\"))\n"
+    }
+  ],
+  "final": "ROOT CAUSE: def greet(name) 缺少冒号。\nCHANGE: 补上冒号。\nVERIFICATION: python -m py_compile app.py — pass.\nOUTCOME: fixed",
+  "expect_fixed": true
+}

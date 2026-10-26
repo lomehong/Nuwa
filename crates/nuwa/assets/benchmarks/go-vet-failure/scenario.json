@@ -1,0 +1,18 @@
+{
+  "name": "go-vet-failure",
+  "title": "Go vet 失败（printf 格式串类型不匹配）",
+  "description": "fmt.Printf 用 %d 打印字符串；go vet 在 base 上失败，修复应改格式串。",
+  "language": "go",
+  "failing_check": {
+    "command": "go vet ./...",
+    "timeout_secs": 180
+  },
+  "writes": [
+    {
+      "path": "main.go",
+      "content": "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Printf(\"%s\\n\", \"not a number\")\n}\n"
+    }
+  ],
+  "final": "ROOT CAUSE: fmt.Printf 的 %d 与字符串参数类型不匹配。\nCHANGE: 改为 %s。\nVERIFICATION: go vet ./... — pass.\nOUTCOME: fixed",
+  "expect_fixed": true
+}

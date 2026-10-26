@@ -60,6 +60,17 @@ jobs:
       - name: doctests
         timeout-minutes: 10
         run: cargo test --workspace --doc
+      # 全场景 faux 基准：每个内嵌场景都必须 base 红/分支绿，负对照必须被门禁拦住。
+      - name: benchmark (faux scenarios)
+        timeout-minutes: 10
+        run: |
+          cargo run -p nuwa -- benchmark run --provider faux --db /tmp/bench.db --json > /tmp/bench.raw
+          sed -n '/^{/,$p' /tmp/bench.raw > /tmp/bench.json
+          if ! jq -e 'all(.results[]; (.error == null) and (if .expected_fixed then (.repaired and .delivery_ok) else ((.repaired|not) and (.delivery_ok|not)) end))' /tmp/bench.json; then
+            echo "::error::benchmark scenarios regressed:"
+            jq -r '.results[] | select(.error != null or (if .expected_fixed then ((.repaired|not) or (.delivery_ok|not)) else (.repaired or .delivery_ok) end)) | "\(.scenario): expected_fixed=\(.expected_fixed) repaired=\(.repaired) delivery=\(.delivery_ok) error=\(.error)"' /tmp/bench.json
+            exit 1
+          fi
 
   web:
     runs-on: ubuntu-latest

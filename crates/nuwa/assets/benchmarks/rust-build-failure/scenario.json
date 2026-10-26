@@ -1,0 +1,18 @@
+{
+  "name": "rust-build-failure",
+  "title": "Rust 编译失败（i32 与 String 相加）",
+  "description": "add 把 i32 与 right.to_string() 相加；cargo check 在 base 上失败，修复应去掉错误的字符串转换。",
+  "language": "rust",
+  "failing_check": {
+    "command": "cargo check --quiet",
+    "timeout_secs": 300
+  },
+  "writes": [
+    {
+      "path": "src/lib.rs",
+      "content": "pub fn add(left: i32, right: i32) -> i32 {\n    left + right\n}\n"
+    }
+  ],
+  "final": "ROOT CAUSE: add 对 right 调用了 to_string()，导致 i32 + String 类型不匹配。\nCHANGE: 直接用 i32 相加。\nVERIFICATION: cargo check --quiet — pass.\nOUTCOME: fixed",
+  "expect_fixed": true
+}

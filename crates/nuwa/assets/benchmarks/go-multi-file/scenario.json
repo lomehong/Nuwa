@@ -1,0 +1,22 @@
+{
+  "name": "go-multi-file",
+  "title": "Go 缺辅助函数（需要多文件修改）",
+  "description": "main 调用未定义的 double；修复需要新增 double.go 并整理 main.go，验证多文件编辑。",
+  "language": "go",
+  "failing_check": {
+    "command": "go build ./...",
+    "timeout_secs": 180
+  },
+  "writes": [
+    {
+      "path": "double.go",
+      "content": "package main\n\nfunc double(value int) int {\n\treturn value * 2\n}\n"
+    },
+    {
+      "path": "main.go",
+      "content": "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(double(21))\n}\n"
+    }
+  ],
+  "final": "ROOT CAUSE: main 调用了未定义的 double。\nCHANGE: 新增 double.go 实现，并整理 main.go。\nVERIFICATION: go build ./... — pass.\nOUTCOME: fixed",
+  "expect_fixed": true
+}

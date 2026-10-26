@@ -669,7 +669,15 @@ mod tests {
     #[test]
     fn builtin_scenarios_parse_and_have_fixtures() {
         let scenarios = load_scenarios().expect("scenarios");
-        assert!(scenarios.len() >= 4, "expected a meaningful seed set");
+        assert!(scenarios.len() >= 10, "expected a meaningful seed set");
+        for language in ["go", "node", "python", "rust"] {
+            assert!(
+                scenarios
+                    .iter()
+                    .any(|scenario| scenario.language == language),
+                "missing a {language} scenario"
+            );
+        }
         assert!(scenarios.iter().any(|scenario| scenario.expect_fixed));
         assert!(
             scenarios.iter().any(|scenario| !scenario.expect_fixed),
@@ -798,6 +806,68 @@ mod tests {
             "red→green reproducer must pass the gate: {:?}",
             result.error
         );
+        assert!(result.error.is_none(), "{:?}", result.error);
+    }
+
+    async fn run_named_scenario(name: &str) -> BenchmarkResultInput {
+        let scenario = load_scenarios()
+            .expect("scenarios")
+            .into_iter()
+            .find(|scenario| scenario.name == name)
+            .unwrap_or_else(|| panic!("missing scenario {name}"));
+        let mut result = BenchmarkResultInput {
+            run_id: format!("test-{name}"),
+            scenario: scenario.name.clone(),
+            language: scenario.language.clone(),
+            expected_fixed: scenario.expect_fixed,
+            repaired: false,
+            claimed_fixed: false,
+            delivery_ok: false,
+            turns: 0,
+            tokens_uncached: 0,
+            tokens_cached: 0,
+            duration_ms: 0,
+            root_cause: None,
+            final_report: None,
+            error: None,
+        };
+        run_one_inner(
+            "test",
+            &scenario,
+            &ProviderKind::Faux,
+            12,
+            &secrets::Secrets::default(),
+            &mut result,
+        )
+        .await
+        .expect("scenario run");
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn faux_build_failure_repairs() {
+        let result = run_named_scenario("go-build-failure").await;
+        assert!(result.repaired, "{:?}", result.error);
+        assert!(result.claimed_fixed);
+        assert!(result.delivery_ok, "{:?}", result.error);
+        assert!(result.error.is_none(), "{:?}", result.error);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn faux_multi_file_repairs() {
+        let result = run_named_scenario("go-multi-file").await;
+        assert!(result.repaired, "{:?}", result.error);
+        assert!(result.claimed_fixed);
+        assert!(result.delivery_ok, "{:?}", result.error);
+        assert!(result.error.is_none(), "{:?}", result.error);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn faux_rust_runtime_only_uses_reproducer() {
+        let result = run_named_scenario("rust-main-panic").await;
+        assert!(result.repaired, "{:?}", result.error);
+        assert!(result.claimed_fixed);
+        assert!(result.delivery_ok, "{:?}", result.error);
         assert!(result.error.is_none(), "{:?}", result.error);
     }
 

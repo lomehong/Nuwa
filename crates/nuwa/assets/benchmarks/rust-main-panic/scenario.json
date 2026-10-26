@@ -1,0 +1,25 @@
+{
+  "name": "rust-main-panic",
+  "title": "Rust main 运行时 panic（单测不覆盖）",
+  "description": "average 的循环越界只在 main 的调用路径触发；cargo test 在 base 上为绿，必须写复现脚本证明 red→green。",
+  "language": "rust",
+  "failing_check": {
+    "command": "cargo test --quiet",
+    "timeout_secs": 300
+  },
+  "base_green": true,
+  "writes": [
+    {
+      "path": "src/main.rs",
+      "content": "fn average(values: &[i32]) -> i32 {\n    if values.is_empty() {\n        return 0;\n    }\n    let mut sum = 0;\n    for value in values {\n        sum += *value;\n    }\n    sum / values.len() as i32\n}\n\nfn greeting() -> &'static str {\n    \"hello\"\n}\n\nfn main() {\n    println!(\"{}\", average(&[1, 2, 3]));\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn greeting_is_stable() {\n        assert_eq!(greeting(), \"hello\");\n    }\n}\n"
+    }
+  ],
+  "reproducer": {
+    "unix_path": ".nuwa/repro.sh",
+    "unix_content": "#!/bin/sh\nset -e\ncargo run --quiet\n",
+    "windows_path": ".nuwa/repro.cmd",
+    "windows_content": "@cargo run --quiet\r\n@if errorlevel 1 exit /b 1\r\n"
+  },
+  "final": "ROOT CAUSE: average 的循环 0..=len 越界，空切片还会除零；单测未覆盖 main 路径。\nCHANGE: 改为遍历元素并处理空切片。\nVERIFICATION: cargo test --quiet 绿；.nuwa/repro.sh 在 base 红、修复后绿。\nOUTCOME: fixed",
+  "expect_fixed": true
+}
