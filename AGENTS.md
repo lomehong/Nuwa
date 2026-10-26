@@ -26,6 +26,8 @@ Nuwa = 自愈式修复 agent：运行时问题信号 → 山海经问题单（SQ
 ```bash
 cargo clippy --workspace --all-targets   # 自建 crate 必须零 warning
 cargo test --workspace                   # 上游 1662 测试是安全网
+# CI 用 nextest（每测试独立进程 + 120s 硬超时）：
+#   cargo nextest run --workspace --profile ci && cargo test --workspace --doc
 # 青鸟 Go SDK 的测试在独立仓 github.com/lomehong/qingniao-go（已迁出）
 cd web && npm ci && npm run typecheck && npm run lint && npm test && npm run build
 ```
