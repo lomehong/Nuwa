@@ -37,11 +37,28 @@ jobs:
       - name: nuwa bin parallel probe
         timeout-minutes: 20
         run: |
+          mkdir -p probe-logs
           for i in $(seq 1 "${{ inputs.iterations }}"); do
-            echo "=== parallel iteration $i/${{ inputs.iterations }} ==="
-            timeout -k 10 180 cargo test -p nuwa --bin nuwa -- --test-threads=2 --nocapture
+            log="probe-logs/nuwa-bin-$i.log"
+            echo "=== parallel iteration $i/${{ inputs.iterations }} -> $log ==="
+            # Redirect to a file: a hung test process may survive `timeout`
+            # and keep the file fd, but it cannot hold the step's stdout pipe
+            # open and wedge the job (the historical failure mode).
+            if ! timeout -k 10 180 cargo test -p nuwa --bin nuwa -- --test-threads=2 --nocapture >"$log" 2>&1; then
+              echo "=== iteration $i failed or hung; last 120 lines: ==="
+              tail -n 120 "$log" || true
+              exit 1
+            fi
+            tail -n 5 "$log"
           done
       - name: full workspace parallel probe (one pass)
         continue-on-error: true
         run: |
-          timeout -k 20 600 cargo test --workspace -- --test-threads=2 --nocapture
+          mkdir -p probe-logs
+          timeout -k 20 600 cargo test --workspace -- --test-threads=2 --nocapture > probe-logs/workspace.log 2>&1 || true
+          tail -n 200 probe-logs/workspace.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hang-probe-logs
+          path: probe-logs
