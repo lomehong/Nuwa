@@ -97,7 +97,7 @@
   - **vendored 就地补丁（ADR-014，所有者授权突破硬规则 1）**：㉑ os_env 用 `select!` 并发驱动读流与进程等待（大输出不再活锁到超时，实测 256KiB 输出从必超时转为正常完成）+ `read_binary_file_range` 有界读取。㉒ settle 关键持久化（assistant 提交/tool_started）失败引入 run 取消令牌立即终止，不再"先执行后丢证据"。㉓ agent_harness 预算耗尽明确 outcome（不再误报 Completed）。㉔ compaction 摘要请求继承 harness pin 的 timeout/max_retries。㉕ read 工具流式有预算读取（`limit=1` 不再全量载入大文件）。每处带 `// Nuwa 本地补丁(2026-10-21)` 注释 + 回归测试（4 个新测试文件）。
   - **构建契约**：㉖ Cargo.toml `rust-version` 1.79→1.88（对齐 image/time 锁定依赖的实际下限，旧声明根本编译不过）。
   - **自测证据**：Rust 全量 **1119 通过 / 0 失败 / 1 ignored**（排除文档已注明的 Windows 上游 `os_cancel_interrupts…`），较基线 +31 测试；自建 crate `clippy -D warnings` 零警告（顺带清掉新工具链在 auth/common/overview/serve/main 暴露的 6 处既有 `map_or`/`%` lint）；前端 **344 通过 / 47 文件**（+9），typecheck/lint/build 零错误。**未提交/未推送/未部署**。
-  - **后续处理**：transcript 原始日志读取窗口已由 ADR-019 的脱敏快照发布边界关闭（见系统性审查修复条目）；serve 不持有 work 密钥，未发布快照不回退原始日志。同 runner-id 双活已由 v8 启动租约解决（见 2026-10-23 条目）。
+  - **后续处理**：transcript 原始日志读取窗口已由 ADR-019 的脱敏快照发布边界关闭（见系统性审查修复条目）；2026-10-26 起运行中每 3s 发布一版脱敏快照，serve 仍只读快照、不持有 work 密钥，未发布快照不回退原始日志。同 runner-id 双活已由 v8 启动租约解决（见 2026-10-23 条目）。
 - **控制台架构图页（2026-10-21）**：左侧菜单新增「架构图」（`/architecture`，置于「设置」之后），替换侧栏底部的「会话由 HttpOnly Cookie 保护」文案（本地模式提示保留）。页面以同源 iframe 内嵌 archify 生成的自包含交互图：产物 `web/public/architecture.html`（随 dist 经 rust-embed 装载），源规范 `web/architecture/archify.json`。配套：① serve 对该唯一路径放宽安全头——`frame_policy_for` 给 `/architecture.html` 单独发 `X-Frame-Options: SAMEORIGIN` + 允许内联与同源 frame 的 CSP（自包含单文件必须内联、控制台要内嵌），其余路由仍 strict + DENY，2 个单元测试钉住；② 命令面板 ⌘K 快捷入口。验证：前端 348/348（+3）、typecheck/lint/build 零错误；`clippy -p nuwa` 零警告，新增测试单独全绿（`git_ops` 管道时序测试在全量并行下偶发超时，单独复跑通过——既有 Windows 抖动，与本次无关）。
 - **P0/P1 硬化批次（2026-10-22，未提交/未推送）**：按“先证据、后动作”补齐交付纪律与可审计性，ADR-015 记录取舍。
   - **P0-1 单一修复路径**：新增 `pipeline.rs`，`work_once` 与 `nuwa fix` 共用问题单构建/脱敏、技能选择、session 布局、`RepairJob` 与 `deliver` 参数；CLI 路径由此补上仓库 `notes` 与外部输入脱敏（此前真实漂移）。`repair::session_dir_for` 成为唯一布局来源。
@@ -135,6 +135,7 @@
 - **基准补 main 运行时场景（2026-10-26）**：新增 `go-main-panic`——base 上 `go test ./...` 绿，panic 只在 main 调用路径触发；场景声明 `base_green` + 平台复现脚本，faux 修复后由交付门验证 `.nuwa/repro.sh` red→green，基准用同一复现命令计分（不再拿已绿的 failing_check 冒充 repaired）。带集成测试。
 - **musl 静态产物（2026-10-26）**：CI 新增 `musl` job（`musl-tools` + `x86_64-unknown-linux-musl`），release 矩阵增加 `nuwa-linux-x64-musl`；构建后用 PT_INTERP 断言无动态加载器，并用临时库跑 `nuwa status` 冒烟。gnu/msvc 仍跑 clippy + 全量测试，musl 只做构建/冒烟。
 - **多 worker checkout 互斥（2026-10-26，A-3 拓扑）**：runner 租约在同一事务内新增 checkout 占用检查——不同 runner id 不能共用同一份 canonical 仓库路径（否则两个进程会互相 reset/fetch）。配合同 id 互斥与 claim 原子 owner，支持“同库多 worker、各自 clone”的并发拓扑；docs/08 补部署说明。**仍未做**：单进程内多工作树池与预构建 runner 镜像矩阵（ops 产物）。
+- **转录运行中脱敏（2026-10-26）**：progress 回调每 3s（首帧立即）触发一次 `redact_session_dir`，原子重发 `redacted/` 快照；serve 仍只读快照、永不回退原始 JSONL。快照失败只告警不中断 run，最终发布仍由 `execute` 保证。测试：progress 触发后快照已脱敏，且调用方 sink 仍被执行。
 - 下一步：真实系统首例机器人闭环（部署环境/密钥）→ runner 镜像矩阵/单进程池（A-3 剩余）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）

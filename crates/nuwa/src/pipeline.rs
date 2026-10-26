@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 
@@ -73,6 +74,44 @@ impl PreparedRepair {
     }
 }
 
+/// While a repair is running, atomically republish the redacted snapshot every
+/// few seconds so the console can show live progress without ever reading the
+/// private JSONL (ADR-019). The final publish still happens in `execute`.
+const LIVE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
+
+fn live_snapshot_progress(
+    inner: Option<ProgressSink>,
+    secrets: Arc<secrets::Secrets>,
+    session_dir: PathBuf,
+) -> ProgressSink {
+    let last = std::sync::Mutex::new(
+        std::time::Instant::now()
+            .checked_sub(LIVE_SNAPSHOT_INTERVAL)
+            .unwrap_or_else(std::time::Instant::now),
+    );
+    Arc::new(move |progress| {
+        if let Some(inner) = &inner {
+            inner(progress);
+        }
+        let due = {
+            let mut last = last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last.elapsed() < LIVE_SNAPSHOT_INTERVAL {
+                false
+            } else {
+                *last = std::time::Instant::now();
+                true
+            }
+        };
+        if due {
+            if let Err(error) = secrets.redact_session_dir(&session_dir) {
+                // A partial tail or an unreadable file must not abort the run;
+                // the next tick (or the final publish) retries.
+                eprintln!("transcript: live snapshot failed: {error:#}");
+            }
+        }
+    })
+}
+
 pub fn prepare_repair(req: RepairRequest) -> anyhow::Result<PreparedRepair> {
     let session_dir = repair::session_dir_for(&req.sessions_dir, &req.issue, req.run_id.as_deref());
     let session_dir = std::path::absolute(&session_dir)
@@ -99,6 +138,8 @@ pub fn prepare_repair(req: RepairRequest) -> anyhow::Result<PreparedRepair> {
         (false, false) => format!("{base_notes}\n{}", selection.section),
     };
     let guards = Arc::new(guard::Guards::new(req.issue.forbidden_paths.clone()));
+    let progress =
+        live_snapshot_progress(req.progress, Arc::clone(&req.secrets), session_dir.clone());
     let job = repair::RepairJob {
         repo: req.repo,
         issue: req.issue,
@@ -108,7 +149,7 @@ pub fn prepare_repair(req: RepairRequest) -> anyhow::Result<PreparedRepair> {
         guards,
         secrets: req.secrets,
         notes,
-        progress: req.progress,
+        progress: Some(progress),
         faux_script: req.faux_script,
         run_id: req.run_id,
     };
@@ -412,6 +453,51 @@ mod tests {
                 "{\"text\":\"[REDACTED]\"}\n"
             );
         }
+    }
+
+    #[test]
+    fn progress_publishes_a_live_redacted_snapshot() {
+        let dir = tempfile::tempdir().expect("test fixture");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner_calls = Arc::clone(&calls);
+        let prepared = prepare_repair(RepairRequest {
+            repo: dir.path().to_path_buf(),
+            issue: issue(),
+            sessions_dir: dir.path().join("sessions"),
+            provider: repair::ProviderKind::Faux,
+            max_turns: 1,
+            repo_config: None,
+            secrets: Arc::new(secrets::Secrets::default()),
+            progress: Some(Arc::new(move |progress| {
+                inner_calls.lock().expect("calls").push(progress);
+            })),
+            faux_script: None,
+            run_id: Some("live-snapshot".into()),
+        })
+        .expect("test fixture");
+        std::fs::create_dir_all(prepared.session_dir()).expect("test fixture");
+        std::fs::write(
+            prepared.session_dir().join("private.jsonl"),
+            "{\"text\":\"ghp_abcdefghijklmnopqrstuvwxyz0123456789\"}\n",
+        )
+        .expect("test fixture");
+
+        prepared.job.progress.as_ref().expect("wrapped progress")(repair::RepairProgress {
+            turns: 1,
+            uncached_tokens: 10,
+            cached_tokens: 2,
+        });
+
+        assert_eq!(
+            calls.lock().expect("calls").len(),
+            1,
+            "the caller's progress sink must still run"
+        );
+        assert_eq!(
+            std::fs::read_to_string(prepared.session_dir().join("redacted/private.jsonl"))
+                .expect("live snapshot"),
+            "{\"text\":\"[REDACTED]\"}\n"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
