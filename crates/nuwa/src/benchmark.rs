@@ -171,7 +171,7 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     } else {
         "live"
     };
-    let secrets = Arc::new(secrets::Secrets::load_and_scrub_env());
+    let secrets = Arc::new(secrets::Secrets::load());
     let store = Store::open(&options.db_path)
         .with_context(|| format!("open db {}", options.db_path.display()))?;
     let run_id = options
@@ -368,9 +368,7 @@ fn parse_options(args: Vec<String>) -> anyhow::Result<RunOptions> {
             ProviderKind::Faux
         }
         Some("zai") => ProviderKind::Zai {
-            base_url: std::env::var("NUWA_BASE_URL")
-                .ok()
-                .filter(|value| !value.is_empty()),
+            base_url: crate::env_store::var("NUWA_BASE_URL").filter(|value| !value.is_empty()),
             model,
         },
         Some("anthropic") => ProviderKind::Anthropic { model },

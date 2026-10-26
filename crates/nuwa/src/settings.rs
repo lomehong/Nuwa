@@ -487,9 +487,9 @@ pub fn setting_spec(key: &str) -> Option<&'static SettingSpec> {
 }
 
 pub fn env_file_path() -> std::path::PathBuf {
-    std::env::var("NUWA_ENV_FILE")
+    crate::env_store::var("NUWA_ENV_FILE")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/opt/nuwa/nuwa.env"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/opt/nuwa/nuwa.env"))
 }
 
 pub fn parse_env(text: &str) -> BTreeMap<String, String> {

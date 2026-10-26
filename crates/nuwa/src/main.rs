@@ -4,6 +4,7 @@ mod check;
 mod ci;
 mod ci_watch;
 mod deliver;
+mod env_store;
 mod git_ops;
 mod guard;
 mod instructions;
@@ -105,14 +106,21 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<Cli> {
     Ok(cli)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let result = run_command().await;
+fn main() -> anyhow::Result<()> {
+    // Snapshot + scrub before any runtime thread exists: setenv/unsetenv racing
+    // getenv/environ/fork is unsafe, and the snapshot is what later reads use.
+    env_store::init_from_process_env();
+    secrets::scrub_os_env();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+    let result = runtime.block_on(run_command());
     // Webhook delivery runs in a detached task. The events that matter most
     // (escalated, ci_red) are emitted right before the runner gives up on an
     // issue, and the process may exit immediately afterwards — without this
     // drain they die with the runtime.
-    let _ = webhook::flush(std::time::Duration::from_secs(10)).await;
+    let _ = runtime.block_on(webhook::flush(std::time::Duration::from_secs(10)));
     result
 }
 
@@ -350,16 +358,10 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         .parse()
         .unwrap_or(50_000_000);
     let mut ci_timeout_secs: u64 = env_d("NUWA_CI_TIMEOUT", "600").parse().unwrap_or(600);
-    let mut runner_id_given: Option<String> = std::env::var("NUWA_RUNNER_ID")
-        .ok()
-        .filter(|v| !v.is_empty());
-    let mut service_unit = std::env::var("NUWA_SERVICE_UNIT")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "nuwa-work".to_string());
-    let event_retention_days = crate::serve::retention_days_from_env(
-        std::env::var("NUWA_EVENT_RETENTION_DAYS").ok().as_deref(),
-    );
+    let mut runner_id_given: Option<String> = env_opt("NUWA_RUNNER_ID");
+    let mut service_unit = env_opt("NUWA_SERVICE_UNIT").unwrap_or_else(|| "nuwa-work".to_string());
+    let event_retention_days =
+        crate::serve::retention_days_from_env(env_opt("NUWA_EVENT_RETENTION_DAYS").as_deref());
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
         let mut value = |name: &str| {
@@ -422,7 +424,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     if !(1..=16).contains(&pool) {
         bail!("--pool must be between 1 and 16");
     }
-    let secrets = Arc::new(secrets::Secrets::load_and_scrub_env());
+    let secrets = Arc::new(secrets::Secrets::load());
     let provider = provider_given.unwrap_or_else(env_provider_default);
     let instructions_path = instructions_path.context("--instructions <path> is required")?;
     // One absolute root drives both the pre-repair `runs.session_dir` write
@@ -2571,9 +2573,7 @@ async fn work_once_in(
     .await;
     let draft = repo_config.draft_first_n > 0
         && store.merged_pr_count(&repo_config.repo)? < u64::from(repo_config.draft_first_n);
-    let public_base_url = std::env::var("NUWA_PUBLIC_BASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let public_base_url = env_opt("NUWA_PUBLIC_BASE_URL");
     let delivered = match pipeline::deliver(pipeline::DeliveryRequest {
         repo: workspace.path(),
         issue: prepared.issue(),
@@ -3193,8 +3193,8 @@ async fn run_sync(args: Vec<String>) -> anyhow::Result<()> {
             other => bail!("unknown sync flag {other}"),
         }
     }
-    let token = std::env::var("NUWA_GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+    let token = env_store::var("NUWA_GITHUB_TOKEN")
+        .or_else(|| env_store::var("GITHUB_TOKEN"))
         .context("NUWA_GITHUB_TOKEN not set — sync needs to read PR state")?;
     let store = shanhaijing::Store::open(&db_path)
         .with_context(|| format!("open db {}", db_path.display()))?;
@@ -3212,26 +3212,27 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// env 读取（空值视为未设置）。
+/// env 读取（空值视为未设置）；运行期改动走 `env_store`，不碰进程环境。
 fn env_d(name: &str, default: &str) -> String {
-    std::env::var(name)
-        .ok()
+    env_store::var(name)
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn env_opt(name: &str) -> Option<String> {
+    env_store::var(name).filter(|value| !value.is_empty())
 }
 
 /// 设置页驱动的 provider 默认值（CLI 显式 flag 优先）。
 pub(crate) fn env_provider_default() -> repair::ProviderKind {
     match env_d("NUWA_PROVIDER", "anthropic").as_str() {
         "zai" => repair::ProviderKind::Zai {
-            base_url: std::env::var("NUWA_BASE_URL")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            model: std::env::var("NUWA_MODEL").ok().filter(|s| !s.is_empty()),
+            base_url: env_opt("NUWA_BASE_URL"),
+            model: env_opt("NUWA_MODEL"),
         },
         "faux" => repair::ProviderKind::Faux,
         _ => repair::ProviderKind::Anthropic {
-            model: std::env::var("NUWA_MODEL").ok().filter(|s| !s.is_empty()),
+            model: env_opt("NUWA_MODEL"),
         },
     }
 }
@@ -3274,7 +3275,7 @@ fn run_status(args: Vec<String>) -> anyhow::Result<()> {
 async fn run_fix() -> anyhow::Result<()> {
     let cli = parse_args(std::env::args().skip(2).collect())?;
     webhook::init_from_env();
-    let secrets = Arc::new(secrets::Secrets::load_and_scrub_env());
+    let secrets = Arc::new(secrets::Secrets::load());
     // 文件里的问题单是外部输入：与常驻 runner 一样先脱敏。
     let prob = pipeline::redact_issue(
         issue::Issue::load(&cli.issue_path).context("load issue")?,

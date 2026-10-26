@@ -353,8 +353,7 @@ fn provided_value(values: &BTreeMap<String, Value>, key: &str) -> Result<Option<
 }
 
 fn env_value(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
+    crate::env_store::var(key)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -885,6 +884,11 @@ fn write_settings(
             eprintln!("settings: write failed: {error}");
             internal_error("failed to write settings")
         })?;
+        // Apply to the runtime store, not the process environment: a settings
+        // save must not race a child spawn (docs/07 CI hang).
+        for (key, value) in &write_map {
+            crate::env_store::set(key, Some(value));
+        }
     }
 
     if !migrated.is_empty() {

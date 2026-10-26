@@ -27,6 +27,7 @@
 | NFR-003 | DES-019 / ADR-019 | `pipeline.rs`、`repair.rs`、`session.rs`、`api/transcript.rs` | usage 排水、快照脱敏、会话代际与失败原子性测试 |
 | REQ-005 | DES-020 / ADR-020 | `main.rs`、`deliver.rs`、`ci_watch.rs`、`shanhaijing` deliveries/ci_watches | 失败收敛、恢复 head/base、退避、终态和分页测试 |
 | NFR-007 | DES-021 / ADR-021 | `nuwa/src/verify.rs` Go 深检三角 | 规格选择、红基线跳过、分支红拦截、双侧绿测试 |
+| NFR-003 | DES-022 / ADR-022 | `nuwa/src/env_store.rs`、`secrets.rs`、`api/settings.rs` | env_store 读写/清除单测；设置 PUT 更新 store；并行测试不再改 OS env |
 
 ## 尚未实现／明确延期
 

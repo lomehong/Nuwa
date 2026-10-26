@@ -237,26 +237,25 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
     spawn_daily_prune(Arc::clone(&store), event_days, RETENTION_PERIOD);
     // pr_open issues no longer depend on the owner remembering to click
     // "sync"; the same reconciler also feeds sync_error webhooks.
-    let sync_token = std::env::var("NUWA_GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GITHUB_TOKEN"))
-        .ok()
+    let sync_token = crate::env_store::var("NUWA_GITHUB_TOKEN")
+        .or_else(|| crate::env_store::var("GITHUB_TOKEN"))
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty());
     spawn_reconciler(Arc::clone(&store), sync_token, sync_interval_from_env());
     spawn_heartbeat_monitor(Arc::clone(&store));
     crate::ci_watch::spawn(Arc::clone(&store));
     let env_path = crate::settings::env_file_path();
-    let tokens = serve_tokens(&std::env::vars().collect());
+    let tokens = serve_tokens(&crate::env_store::vars());
     let ingest_token = tokens.ingest;
     let ui_token = tokens.console;
-    let ttl_ms = session_ttl_ms(std::env::var("NUWA_SESSION_TTL_SECS").ok().as_deref());
-    let cookie_mode = std::env::var("NUWA_COOKIE_SECURE").ok();
+    let ttl_ms = session_ttl_ms(crate::env_store::var("NUWA_SESSION_TTL_SECS").as_deref());
+    let cookie_mode = crate::env_store::var("NUWA_COOKIE_SECURE");
     let cookie_secure = cookie_mode.as_deref() == Some("always");
     // `never` is an explicit opt-out that also beats a proxy's
     // `X-Forwarded-Proto: https`.
     let cookie_secure_never = cookie_mode.as_deref() == Some("never");
-    let serve_unit = serve_unit_from_env(std::env::var("NUWA_SERVE_UNIT").ok().as_deref());
-    let runner_units = runner_units_from_env(std::env::var("NUWA_RUNNER_UNITS").ok().as_deref());
+    let serve_unit = serve_unit_from_env(crate::env_store::var("NUWA_SERVE_UNIT").as_deref());
+    let runner_units = runner_units_from_env(crate::env_store::var("NUWA_RUNNER_UNITS").as_deref());
     let state = AppState {
         store: Arc::clone(&store),
         ui_token: Arc::clone(&ui_token),
@@ -377,7 +376,7 @@ fn runner_units_from_env(raw: Option<&str>) -> Vec<String> {
 
 /// `NUWA_EVENT_RETENTION_DAYS` — normal events roll off after this many days.
 fn event_retention_days() -> u32 {
-    retention_days_from_env(std::env::var("NUWA_EVENT_RETENTION_DAYS").ok().as_deref())
+    retention_days_from_env(crate::env_store::var("NUWA_EVENT_RETENTION_DAYS").as_deref())
 }
 
 /// `NUWA_EVENT_RETENTION_DAYS` — normal events roll off after this many days.
@@ -421,7 +420,7 @@ const HEARTBEAT_STALE_MS: i64 = 15 * 60_000;
 const HEARTBEAT_MONITOR_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn sync_interval_from_env() -> std::time::Duration {
-    let raw = std::env::var("NUWA_SYNC_INTERVAL").ok();
+    let raw = crate::env_store::var("NUWA_SYNC_INTERVAL");
     sync_interval_from_secs(raw.as_deref())
 }
 

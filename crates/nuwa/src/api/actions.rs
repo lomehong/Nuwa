@@ -189,8 +189,7 @@ pub async fn sync(State(state): State<AppState>) -> Response {
 /// `TOKEN=   ` line is a 502 instead of an opaque GitHub 401.
 fn github_token() -> Option<String> {
     let read = |key: &str| {
-        std::env::var(key)
-            .ok()
+        crate::env_store::var(key)
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty())
     };
@@ -614,9 +613,10 @@ mod tests {
             .expect("upsert runner");
     }
 
-    /// Cargo runs tests in parallel and process env is global: the tests that
-    /// fake `NUWA_GITHUB_TOKEN`/`GITHUB_TOKEN` serialize on this async lock,
-    /// which may be held across the request await.
+    /// The runtime env store is process-global: tests that fake
+    /// `NUWA_GITHUB_TOKEN`/`GITHUB_TOKEN` serialize on this async lock, which
+    /// may be held across the request await. No process environment is touched
+    /// (docs/07 CI hang).
     async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
         static ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         ENV_LOCK
@@ -625,15 +625,15 @@ mod tests {
             .await
     }
 
-    /// Restores saved env vars on drop, so a failed assertion cannot leak a
-    /// fake token into another test.
+    /// Restores saved runtime values on drop, so a failed assertion cannot
+    /// leak a fake token into another test.
     struct EnvRestore(Vec<(&'static str, Option<String>)>);
 
     impl EnvRestore {
         fn save(keys: &[&'static str]) -> Self {
             Self(
                 keys.iter()
-                    .map(|key| (*key, std::env::var(key).ok()))
+                    .map(|key| (*key, crate::env_store::var(key)))
                     .collect(),
             )
         }
@@ -642,10 +642,7 @@ mod tests {
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             for (key, value) in &self.0 {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
+                crate::env_store::set(key, value.as_deref());
             }
         }
     }
@@ -1052,12 +1049,12 @@ mod tests {
         let _restore = EnvRestore::save(&["NUWA_GITHUB_TOKEN", "GITHUB_TOKEN"]);
         for (nuwa, legacy) in [(None, None), (Some(" \t"), Some("  "))] {
             match nuwa {
-                Some(token) => std::env::set_var("NUWA_GITHUB_TOKEN", token),
-                None => std::env::remove_var("NUWA_GITHUB_TOKEN"),
+                Some(token) => crate::env_store::set("NUWA_GITHUB_TOKEN", Some(token)),
+                None => crate::env_store::set("NUWA_GITHUB_TOKEN", None),
             }
             match legacy {
-                Some(token) => std::env::set_var("GITHUB_TOKEN", token),
-                None => std::env::remove_var("GITHUB_TOKEN"),
+                Some(token) => crate::env_store::set("GITHUB_TOKEN", Some(token)),
+                None => crate::env_store::set("GITHUB_TOKEN", None),
             }
 
             let response = post_json(&app, "/api/v1/sync", Some(&csrf), "").await;
@@ -1087,7 +1084,7 @@ mod tests {
 
         let _env = env_guard().await;
         let _restore = EnvRestore::save(&["NUWA_GITHUB_TOKEN"]);
-        std::env::set_var("NUWA_GITHUB_TOKEN", "test-token-never-used");
+        crate::env_store::set("NUWA_GITHUB_TOKEN", Some("test-token-never-used"));
         let held = super::sync_lock().try_lock().expect("sync lock free");
         let response = post_json(&app, "/api/v1/sync", Some(&csrf), "").await;
         drop(held);
@@ -1313,8 +1310,8 @@ mod tests {
         {
             let _env = env_guard().await;
             let _restore = EnvRestore::save(&["NUWA_GITHUB_TOKEN", "GITHUB_TOKEN"]);
-            std::env::remove_var("NUWA_GITHUB_TOKEN");
-            std::env::remove_var("GITHUB_TOKEN");
+            crate::env_store::set("NUWA_GITHUB_TOKEN", None);
+            crate::env_store::set("GITHUB_TOKEN", None);
             let response = post_json(&app, "/api/v1/sync", Some(&csrf), "").await;
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             let value = json_body(response).await;

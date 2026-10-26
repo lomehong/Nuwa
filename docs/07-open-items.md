@@ -124,7 +124,7 @@
 **2026-10-26 探针诊断（间歇性，未完全定位）**：新增手动 `hang-probe` / `hang-bisect` 工作流复现同进程并行（`cargo test -p nuwa --bin nuwa -- --test-threads=2 --nocapture`）。结果：**间歇性**挂死——探针 #2/#3 与二分 #1 挂在 suite step（#1 中跳过 `benchmark::tests` 的 job 15 秒跑完、其余 job 卡死；二分 #2 七个 job 全部通过）。挂死时内层 `timeout -k 10 180` 与 step `timeout-minutes: 20` 都无法收尾（截图显示 20m20s 仍停在 iteration 1），与历史 #54/release gnu 现象一致；日志被卡住不可取，只能靠 job 名二分。
 **定位到的已知不安全模式**：运行期**进程级 env 突变**与并发读/派生竞争——`api/actions.rs` 的设置处理器 `std::env::set_var/remove_var`（保存设置时改进程 env）、`secrets::load_and_scrub_env` 的 `remove_var`（每 key 一次），与 37 处 `std::env::var`、每次子进程前 `std::env::vars()` 白名单（`agent_env_allowlist`）以及 `git/go/node/cargo` 的 fork/exec 并发。glibc 下 `setenv/unsetenv` 不保证与 `getenv`/`environ` 迭代及 fork 并发安全；这与“间歇、与负载相关、挂死后子进程难回收”的特征吻合。该模式**生产同样存在**：设置页保存会改进程 env，而 repair 正在派生检查/工具子进程。
 **缓解（已生效）**：CI 用 nextest（每测试独立进程）且串行；release 不跑 Rust 测试。多轮 CI（含全 workspace）绿。
-**下一步修复方向（拟）**：取消运行期 env 突变——设置保存只写 `nuwa.env` + 进程内配置对象，密钥/白名单从配置对象读取；测试改用注入的 `Secrets`，不调 `load_and_scrub_env`。这样才可能安全收回并行 libtest（否则即便并行通过也仍是 UB）。
+**修复已落地（2026-10-26，ADR-022）**：新增 `env_store`（`RwLock` 单例）——`main()` 在任何线程派生前**单线程**快照 OS 环境并擦除已知密钥的 OS 副本；运行期读取走 `env_store::var/vars`（未覆盖回退 OS 环境）；设置保存只写 `nuwa.env` + 更新 store（不再 `set_var`）；测试用 `env_store::set`。`setenv/unsetenv` 现在只剩启动时一次，运行期零改写。设置保存顺带修正为**即时生效**（旧实现要重启）。下一步：复跑 `hang-probe`（同进程并行 10 轮）验证稳定性，再决定是否收回并行 libtest（CI 仍保留 nextest + 串行作为基线）。
 - **同 runner-id 双活租约（2026-10-23，schema v8）**：`nuwa work` 启动时先原子获取 `runners` 行的单实例租约（`instance_id` + `lease_until`，TTL 60s）。同 id 的第二个进程先等待旧租约过期（至多 TTL+10s），仍被活进程持有则拒绝启动并提示改用不同 `--runner-id`；心跳每 5–15s 续租，续租失败（被接管）即以 0 退出让新持有者继续；正常退出或 SIGTERM 释放租约（systemd 重启不空等 TTL）。此前两个同 id 活进程会在各自启动时按 id 互相孤儿回收，导致同一问题单被两个 runner 同时修复、双推 `agent/fix/*` 分支。`revive_orphaned_fixing` 语义不变，由租约保证它只在独占时运行。租约是单写者前置条件而非分布式锁：不做 fencing token，长时间暂停后仍可能出现短暂重叠，由续租失败退出收敛（ADR-018）。测试：互斥/续租/过期接管/释放接管 + v7→v8 迁移。
 - **系统性审查修复（2026-10-23，未提交/未推送）**：按 ADR-019 收敛 v0.10.0 全仓审查的 3 P1 / 10 P2 / 1 P3 与二轮复审 5 项遗漏：
   ① **护栏与基线**：fetch/reset 后刷新权威配置，支持 PrivateCopy→Tracked 来源切换且坏 JSON 不覆盖私有副本；交付后 `fetch`/`ls-remote` 统一硬超时；基线移动重验使用新 tip，风险画像基于完整最终 diff；首次坏配置不建立权威副本。
@@ -147,7 +147,7 @@
 - **A-3 前置重构③：RunWorkspace + 配置根/编辑根拆分（2026-10-26）**：新增 workspace 模块：`Direct` 借用主 checkout（现状），`Worktree` 从 `origin/<base>` 创建 detached git worktree 并在 Drop 时移除；`work_once` 的 repair/deliver 改走 `workspace.path()`。`RepairRequest` 增加 `workspace`（`None` = 编辑 `repo`），skills/config 仍从 `repo` 读取，修复写入 workspace；`work_once_in` 同步区分 `config_root` 与编辑目录。测试：worktree 独立、编辑不泄漏、Drop 后目录与注册项消失；配置根与编辑根分离。
 - **A-3 单进程池（2026-10-26）**：`nuwa work --pool N`（1–16）在一个进程内起 N 个逻辑 runner；#1 用主 checkout，#2..N 用 detached worktree；每 worker 独立 id/租约/心跳/TrustedInstructions，共享 DB 队列与 fetch 锁；SIGTERM 释放全部租约。`preflight_repo` 对 detached worktree 采用 fetch+reset（不 checkout base）。测试：2 张 ready 单 + faux，同一进程两 worker 各完成一单。边界：异步并发而非 OS 进程隔离；崩溃残留 worktree 需 prune；镜像矩阵仍是 ops。
 - **Runner 镜像矩阵（2026-10-26）**：`docker/` 新增 base + go/rust/node/python 五个镜像；静态 musl 二进制 + 每栈工具链；非 root、安全目录、/data /sessions 卷、缓存卷说明。CI `docker` job 用 musl artifact 构建全部镜像并跑 base 冒烟；registry 推送保持所有者动作。单容器多 worker 时 checkout 需挂不同路径（checkout 互斥按 `repo_path`）。
-- 下一步：**取消运行期进程 env 突变（设置写文件+进程内配置；测试注入 Secrets）** → 真实系统首例机器人闭环（部署环境/密钥）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
+- 下一步：**复跑 hang-probe 验证并行稳定性**（env_store 修复后）→ 真实系统首例机器人闭环（部署环境/密钥）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 

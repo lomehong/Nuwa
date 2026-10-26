@@ -120,19 +120,16 @@ static GLOBAL: OnceLock<WebhookHandle> = OnceLock::new();
 /// the first caller wins. Both `serve` and `work` call this at startup.
 pub fn init_from_env() -> &'static WebhookHandle {
     GLOBAL.get_or_init(|| {
-        let Some(url) = std::env::var("NUWA_WEBHOOK_URL")
-            .ok()
+        let Some(url) = crate::env_store::var("NUWA_WEBHOOK_URL")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
         else {
             return WebhookHandle::disabled();
         };
-        let secret = std::env::var("NUWA_WEBHOOK_SECRET")
-            .ok()
+        let secret = crate::env_store::var("NUWA_WEBHOOK_SECRET")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let events = std::env::var("NUWA_WEBHOOK_EVENTS")
-            .ok()
+        let events = crate::env_store::var("NUWA_WEBHOOK_EVENTS")
             .map(|raw| parse_events(&raw))
             .filter(|events| !events.is_empty())
             .unwrap_or_else(|| {

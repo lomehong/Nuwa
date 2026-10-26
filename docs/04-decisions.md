@@ -234,6 +234,16 @@
 
 ---
 
+## ADR-022 · 运行期配置不改进程环境（env_store）
+
+- 状态：已接受（2026-10-26）
+- 背景：`setenv`/`unsetenv` 与 `getenv`、`environ` 迭代、`fork`/`exec` 并发在 glibc 下不保证线程安全；测试与设置页的运行期 env 改写会与派生的 `git`/`go`/`node`/`cargo` 子进程竞争。表现为**间歇挂死**（同进程并行测试），挂死后内层 `timeout` 与 CI step/取消都难以收尾（docs/07「CI 测试卡死」，2026-10-26 探针复现）。
+- 决策：新增 `env_store`（`RwLock` 单例）。`main()` 在任何线程派生之前**单线程**快照 OS 环境，并由 `Secrets::scrub_os_env()` 擦除已知密钥的 OS 副本；此后运行期读取走 `env_store::var/vars`（未覆盖的键回退 OS 环境），设置保存只写 `nuwa.env` 并更新 store（不再 `set_var`），测试用 `env_store::set` 而非 `std::env::set_var`。`Secrets::load()` 从快照读取密钥；子进程白名单由 store 快照 + `SAFE_ENV` 白名单构造（密钥不在白名单内，不会下发）。
+- 取舍：设置保存对运行中进程**即时生效**（旧实现只写文件、要重启才生效——这是顺带修正的行为）；`env_store` 是进程内单例，测试写入仍自行串行（保留 `env_guard`）；不再支持「运行期改 OS env 让第三方库看到」（本来也不安全）。
+- 被否决备选：给所有 env 读写加全局 RwLock（第三方库与子进程派生不可控，覆盖不全）；仅测试用 `serial_test`（生产设置页写入与 repair 派生仍有同一竞争）。
+
+---
+
 ## ADR-021 · 验证门深检三角（Go vet/build）
 
 - 状态：已接受（2026-10-26）

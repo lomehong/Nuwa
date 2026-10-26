@@ -1,10 +1,11 @@
 //! Secret handling for the repair runner.
 //!
-//! The work process loads the credentials it needs, removes them from
-//! `std::env`, and passes them explicitly to the provider/PR/CI call sites.
-//! Agent tools and verification subprocesses therefore inherit nothing
-//! sensitive. Output that leaves the process (PR body, evidence, transcripts)
-//! is redacted as a second layer.
+//! The work process loads the credentials it needs from the startup snapshot
+//! ([`crate::env_store`]), scrubs the OS copies once at process start, and
+//! passes values explicitly to the provider/PR/CI call sites. Agent tools and
+//! verification subprocesses therefore inherit nothing sensitive. Output that
+//! leaves the process (PR body, evidence, transcripts) is redacted as a second
+//! layer.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -113,16 +114,21 @@ pub struct Secrets {
 }
 
 impl Secrets {
-    /// Read known credentials, remove them from the process environment, and
-    /// keep their values for redaction. Call once at process startup, before
-    /// any agent tool or provider is constructed.
-    pub fn load_and_scrub_env() -> Self {
-        let mut vars: BTreeMap<String, String> = std::env::vars().collect();
-        let secrets = Self::from_vars(&mut vars);
+    /// Read known credentials from the runtime store (the startup snapshot)
+    /// and keep their values for redaction. The process environment is never
+    /// mutated here, so this is safe to call from parallel tests.
+    pub fn load() -> Self {
+        let mut vars = crate::env_store::vars();
+        Self::from_vars(&mut vars)
+    }
+
+    /// Remove the known secret keys from the OS environment. Call once at
+    /// process start, before any thread spawns a child process; afterwards
+    /// [`Self::load`] reads the snapshot kept by `env_store`.
+    pub fn scrub_os_env() {
         for key in KNOWN_SECRET_KEYS {
             std::env::remove_var(key);
         }
-        secrets
     }
 
     fn from_vars(vars: &mut BTreeMap<String, String>) -> Self {
@@ -359,8 +365,7 @@ fn redact_json(secrets: &Secrets, value: &mut Value) {
 /// Build the child-process environment from the whitelist plus explicit
 /// `NUWA_AGENT_ENV_ALLOW` additions. Known secrets are never admitted.
 pub fn agent_env_allowlist() -> BTreeMap<String, String> {
-    let vars: BTreeMap<String, String> = std::env::vars().collect();
-    build_allowlist(&vars)
+    build_allowlist(&crate::env_store::vars())
 }
 
 fn build_allowlist(vars: &BTreeMap<String, String>) -> BTreeMap<String, String> {

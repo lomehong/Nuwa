@@ -228,8 +228,7 @@ pub(crate) fn runner_interval_secs(config_json: &str) -> u64 {
 /// docs/09 §8.4). Unset or malformed values keep the 300s default; parsed
 /// values clamp to the documented 60..=86400 range.
 pub(crate) fn stuck_floor_ms() -> i64 {
-    match std::env::var("NUWA_STUCK_AFTER_SECS")
-        .ok()
+    match crate::env_store::var("NUWA_STUCK_AFTER_SECS")
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .map(|secs| secs.clamp(STUCK_FLOOR_MIN_SECS, STUCK_FLOOR_MAX_SECS))
     {

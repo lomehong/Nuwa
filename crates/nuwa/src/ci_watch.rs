@@ -322,9 +322,8 @@ pub fn spawn(store: Arc<Store>) -> tokio::task::JoinHandle<()> {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let token = std::env::var("NUWA_GITHUB_TOKEN")
-                .or_else(|_| std::env::var("GITHUB_TOKEN"))
-                .ok()
+            let token = crate::env_store::var("NUWA_GITHUB_TOKEN")
+                .or_else(|| crate::env_store::var("GITHUB_TOKEN"))
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty());
             let Some(token) = token else {
