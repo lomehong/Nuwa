@@ -1,6 +1,6 @@
 # 10 · 需求—设计—实现—验证追溯
 
-状态：当前基线（v0.15.0，2026-10-26）。需求正文见 `01-vision.md` 与 `06-requirements.md`；设计决策见 `04-decisions.md`。每行是一个唯一设计，需求可在多行复用。`scripts/check-traceability.py` 校验编号、ADR 覆盖、孤立设计和证据字段。
+状态：当前基线（v0.16.0，2026-10-26）。需求正文见 `01-vision.md` 与 `06-requirements.md`；设计决策见 `04-decisions.md`。每行是一个唯一设计，需求可在多行复用。`scripts/check-traceability.py` 校验编号、ADR 覆盖、孤立设计和证据字段。
 
 ## 追溯矩阵
 
