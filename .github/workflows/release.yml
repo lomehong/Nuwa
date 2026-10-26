@@ -40,7 +40,9 @@ jobs:
         working-directory: web
         run: npm ci
       # `web/dist` (gitignored) must exist before rust-embed compiles the
-      # release binary. Test failures must stop the tag before packaging.
+      # release binary. Web tests/build must stop the tag before packaging;
+      # Rust tests are gated by ci.yml on the same commit (release runners
+      # hung twice in 2026-10-26, so do not duplicate the suite here).
       - name: test and build web console
         working-directory: web
         run: npm run typecheck && npm run lint && npm test && npm run build
@@ -50,13 +52,9 @@ jobs:
         # musl 变体只负责静态构建与冒烟；host 编译门已由 gnu/msvc 覆盖。
         if: matrix.target != 'x86_64-unknown-linux-musl'
         run: cargo clippy --no-deps -p nuwa -p shanhaijing --all-targets -- -D warnings
-      - name: tests (self-owned crates)
-        # Vendored 全量测试由同提交的 ci.yml 覆盖；release 只回归自建产品
-        # crate。workspace 全量在冷缓存 runner 上曾挂死（2026-10-26）。
-        if: matrix.target != 'x86_64-unknown-linux-musl'
-        timeout-minutes: 12
-        shell: bash
-        run: cargo test -p nuwa -p shanhaijing -- --test-threads=1 --nocapture
+      # 不在 release 重复跑 Rust 测试：tag 指向的 commit 必须已有绿色 CI
+      # （ci.yml 跑全 workspace）；release runner 的冷缓存测试步曾两次挂死且
+      # timeout 未生效（2026-10-26）。这里只保留构建与静态冒烟。
       - run: cargo build --release -p nuwa --target ${{ matrix.target }}
         env:
           # 编译期注入版本指纹：/api/v1/system 的 build_commit（tag 构建时是
