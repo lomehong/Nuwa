@@ -122,6 +122,7 @@ curl -sS -X POST "$NUWA_INGEST_URL/ingest" \
 - `failing_check.command` 是"当前失败、修复后必须过"的回归门；`timeout_secs` 默认 600
 - `reproduce_check` 可选：交付门要求它在 **base 上失败、分支上通过**。没有配置时，先跑 `failing_check`：base 红则直接作为复现；base 绿则要求分支提交自包含的 `.nuwa/repro.sh`（Windows 为 `.nuwa/repro.cmd`），否则 `escalated` 不开 PR
 - **验证模式在修复开始前探测**：runner 先确认 base 上 `failing_check` 是红还是绿，prompt 随之切换。base 绿时 prompt 会明确要求写 `.nuwa/repro.sh`（旧行为无条件告诉模型"check 当前失败"，base 绿的单必然在交付门硬失败）。配了 `reproduce_check` 的仓库跳过探测
+- **Go 深检三角**：问题语言为 `go` 且 base 根目录有 `go.mod` 时，验证门在 red/green 之外再跑 `go vet ./...` 与 `go build ./...`。base 绿则分支必须绿；base 红/超时/工具缺失则跳过并写入证据。深检不能替代复现门（ADR-021）
 - `forbidden_paths` 在工具调用前做子串否决（拦截诚实错误），并在交付面对 `git diff --name-status` 做 glob 终检（权威；`*.pem` 现在真的能匹配嵌套文件）
 - `max_attempts`：problem-level 失败累计到阈值后自动 `ignored`，避免自动重试循环
 - `draft_first_n`：该仓前 N 个 PR 以 draft 打开；0 保持 ADR-003 的非 draft 默认

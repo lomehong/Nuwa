@@ -30,6 +30,17 @@ pub struct CheckOutput {
     pub output: String,
 }
 
+/// A language-level hygiene check (e.g. `go vet`) that runs alongside the
+/// configured red/green check. A red baseline is skipped: the default branch
+/// was already broken, so the branch cannot be blamed for it.
+#[derive(Debug, Clone)]
+pub struct DeepCheckResult {
+    pub command: String,
+    pub base: CheckOutput,
+    /// `None` when the baseline was not green and the check was skipped.
+    pub branch: Option<CheckOutput>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DiffFile {
     pub status: String,
@@ -54,6 +65,9 @@ pub struct VerificationEvidence {
     pub failing_branch: CheckOutput,
     pub reproduce_base: Option<CheckOutput>,
     pub reproduce_branch: Option<CheckOutput>,
+    /// Deep checks that must stay green on the branch when they are green on
+    /// the base (currently Go: `go vet` + `go build`).
+    pub deep_checks: Vec<DeepCheckResult>,
     pub diff: DiffSummary,
 }
 
@@ -86,6 +100,21 @@ impl VerificationEvidence {
                 verdict(branch),
                 branch.output
             ));
+        }
+        for deep in &self.deep_checks {
+            match &deep.branch {
+                Some(branch) => out.push_str(&format!(
+                    "DEEP CHECK `{}`: base {} -> branch {}\n",
+                    deep.command,
+                    verdict(&deep.base),
+                    verdict(branch)
+                )),
+                None => out.push_str(&format!(
+                    "DEEP CHECK `{}`: base {} — skipped\n",
+                    deep.command,
+                    verdict(&deep.base)
+                )),
+            }
         }
         out.push_str(&format!(
             "DIFF: {} file(s), +{}, -{}, tests={}, ci={}\n",
@@ -223,6 +252,8 @@ pub async fn verify(
         );
     }
 
+    let deep_checks = run_deep_checks(issue, base_dir, repo, &env, secrets).await?;
+
     let diff = diff_summary(repo, base, &issue.forbidden_paths)?;
     if !diff.forbidden_hits.is_empty() {
         bail!(
@@ -237,6 +268,7 @@ pub async fn verify(
         failing_branch,
         reproduce_base,
         reproduce_branch,
+        deep_checks,
         diff,
     })
 }
@@ -280,6 +312,88 @@ pub(crate) async fn check_working_tree(
 ) -> anyhow::Result<CheckOutput> {
     let env = crate::secrets::agent_env_allowlist();
     run_check(repo, check, &env, secrets).await
+}
+
+/// Go repos get a vet/build triangle alongside the configured test check.
+/// Repos without a root `go.mod` (or other languages) are left alone: the
+/// runner cannot derive a meaningful command for them.
+fn deep_check_specs(issue: &Issue, base_dir: &Path) -> Vec<String> {
+    if !issue.language.eq_ignore_ascii_case("go") || !base_dir.join("go.mod").is_file() {
+        return Vec::new();
+    }
+    vec!["go vet ./...".to_string(), "go build ./...".to_string()]
+}
+
+async fn run_deep_checks(
+    issue: &Issue,
+    base_dir: &Path,
+    repo: &Path,
+    env: &BTreeMap<String, String>,
+    secrets: &Secrets,
+) -> anyhow::Result<Vec<DeepCheckResult>> {
+    let specs = deep_check_specs(issue, base_dir);
+    run_deep_checks_with_specs(
+        &specs,
+        base_dir,
+        repo,
+        issue.failing_check.timeout_secs.max(1),
+        env,
+        secrets,
+    )
+    .await
+}
+
+async fn run_deep_checks_with_specs(
+    commands: &[String],
+    base_dir: &Path,
+    repo: &Path,
+    timeout_secs: u64,
+    env: &BTreeMap<String, String>,
+    secrets: &Secrets,
+) -> anyhow::Result<Vec<DeepCheckResult>> {
+    let mut results = Vec::new();
+    for command in commands {
+        let check = FailingCheck {
+            command: command.clone(),
+            target: None,
+            timeout_secs,
+        };
+        // A command that cannot run at all (toolchain absent) is a skipped
+        // baseline, not a delivery blocker: the configured failing_check still
+        // has to pass on the branch.
+        let base = match run_check(base_dir, &check, env, secrets).await {
+            Ok(output) => output,
+            Err(error) => CheckOutput {
+                ok: false,
+                timed_out: false,
+                output: format!("unavailable: {error:#}"),
+            },
+        };
+        let branch = if base.ok && !base.timed_out {
+            let output = run_check(repo, &check, env, secrets).await?;
+            if output.timed_out {
+                bail!(
+                    "deep check `{command}` timed out on the branch after {timeout_secs}s:\n{}",
+                    output.output
+                );
+            }
+            if !output.ok {
+                bail!(
+                    "deep check `{command}` fails on the branch:\n{}",
+                    output.output
+                );
+            }
+            Some(output)
+        } else {
+            None
+        };
+        results.push(DeepCheckResult {
+            command: command.clone(),
+            base,
+            branch,
+        });
+    }
+    Ok(results)
 }
 
 async fn run_check(
@@ -957,6 +1071,85 @@ mod tests {
         assert_eq!((summary.added, summary.removed), (2, 0));
         assert!(summary.touches_tests);
         assert_eq!(summary.forbidden_hits.len(), 1);
+    }
+
+    #[test]
+    fn deep_check_specs_require_a_go_module() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let go_issue = Issue {
+            language: "go".into(),
+            ..issue("exit 0")
+        };
+        assert!(deep_check_specs(&go_issue, dir.path()).is_empty());
+        std::fs::write(dir.path().join("go.mod"), "module example.com/m\n").expect("go.mod");
+        assert_eq!(
+            deep_check_specs(&go_issue, dir.path()),
+            vec!["go vet ./...".to_string(), "go build ./...".to_string()]
+        );
+        let python_issue = Issue {
+            language: "python".into(),
+            ..issue("exit 0")
+        };
+        assert!(deep_check_specs(&python_issue, dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn deep_checks_skip_a_red_baseline() {
+        let base = tempfile::tempdir().expect("base");
+        let repo = tempfile::tempdir().expect("repo");
+        let env = crate::secrets::agent_env_allowlist();
+        let results = run_deep_checks_with_specs(
+            &["exit 1".to_string()],
+            base.path(),
+            repo.path(),
+            10,
+            &env,
+            &Secrets::default(),
+        )
+        .await
+        .expect("deep checks");
+        assert!(
+            results[0].branch.is_none(),
+            "a red baseline must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_checks_block_a_red_branch() {
+        let base = tempfile::tempdir().expect("base");
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::write(base.path().join("deep.txt"), "ok").expect("write");
+        let env = crate::secrets::agent_env_allowlist();
+        let error = run_deep_checks_with_specs(
+            &[exists_command("deep.txt")],
+            base.path(),
+            repo.path(),
+            10,
+            &env,
+            &Secrets::default(),
+        )
+        .await
+        .expect_err("branch must fail");
+        assert!(format!("{error:#}").contains("fails on the branch"));
+    }
+
+    #[tokio::test]
+    async fn deep_checks_pass_when_both_sides_are_green() {
+        let base = tempfile::tempdir().expect("base");
+        let repo = tempfile::tempdir().expect("repo");
+        let env = crate::secrets::agent_env_allowlist();
+        let results = run_deep_checks_with_specs(
+            &["exit 0".to_string()],
+            base.path(),
+            repo.path(),
+            10,
+            &env,
+            &Secrets::default(),
+        )
+        .await
+        .expect("deep checks");
+        assert!(results[0].base.ok);
+        assert!(results[0].branch.as_ref().is_some_and(|output| output.ok));
     }
 
     fn reproduction_path() -> &'static str {

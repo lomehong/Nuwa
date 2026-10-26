@@ -230,3 +230,13 @@
   5. schema v9 新增 `deliveries`、`ci_watches`；所有恢复/收敛写操作走 Store 事务。
 - 取舍：持续 CI 依赖部署中的 serve 常驻；不做外部队列、分布式锁、自动回滚或自动重开已合并问题。CI 重跑导致已合并后转红只能告警，根因/部署版本关联仍是后续能力。
 - 被否决备选：把 CI 观察绑在修复进程（超时即失明）；PR 创建失败一律删远端分支（会丢失已存在 PR）；issue-level 失败一律人工升级（无法无人值守）；自动重开已合并问题（无法回滚已合入代码）。
+
+---
+
+## ADR-021 · 验证门深检三角（Go vet/build）
+
+- 状态：已接受（2026-10-26）
+- 背景：ADR-010 的复现门解决“能否证明 bug 修好”，但配置的 `go test ./...` 不覆盖 main 包运行时路径与全部 vet 分析；agent 的改动可能让构建或静态检查退化而 red/green 检查仍然通过。docs/07 的 mindloop 案例即 `go test` 绿、main 运行时 panic 未被覆盖。
+- 决策：问题语言为 `go` 且干净 base worktree 根有 `go.mod` 时，验证门额外运行 `go vet ./...` 与 `go build ./...`，各自独立超时（复用 `failing_check.timeout_secs`）。base 绿 → 分支必须绿，否则拒绝交付；base 红/超时/工具不可用 → 跳过并在证据中注明（默认分支已坏，不能归因本次修复）。深检不替代复现门：base 绿且无 `reproduce_check` 时仍要求 `.nuwa/repro.sh`。结果写入 `verification_detail` 与 PR 正文。
+- 边界：只对根 `go.mod` 的 Go 仓库自动启用；无根 `go.mod` 的多模块仓不猜测命令。其他语言暂不自动推导（`cargo check`/`npm build` 的仓库差异过大），需要时用 `reproduce_check` 显式配置。
+- 被否决备选：对所有语言自动推导构建命令（误报率高）；把深检当复现门（vet/build 不能证明运行时 bug 被修复）；base 红也强制分支绿（把既有债算到本次修复）。
