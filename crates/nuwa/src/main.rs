@@ -1926,10 +1926,11 @@ async fn work_once_in(
     // waiting: an idle runner polls every 30–60s, and a fetch per poll was a
     // pointless round trip to GitHub.
     let pickable = store.count_ready_for_repo(now, &repo_config.repo)? > 0;
-    let base = match {
+    let preflight = {
         let _guard = shared_repo.lock().await;
         preflight_repo(repo_dir, pickable).await
-    } {
+    };
+    let base = match preflight {
         Ok(base) => base,
         Err(e) => {
             live_update(&live, "error", None, None, Some(format!("{e:#}"))).await;
