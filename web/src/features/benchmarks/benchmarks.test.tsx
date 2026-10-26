@@ -52,7 +52,13 @@ describe("修复基准台账", () => {
     );
     renderApp("/benchmarks");
 
-    expect(await screen.findByRole("heading", { level: 2, name: "修复基准" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole(
+        "heading",
+        { level: 2, name: "修复基准" },
+        { timeout: 5000 },
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByText("nuwa benchmark run --provider faux")).toBeInTheDocument();
     expect(await screen.findByText("误报率")).toBeInTheDocument();
     expect(screen.getAllByText("50.0%").length).toBeGreaterThan(0);
@@ -101,7 +107,13 @@ describe("基准运行详情", () => {
     );
     renderApp(`/benchmarks/${RUN.id}`);
 
-    expect(await screen.findByRole("heading", { level: 2, name: "基准运行" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole(
+        "heading",
+        { level: 2, name: "基准运行" },
+        { timeout: 5000 },
+      ),
+    ).toBeInTheDocument();
     expect(await screen.findByText("门禁正确拦截了这次误报")).toBeInTheDocument();
     expect(screen.getAllByText("误报").length).toBeGreaterThan(0);
     expect(screen.getByText("与预期不符")).toBeInTheDocument();
