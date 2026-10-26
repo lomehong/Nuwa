@@ -19,6 +19,7 @@ mod trace;
 mod verify;
 mod web;
 mod webhook;
+mod workspace;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1942,8 +1943,11 @@ async fn work_once(
             .await;
         });
     }));
+    // The future in-process pool swaps this for `RunWorkspace::worktree`;
+    // the single-run loop keeps editing the primary checkout.
+    let workspace = workspace::RunWorkspace::direct(repo_dir);
     let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
-        repo: repo_dir.to_path_buf(),
+        repo: workspace.path().to_path_buf(),
         issue: prob,
         sessions_dir: sessions_dir.clone(),
         provider,
@@ -2289,7 +2293,7 @@ async fn work_once(
         .ok()
         .filter(|value| !value.trim().is_empty());
     let delivered = match pipeline::deliver(pipeline::DeliveryRequest {
-        repo: repo_dir,
+        repo: workspace.path(),
         issue: prepared.issue(),
         report: &report,
         sessions_dir: &sessions_dir,

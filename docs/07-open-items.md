@@ -16,7 +16,7 @@
 3. **运行器池调度**（应龙）
    - 按技术栈选 runner；并发与队列；预算闸（每问题单 token 上限 + 每仓库每日 PR 上限）接入 rpi-harness budget 钩子
    - runner 镜像矩阵（per-stack 工具链 + 离线依赖缓存）
-   - 状态：调度闸/串行 runner 已完成；多 worker（不同 `--runner-id` + 独立 checkout）已由租约与 checkout 互斥支持；A-3 前置重构进行中：① **turn 上限已按 run 传参**、② **runner 多值遥测已就绪**（2026-10-26），③ per-run worktree 生命周期未做；**单进程多工作树池与预构建镜像矩阵未做**（见 docs/08 多 worker 拓扑，ADR-018）。
+   - 状态：调度闸/串行 runner 已完成；多 worker（不同 `--runner-id` + 独立 checkout）已由租约与 checkout 互斥支持；A-3 前置重构进行中：① **turn 上限已按 run 传参**、② **runner 多值遥测已就绪**、③-a **RunWorkspace 生命周期已就位**（2026-10-26），③-b 配置根/编辑根拆分未做；**单进程多工作树池与预构建镜像矩阵未做**（见 docs/08 多 worker 拓扑，ADR-018）。
 4. **验证探针协议**（现场验证，命名待定）
    - 补丁下发 → 现场执行预定义脚本 → 回报 pass/fail + 新日志 的安全协议；触发条件（中心 runner 无法复现的环境特定 bug）
    - 状态：**阻塞**——执行端是现场 SDK（青鸟），本轮明确排除；在 SDK 未提供“预定义脚本 + 结果回传”能力前，服务端单边实现只会扩大攻击面，不落地（2026-10-26）。
@@ -140,7 +140,8 @@
 - **转录运行中脱敏（2026-10-26）**：progress 回调每 3s（首帧立即）触发一次 `redact_session_dir`，原子重发 `redacted/` 快照；serve 仍只读快照、永不回退原始 JSONL。快照失败只告警不中断 run，最终发布仍由 `execute` 保证。测试：progress 触发后快照已脱敏，且调用方 sink 仍被执行。
 - **A-3 前置重构①：turn 上限按 run 传参（2026-10-26）**：vendored harness 新增 `AgentHarness::set_max_turns`（未调用时回退 `RPI_MAX_TURNS_PER_RUN`）；`repair::run` 不再写进程级 env，改为创建后调用 `set_max_turns(job.max_turns)`。回归测试：同进程并发两个 run（cap 1 / cap 5），cap 1 按自己的上限 aborted、cap 5 完成 3 轮，互不覆盖。
 - **A-3 前置重构②：runner 多值遥测（2026-10-26）**：`RunnerLive` 改为活动 run 集合；单 run 时 heartbeat 仍上报该 fingerprint/phase，多 run 时上报 NULL（不随便挑一个），逐 run 细节留在 `runs` 表；`live_end` 逐个移除。单 run 行为不变。边界：多 run 时 shanhaijing 的 `stuck` 判定回退到 runner 心跳（`current_fingerprint` 单值匹配不到具体 issue），池落地时需补 per-run 进度。测试：1/2 run 聚合、逐个结束。
-- 下一步：③ per-run worktree 生命周期 → 接入单进程池（A-3）→ 真实系统首例机器人闭环（部署环境/密钥）→ runner 镜像矩阵 → 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
+- **A-3 前置重构③-a：RunWorkspace 生命周期（2026-10-26）**：新增 workspace 模块：`Direct` 借用主 checkout（现状），`Worktree` 从 `origin/<base>` 创建 detached git worktree 并在 Drop 时移除；`work_once` 的 repair/deliver 改走 `workspace.path()`（Direct 行为不变）。测试：worktree 独立、编辑不泄漏、Drop 后目录与注册项消失。**未做**：pipeline 仍用同一路径读取 skills/config，池落地前需把“配置根（主 checkout）”与“编辑根（worktree）”拆开。
+- 下一步：③-b 配置根/编辑根拆分 → 接入单进程池（A-3）→ 真实系统首例机器人闭环（部署环境/密钥）→ runner 镜像矩阵 → 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 
