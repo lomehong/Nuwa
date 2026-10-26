@@ -18,14 +18,12 @@ jobs:
       matrix:
         skip:
           - "none"
-          - "api::actions::tests"
-          - "api::"
-          - "verify::tests"
-          - "repair::tests"
           - "benchmark::tests"
-          - "serve::tests"
-          - "tests::pool_"
-          - "tests::run_work"
+          - "benchmark::tests::faux_scenario_repairs_and_delivers"
+          - "benchmark::tests::honest_failure_is_not_a_fixed_claim"
+          - "benchmark::tests::faux_runtime_only_scenario_uses_reproducer"
+          - "benchmark::tests::builtin_scenarios_parse_and_have_fixtures"
+          - "benchmark::tests::only_one_explicit_fixed_outcome_counts_as_a_claim"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
