@@ -455,6 +455,95 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     let runner_id = runner_id_given
         .map(|id| sanitize_runner_id(&id))
         .unwrap_or_else(|| default_runner_id(&repo_config.repo));
+    let leases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let shared_repo = Arc::new(tokio::sync::Mutex::new(()));
+    #[cfg(unix)]
+    spawn_sigterm_lease_release(Arc::clone(&store), Arc::clone(&leases));
+    run_runner(RunnerRun {
+        store,
+        trusted,
+        repo_dir: repo_dir.clone(),
+        config_root: repo_dir,
+        sessions_dir,
+        provider,
+        max_turns,
+        push,
+        create_pr,
+        loop_run,
+        interval_secs,
+        daily_pr_limit,
+        max_tokens,
+        daily_token_limit,
+        monthly_token_limit,
+        ci_timeout_secs,
+        runner_id,
+        service_unit,
+        secrets,
+        event_retention_days,
+        maintenance: true,
+        leases,
+        shared_repo,
+    })
+    .await
+}
+
+/// Everything one runner needs. A pool builds several of these with distinct
+/// ids, checkouts, and trusted-instruction copies.
+struct RunnerRun {
+    store: Arc<shanhaijing::Store>,
+    trusted: instructions::TrustedInstructions,
+    repo_dir: PathBuf,
+    config_root: PathBuf,
+    sessions_dir: PathBuf,
+    provider: repair::ProviderKind,
+    max_turns: u32,
+    push: bool,
+    create_pr: bool,
+    loop_run: bool,
+    interval_secs: u64,
+    daily_pr_limit: u64,
+    max_tokens: u64,
+    daily_token_limit: u64,
+    monthly_token_limit: u64,
+    ci_timeout_secs: u64,
+    runner_id: String,
+    service_unit: String,
+    secrets: Arc<secrets::Secrets>,
+    event_retention_days: u32,
+    /// Only the first worker prunes retention and runs startup session cleanup.
+    maintenance: bool,
+    leases: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Serializes fetch/reset/branch-cleanup across workers sharing one repo.
+    shared_repo: Arc<tokio::sync::Mutex<()>>,
+}
+
+async fn run_runner(spec: RunnerRun) -> anyhow::Result<()> {
+    let RunnerRun {
+        store,
+        mut trusted,
+        repo_dir,
+        config_root,
+        sessions_dir,
+        provider,
+        max_turns,
+        push,
+        create_pr,
+        loop_run,
+        interval_secs,
+        daily_pr_limit,
+        max_tokens,
+        daily_token_limit,
+        monthly_token_limit,
+        ci_timeout_secs,
+        runner_id,
+        service_unit,
+        secrets,
+        event_retention_days,
+        maintenance,
+        leases,
+        shared_repo,
+    } = spec;
+    let repo_config = trusted.instructions.clone();
     let (provider_name, model_name) = provider_meta(&provider);
     let config_json = effective_config_json(
         &repo_config,
@@ -529,8 +618,10 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             Err(e) => return Err(e).context("acquire runner lease"),
         }
     }
-    #[cfg(unix)]
-    spawn_sigterm_lease_release(Arc::clone(&store), runner_id.clone(), instance_id.clone());
+    leases
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((runner_id.clone(), instance_id.clone()));
     let now = now_ms();
     let _ = store.mark_interrupted(&runner_id, now);
     if let Err(error) = crate::serve::prune_retention(&store, now, event_retention_days) {
@@ -555,29 +646,35 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         Ok(n) => println!("revive      : {n} orphaned fixing issue(s) requeued at startup"),
         Err(e) => eprintln!("warning : revive orphaned fixing failed: {e}"),
     }
-    match cleanup_terminal_branches(&store, &repo_dir, push).await {
-        Ok(0) => {}
-        Ok(n) => println!("cleanup     : removed {n} terminal branch(es) at startup"),
-        Err(e) => eprintln!("warning : terminal branch cleanup failed: {e:#}"),
+    if maintenance {
+        let _guard = shared_repo.lock().await;
+        match cleanup_terminal_branches(&store, &repo_dir, push).await {
+            Ok(0) => {}
+            Ok(n) => println!("cleanup     : removed {n} terminal branch(es) at startup"),
+            Err(e) => eprintln!("warning : terminal branch cleanup failed: {e:#}"),
+        }
+        match cleanup_sessions(&sessions_dir, &store, now, 365) {
+            Ok(0) => {}
+            Ok(n) => println!("cleanup     : removed {n} expired session dir(s) at startup"),
+            Err(e) => eprintln!("warning : session cleanup failed: {e:#}"),
+        }
     }
-    match cleanup_sessions(&sessions_dir, &store, now, 365) {
-        Ok(0) => {}
-        Ok(n) => println!("cleanup     : removed {n} expired session dir(s) at startup"),
-        Err(e) => eprintln!("warning : session cleanup failed: {e:#}"),
-    }
-    match reconcile_deliveries(
-        &store,
-        &repo_dir,
-        &repo_config.repo,
-        push,
-        u64::from(repo_config.max_attempts.max(1)),
-        &secrets,
-    )
-    .await
     {
-        Ok(0) => {}
-        Ok(n) => println!("delivery    : reconciled {n} unfinished delivery record(s)"),
-        Err(e) => eprintln!("warning : delivery reconciliation failed: {e:#}"),
+        let _guard = shared_repo.lock().await;
+        match reconcile_deliveries(
+            &store,
+            &repo_dir,
+            &repo_config.repo,
+            push,
+            u64::from(repo_config.max_attempts.max(1)),
+            &secrets,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(n) => println!("delivery    : reconciled {n} unfinished delivery record(s)"),
+            Err(e) => eprintln!("warning : delivery reconciliation failed: {e:#}"),
+        }
     }
 
     let mut cycles: u64 = 0;
@@ -586,23 +683,26 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             // A delivery can become ambiguous after a crash mid-process, not
             // only at startup. Reconcile before claiming so the next cycle
             // adopts an already-created PR instead of opening a second one.
-            if let Err(error) = reconcile_deliveries(
-                &store,
-                &repo_dir,
-                &trusted.instructions.repo,
-                push,
-                u64::from(trusted.instructions.max_attempts.max(1)),
-                &secrets,
-            )
-            .await
             {
-                eprintln!("delivery    : reconciliation failed: {error:#}");
+                let _guard = shared_repo.lock().await;
+                if let Err(error) = reconcile_deliveries(
+                    &store,
+                    &repo_dir,
+                    &trusted.instructions.repo,
+                    push,
+                    u64::from(trusted.instructions.max_attempts.max(1)),
+                    &secrets,
+                )
+                .await
+                {
+                    eprintln!("delivery    : reconciliation failed: {error:#}");
+                }
             }
             let worked = match work_once_in(
                 &store,
                 &mut trusted,
                 &repo_dir,
-                &repo_dir,
+                &config_root,
                 sessions_dir.clone(),
                 provider.clone(),
                 max_turns,
@@ -641,6 +741,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
                 }
             };
             if worked {
+                let _guard = shared_repo.lock().await;
                 if let Ok(n) = cleanup_terminal_branches(&store, &repo_dir, push).await {
                     if n > 0 {
                         println!("cleanup     : removed {n} terminal branch(es)");
@@ -648,7 +749,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
                 }
             }
             cycles += 1;
-            if cycles.is_multiple_of(100) {
+            if maintenance && cycles.is_multiple_of(100) {
                 if let Ok(n) = cleanup_sessions(&sessions_dir, &store, now_ms(), 365) {
                     if n > 0 {
                         println!("cleanup     : removed {n} expired session dir(s)");
@@ -670,6 +771,10 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     if let Err(e) = store.release_runner_lease(&runner_id, &instance_id) {
         eprintln!("lease       : release failed: {e}");
     }
+    leases
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(id, _)| id != &runner_id);
     result
 }
 
@@ -982,8 +1087,7 @@ const RUNNER_LEASE_TTL_MS: i64 = 60_000;
 #[cfg(unix)]
 fn spawn_sigterm_lease_release(
     store: Arc<shanhaijing::Store>,
-    runner_id: String,
-    instance_id: String,
+    leases: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 ) {
     tokio::spawn(async move {
         let Ok(mut term) =
@@ -992,7 +1096,13 @@ fn spawn_sigterm_lease_release(
             return;
         };
         term.recv().await;
-        let _ = store.release_runner_lease(&runner_id, &instance_id);
+        let leases = leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for (runner_id, instance_id) in leases {
+            let _ = store.release_runner_lease(&runner_id, &instance_id);
+        }
         std::process::exit(0);
     });
 }
