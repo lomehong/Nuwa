@@ -4,5 +4,5 @@
 FROM nuwa-runner-base:local
 
 USER root
-RUN apk add --no-cache rust cargo build-base pkg-config openssl-dev
+RUN apk add --no-cache rust cargo build-base pkgconf openssl-dev
 USER nuwa
