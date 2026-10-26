@@ -1,15 +1,12 @@
 name: hang-probe
 
-# Manual diagnostic for the CI test hang (docs/07 §D). Reproduces the
-# same-process parallel condition from run #54 with a hard `timeout`, so a
-# hang leaves the last test name in the log instead of blocking the job.
+# Manual diagnostic for the same-process parallel test hang (docs/07 §D).
+# First run nextest (per-test process + per-test deadline): a hung test is
+# killed and reported by name, and the job still finishes with logs. If that
+# passes, run libtest in parallel with live output; a hang there leaves the
+# last started test name in the step log.
 on:
   workflow_dispatch:
-    inputs:
-      iterations:
-        description: "nuwa lib parallel iterations"
-        required: false
-        default: "10"
 
 permissions:
   contents: read
@@ -32,33 +29,12 @@ jobs:
       - name: build web console (embedded fixtures)
         working-directory: web
         run: npm ci && npm run build
-      - name: compile nuwa bin tests
-        run: cargo test -p nuwa --bin nuwa --no-run
-      - name: nuwa bin parallel probe
-        timeout-minutes: 20
-        run: |
-          mkdir -p probe-logs
-          for i in $(seq 1 "${{ inputs.iterations }}"); do
-            log="probe-logs/nuwa-bin-$i.log"
-            echo "=== parallel iteration $i/${{ inputs.iterations }} -> $log ==="
-            # Redirect to a file: a hung test process may survive `timeout`
-            # and keep the file fd, but it cannot hold the step's stdout pipe
-            # open and wedge the job (the historical failure mode).
-            if ! timeout -k 10 180 cargo test -p nuwa --bin nuwa -- --test-threads=2 --nocapture >"$log" 2>&1; then
-              echo "=== iteration $i failed or hung; last 120 lines: ==="
-              tail -n 120 "$log" || true
-              exit 1
-            fi
-            tail -n 5 "$log"
-          done
-      - name: full workspace parallel probe (one pass)
-        continue-on-error: true
-        run: |
-          mkdir -p probe-logs
-          timeout -k 20 600 cargo test --workspace -- --test-threads=2 --nocapture > probe-logs/workspace.log 2>&1 || true
-          tail -n 200 probe-logs/workspace.log
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - uses: taiki-e/install-action@v2
         with:
-          name: hang-probe-logs
-          path: probe-logs
+          tool: nextest
+      - name: nextest parallel probe (bounded; names a hung test)
+        run: cargo nextest run -p nuwa --bin nuwa --profile hang-probe
+      - name: libtest parallel probe (live output)
+        if: success()
+        timeout-minutes: 20
+        run: cargo test -p nuwa --bin nuwa -- --test-threads=2 --nocapture
