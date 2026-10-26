@@ -598,9 +598,10 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
             {
                 eprintln!("delivery    : reconciliation failed: {error:#}");
             }
-            let worked = match work_once(
+            let worked = match work_once_in(
                 &store,
                 &mut trusted,
+                &repo_dir,
                 &repo_dir,
                 sessions_dir.clone(),
                 provider.clone(),
@@ -1571,13 +1572,59 @@ fn remember_verified_fix(
     });
 }
 
-/// One pickup attempt. `Ok(true)` = an issue was claimed and driven to a
-/// terminal state this pass; `Ok(false)` = nothing pickable.
+/// Single-run entry: the config root and the editable checkout are the same
+/// directory. A pool calls [`work_once_in`] with a separate edit checkout.
 #[allow(clippy::too_many_arguments)]
 async fn work_once(
     store: &Arc<shanhaijing::Store>,
     trusted: &mut instructions::TrustedInstructions,
     repo_dir: &Path,
+    sessions_dir: PathBuf,
+    provider: repair::ProviderKind,
+    max_turns: u32,
+    push: bool,
+    create_pr: bool,
+    daily_pr_limit: u64,
+    max_tokens: u64,
+    daily_token_limit: u64,
+    monthly_token_limit: u64,
+    ci_timeout_secs: u64,
+    runner_id: &str,
+    live: SharedLive,
+    secrets: &Arc<secrets::Secrets>,
+) -> anyhow::Result<bool> {
+    work_once_in(
+        store,
+        trusted,
+        repo_dir,
+        repo_dir,
+        sessions_dir,
+        provider,
+        max_turns,
+        push,
+        create_pr,
+        daily_pr_limit,
+        max_tokens,
+        daily_token_limit,
+        monthly_token_limit,
+        ci_timeout_secs,
+        runner_id,
+        live,
+        secrets,
+    )
+    .await
+}
+
+/// One pickup attempt. `config_root` supplies the trusted instructions and
+/// skills; `repo_dir` is the checkout this run edits. `Ok(true)` = an issue
+/// was claimed and driven to a terminal state this pass; `Ok(false)` = nothing
+/// pickable.
+#[allow(clippy::too_many_arguments)]
+async fn work_once_in(
+    store: &Arc<shanhaijing::Store>,
+    trusted: &mut instructions::TrustedInstructions,
+    repo_dir: &Path,
+    config_root: &Path,
     sessions_dir: PathBuf,
     provider: repair::ProviderKind,
     max_turns: u32,
@@ -1947,7 +1994,7 @@ async fn work_once(
     // the single-run loop keeps editing the primary checkout.
     let workspace = workspace::RunWorkspace::direct(repo_dir);
     let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
-        repo: repo_dir.to_path_buf(),
+        repo: config_root.to_path_buf(),
         workspace: Some(workspace.path().to_path_buf()),
         issue: prob,
         sessions_dir: sessions_dir.clone(),
