@@ -1,0 +1,13 @@
+# CI test profile.
+#
+# Each test runs in its own process, so a global/static deadlock in one test
+# cannot wedge the rest of the suite. A hung test is killed after two 60s slow
+# periods and reported by name instead of blocking the job indefinitely.
+#
+# Serial execution is retained while the root cause of the 2026-10-23/26 hangs
+# is unknown: process isolation plus a hard per-test deadline is the safety net,
+# not a claim that the suite is safe to parallelize yet.
+[profile.ci]
+test-threads = 1
+slow-timeout = { period = "60s", terminate-after = 2 }
+fail-fast = false
