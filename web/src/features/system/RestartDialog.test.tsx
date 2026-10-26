@@ -45,8 +45,7 @@ const ACTIVE_RUN = {
 const PENDING_RESTART = "正在重启，等待服务恢复…";
 
 async function openRestart() {
-  await screen.findByRole("heading", { level: 2, name: "设置" }, { timeout: 10_000 });
-  fireEvent.click(await screen.findByRole("button", { name: "重启服务" }));
+  fireEvent.click(await screen.findByRole("button", { name: "重启服务" }, { timeout: 10_000 }));
   fireEvent.click(await screen.findByRole("button", { name: "确认重启" }));
 }
 
@@ -91,7 +90,7 @@ describe("RestartDialog", () => {
         return new HttpResponse(null, { status: 202 });
       }),
     );
-    renderApp("/settings");
+    renderApp("/system");
 
     await openRestart();
 
@@ -136,7 +135,7 @@ describe("RestartDialog", () => {
         }),
     );
     const reload = health.reloadConsole;
-    renderApp("/settings");
+    renderApp("/system");
 
     await openRestart();
 
@@ -164,7 +163,7 @@ describe("RestartDialog", () => {
     health.waitForServeRecovery.mockRejectedValue(
       new SessionExpiredDuringRecoveryError(),
     );
-    renderApp("/settings");
+    renderApp("/system");
 
     await openRestart();
 
@@ -191,7 +190,7 @@ describe("RestartDialog", () => {
         ),
       ),
     );
-    renderApp("/settings");
+    renderApp("/system");
 
     await openRestart();
 
@@ -217,7 +216,7 @@ describe("RestartDialog", () => {
         );
       }),
     );
-    renderApp("/settings");
+    renderApp("/system");
 
     await openRestart();
 
@@ -244,7 +243,7 @@ describe("RestartDialog", () => {
         ),
       ),
     );
-    renderApp("/settings");
+    renderApp("/system");
 
     await openRestart();
 
@@ -263,7 +262,7 @@ describe("RestartDialog", () => {
       }),
     );
     health.waitForServeRecovery.mockRejectedValue(new Error("服务未恢复"));
-    renderApp("/settings");
+    renderApp("/system");
 
     await openRestart();
 
@@ -290,7 +289,7 @@ describe("RestartDialog", () => {
         return new HttpResponse(null, { status: 202 });
       }),
     );
-    renderApp("/settings");
+    renderApp("/system");
 
     fireEvent.click(await screen.findByRole("button", { name: "重启服务" }));
     fireEvent.click(await screen.findByRole("button", { name: "确认重启" }));
@@ -323,7 +322,7 @@ describe("RestartDialog", () => {
         );
       });
     });
-    const { unmount } = renderApp("/settings");
+    const { unmount } = renderApp("/system");
 
     await openRestart();
     expect(await screen.findByText(PENDING_RESTART)).toBeInTheDocument();
@@ -343,7 +342,7 @@ describe("RestartDialog", () => {
         return new HttpResponse(null, { status: 202 });
       }),
     );
-    renderApp("/settings");
+    renderApp("/system");
 
     fireEvent.click(await screen.findByRole("button", { name: "重启服务" }));
     await screen.findByRole("dialog", { name: "重启服务？" });

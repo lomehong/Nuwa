@@ -97,7 +97,7 @@ describe("AppShell", () => {
     ["/issues", "问题单"],
     ["/runners", "运行器"],
     ["/events", "活动"],
-    ["/settings", "设置"],
+    ["/settings/connection", "连接"],
     ["/architecture", "架构图"],
   ] as const)("sets the document title on %s", async (route, title) => {
     server.use(
@@ -131,15 +131,21 @@ describe("AppShell", () => {
     await waitFor(() => expect(document.title).toBe("问题单 · 女娲"));
   });
 
-  it("marks the settings nav link current on /settings", async () => {
+  it("marks the active settings area and shows the settings breadcrumb", async () => {
     server.use(mockMe(), ...mockOverviewResources(), mockSystem(), mockSettings());
-    renderApp("/settings");
+    renderApp("/settings/execution");
 
+    expect(await screen.findByRole("heading", { level: 1, name: "执行" })).toBeInTheDocument();
     const nav = await screen.findByRole("navigation", { name: "主导航" });
-    expect(within(nav).getByRole("link", { name: "设置" })).toHaveAttribute(
+    expect(within(nav).getByRole("link", { name: "设置" })).toHaveAttribute("href", "/settings");
+    const areas = screen.getByRole("group", { name: "设置区域" });
+    expect(within(areas).getByRole("link", { name: "执行" })).toHaveAttribute(
       "aria-current",
       "page",
     );
+    expect(screen.getByTestId("settings-breadcrumb")).toHaveTextContent("设置/执行");
+    expect(within(nav).getByRole("link", { name: "服务" })).toHaveAttribute("href", "/system");
+    expect(screen.queryByRole("region", { name: "全局状态" })).not.toBeInTheDocument();
   });
 
   it("renders the runners route with the page title and placeholder", async () => {

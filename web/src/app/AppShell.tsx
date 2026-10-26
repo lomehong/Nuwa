@@ -12,11 +12,20 @@ import {
   Network,
   RefreshCw,
   Search,
+  Server,
   Settings,
   X,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 
@@ -27,6 +36,9 @@ import { useOverviewQuery } from "../features/overview/queries";
 import { ProjectRail } from "../features/projects/ProjectRail";
 import { projectLabel } from "../features/projects/format";
 import { useProjectsQuery } from "../features/projects/queries";
+import { settingsAreaFromPath } from "../features/settings/areas";
+import { SettingsDirtyProvider } from "../features/settings/dirty";
+import { SettingsSubNav } from "../features/settings/SettingsSubNav";
 import { ApiError } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { useModalBehavior } from "../lib/modal";
@@ -46,6 +58,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { label: "活动", icon: Activity, to: "/events" },
   { label: "基准", icon: FlaskConical, to: "/benchmarks" },
   { label: "设置", icon: Settings, to: "/settings" },
+  { label: "服务", icon: Server, to: "/system" },
   { label: "架构图", icon: Network, to: "/architecture" },
 ];
 
@@ -116,8 +129,11 @@ function pageMeta(pathname: string): PageMeta {
   if (pathname === "/events" || pathname === "/events/") {
     return { title: "活动", breadcrumb: null };
   }
-  if (pathname === "/settings" || pathname === "/settings/") {
+  if (pathname === "/settings" || pathname === "/settings/" || pathname.startsWith("/settings/")) {
     return { title: "设置", breadcrumb: null };
+  }
+  if (pathname === "/system" || pathname === "/system/") {
+    return { title: "服务", breadcrumb: null };
   }
   if (pathname === "/architecture" || pathname === "/architecture/") {
     return { title: "架构图", breadcrumb: null };
@@ -157,9 +173,9 @@ function ShellBrand() {
     <>
       <span
         aria-hidden="true"
-        className="flex size-9 shrink-0 items-center justify-center rounded-card border border-accent/40 bg-accent/10 text-accent"
+        className="flex size-9 shrink-0 items-center justify-center text-accent"
       >
-        <Gem className="size-4" />
+        <Gem className="size-5" />
       </span>
       <div className="min-w-0">
         <p className="truncate text-body font-semibold text-text">女娲</p>
@@ -170,39 +186,78 @@ function ShellBrand() {
 }
 
 function SidebarNavList({ onNavigate }: { onNavigate?: () => void }) {
+  const location = useLocation();
+  const settingsArea = settingsAreaFromPath(location.pathname);
+
+  function linkClass(isActive: boolean, quiet = false): string {
+    if (!isActive) {
+      return "text-text-secondary hover:bg-raised hover:text-text";
+    }
+    return quiet ? "font-medium text-text" : "bg-raised font-medium text-text";
+  }
+
   return (
     <ul className="space-y-1">
       {NAV_ITEMS.map((item) => {
         const Icon = item.icon;
+        const isSettings = item.to === "/settings";
+        const settingsActive = isSettings && location.pathname.startsWith("/settings");
+        const quietActive = isSettings && settingsArea !== null;
         return (
-          <li key={item.label}>
-            <NavLink
-              to={item.to}
-              end={item.end}
-              onClick={onNavigate}
-              className={({ isActive }) =>
-                clsx(
-                  "flex min-h-11 items-center gap-2.5 rounded-card px-3 py-2 text-body transition-colors",
-                  isActive
-                    ? "bg-accent/10 font-medium text-text"
-                    : "text-text-secondary hover:bg-raised hover:text-text",
-                )
-              }
-            >
-              {({ isActive }) => (
-                <>
+          <Fragment key={item.label}>
+            <li>
+              {isSettings ? (
+                <Link
+                  to={item.to}
+                  onClick={onNavigate}
+                  aria-current={settingsActive && !settingsArea ? "page" : undefined}
+                  className={clsx(
+                    "flex min-h-11 items-center gap-2.5 rounded-card px-3 py-2 text-body transition-colors",
+                    linkClass(settingsActive, quietActive),
+                  )}
+                >
                   <Icon
                     aria-hidden="true"
                     className={clsx(
                       "size-4 shrink-0",
-                      isActive ? "text-accent" : "text-text-muted",
+                      settingsActive ? "text-text" : "text-text-muted",
                     )}
                   />
                   <span>{item.label}</span>
-                </>
+                </Link>
+              ) : (
+                <NavLink
+                  to={item.to}
+                  end={item.end}
+                  onClick={onNavigate}
+                  className={({ isActive }) =>
+                    clsx(
+                      "flex min-h-11 items-center gap-2.5 rounded-card px-3 py-2 text-body transition-colors",
+                      linkClass(isActive),
+                    )
+                  }
+                >
+                  {({ isActive }) => (
+                    <>
+                      <Icon
+                        aria-hidden="true"
+                        className={clsx(
+                          "size-4 shrink-0",
+                          isActive ? "text-text" : "text-text-muted",
+                        )}
+                      />
+                      <span>{item.label}</span>
+                    </>
+                  )}
+                </NavLink>
               )}
-            </NavLink>
-          </li>
+            </li>
+            {isSettings && settingsArea ? (
+              <li>
+                <SettingsSubNav onNavigate={onNavigate} />
+              </li>
+            ) : null}
+          </Fragment>
         );
       })}
     </ul>
@@ -453,6 +508,11 @@ export function AppShell() {
   const { toast } = useToast();
   const location = useLocation();
   const { title, breadcrumb } = pageMeta(location.pathname);
+  const settingsArea = settingsAreaFromPath(location.pathname);
+  const isSettingsRoute =
+    location.pathname === "/settings" ||
+    location.pathname === "/settings/" ||
+    settingsArea !== null;
   const projects = useProjectsQuery();
   /**
    * The project the operator is looking at: the project page's route
@@ -536,8 +596,9 @@ export function AppShell() {
   // screen-reader page announcements stay distinguishable. The login page sets
   // its own title.
   useEffect(() => {
-    document.title = title === "Nuwa 控制台" ? "女娲 · 补天" : `${title} · 女娲`;
-  }, [title]);
+    const pageTitle = settingsArea ? settingsArea.label : title;
+    document.title = pageTitle === "Nuwa 控制台" ? "女娲 · 补天" : `${pageTitle} · 女娲`;
+  }, [settingsArea, title]);
 
   // A route change always dismisses the drawer and the palette (nav links and
   // palette results close themselves; this covers browser back/forward and
@@ -597,7 +658,8 @@ export function AppShell() {
   }
 
   return (
-    <div className="min-h-screen bg-bg text-text">
+    <SettingsDirtyProvider>
+      <div className="min-h-screen bg-bg text-text">
       <a
         href="#main-content"
         onClick={(event) => {
@@ -661,50 +723,78 @@ export function AppShell() {
             >
               <span
                 aria-hidden="true"
-                className="flex size-9 items-center justify-center rounded-card border border-accent/40 bg-accent/10 text-accent"
+                className="flex size-9 items-center justify-center text-accent"
               >
-                <Gem className="size-4" />
+                <Gem className="size-5" />
               </span>
               <span className="hidden text-body font-semibold text-text sm:inline">女娲</span>
             </Link>
 
             <div className="min-w-0 flex-1">
-              <h1 className="truncate text-heading font-semibold text-text">{title}</h1>
-              {breadcrumb ? (
-                <p className="truncate font-mono text-caption text-text-secondary">{breadcrumb}</p>
-              ) : null}
+              {settingsArea ? (
+                <p
+                  className="truncate text-body-sm text-text-secondary"
+                  data-testid="settings-breadcrumb"
+                >
+                  <span>设置</span>
+                  <span className="mx-1.5 text-text-muted">/</span>
+                  <strong className="font-medium text-text">{settingsArea.label}</strong>
+                </p>
+              ) : (
+                <>
+                  <h1 className="truncate text-heading font-semibold text-text">{title}</h1>
+                  {breadcrumb ? (
+                    <p className="truncate font-mono text-caption text-text-secondary">
+                      {breadcrumb}
+                    </p>
+                  ) : null}
+                </>
+              )}
             </div>
 
-            <div className="hidden md:block">
-              <Button
-                variant="secondary"
-                size="sm"
+            {settingsArea ? (
+              <Link
+                to="/system"
+                className="hidden shrink-0 text-body-sm text-text-secondary transition-colors hover:text-text md:inline-flex"
+              >
+                服务状态与重启
+              </Link>
+            ) : null}
+
+            {!isSettingsRoute ? (
+              <div className="hidden md:block">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  aria-label="搜索问题单"
+                  aria-haspopup="dialog"
+                  aria-expanded={paletteOpen}
+                  onClick={(event) => openPalette(event.currentTarget)}
+                  className="w-60 justify-start font-normal"
+                >
+                  <Search aria-hidden="true" className="size-3.5 shrink-0" />
+                  <span className="truncate">搜索问题单…</span>
+                  <kbd className="ml-auto rounded border border-border px-1 font-mono text-caption">
+                    ⌘K
+                  </kbd>
+                </Button>
+              </div>
+            ) : null}
+
+            {/* Touch equivalent of the desktop search field. It is the visible
+                return target for the palette on small screens. */}
+            {!isSettingsRoute ? (
+              <button
+                type="button"
                 aria-label="搜索问题单"
                 aria-haspopup="dialog"
                 aria-expanded={paletteOpen}
                 onClick={(event) => openPalette(event.currentTarget)}
-                className="w-60 justify-start font-normal"
+                className="flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-raised hover:text-text md:hidden"
               >
-                <Search aria-hidden="true" className="size-3.5 shrink-0" />
-                <span className="truncate">搜索问题单…</span>
-                <kbd className="ml-auto rounded border border-border px-1 font-mono text-caption">
-                  ⌘K
-                </kbd>
-              </Button>
-            </div>
-
-            {/* Touch equivalent of the desktop search field. It is the visible
-                return target for the palette on small screens. */}
-            <button
-              type="button"
-              aria-label="搜索问题单"
-              aria-haspopup="dialog"
-              aria-expanded={paletteOpen}
-              onClick={(event) => openPalette(event.currentTarget)}
-              className="flex size-11 shrink-0 items-center justify-center rounded-card text-text-secondary transition-colors duration-150 ease-out hover:bg-raised hover:text-text md:hidden"
-            >
-              <Search aria-hidden="true" className="size-5" />
-            </button>
+                <Search aria-hidden="true" className="size-5" />
+              </button>
+            ) : null}
 
             <ThemeToggle />
 
@@ -730,7 +820,7 @@ export function AppShell() {
 
         <OfflineBanner />
 
-        <HealthStrip scope={scope} />
+        {isSettingsRoute ? null : <HealthStrip scope={scope} />}
 
         <main
           id="main-content"
@@ -821,7 +911,7 @@ export function AppShell() {
                   className={({ isActive }) =>
                     clsx(
                       "flex h-14 flex-col items-center justify-center gap-1 text-caption transition-colors",
-                      isActive ? "text-accent" : "text-text-secondary hover:text-text",
+                      isActive ? "text-text" : "text-text-secondary hover:text-text",
                     )
                   }
                 >
@@ -839,6 +929,7 @@ export function AppShell() {
         onClose={closePalette}
         returnFocusRef={paletteReturnFocusRef}
       />
-    </div>
+      </div>
+    </SettingsDirtyProvider>
   );
 }

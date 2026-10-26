@@ -27,6 +27,11 @@ const SettingsPage = lazy(() =>
     default: module.SettingsPage,
   })),
 );
+const SystemPage = lazy(() =>
+  import("../features/system/SystemPage").then((module) => ({
+    default: module.SystemPage,
+  })),
+);
 const ProjectSkillsPage = lazy(() =>
   import("../features/skills/ProjectSkillsPage").then((module) => ({
     default: module.ProjectSkillsPage,
@@ -153,9 +158,21 @@ export const appRoutes: RouteObject[] = [
           { path: "architecture", element: <ArchitecturePage /> },
           {
             path: "settings",
+            element: <Navigate to="/settings/connection" replace />,
+          },
+          {
+            path: "settings/:area",
             element: (
               <LazyRoute>
                 <SettingsPage />
+              </LazyRoute>
+            ),
+          },
+          {
+            path: "system",
+            element: (
+              <LazyRoute>
+                <SystemPage />
               </LazyRoute>
             ),
           },
