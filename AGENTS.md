@@ -6,7 +6,7 @@
 
 Nuwa = 自愈式修复 agent：运行时问题信号 → 山海经问题单（SQLite）→ 应龙 runner 修复（vendored rpi-harness）→ 独立验证门 → `agent/fix/*` 分支 → GitHub REST API 开 PR。**注意区分**：本文件的读者是"修 Nuwa 的 agent"；Nuwa 修复目标仓库时读的是目标仓的 `nuwa.repo.json`，两者不可混淆。
 
-当前版本 `0.14.0`：控制台是 `nuwa serve` 内嵌的 SPA（单二进制），旧服务端渲染控制台已移除。
+当前版本 `0.15.0`：控制台是 `nuwa serve` 内嵌的 SPA（单二进制），旧服务端渲染控制台已移除。
 
 ## 布局
 
