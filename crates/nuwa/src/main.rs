@@ -496,6 +496,8 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     // In-process pool: worker #1 edits the primary checkout; #2..N get
     // detached worktrees. Each worker owns its runner id, lease, heartbeat and
     // trusted-instruction copy; the DB queue stays shared.
+    // Drop registrations left by a crashed pool; new temp paths are unique.
+    let _ = git_ops::git(&repo_dir, &["worktree", "prune"]);
     let mut worktrees = Vec::new();
     for i in 2..=pool {
         worktrees.push(
