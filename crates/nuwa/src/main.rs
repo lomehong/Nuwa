@@ -433,7 +433,7 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         .map(Path::to_path_buf)
         .context("instructions path has no parent")?;
     let base = resolve_base(&repo_dir)?;
-    let mut trusted = instructions::TrustedInstructions::load(
+    let trusted = instructions::TrustedInstructions::load(
         &repo_dir,
         &instructions_path,
         base,
