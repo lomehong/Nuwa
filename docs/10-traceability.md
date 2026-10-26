@@ -1,6 +1,6 @@
 # 10 · 需求—设计—实现—验证追溯
 
-状态：当前基线（v0.13.2，2026-10-26）。需求正文见 `01-vision.md` 与 `06-requirements.md`；设计决策见 `04-decisions.md`。每行是一个唯一设计，需求可在多行复用。`scripts/check-traceability.py` 校验编号、ADR 覆盖、孤立设计和证据字段。
+状态：当前基线（v0.14.0，2026-10-26）。需求正文见 `01-vision.md` 与 `06-requirements.md`；设计决策见 `04-decisions.md`。每行是一个唯一设计，需求可在多行复用。`scripts/check-traceability.py` 校验编号、ADR 覆盖、孤立设计和证据字段。
 
 ## 追溯矩阵
 
@@ -33,5 +33,5 @@
 以下内容不伪装为已实现，也不建立虚假的“完成”证据：
 
 - `docs/07-open-items.md` A-3 后半：多仓库并发池和 runner 镜像矩阵。
-- `docs/07-open-items.md` A-4：现场预定义验证探针协议，等待首个环境特定 bug。
+- `docs/07-open-items.md` A-4：现场预定义验证探针协议——阻塞于现场 SDK（本轮排除）执行预定义脚本并回传结果。
 - `docs/09-web-console-design.md` §19：SSE、GitHub OAuth、项目级权限等后续候选。
