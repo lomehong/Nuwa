@@ -758,6 +758,7 @@ mod tests {
         ]));
         let prepared = crate::pipeline::prepare_repair(crate::pipeline::RepairRequest {
             repo: repo.clone(),
+            workspace: None,
             issue: crate::issue::Issue {
                 fingerprint: fp.clone(),
                 title: "synthetic snapshot regression".into(),

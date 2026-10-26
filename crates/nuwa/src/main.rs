@@ -1947,7 +1947,8 @@ async fn work_once(
     // the single-run loop keeps editing the primary checkout.
     let workspace = workspace::RunWorkspace::direct(repo_dir);
     let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
-        repo: workspace.path().to_path_buf(),
+        repo: repo_dir.to_path_buf(),
+        workspace: Some(workspace.path().to_path_buf()),
         issue: prob,
         sessions_dir: sessions_dir.clone(),
         provider,
@@ -3015,6 +3016,7 @@ async fn run_fix() -> anyhow::Result<()> {
     let repo_config = instructions::load_working_tree(&cli.repo)?;
     let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
         repo: cli.repo.clone(),
+        workspace: None,
         issue: prob.clone(),
         sessions_dir: cli.sessions_dir.clone(),
         provider: cli.provider,

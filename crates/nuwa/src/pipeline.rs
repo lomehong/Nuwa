@@ -17,7 +17,12 @@ pub type ProgressSink = Arc<dyn Fn(repair::RepairProgress) + Send + Sync>;
 
 /// 一次修复的完整输入。
 pub struct RepairRequest {
+    /// Config/skills root (the primary checkout). `nuwa.repo.json` and
+    /// `.nuwa/skills` are read from here even when the edit happens elsewhere.
     pub repo: PathBuf,
+    /// Editable checkout. `None` edits `repo` (single-run behavior); a pool
+    /// passes a per-run worktree so concurrent runs cannot reset each other.
+    pub workspace: Option<PathBuf>,
     pub issue: issue::Issue,
     pub sessions_dir: PathBuf,
     pub provider: repair::ProviderKind,
@@ -122,6 +127,7 @@ pub fn prepare_repair(req: RepairRequest) -> anyhow::Result<PreparedRepair> {
         .as_ref()
         .map(|config| config.skills.as_slice())
         .unwrap_or(&[]);
+    let workspace = req.workspace.clone().unwrap_or_else(|| req.repo.clone());
     let selection = skills::select(&req.repo, &req.issue, allowlist);
     for warning in &selection.warnings {
         eprintln!("skills    : {warning}");
@@ -141,7 +147,7 @@ pub fn prepare_repair(req: RepairRequest) -> anyhow::Result<PreparedRepair> {
     let progress =
         live_snapshot_progress(req.progress, Arc::clone(&req.secrets), session_dir.clone());
     let job = repair::RepairJob {
-        repo: req.repo,
+        repo: workspace,
         issue: req.issue,
         sessions_dir: req.sessions_dir,
         provider: req.provider,
@@ -389,6 +395,7 @@ mod tests {
     fn session_dir_is_per_run_and_absolute() {
         let req = RepairRequest {
             repo: PathBuf::from("."),
+            workspace: None,
             issue: issue(),
             sessions_dir: PathBuf::from("sessions"),
             provider: repair::ProviderKind::Faux,
@@ -405,6 +412,37 @@ mod tests {
     }
 
     #[test]
+    fn workspace_is_the_edit_root_not_the_config_root() {
+        let dir = tempfile::tempdir().expect("test fixture");
+        let config = dir.path().join("config");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&config).expect("config");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let prepared = prepare_repair(RepairRequest {
+            repo: config.clone(),
+            workspace: Some(workspace.clone()),
+            issue: issue(),
+            sessions_dir: dir.path().join("sessions"),
+            provider: repair::ProviderKind::Faux,
+            max_turns: 1,
+            repo_config: None,
+            secrets: Arc::new(secrets::Secrets::default()),
+            progress: None,
+            faux_script: None,
+            run_id: Some("workspace-split".into()),
+        })
+        .expect("prepare");
+        assert_eq!(
+            prepared.job.repo, workspace,
+            "repair must edit the workspace"
+        );
+        assert_ne!(
+            prepared.job.repo, config,
+            "config/skills root must not be the edit root"
+        );
+    }
+
+    #[test]
     fn cli_session_dir_stays_flat() {
         let dir = std::env::temp_dir().join("nuwa-pipeline-flat");
         let dir = repair::session_dir_for(&dir, &issue(), None);
@@ -414,6 +452,7 @@ mod tests {
     fn snapshot_repair(dir: &Path, fail: bool) -> PreparedRepair {
         prepare_repair(RepairRequest {
             repo: dir.to_path_buf(),
+            workspace: None,
             issue: issue(),
             sessions_dir: dir.join("sessions"),
             provider: if fail {
@@ -462,6 +501,7 @@ mod tests {
         let inner_calls = Arc::clone(&calls);
         let prepared = prepare_repair(RepairRequest {
             repo: dir.path().to_path_buf(),
+            workspace: None,
             issue: issue(),
             sessions_dir: dir.path().join("sessions"),
             provider: repair::ProviderKind::Faux,

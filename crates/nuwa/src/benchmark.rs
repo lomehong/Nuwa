@@ -470,6 +470,7 @@ async fn run_one_inner(
     let faux_script = matches!(provider, ProviderKind::Faux).then(|| scenario_script(scenario));
     let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
         repo: repo.clone(),
+        workspace: None,
         issue: issue.clone(),
         sessions_dir: sessions.clone(),
         provider: provider.clone(),
