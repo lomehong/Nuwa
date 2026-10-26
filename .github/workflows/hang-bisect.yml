@@ -1,0 +1,65 @@
+name: hang-bisect
+
+# Manual bisection for the same-process parallel hang. Each matrix entry runs
+# the full bin suite with one module group skipped. A job that no longer hangs
+# names the group that contains the trigger; a job that still hangs narrows the
+# other direction. Logs are captured to a file/artifact where possible, but the
+# job name itself is the signal when the runner cannot reap a hung child.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bisect:
+    strategy:
+      fail-fast: false
+      matrix:
+        skip:
+          - "none"
+          - "api::actions::tests"
+          - "api::"
+          - "verify::tests"
+          - "repair::tests"
+          - "benchmark::tests"
+          - "serve::tests"
+          - "tests::pool_"
+          - "tests::run_work"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CARGO_INCREMENTAL: "0"
+      NUWA_BUILD_COMMIT: hang-bisect
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: build web console (embedded fixtures)
+        working-directory: web
+        run: npm ci && npm run build
+      - name: compile nuwa bin tests
+        run: cargo test -p nuwa --bin nuwa --no-run
+      - name: parallel suite
+        run: |
+          set +e
+          log="probe.log"
+          if [ "${{ matrix.skip }}" = "none" ]; then
+            timeout -k 10 180 cargo test -p nuwa --bin nuwa -- --test-threads=2 --nocapture > "$log" 2>&1
+          else
+            timeout -k 10 180 cargo test -p nuwa --bin nuwa -- --test-threads=2 --nocapture --skip "${{ matrix.skip }}" > "$log" 2>&1
+          fi
+          status=$?
+          echo "exit status: $status"
+          tail -n 40 "$log" || true
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bisect-${{ strategy.job-index }}
+          path: probe.log
