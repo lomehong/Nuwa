@@ -1,0 +1,47 @@
+name: hang-probe
+
+# Manual diagnostic for the CI test hang (docs/07 §D). Reproduces the
+# same-process parallel condition from run #54 with a hard `timeout`, so a
+# hang leaves the last test name in the log instead of blocking the job.
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "nuwa lib parallel iterations"
+        required: false
+        default: "10"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      NUWA_BUILD_COMMIT: hang-probe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: build web console (embedded fixtures)
+        working-directory: web
+        run: npm ci && npm run build
+      - name: compile nuwa lib tests
+        run: cargo test -p nuwa --lib --no-run
+      - name: nuwa lib parallel probe
+        timeout-minutes: 20
+        run: |
+          for i in $(seq 1 "${{ inputs.iterations }}"); do
+            echo "=== parallel iteration $i/${{ inputs.iterations }} ==="
+            timeout -k 10 180 cargo test -p nuwa --lib -- --test-threads=2 --nocapture
+          done
+      - name: full workspace parallel probe (one pass)
+        continue-on-error: true
+        run: |
+          timeout -k 20 600 cargo test --workspace -- --test-threads=2 --nocapture
