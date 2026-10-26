@@ -16,7 +16,7 @@
 3. **运行器池调度**（应龙）
    - 按技术栈选 runner；并发与队列；预算闸（每问题单 token 上限 + 每仓库每日 PR 上限）接入 rpi-harness budget 钩子
    - runner 镜像矩阵（per-stack 工具链 + 离线依赖缓存）
-   - 状态：调度闸/串行 runner 已完成；多 worker（不同 `--runner-id` + 独立 checkout）与**单进程池 `--pool N`**（不同 id + worktree，2026-10-26）均已支持；剩余预构建 runner 镜像矩阵（ops 产物）。（见 docs/08 多 worker / 单进程池，ADR-018）
+   - 状态：调度闸/串行 runner 已完成；多 worker（不同 `--runner-id` + 独立 checkout）、**单进程池 `--pool N`**（不同 id + worktree）与**镜像矩阵**（base/go/rust/node/python Dockerfile，CI 构建验证；registry 推送由所有者执行，2026-10-26）均已落地。（见 docs/08 多 worker / 单进程池 / 镜像矩阵，ADR-018）
 4. **验证探针协议**（现场验证，命名待定）
    - 补丁下发 → 现场执行预定义脚本 → 回报 pass/fail + 新日志 的安全协议；触发条件（中心 runner 无法复现的环境特定 bug）
    - 状态：**阻塞**——执行端是现场 SDK（青鸟），本轮明确排除；在 SDK 未提供“预定义脚本 + 结果回传”能力前，服务端单边实现只会扩大攻击面，不落地（2026-10-26）。
@@ -142,7 +142,8 @@
 - **A-3 前置重构②：runner 多值遥测（2026-10-26）**：`RunnerLive` 改为活动 run 集合；单 run 时 heartbeat 仍上报该 fingerprint/phase，多 run 时上报 NULL（不随便挑一个），逐 run 细节留在 `runs` 表；`live_end` 逐个移除。单 run 行为不变。边界：多 run 时 shanhaijing 的 `stuck` 判定回退到 runner 心跳（`current_fingerprint` 单值匹配不到具体 issue），池落地时需补 per-run 进度。测试：1/2 run 聚合、逐个结束。
 - **A-3 前置重构③：RunWorkspace + 配置根/编辑根拆分（2026-10-26）**：新增 workspace 模块：`Direct` 借用主 checkout（现状），`Worktree` 从 `origin/<base>` 创建 detached git worktree 并在 Drop 时移除；`work_once` 的 repair/deliver 改走 `workspace.path()`。`RepairRequest` 增加 `workspace`（`None` = 编辑 `repo`），skills/config 仍从 `repo` 读取，修复写入 workspace；`work_once_in` 同步区分 `config_root` 与编辑目录。测试：worktree 独立、编辑不泄漏、Drop 后目录与注册项消失；配置根与编辑根分离。
 - **A-3 单进程池（2026-10-26）**：`nuwa work --pool N`（1–16）在一个进程内起 N 个逻辑 runner；#1 用主 checkout，#2..N 用 detached worktree；每 worker 独立 id/租约/心跳/TrustedInstructions，共享 DB 队列与 fetch 锁；SIGTERM 释放全部租约。`preflight_repo` 对 detached worktree 采用 fetch+reset（不 checkout base）。测试：2 张 ready 单 + faux，同一进程两 worker 各完成一单。边界：异步并发而非 OS 进程隔离；崩溃残留 worktree 需 prune；镜像矩阵仍是 ops。
-- 下一步：真实系统首例机器人闭环（部署环境/密钥）→ runner 镜像矩阵（ops）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
+- **Runner 镜像矩阵（2026-10-26）**：`docker/` 新增 base + go/rust/node/python 五个镜像；静态 musl 二进制 + 每栈工具链；非 root、安全目录、/data /sessions 卷、缓存卷说明。CI `docker` job 用 musl artifact 构建全部镜像并跑 base 冒烟；registry 推送保持所有者动作。单容器多 worker 时 checkout 需挂不同路径（checkout 互斥按 `repo_path`）。
+- 下一步：真实系统首例机器人闭环（部署环境/密钥）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 

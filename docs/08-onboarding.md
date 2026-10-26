@@ -174,6 +174,7 @@ nuwa work --db shanhaijing.db \
 - `--runner-id`：控制台可见的 runner 身份，默认 `hostname:repo`；仅保留字母数字与 `.:_-`，超长截断。**同一 id 只允许一个活进程**（ADR-018）：第二个进程会等待旧租约过期（至多 TTL+10s，约 70s），仍被持有则启动失败；要并行跑多个 runner 请给每个进程不同的 `--runner-id`。被接管时进程以 0 退出（systemd 不再重启），由新持有者继续。
 - **多 worker（A-3 拓扑）**：一个 DB 就是队列；每个 worker 是独立的 `nuwa work --loop` 进程，必须使用**不同**的 `--runner-id` 和**不同**的仓库 checkout（各自 clone）。不同 id 共用同一 checkout 会被租约直接拒绝（错误里带占用者 id），避免两个进程互相 reset/fetch。每个 worker 按目标栈准备工具链（Go/Rust/Node/Python），这就是 runner 镜像矩阵的部署侧含义；当前发布单一二进制，镜像/unit 由部署方按栈组合。每日 PR/token 配额在 DB 内按仓库聚合，N 个 worker 共享同一额度。
 - **单进程池 `--pool N`（1–16，默认 1）**：一个 `nuwa work` 进程内起 N 个逻辑 runner；worker #1 用主 checkout，#2..N 用 detached git worktree（临时目录，正常退出清理）。每个 worker 有独立 runner id（`<id>-2`…）、租约、心跳与 trusted 配置副本；共享 DB 队列、配额与一把 fetch/清理互斥锁。控制台显示 N 个 runner。SIGTERM 释放全部 worker 租约；崩溃重启时残留 worktree 需 `git worktree prune` 清元数据。单进程内是异步并发而非 OS 进程隔离。
+- **预构建镜像矩阵**：`docker/` 提供 base + go/rust/node/python 五种 runner 镜像（[docker/README.md](../docker/README.md) 有构建/运行/缓存/安全说明）。CI 的 `docker` job 每次用 musl 产物构建验证；registry 推送由所有者执行，本仓不自动发布镜像。容器内每个 worker 的 checkout 必须挂到不同路径（checkout 互斥按 `repo_path` 比较）。
 - `--service-unit`：记录 systemd 单元名（默认 `nuwa-work`）。控制台的「重启 unit」动作会消费它（缺失/非法时该动作禁用或 422）
 - `--daily-token-limit` / `--monthly-token-limit`：每仓库每日 / 滚动 30 天 token 上限（默认 5M / 50M；失败尝试也计入）
 - 密钥隔离：work 启动时把 `NUWA_GITHUB_TOKEN`/`GITHUB_TOKEN`/`ZAI_API_KEY`/`ANTHROPIC_API_KEY` 读入内存并从 env 移除；bash/验证子进程只收到白名单（PATH/HOME/GOCACHE 等）。非敏感的额外变量用 `NUWA_AGENT_ENV_ALLOW` 逗号追加。ssh-agent / credential store 仍需部署侧隔离（建议 runner 专用用户）。

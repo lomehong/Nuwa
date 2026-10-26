@@ -135,6 +135,36 @@ jobs:
           db="$(mktemp -d)/smoke.db"
           "$bin" status --db "$db" > /dev/null
           test -s "$db"
+      - name: upload static binary (runner images)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuwa-musl
+          path: target/x86_64-unknown-linux-musl/release/nuwa
+
+  docker:
+    # 用 musl 产物构建 runner 镜像矩阵，验证 Dockerfile 与工具链组合。
+    # 推送到 registry 是所有者动作，CI 不发布镜像。
+    needs: musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nuwa-musl
+          path: docker
+      - name: build image matrix
+        run: |
+          chmod +x docker/nuwa
+          docker build -f docker/runner-base.Dockerfile -t nuwa-runner-base:local .
+          for stack in go rust node python; do
+            docker build -f "docker/runner-$stack.Dockerfile" -t "nuwa-runner-$stack:local" .
+          done
+      - name: smoke base image
+        run: |
+          tmp="$(mktemp -d)"
+          chmod 777 "$tmp"
+          docker run --rm -v "$tmp:/data" nuwa-runner-base:local status --db /data/smoke.db
+          test -s "$tmp/smoke.db"
 
   types:
     # API DTO → 前端 TypeScript 类型的单一来源：ts-rs 只在 `ts-export` feature

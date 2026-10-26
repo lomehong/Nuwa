@@ -24,6 +24,9 @@ Cargo.lock.bak
 .env.*
 job-logs.txt
 
+# Runner image build context (docker/build.sh copies the static binary here)
+/docker/nuwa
+
 # local serve/probe logs
 /fg*.log
 /fg*e.log
