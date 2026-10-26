@@ -301,9 +301,9 @@ fn default_faux_script() -> FauxScript {
 }
 
 pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
-    // Turn budget (rpi-harness RunBudget reads this per run). Token-level caps
-    // land with the 运行器池 scheduler; the turn cap bounds runaway loops now.
-    std::env::set_var("RPI_MAX_TURNS_PER_RUN", job.max_turns.to_string());
+    // The turn cap is a per-run harness option, not the process-global
+    // RPI_MAX_TURNS_PER_RUN: concurrent repairs in one process must not
+    // overwrite each other's limit (A-3 pre-refactor).
 
     let repo = std::path::absolute(&job.repo)
         .with_context(|| format!("resolve repo {}", job.repo.display()))?;
@@ -464,11 +464,13 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         },
         ..AgentHarnessOptions::default()
     };
-    let harness = Arc::new(
-        AgentHarness::create(options)
-            .await
-            .context("harness create")?,
-    );
+    let harness = AgentHarness::create(options)
+        .await
+        .context("harness create")?;
+    // Per-run cap: several harnesses may run in one process, so the limit
+    // must not go through the process-global RPI_MAX_TURNS_PER_RUN.
+    harness.set_max_turns(job.max_turns);
+    let harness = Arc::new(harness);
 
     // 压缩是上下文预算里唯一有事件的一环：每次自动压缩的 guard 会发
     // active=true/false 两个事件，只数开始那一次。
@@ -888,5 +890,78 @@ mod tests {
 
         let fixed = std::fs::read_to_string(&source).expect("read");
         assert!(fixed.contains("i < len(xs)"), "faux edit must land");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_run_turn_caps_do_not_race() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let make_job = |name: &str, max_turns: u32, seen: Arc<Mutex<Vec<RepairProgress>>>| {
+            let repo = root.path().join(name);
+            std::fs::create_dir_all(&repo).expect("repo");
+            std::fs::write(
+                repo.join("calc.go"),
+                "package main\n\nfunc Average(xs []float64) float64 {\n\
+                 \tvar sum float64\n\
+                 \tfor i := 0; i <= len(xs); i++ {\n\
+                 \t\tsum += xs[i]\n\
+                 \t}\n\
+                 \treturn sum / float64(len(xs))\n\
+                 }\n",
+            )
+            .expect("write");
+            let seen_cb = Arc::clone(&seen);
+            RepairJob {
+                repo,
+                issue: issue(),
+                sessions_dir: root.path().join(format!("sessions-{name}")),
+                provider: ProviderKind::Faux,
+                max_turns,
+                guards: Arc::new(Guards::new(Vec::new())),
+                secrets: Arc::new(crate::secrets::Secrets::default()),
+                notes: String::new(),
+                progress: Some(Arc::new(move |progress| {
+                    seen_cb.lock().expect("progress").push(progress);
+                })),
+                faux_script: None,
+                run_id: Some(name.into()),
+            }
+        };
+        let low_seen = Arc::new(Mutex::new(Vec::new()));
+        let high_seen = Arc::new(Mutex::new(Vec::new()));
+        let low = make_job("low", 1, Arc::clone(&low_seen));
+        let high = make_job("high", 5, Arc::clone(&high_seen));
+
+        let (low_result, high_result) = tokio::join!(run(&low), run(&high));
+
+        let low_error = match low_result {
+            Ok(_) => panic!("cap 1 must abort after the first turn"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{low_error:#}").contains("aborted"),
+            "unexpected low-cap outcome: {low_error:#}"
+        );
+        let high_report = high_result.expect("cap 5 must finish the 3-turn script");
+        assert_eq!(high_report.turns, 3);
+        assert_eq!(
+            low_seen
+                .lock()
+                .expect("progress")
+                .last()
+                .expect("low progress")
+                .turns,
+            1,
+            "the cap-1 run must stop at its own limit"
+        );
+        assert_eq!(
+            high_seen
+                .lock()
+                .expect("progress")
+                .last()
+                .expect("high progress")
+                .turns,
+            3,
+            "the cap-5 run must keep its own limit"
+        );
     }
 }

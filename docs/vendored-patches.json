@@ -5,7 +5,7 @@
   "files": [
     {
       "path": "crates/rpi-harness/src/agent_harness.rs",
-      "reason": "预算耗尽不再误报 Completed（返回 Aborted）；compaction 摘要请求继承调用方 pin 的 stream options"
+      "reason": "预算耗尽不再误报 Completed（返回 Aborted）；compaction 摘要请求继承调用方 pin 的 stream options；新增 set_max_turns，使每次 run 的 turn 上限不依赖进程级环境变量（A-3 前置重构）"
     },
     {
       "path": "crates/rpi-harness/src/compaction/compaction.rs",

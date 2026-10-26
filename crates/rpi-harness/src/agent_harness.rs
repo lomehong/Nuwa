@@ -604,6 +604,8 @@ struct HarnessInner {
     stream_options: AgentHarnessStreamOptions,
     retry: RetryPolicy,
     compaction: CompactionSettings,
+    // Nuwa 本地补丁(2026-10-26): per-run turn ceiling.
+    max_turns: Option<u32>,
     /// v1 leaves the harness in `Automatic` driving mode; the field is kept so
     /// the contract mirrors TS `AgentHarnessOptions.drive`.
     #[allow(dead_code)]
@@ -659,6 +661,15 @@ pub struct AgentHarness {
 }
 
 impl AgentHarness {
+    // Nuwa 本地补丁(2026-10-26): per-run turn ceiling without changing
+    // `AgentHarnessOptions` (vendored callers construct it exhaustively).
+    /// Set this harness's own turn ceiling. `None` (the default) keeps the
+    /// upstream `RPI_MAX_TURNS_PER_RUN` fallback; callers running several
+    /// harnesses in one process should set a per-run value instead.
+    pub fn set_max_turns(&self, max_turns: u32) {
+        self.inner.lock().unwrap().max_turns = Some(max_turns);
+    }
+
     /// Construct from options. Mirrors TS `AgentHarness.create`: when the
     /// session already has records (a prior operation) the default is to
     /// reject (TS throws `HarnessNotImplemented("create.restore")`). The
@@ -744,6 +755,8 @@ impl AgentHarness {
             stream_options: options.stream_options,
             retry: options.retry,
             compaction: options.compaction,
+            // Nuwa 本地补丁(2026-10-26): set through `set_max_turns`.
+            max_turns: None,
             driving: options.drive,
             tool_execution: options.tool_execution,
             system_prompt: options.system_prompt,
@@ -3033,6 +3046,7 @@ impl AgentHarness {
             stream_options: inner.stream_options.clone(),
             retry: inner.retry.clone(),
             compaction: inner.compaction,
+            max_turns: inner.max_turns,
             tool_execution: inner.tool_execution,
             models: inner.models.clone(),
             to_provider_messages: inner.to_provider_messages.clone(),
@@ -3759,7 +3773,12 @@ impl AgentHarness {
         // run (`docs/debugging/llm-repetition-forensics.md` §二). Upstream has no such
         // ceiling either, so this is **off unless** `RPI_MAX_TURNS_PER_RUN=<n>`
         // asks for it; when off the hook stays `None` and the loop is unchanged.
-        let run_budget = Arc::new(Mutex::new(crate::run_budget::RunBudget::from_env()));
+        // Nuwa 本地补丁(2026-10-26): a per-run value wins over the process
+        // env, so concurrent harnesses in one process keep separate caps.
+        let run_budget = Arc::new(Mutex::new(match snap.max_turns {
+            Some(limit) => crate::run_budget::RunBudget::new(limit),
+            None => crate::run_budget::RunBudget::from_env(),
+        }));
         let should_stop_after_turn: Option<rpi_agent::ShouldStopAfterTurn> =
             if run_budget.lock().unwrap().is_enabled() {
                 let budget = Arc::clone(&run_budget);
@@ -4441,6 +4460,7 @@ struct ConfigSnapshot {
     stream_options: AgentHarnessStreamOptions,
     retry: RetryPolicy,
     compaction: CompactionSettings,
+    max_turns: Option<u32>,
     tool_execution: HarnessToolExecution,
     models: Vec<Arc<dyn AiProvider>>,
     to_provider_messages: Option<ConvertToLlm>,

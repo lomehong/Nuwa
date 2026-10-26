@@ -16,7 +16,7 @@
 3. **运行器池调度**（应龙）
    - 按技术栈选 runner；并发与队列；预算闸（每问题单 token 上限 + 每仓库每日 PR 上限）接入 rpi-harness budget 钩子
    - runner 镜像矩阵（per-stack 工具链 + 离线依赖缓存）
-   - 状态：调度闸/串行 runner 已完成；多 worker（不同 `--runner-id` + 独立 checkout）已由租约与 checkout 互斥支持；**单进程多工作树池与预构建镜像矩阵未做**（2026-10-26，见 docs/08 多 worker 拓扑；单进程池受进程级 turn 环境变量、单值 runner 遥测与共享 checkout 生命周期限制，ADR-018）。
+   - 状态：调度闸/串行 runner 已完成；多 worker（不同 `--runner-id` + 独立 checkout）已由租约与 checkout 互斥支持；A-3 前置重构进行中：① **turn 上限已按 run 传参**（2026-10-26，不再依赖进程级 env），② runner 多值遥测、③ per-run worktree 生命周期未做；**单进程多工作树池与预构建镜像矩阵未做**（见 docs/08 多 worker 拓扑，ADR-018）。
 4. **验证探针协议**（现场验证，命名待定）
    - 补丁下发 → 现场执行预定义脚本 → 回报 pass/fail + 新日志 的安全协议；触发条件（中心 runner 无法复现的环境特定 bug）
    - 状态：**阻塞**——执行端是现场 SDK（青鸟），本轮明确排除；在 SDK 未提供“预定义脚本 + 结果回传”能力前，服务端单边实现只会扩大攻击面，不落地（2026-10-26）。
@@ -138,7 +138,8 @@
 - **musl 静态产物（2026-10-26）**：CI 新增 `musl` job（`musl-tools` + `x86_64-unknown-linux-musl`），release 矩阵增加 `nuwa-linux-x64-musl`；构建后用 PT_INTERP 断言无动态加载器，并用临时库跑 `nuwa status` 冒烟。gnu/msvc 仍跑 clippy + 全量测试，musl 只做构建/冒烟。
 - **多 worker checkout 互斥（2026-10-26，A-3 拓扑）**：runner 租约在同一事务内新增 checkout 占用检查——不同 runner id 不能共用同一份 canonical 仓库路径（否则两个进程会互相 reset/fetch）。配合同 id 互斥与 claim 原子 owner，支持“同库多 worker、各自 clone”的并发拓扑；docs/08 补部署说明。**仍未做**：单进程内多工作树池与预构建 runner 镜像矩阵（ops 产物）。
 - **转录运行中脱敏（2026-10-26）**：progress 回调每 3s（首帧立即）触发一次 `redact_session_dir`，原子重发 `redacted/` 快照；serve 仍只读快照、永不回退原始 JSONL。快照失败只告警不中断 run，最终发布仍由 `execute` 保证。测试：progress 触发后快照已脱敏，且调用方 sink 仍被执行。
-- 下一步：真实系统首例机器人闭环（部署环境/密钥）→ runner 镜像矩阵/单进程池（A-3 剩余）→ 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
+- **A-3 前置重构①：turn 上限按 run 传参（2026-10-26）**：vendored harness 新增 `AgentHarness::set_max_turns`（未调用时回退 `RPI_MAX_TURNS_PER_RUN`）；`repair::run` 不再写进程级 env，改为创建后调用 `set_max_turns(job.max_turns)`。回归测试：同进程并发两个 run（cap 1 / cap 5），cap 1 按自己的上限 aborted、cap 5 完成 3 轮，互不覆盖。下一步：② runner 多值遥测与 ③ per-run worktree 生命周期。
+- 下一步：②③ 完成后接入单进程池（A-3）→ 真实系统首例机器人闭环（部署环境/密钥）→ runner 镜像矩阵 → 青鸟 SDK 同步 repo 限定指纹（ADR-013 跟进）→ 基准场景扩充（真实仓库故障与 live 基线）。
 
 ## E · clippy / unwrap 基线（2026-10-15 盘点，`clippy -p <crate> --lib`）
 
