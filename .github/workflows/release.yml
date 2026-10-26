@@ -50,17 +50,13 @@ jobs:
         # musl 变体只负责静态构建与冒烟；host 编译门已由 gnu/msvc 覆盖。
         if: matrix.target != 'x86_64-unknown-linux-musl'
         run: cargo clippy --no-deps -p nuwa -p shanhaijing --all-targets -- -D warnings
-      - name: tests (workspace)
+      - name: tests (self-owned crates)
+        # Vendored 全量测试由同提交的 ci.yml 覆盖；release 只回归自建产品
+        # crate。workspace 全量在冷缓存 runner 上曾挂死（2026-10-26）。
         if: matrix.target != 'x86_64-unknown-linux-musl'
-        timeout-minutes: 20
+        timeout-minutes: 12
         shell: bash
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test --workspace -- --test-threads=1 --nocapture \
-              --skip execution_env_conformance::os_cancel_interrupts_even_when_timeout_is_set
-          else
-            cargo test --workspace -- --test-threads=1 --nocapture
-          fi
+        run: cargo test -p nuwa -p shanhaijing -- --test-threads=1 --nocapture
       - run: cargo build --release -p nuwa --target ${{ matrix.target }}
         env:
           # 编译期注入版本指纹：/api/v1/system 的 build_commit（tag 构建时是
