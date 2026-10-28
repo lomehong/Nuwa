@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::api::common::{DAY_MS, RUNNER_OFFLINE_MS};
 use crate::api::ApiError;
+use crate::config_activation::{self, ProcessConfigDto, SavedConfigDto};
 use crate::serve::AppState;
 use shanhaijing::{RunnerRow, ShanResult, Store};
 
@@ -43,12 +44,17 @@ pub struct RunnerDto {
     pub phase: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Last reported by this process, not a centrally enforced fleet limit.
     pub daily_pr_limit: Option<i64>,
+    /// Historical PR creation/local observation metric, not admission usage.
     pub prs_today: u64,
+    /// Repo-wide UTC admission-day slots, including in-flight/ambiguous work.
+    pub pr_slots_today: u64,
     pub repo_path: Option<String>,
     pub service_unit: Option<String>,
     pub last_error: Option<String>,
     pub effective: EffectiveConfig,
+    pub configuration: ProcessConfigDto,
 }
 
 /// The config a runner reported in its last heartbeat. Missing/malformed keys
@@ -79,7 +85,13 @@ pub struct EffectiveConfig {
 pub async fn list(State(state): State<AppState>) -> Response {
     let now = crate::now_ms();
     let store = Arc::clone(&state.store);
-    match tokio::task::spawn_blocking(move || build_runners(&store, now)).await {
+    let path = state.env_path.clone();
+    match tokio::task::spawn_blocking(move || {
+        let saved = config_activation::saved_config(&store, &path);
+        build_runners(&store, now, &saved)
+    })
+    .await
+    {
         Ok(Ok(body)) => Json(body).into_response(),
         Ok(Err(error)) => {
             eprintln!("runners: store read failed: {error}");
@@ -102,26 +114,39 @@ pub async fn list(State(state): State<AppState>) -> Response {
     }
 }
 
-fn build_runners(store: &Store, now: i64) -> ShanResult<RunnerListResponse> {
+fn build_runners(
+    store: &Store,
+    now: i64,
+    saved: &SavedConfigDto,
+) -> ShanResult<RunnerListResponse> {
     let day_start = now - now.rem_euclid(DAY_MS);
-    // Quota is per repo; runners of the same repo share one count.
-    let mut prs_by_repo: BTreeMap<String, u64> = BTreeMap::new();
+    // Counts are per repo; reported process limits may differ.
+    let mut prs_by_repo: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut data = Vec::new();
     for runner in store.list_runners()? {
-        let prs_today = match prs_by_repo.get(&runner.repo) {
-            Some(count) => *count,
+        let (prs_today, pr_slots_today) = match prs_by_repo.get(&runner.repo) {
+            Some(counts) => *counts,
             None => {
-                let count = store.prs_opened_since(&runner.repo, day_start)?;
-                prs_by_repo.insert(runner.repo.clone(), count);
-                count
+                let counts = (
+                    store.prs_opened_since(&runner.repo, day_start)?,
+                    store.pr_slots_used(&runner.repo, day_start)?,
+                );
+                prs_by_repo.insert(runner.repo.clone(), counts);
+                counts
             }
         };
-        data.push(runner_dto(&runner, now, prs_today));
+        data.push(runner_dto(&runner, now, prs_today, pr_slots_today, saved));
     }
     Ok(RunnerListResponse { data })
 }
 
-fn runner_dto(runner: &RunnerRow, now: i64, prs_today: u64) -> RunnerDto {
+fn runner_dto(
+    runner: &RunnerRow,
+    now: i64,
+    prs_today: u64,
+    pr_slots_today: u64,
+    saved: &SavedConfigDto,
+) -> RunnerDto {
     RunnerDto {
         id: runner.id.clone(),
         repo: runner.repo.clone(),
@@ -138,10 +163,12 @@ fn runner_dto(runner: &RunnerRow, now: i64, prs_today: u64) -> RunnerDto {
         model: runner.model.clone(),
         daily_pr_limit: runner.daily_pr_limit,
         prs_today,
+        pr_slots_today,
         repo_path: runner.repo_path.clone(),
         service_unit: runner.service_unit.clone(),
         last_error: runner.last_error.clone(),
         effective: effective_config(&runner.config_json),
+        configuration: config_activation::runner_configuration(runner, saved, now),
     }
 }
 
@@ -203,6 +230,14 @@ mod tests {
         let db_path = dir.path().join("s.db");
         let store = Arc::new(shanhaijing::Store::open(&db_path).expect("open"));
         let state = AppState {
+            startup_config: Arc::new(crate::config_activation::StartupConfig::capture(
+                &store,
+                &dir.path().join("nuwa.env"),
+                "serve",
+                uuid::Uuid::new_v4().to_string(),
+                crate::now_ms(),
+                &std::collections::BTreeMap::new(),
+            )),
             store,
             ui_token: Arc::new(None),
             ingest_token: Arc::new(Some("ingest-secret".into())),
@@ -272,6 +307,7 @@ mod tests {
                 "panic: {title}\ngoroutine 1 [running]:\nexample.com/app.Fn_{}()\n\t/app/x.go:1 +0x1",
                 title.replace(' ', "_")
             ),
+            ..Default::default()
         };
         match store.report_signal(&signal, at).expect("report signal") {
             shanhaijing::ReportOutcome::NewIssue { fingerprint } => fingerprint,
@@ -382,6 +418,31 @@ mod tests {
             )
             .expect("other pr");
 
+        // An in-flight admission has no confirmed PR and must not replace
+        // the historical metric above.
+        let claim = state
+            .store
+            .claim_delivery(
+                &shanhaijing::DeliveryStart {
+                    id: "pending".into(),
+                    run_id: None,
+                    fingerprint: "pending-fp".into(),
+                    repo: APP.into(),
+                    branch: "agent/fix/pending".into(),
+                    base: "main".into(),
+                    head_sha: "pending-sha".into(),
+                    now,
+                },
+                "owner",
+                DAY_MS,
+            )
+            .expect("claim")
+            .expect("owned");
+        assert!(state
+            .store
+            .reserve_pr_slot_owned(&claim, 5, now)
+            .expect("reserve"));
+
         upsert_runner(
             &state.store,
             "runner-live",
@@ -436,6 +497,9 @@ mod tests {
         assert_eq!(live["heartbeat_at_ms"].as_i64(), Some(now - 1_000));
         assert_eq!(live["status"].as_str(), Some("working"));
         assert_eq!(live["offline"].as_bool(), Some(false));
+        assert_eq!(live["configuration"]["activation"], "unknown");
+        assert_eq!(live["configuration"]["freshness"], "online");
+        assert!(live["configuration"]["snapshot"].is_null());
         assert_eq!(live["current_fingerprint"].as_str(), Some(fp_a.as_str()));
         assert_eq!(live["phase"].as_str(), Some("repair"));
         assert_eq!(live["provider"].as_str(), Some("zai"));
@@ -446,6 +510,7 @@ mod tests {
             Some(2),
             "both APP PRs count for the APP runner"
         );
+        assert_eq!(live["pr_slots_today"].as_u64(), Some(1));
         assert_eq!(live["repo_path"].as_str(), Some("/opt/nuwa/repo/app"));
         assert_eq!(live["service_unit"].as_str(), Some("nuwa-work"));
         assert_eq!(live["last_error"], serde_json::Value::Null);
@@ -466,11 +531,14 @@ mod tests {
         assert_eq!(stale["repo"].as_str(), Some(OTHER));
         assert_eq!(stale["heartbeat_at_ms"].as_i64(), Some(now - 200_000));
         assert_eq!(stale["offline"].as_bool(), Some(true));
+        assert_eq!(stale["configuration"]["activation"], "unknown");
+        assert_eq!(stale["configuration"]["freshness"], "offline");
         assert_eq!(stale["status"].as_str(), Some("idle"));
         assert_eq!(stale["current_fingerprint"], serde_json::Value::Null);
         assert_eq!(stale["phase"], serde_json::Value::Null);
         assert_eq!(stale["last_error"].as_str(), Some("repair failed"));
         assert_eq!(stale["prs_today"].as_u64(), Some(1));
+        assert_eq!(stale["pr_slots_today"].as_u64(), Some(0));
         assert_eq!(
             stale["effective"],
             serde_json::json!({

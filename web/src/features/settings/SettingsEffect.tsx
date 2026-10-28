@@ -9,10 +9,10 @@ import {
   formatSecondsShort,
   secretIsSet,
   secretLabel,
-  unitForSpec,
   type SettingsAreaDef,
 } from "./areas";
 import { EnvironmentDetails } from "./EnvironmentDetails";
+import { ProcessConfiguration } from "./ProcessConfiguration";
 import type { SettingDto, SettingsResponse } from "./types";
 
 interface SettingsEffectProps {
@@ -22,7 +22,6 @@ interface SettingsEffectProps {
   drafts: Record<string, string>;
   /** Connection probes; the only area with an action beyond save. */
   testActions?: ReactNode;
-  lastSave?: { changed: string[]; restartRequired: boolean } | null;
 }
 
 interface EffectRow {
@@ -46,33 +45,9 @@ function numeric(raw: string): number | null {
   return Number.isFinite(value) ? value : null;
 }
 
-function runtimeValue(spec: SettingDto, raw: string): string {
-  const unit = unitForSpec(spec);
-  if (spec.key.includes("TOKEN")) {
-    const value = numeric(raw);
-    return value === null ? raw : formatTokens(value);
-  }
-  if (unit === "秒") {
-    return `${raw}s`;
-  }
-  return unit ? `${raw} ${unit}` : raw;
-}
-
-function restartTarget(area: SettingsAreaDef): string {
-  if (area.id === "governance") {
-    return "serve";
-  }
-  if (area.id === "environment") {
-    return "unit";
-  }
-  return "work";
-}
-
 /**
- * The left-hand column answers "what changes when I save": the resulting
- * behavior, the keys that will change, and the runtime values that are still in
- * effect until a restart. It carries the product-specific evidence the form
- * itself cannot show.
+ * Saved/draft candidates are not runtime evidence. Each relevant process
+ * reports its own startup revision, actual values and independent freshness.
  */
 export function SettingsEffect({
   area,
@@ -80,7 +55,6 @@ export function SettingsEffect({
   specs,
   drafts,
   testActions,
-  lastSave,
 }: SettingsEffectProps) {
   const byKey = new Map(specs.map((spec) => [spec.key, spec]));
   const raw = (key: string): string => {
@@ -92,7 +66,10 @@ export function SettingsEffect({
 
   const dirtySpecs = specs.filter((spec) => drafts[spec.key] !== undefined);
   const restartDirty = dirtySpecs.filter((spec) => spec.requires_restart).length;
-  const runtimeDiffs = specs.filter((spec) => data.effective_diff[spec.key]);
+  const processes = data.processes.filter((process) =>
+    !["serve", "work"].includes(process.role) ||
+    specs.some((spec) => spec.scope === "both" || spec.scope === process.role),
+  );
 
   const rows: EffectRow[] = [];
   if (area.id === "connection") {
@@ -133,8 +110,8 @@ export function SettingsEffect({
   } else if (area.id === "execution") {
     if (has("NUWA_INTERVAL")) {
       rows.push({
-        label: "下一次轮询",
-        value: `${raw("NUWA_INTERVAL") || "—"}s 后`,
+        label: "候选轮询间隔",
+        value: `${raw("NUWA_INTERVAL") || "—"}s`,
         changed: changed("NUWA_INTERVAL"),
       });
     }
@@ -244,23 +221,24 @@ export function SettingsEffect({
     .map((row) => `${row.label} ${row.value}`)
     .join(" · ");
 
-  const runtimeText = runtimeDiffs
-    .map((spec) => `${spec.label} ${runtimeValue(spec, data.effective_diff[spec.key].runtime)}`)
-    .join(" · ");
-  const target = restartTarget(area);
-  const pendingRestart =
-    data.restart_pending || (lastSave?.restartRequired ?? false);
+  const candidateLabel = dirtySpecs.length > 0 ? "草稿候选" : "已保存候选";
+  const savedLabel = data.saved.state === "saved" && data.saved.revision
+    ? "已保存（saved）"
+    : data.saved.state === "unversioned"
+      ? "未建立版本（unversioned）"
+      : "未知（unknown），不能确认保存版本";
 
   return (
     <>
-      <section className="st-effect" aria-label="保存后的行为">
+      <section className="st-effect" aria-label="候选配置预览">
         <p className="st-effect-head">
-          <span>保存后</span>
+          <span>{candidateLabel}</span>
           <span
             className={clsx("st-dot", dirtySpecs.length > 0 ? "warn" : "ok")}
             aria-hidden="true"
           />
         </p>
+        <p className="st-envnote">仅为候选预览；保存不会改变运行进程。需重启相关进程，并以其启动上报确认生效；CLI 覆盖不会因重启而消失。</p>
         <dl className="st-effect-rows">
           {rows.map((row) => (
             <div className="st-effect-row" key={row.label}>
@@ -297,7 +275,7 @@ export function SettingsEffect({
         <div className="st-effect-sep" />
         <div className="st-envhead">
           <span>写入 nuwa.env</span>
-          <code>{dirtySpecs.length > 0 ? "仅本区键" : "当前值"}</code>
+          <code>{dirtySpecs.length > 0 ? "仅本区草稿键" : "已保存文件 / 默认值"}</code>
         </div>
         {envPreviewLines.length > 0 ? (
           <pre className="st-env">
@@ -327,26 +305,32 @@ export function SettingsEffect({
         </p>
       </section>
 
-      <p className="st-mobile-summary">保存后：{summaryText}</p>
+      <p className="st-mobile-summary">{candidateLabel}（需重启相关进程）：{summaryText}</p>
 
       {area.id === "environment" ? <EnvironmentDetails data={data} /> : null}
 
-      {runtimeDiffs.length > 0 ? (
+      <section className="my-4 space-y-2 break-all text-caption" aria-label="保存状态">
+        <h3 className="font-semibold">保存状态：{savedLabel}</h3>
+        <p>文件身份：<code>{data.saved.env_id || "未知"}</code></p>
+        <p>保存版本：<code>{data.saved.revision ?? "未知"}</code></p>
+        {data.saved.reason ? <p>原因：{data.saved.reason}</p> : null}
+      </section>
+      <section className="my-4 space-y-3" aria-label="本区进程配置">
+        <h3 className="text-caption font-semibold">相关进程启动证据</h3>
+        <p className="text-caption text-text-muted">配置状态按整个启动版本判定；实际值仅列本区适用的非密钥字段。在线不代表已加载保存版本。</p>
+        {processes.length === 0 ? <p className="text-caption">没有相关进程上报；生效状态未知。</p> : processes.map((process, index) => (
+          <ProcessConfiguration
+            key={process.snapshot?.process_instance_id ?? `${process.role}-${process.runner_id}-${index}`}
+            process={process}
+            specs={specs}
+          />
+        ))}
+      </section>
+      {processes.some((process) => process.activation === "stale") ? (
         <p className="st-runtime">
           <span className="st-dot warn" aria-hidden="true" />
           <span>
-            运行中仍是 <b>{runtimeText}</b>；保存并重启 {target} 后切换。
-          </span>
-        </p>
-      ) : null}
-
-      {pendingRestart ? (
-        <p className="st-runtime">
-          <span className="st-dot warn" aria-hidden="true" />
-          <span>
-            {lastSave?.restartRequired
-              ? `已保存；重启 ${target} 后生效。`
-              : `有配置等待重启；重启 ${target} 后生效。`}
+            存在旧版本进程，需分别重启并重新上报确认。
             <Link to="/system">去服务页重启 →</Link>
           </span>
         </p>
@@ -354,7 +338,8 @@ export function SettingsEffect({
 
       {testActions ? (
         <div className="st-test">
-          <p className="st-test-title">连接测试</p>
+          <p className="st-test-title">候选连接测试</p>
+          <p className="st-envnote">测试已保存文件，或文件叠加本次草稿；不测试运行中的进程，也不证明已生效。</p>
           {testActions}
         </div>
       ) : null}

@@ -47,8 +47,12 @@ pub struct ProjectDto {
     pub rejected: i64,
     pub runners: i64,
     pub runners_online: i64,
+    /// Historical PR creation/local observation metric, not admission usage.
     pub prs_today: i64,
-    /// Daily PR quota shared by the project's runners.
+    /// UTC admission-day slots: reserved/requested/ambiguous/consumed.
+    pub pr_slots_today: u64,
+    /// Maximum runner-reported daily limit observed, not a central hard cap.
+    /// Processes may differ; admission uses the creating process's policy.
     pub pr_limit: i64,
     pub ci_green: i64,
     pub ci_red: i64,
@@ -252,6 +256,7 @@ fn build_projects(store: &Store, now: i64) -> ShanResult<ProjectsResponse> {
             runners: entry.runners,
             runners_online: entry.runners_online,
             prs_today: prs_today as i64,
+            pr_slots_today: store.pr_slots_used(repo, day_start)?,
             pr_limit: entry.pr_limit,
             ci_green: entry.ci_green,
             ci_red: entry.ci_red,
@@ -293,6 +298,7 @@ mod tests {
             stack_trace: format!(
                 "panic: {title}\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/a.go:1 +0x1"
             ),
+            ..Default::default()
         }
     }
 
@@ -329,23 +335,25 @@ mod tests {
             .set_state(&alpha_one, State::Escalated, now, None)
             .expect("escalated");
 
-        store
-            .upsert_runner(&shanhaijing::RunnerUpsert {
-                id: "runner-alpha".into(),
-                repo: "app/alpha".into(),
-                host: "host".into(),
-                pid: None,
-                started_at: now - 1_000,
-                heartbeat_at: now,
-                status: "idle".into(),
-                provider: None,
-                model: None,
-                daily_pr_limit: Some(5),
-                repo_path: None,
-                service_unit: None,
-                config_json: "{}".into(),
-            })
-            .expect("runner");
+        for (id, limit) in [("runner-alpha", 5), ("runner-alpha-other-policy", 9)] {
+            store
+                .upsert_runner(&shanhaijing::RunnerUpsert {
+                    id: id.into(),
+                    repo: "app/alpha".into(),
+                    host: "host".into(),
+                    pid: None,
+                    started_at: now - 1_000,
+                    heartbeat_at: now,
+                    status: "idle".into(),
+                    provider: None,
+                    model: None,
+                    daily_pr_limit: Some(limit),
+                    repo_path: None,
+                    service_unit: None,
+                    config_json: "{}".into(),
+                })
+                .expect("runner");
+        }
         store
             .insert_repo(
                 "app/alpha",
@@ -367,9 +375,12 @@ mod tests {
         assert_eq!(alpha.escalated, 1);
         assert_eq!(alpha.attention, 1, "an escalated issue needs a human");
         assert_eq!(alpha.queued, 1);
-        assert_eq!(alpha.runners, 1);
-        assert_eq!(alpha.runners_online, 1);
-        assert_eq!(alpha.pr_limit, 5);
+        assert_eq!(alpha.runners, 2);
+        assert_eq!(alpha.runners_online, 2);
+        assert_eq!(
+            alpha.pr_limit, 9,
+            "maximum observation of differing process policies"
+        );
         assert_eq!(alpha.worst_severity.as_deref(), Some("critical"));
 
         let beta = response
@@ -404,5 +415,87 @@ mod tests {
 
         let response = build_projects(&store, now).expect("projects");
         assert_eq!(response.data[0].repo, "app/loud");
+    }
+
+    #[test]
+    fn admission_slots_are_not_the_historical_pr_metric() {
+        use shanhaijing::{DeliveryStart, DeliveryState};
+
+        let store = Store::open(":memory:").expect("store");
+        let now = DAY_MS + 1_000;
+        store
+            .report_signal(&signal("app/alpha", "legacy", "high"), now)
+            .expect("signal");
+        store
+            .set_pr(
+                &fp_of(&store, "legacy"),
+                "https://github.com/o/r/pull/1",
+                now,
+            )
+            .expect("legacy observation");
+
+        for (id, admitted_at) in [
+            ("reserved", now),
+            ("requested", now),
+            ("ambiguous", now),
+            ("consumed", now),
+            ("released", now),
+            ("yesterday", DAY_MS - 1),
+        ] {
+            let claim = store
+                .claim_delivery(
+                    &DeliveryStart {
+                        id: id.into(),
+                        run_id: None,
+                        fingerprint: format!("fp-{id}"),
+                        repo: "app/alpha".into(),
+                        branch: format!("agent/fix/{id}"),
+                        base: "main".into(),
+                        head_sha: format!("sha-{id}"),
+                        now: admitted_at,
+                    },
+                    "owner",
+                    DAY_MS,
+                )
+                .expect("claim")
+                .expect("owned");
+            assert!(store
+                .reserve_pr_slot_owned(&claim, 10, admitted_at)
+                .expect("reserve"));
+            let mark = |state| {
+                store
+                    .mark_delivery_owned(&claim, state, None, None, None, now)
+                    .expect("transition");
+            };
+            match id {
+                "requested" | "ambiguous" => {
+                    mark(DeliveryState::Pushed);
+                    mark(DeliveryState::PrRequested);
+                    if id == "ambiguous" {
+                        mark(DeliveryState::Ambiguous);
+                    }
+                }
+                "consumed" => store
+                    .complete_delivery_owned(&claim, "https://github.com/o/r/pull/2", 2, None, now)
+                    .expect("confirmed without creation evidence"),
+                "released" => mark(DeliveryState::Failed),
+                "yesterday" => {
+                    assert!(store.reserve_pr_slot_owned(&claim, 0, now).expect("retry"));
+                }
+                _ => {}
+            }
+        }
+
+        let response = build_projects(&store, now).expect("projects");
+        let project = &response.data[0];
+        assert_eq!(project.prs_today, 1, "keep the legacy observation metric");
+        assert_eq!(
+            project.pr_slots_today, 4,
+            "all live/consumed admission states count"
+        );
+        assert_eq!(
+            store.pr_slots_used("app/alpha", 0).expect("original day"),
+            1
+        );
     }
 }

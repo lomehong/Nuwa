@@ -1,6 +1,8 @@
 # 09 · Web 控制台设计（v3）
 
-状态：已定稿（2026-10-17）。替代 v2（2026-10-16）。实施状态：M0–M6 已完成（2026-10-18）；axe、5k 基准、E2E 与回滚演练通过，发布门待明确授权。
+状态：已定稿（2026-10-17）。替代 v2（2026-10-16）。M0–M6 的 axe、5k 基准、E2E 与回滚演练是 2026-10-18 历史快照。2026-10-27 main 基线 v0.17.0：Batch1/2 已完成，Batch3/4 已本地实现，Batch5 observations/schema v13 已本地实现并完成聚焦验证（ADR-027 / DES-027），Batch6 reservations/schema v14 已本地实现、最终检查待完成（ADR-028 / DES-028）；验证时点见 docs/07 §D，不代表完整 workspace/平台/GitHub/systemd 验证；未升版/发版、执行生产迁移或部署。
+
+当前批次顺序：Batch1/schema v10、Batch2/schema v11 已完成 → **Batch3 配置/schema v12 已本地实现** → **Batch4 可信验证/路径护栏已本地实现、最终检查待完成（该批不增 schema）** → **Batch5 observations（信号观察）/schema v13 已本地实现并完成聚焦验证** → **Batch6 reservations（预留）/schema v14 已本地实现、最终检查待完成**。既有验证门或池/镜像不等于后续批次验收已完成。
 
 决策摘要：
 
@@ -8,7 +10,7 @@
 - **鉴权**：登录页 + HMAC 签名 HttpOnly 会话 Cookie + CSRF 双提交；不再是 Basic Auth。
 - **可观测**：一仓一进程不变，新增 runner 身份、后台心跳、run 生命周期、按日信号聚合；支持卡单识别与人工重排。
 - **交付**：M0 线上 P0 热修独立发布；M1–M6 完成后一次性替换旧控制台，随 v0.2.0 发布。
-- **保留**：设置页仍以 `nuwa.env` 为唯一事实源、重启由 systemd 编排（v2 D3）；UI 令牌与上报令牌分离（v2 D2）。
+- **配置边界**：`nuwa.env` 是保存输入源，不是活进程权威；生效按各实例不可变启动证据确认（ADR-025），重启由 systemd 编排（v2 D3）；UI 令牌与上报令牌分离（v2 D2）。
 - **替代**：v2 D1「挂 serve 进程内服务端渲染、零 JS 框架」。
 
 ## 0 · 版本演进
@@ -19,7 +21,7 @@
 | v2 | 2026-10-16 | 三页 SSR（总览/详情/设置）+ G1–G5 + D2 独立 UI 令牌 | 上线 v0.1.5；实测暴露 P0 缺陷与运维盲区 |
 | v3 | 2026-10-17 | SPA + JSON API + 会话鉴权 + runner 遥测 | 本文档 |
 
-v2 的 D2（UI 令牌与上报令牌分离）与 D3（env 文件为唯一事实源 + 重启编排）继续有效；D1（SSR 零 JS）被本版替代。
+v2 的 D2（令牌分离）与 D3 的 env 保存输入/受控重启边界继续有效；Batch3 明确文件不是活进程权威，生效须逐实例启动证明（ADR-025）。D1（SSR 零 JS）被本版替代。
 
 ## 1 · 定位
 
@@ -332,7 +334,7 @@ CREATE TABLE IF NOT EXISTS signal_daily (
 | `repo` | TEXT | 事件所属仓库；配置/系统事件为空 |
 | `actor` | TEXT | `owner` / `runner` / `system`；历史事件为 NULL |
 
-新增事件 kind：`requeued`、`config_migrated`、`restart_requested`、`runner_started`、`runner_stopped`、`runner_error`、`decision`、`memory_updated`、`memory_deleted`。保留既有：`reported`、`state_changed`、`pr_opened`、`ci_green`、`ci_red`、`ci_timeout`、`merged`、`config_changed`。
+新增事件 kind：`requeued`、`config_migrated`、`restart_requested`、`runner_started`、`runner_stopped`、`runner_error`、`decision`、`memory_updated`、`memory_deleted`、`ci_watch`。保留既有：`reported`、`state_changed`、`pr_opened`、`ci_green`、`ci_red`、`ci_timeout`、`merged`、`config_changed`。Batch2 的 `ci_watch` 状态迁移与 CI 观察审计由 Store 和其他本地后果同事务提交。
 `decision` 是结构化决策 trace（ADR-015）：detail 为 `{stage, decision, reason, details}` JSON；活动页与问题时间线渲染为「stage · decision — reason」一行，原始 JSON 保留在 title 中。
 
 系统事件的合成指纹：配置变更/迁移用 `__config__`，重启请求用 `__system__`，runner 生命周期用 `__runner__:<runner_id>`。控制台遇到这些前缀时显示"系统"标签，不当作问题单链接。
@@ -364,6 +366,45 @@ CREATE INDEX idx_signal_day        ON signal_daily(day, repo);
 - 动作：`reopen(fingerprint, actor)`、`requeue_stuck(fingerprint, force, actor)`。
 - 信号：`report_signal` 内改为 `signal_daily` upsert；首次/回归事件照旧。
 - 保留既有 `claim_ready_issue`、`set_state`、`set_pr` 等；`prs_opened_since` 改为按 PR URL 去重统计（`runs` 为主，迁移前 `issues.pr_opened_at` 回退）。
+
+### 7.9 Batch2 · CI 所有权与记忆证据（schema v11，已实现）
+
+- `ci_watches` 唯一绑定 `(slug, pr_number, head_sha)`，关联 repo/fingerprint/run/PR URL 不可挪用，重复登记不复活终态；新增 `claim_token`、`claim_generation`、`claim_until`，所有权与 `next_check_at` 排程分离。claim TTL 120s、每 10s 续租，后台每轮最多 20 条且逐条领取；前台 `wait_for_delivery` 和 serve 共用 claim/计划/处理器，不绕过活跃持有者或未来检查，前台超时/取消保留持久 watch。
+- `claim_ci_watch_owned` / `claim_due_ci_watches_owned`、续租、错误写回和 `finish_ci_watch_owned` 均检查 token/代际/有效期及精确关联。最终事务原子提交 watch、精确 run 的 CI 结论、适用时的 issue 失败收敛、记忆及审计；失败回滚，旧观察不得拒绝新一轮交付。watch 的 green/red 与 run/API 的 success/failure 分开。
+- PR 快照严格解析 state/merged/head；不可读/畸形、CI 未完成与超时不作红灯。head 改变为终态 `head_changed`、不跟随替换 head；green+open 继续观察，green+merged 可发布记忆，closed 即使绿也不发布。红灯关闭前核验 open/同 SHA 与当前交付归属，关闭后再确认 closed/同 SHA 才允许计数重试；外部关闭/合并不自动重开/回滚。
+- `repair_memory_evidence` 独立保存每个来源的内容、有效性与撤销时间/原因，唯一键 `(repo, fingerprint, source_kind, source_id, commit_sha)`，额外校验 PR URL。来源：`ci_green`（source id 为 watch id）、`local_verification`（run id）、`legacy_unknown`（迁移旧记忆，只可见不可注入）。`repair_memory.disabled` 仍只代表人工偏好，不代表证据有效性。
+- red/closed/head_changed 为精确 watch/SHA/PR 的 CI 来源撤销并保留 tombstone（撤销记录，即使未曾绿），不抹除其他提交/独立来源；迟到 green 不得恢复该来源或刷新其摘要。直接红灯不创建/淘汰摘要；每仓普通裁剪只约束最近 50 条未停用摘要、保留停用摘要和证据/tombstone。显式 DELETE 是另一个动作，会同事务移除该记忆摘要和证据。
+- v10 → v11 迁移保留旧摘要内容与 disabled，来源标为 `legacy_unknown`；当前支持版本为 v13（§7.11）。升级必须停全部旧写者及自动重启入口、一致备份 DB/WAL 与 env，不支持混跑；源库版本、隔离副本验证和恢复对应旧二进制/备份见 docs/08，**生产迁移尚未执行**。
+- **不可消除的 GitHub close TOCTOU 限制**：远端没有原子 expected-head close，关前/关后快照和本地租约无法消除已发出的 close 与 push/merge 的竞态；除非不执行自动 close，否则残余风险始终存在。本批没有新增禁用自动 close 的配置开关，不宣称绝不误关或外部 exactly-once。
+
+### 7.10 Batch3 · 保存元数据与不可变启动快照（schema v12，已本地实现）
+
+- 新增 `config_saved(env_id TEXT PRIMARY KEY, revision TEXT NOT NULL, saved_at_ms INTEGER NOT NULL)`，只存版本元数据；`runners.startup_config_json TEXT` 可空，保存脱敏非密钥启动证据。迁移不编造旧文件 revision 或旧 runner 证明，旧实例缺快照保持 unknown；不触及更高 schema。
+- `env_id` 是解析符号链接/最近存在祖先后的绝对文件身份（Windows 小写），revision 是随机 UUID，不是秘密、内容 hash 或密钥 hash。`Store::with_config_save` 的 `BEGIN IMMEDIATE` 串行化同 DB 协作写者的读/校验/备份/替换/版本/键名审计；GET 的文件值与 saved revision 来自同次事务读快照。文件与 DB commit 仍不原子，替换后失败为 `config_save_indeterminate`，不一致显示 unknown。
+- `StartupConfig` 格式版本 1：`process_instance_id/role/runner_id/runner_instance_id/env_id/started_at_ms/loaded_revision/revision_reason/values`。values 只含角色适用非密钥实际值、source、reason；URL 去 userinfo/query/fragment，疑似敏感值省略并给出原因。原始密钥只在内存比较，不进入 snapshot、DB、审计或日志。
+- 真实接线是 `serve::startup_state`、`run_work_with_environment` → `run_runner`：实际解析后的值/来源写入快照。每个 OS 进程一个 UUID，pool 在派生/等租约前取一次输入，各 worker 共享进程身份但 runner 实例不同。`set_runner_startup_config` 核验有效 lease instance、仅首次设置（完全相同重试可接受）；接管清空，心跳/仓库配置刷新不能覆写，旧代际不能补写后继实例。
+- `loaded_revision` 要求启动环境 `NUWA_CONFIG_REVISION` = 文件 marker = DB revision，且该角色全部适用可写 schema 输入与文件精确相等（包括密钥与缺失/存在，在内存中）。缺环境 marker、外部 fallback、歧义语法等保持 unknown；相同明文值/文件 marker/最新 runner 不替代证明。显式 CLI 覆盖可保留 managed input revision 证明，最终值另标 `cli`；active 不表示 CLI 值与文件相等，来源不明/无法解释的覆盖使证明失效。
+- 持久化 saved/unversioned/unknown、生效 active/stale/unknown、在线 online/offline/unreported 独立；离线可保留历史 active，但不代表运行，配置 unit 未上报/无快照不能猜测。`restart_pending/effective_diff` additive 保留为弃用兼容字段，UI 不再使用其作为激活权威。所有者来源/手工编辑约定见 §13.2，升级停写与一致备份见 docs/08；**生产迁移未执行**。
+
+### 7.11 Batch5 · 可审计观察与调用方权威（schema v13，已本地实现并完成聚焦验证）
+
+- `Signal` 的 `observed_at`（epoch 毫秒）、`environment`、`release_sha`、`source_event_id` 均为默认缺省的可选字段；指纹算法不变，旧 payload 继续原回归行为。新增 `signal_observations`，存 id/fingerprint、独立 `received_at_ms`/`observed_at_ms`、环境/版本/来源事件、调用方 `trusted_source`、`time_status`、`disposition`、`duplicate_of`；不是 issue 状态时间线的替代品。
+- 每问题单按 `received_at_ms DESC, id DESC` 保留最近 100 条，另外按**接收时间**清理超过 30 天的回执；不按 observed_at 淘汰。旧问题单不从 first_seen/last_seen 或事件回填观察，空数组不证明从未上报。v12 → v13 增量建表/索引及版本更新同事务，失败保留 v12；所有者授权、停写/备份/副本验证规程见 docs/08，**无生产操作**；当前 schema v14 见 §7.12。
+- 字符串限制为 environment/release/trusted source 各 128 UTF-8 字节、source event 256 字节；空白/控制字符/超限拒绝，不截断身份。时间状态为 `missing/invalid/future/untrusted/trusted`：非正整数或晚于接收时间仍保留，但不能授权；合法时间也必须有调用方授信才可信。来源已授信与时间可信是两件事，页面分别显示。
+- 权威仅由 `report_signal_with_source` 调用方传入。CLI 显式 `nuwa ingest --trust-observations <source-id>` 是 **OWNER ATTESTATION**：所有者核验导入时钟、来源事件 ID、环境与精确 release 关系；不是密码学证明。HTTP bearer/token 鉴权永不授信，payload 不能自授信；UI 不提供把自报字段升级为权威的操作。
+- merged/rejected 只有可信有效采集时间**严格早于**已知正值 `state_changed_at` 才标 `delayed`、不重开；相等、终态时间未知、缺失/无效/未来/未授信时间沿用原回归。去重仅在保留的同 fingerprint、可信 source/event 身份内比对采集时间/环境/release 的精确元数据，冲突拒绝，匹配记 `duplicate`；每条接收仍计 occurrences 和接收日 daily，不承诺全局 exactly-once。
+- 适用的可信有效回归观察有明确 environment、完整 40/64 位十六进制 release（统一小写），且采集时间严格晚于 `evidence.recorded_at` 时，撤销匹配 repo/fingerprint/SHA 的证据；delayed/duplicate/muted 不作新撤销依据。**即使记忆手动 disabled 也撤销证据**，不清除开关、不影响独立提交，启用不复活证据；环境/版本关系仍是所有者确认，不是部署集成。
+- 单回执的聚合/状态/观察/适用撤销同事务；HTTP 元数据错误为有界通用 400、不回显 payload。JSONL 逐回执事务，预校验不是批原子，运行期失败可能部分接收并保留之前提交，响应说明数量。
+- **无部署/健康集成**：API/UI 的 `deployment_status` 与 `recovery_status` 均为 `unknown`；merged、CI green 与上报版本不证明已部署/恢复。手动 disabled 撤销修正后的本地聚焦验证已完成；后端/迁移、严格 clippy、架构与追溯证据见 docs/07 §D / ADR-027，UI 结果见 §10.5。本次仅文档、未运行测试/构建，不覆盖 Batch4 失败记录；完整 workspace/web 套件留给最终验证任务。
+
+### 7.12 Batch6 · 持久准入与最终用量闸（ADR-028 / DES-028，schema v14）
+
+- `pr_slots` 记录 repo、准入时间/UTC 日、state、PR URL、可选 API `created_at_ms` 与本地 `confirmed_at_ms`；`pr_slot_deliveries` 关联精确交付。`BEGIN IMMEDIATE` 内核验 delivery token/generation/expiry 并计数预留；reserved/requested/ambiguous/consumed 占额，released 不占。
+- claim TTL/释放、重启与 prune 不退款；跨午夜/接管复用同槽位及原准入日。请求前安全 supersede 原子转移 reserved；请求后不得挪用。确认同 repo + PR URL 归并槽位，消费与适用 issue/run/watch 同事务。GitHub 创建证据缺失/无效则 unknown，不把本地确认时间当作创建时间。
+- v13 → v14 的表/索引/历史归并/版本同事务、失败保留 v13；历史 runs/issues/已完成 deliveries 按 repo + PR URL 去重，无 URL 保留独立证据，旧 GitHub 创建时间 unknown；未确认 requested/ambiguous 保守占位。停全部旧写者/自动重启、WAL 一致备份、隔离副本及 pending 复核见 docs/08；禁止混跑、直接降级与 TTL/猜测退款。
+- work/pool/独立 fix 的创建在 push 尝试前预留，请求前最终幂等检查并写 requested；branch-only 不占。预 push PR 拒绝释放问题单、不计 attempt；postpush 门禁拒绝保留分支、intent/run/槽位恢复证据，只有确认无 PR 才允许终结释放/条件清理，响应丢失/未知不退款。恢复采用精确 head/base，不保证 GitHub 外部 exactly-once。
+- token 模型前仓库已知用量 `>=` 限额拒绝，最终个体/仓库为 `>`；cached/uncached 各取当前 run 持久值与报告最大值、避免重复计数，含跨窗口当前修复，失败 work/独立 fix 也单调记账。按 run started_at 聚合，monthly 为滚动 30 天非自然月。运行中/并发/provider 部分或未知 usage 可超支，无 token 预留或费用硬 cap，不能撤回花费。
+- API/UI 准入槽位与历史 PR 观察分离，限额为进程上报观测而非中心统一策略，见 §8.6。当前仅 Store 186（timestamp/CLI refinements 前）、quota 3（refinements 前）通过；delivery 42 项及全部最终 gates 待确认，不预记 UI/TS/构建通过，证据见 docs/07 §D。
 
 ## 8 · 运行器遥测与卡单处置
 
@@ -434,10 +475,10 @@ floor = NUWA_STUCK_AFTER_SECS（默认 300s，范围 60–86400）
 
 ### 8.6 配额与待命
 
-- `NUWA_DAILY_PR_LIMIT` 仍是每仓库每日 PR 上限（UTC 日窗口）。
-- `runners` 心跳上报 `daily_pr_limit`；API 按 **PR URL 去重**统计 `prs_today`：优先 `runs.pr_opened_at`，迁移前的历史数据回退 `issues.pr_opened_at`。不能只数 issues，否则同指纹回归重开第二个 PR 会少计。
-- 控制台展示"今日 2/5"；待命时明确文案"配额已用完，UTC 次日自动恢复"，不显示为故障。
-- 配额检查前先写 `standing_down` 心跳（或把心跳前移）——修复 v2 的误判。
+- `NUWA_DAILY_PR_LIMIT` 是创建进程解析的每仓 UTC 日准入预算；同 DB 按 repo 共享持久槽位，不是按 runner 分配。`pr_slots_today` 包含当日 reserved/requested/ambiguous/consumed，released 不计；原准入日不随重试/确认改变。
+- projects/runners additive `pr_slots_today` 用于准入进度；`prs_today` 保留按 PR URL 去重的创建/历史本地观察统计（runs/issues 的 `pr_opened_at`），不能代替槽位计数，也不能把旧观察升级为 GitHub 创建证据。
+- runner 卡展示「UTC 准入槽位 / 本进程上报值」与独立「UTC 今日确认 PR（创建 / 本地观测记录）」；项目工位/台账展示槽位，项目分母 `pr_limit` 是 runner 上报值的**观测最大值**，runner `daily_pr_limit` 是该进程上报值。二者都不是中心统一硬上限，各进程配置不同会影响准入策略。
+- 满额时 `standing_down` 不作故障，心跳仍写；UTC 新日可重新准入，但旧 pending 不因此释放或重记今日。UI 不提供 TTL/手工退款按钮，不承诺午夜会解决全部待命原因（token 闸、provider 等亦可待命）。
 
 ### 8.7 多仓库展示
 
@@ -546,6 +587,8 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 `GET /issues/{fp}`
 
+Batch5 additive 响应（§7.11）：`observations` 最多 100 条，按接收时间/id 倒序；每条含 `id/fingerprint/received_at_ms/observed_at_ms/environment/release_sha/source_event_id/trusted_source/time_status/disposition/duplicate_of`，可选元数据为 null。`deployment_status`、`recovery_status` 固定 `unknown`；下方仅保留原响应主体示例，当前完整响应还须包含上述新增字段。
+
 ```json
 {
   "issue": { "...": "同上" },
@@ -565,6 +608,9 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - `runs` 返回最近 10 次，按 `started_at` 降序；`session_dir` 仅服务端使用，不在此响应中返回。
 - `timeline` 默认最近 200 条；当前返回原始事件（服务端不做聚合），历史上报的按小时聚合只在 `/events?aggregate=1` 提供；详情时间线是否复用该聚合留待 M3 决策。
 - `similar` 用完全相同 title，排除自身；`count` 为同名问题单总数，`items` 最多 5 条。
+- 当前响应另有只读 `ci_watch`（无 watch 时 null）：`state`、`last_verdict`、`last_checked_at_ms`、`next_check_at_ms`、`check_attempts`、`last_error`。state 包括 `pending/green/red/merged/closed/expired/head_changed`；`head_changed` 是停止观察替换 head 的终态，不是新 head 的失败。watch 结论 green/red 与 `runs[].ci_verdict` 的 success/failure 不混用；租约凭据不暴露给页面。
+- 问题详情「信号回执」展示接收/采集时间、环境、发布 SHA、来源事件 ID、授信来源、时间状态、处置与重复关联；以普通文本渲染元数据，不截断为另一身份。处置为 `new/deduped/cooldown/muted/regression/delayed/duplicate`，与状态迁移事件分开。旧问题单/超保留期可为空，缺元数据显示未提供，不推断为已授信。
+- 回执区域分别显示来源授信与时间状态，部署/恢复均显示未知，并明确「PR 已合并不等于已部署，也不等于运行时已恢复」；未知或缺失字段不渲染为成功，不因收到 release 声明改变状态。回执数量不等于 occurrences，迟到/重复也计数，去重只限保留历史。
 
 `GET /issues/{fp}/transcript?run_id=&page=1&page_size=20`
 
@@ -614,6 +660,10 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 `GET /runners`
 
+Batch6 additive 响应：每项 `pr_slots_today` 为仓库级 UTC 准入槽位，`prs_today` 为独立历史观察；`daily_pr_limit` 是本进程上报值。下方保留其余响应示例，完整语义见 §8.6。
+
+Batch3 additive 字段：下述每个 runner 还包含 `configuration: ProcessConfigDto`（§7.10），仅代表该 runner 租约实例；旧 `effective/config_json` 保留用于仓库遥测，不作为配置激活权威。
+
 ```json
 { "data": [{
   "id": "host:spike-target", "repo": "example.com/spike-target", "host": "host",
@@ -621,7 +671,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
   "status": "working", "offline": false,
   "current_fingerprint": "…", "phase": "repair",
   "provider": "zai", "model": "glm-5.3-flash",
-  "daily_pr_limit": 5, "prs_today": 2,
+  "daily_pr_limit": 5, "prs_today": 2, "pr_slots_today": 3,
   "repo_path": "/opt/nuwa/repo/spike-target",
   "service_unit": "nuwa-work", "last_error": null,
   "effective": { "interval_secs": 30, "ci_timeout_secs": 600, "max_turns": 30, "max_tokens": 1500000,
@@ -676,32 +726,22 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 `GET /settings`
 
-```json
+响应节选（schema/文件元信息/审计等字段仍保留）：
+
+<augment_code_snippet mode="EXCERPT">
+````json
 {
-  "schema": [{
-    "key": "NUWA_PROVIDER", "label": "LLM Provider", "group": "model",
-    "type": "enum", "options": ["zai", "anthropic", "faux"], "default": "anthropic",
-    "secret": false, "scope": "work", "requires_restart": true,
-    "help": "修复 runner 使用的模型提供方"
-  }],
-  "values": {
-    "NUWA_PROVIDER": { "value": "zai", "source": "env" },
-    "NUWA_GITHUB_TOKEN": { "set": true, "last4": "abcd", "updated_at_ms": 0 }
-  },
-  "env_path": "/opt/nuwa/nuwa.env",
-  "env_exists": true,
-  "env_permissions": "600",
-  "needs_migration": false,
-  "restart_pending": true,
-  "effective_diff": { "NUWA_INTERVAL": { "file": "60", "runtime": "30", "source": "file" } },
-  "unknown_keys": ["LEGACY_KEY"],
-  "last_changes": [{ "key": "NUWA_INTERVAL", "ts_ms": 0, "actor": "owner" }]
+  "values": { "NUWA_PROVIDER": { "value": "zai", "source": "env" } },
+  "saved": { "env_id": "/opt/nuwa/nuwa.env", "revision": null, "state": "unversioned", "reason": "not_saved" },
+  "processes": [{ "role": "work", "runner_id": null, "snapshot": null, "activation": "unknown", "freshness": "unreported", "last_seen_at_ms": null, "reason": "startup_snapshot_unavailable" }]
 }
-```
+````
+</augment_code_snippet>
 
 - 非密钥返回明文 `value`；密钥只返回 `set/last4/updated_at_ms`。
-- `source`: `env` | `default`（未在文件中的已知键）。
-- `effective_diff`: 由 runner 心跳上报的实际运行值 vs 文件值；无 runner 时为空；**只比较非密钥**。每项带 `source`: `file`（比较值取自 env 文件）| `default`（文件缺该键，显示 schema 默认值）。
+- `values.source`: `env`（文件值，路径项例外为当前路径）或 `default`，不是活进程来源。values 与 saved revision 来自同次保存事务读快照；全部 schema 项 `requires_restart=true`。
+- `saved{env_id,revision,state,reason}` 与 `processes[]` 为 additive 字段，完整快照结构与三轴含义见 §7.10。process 含 role、runner_id、snapshot、activation、freshness、last_seen_at_ms、reason；snapshot.values 显式标记 `file/environment/default/cli/derived/runtime/override/unknown`，不能选最新 runner 代替全局生效状态。
+- `restart_pending/effective_diff` 保留但弃用：前者是旧审计时间比较，后者是合并的旧心跳遥测差异（仅非密钥），**均不是逐进程激活证据、不驱动 UI**。
 - `unknown_keys` 只返回键名，不返回值。
 - env 文件不存在时返回 `env_exists=false`，`values` 使用默认值，页面允许保存以创建文件（不再 500）。
 - `env_permissions` 在非 Unix 返回 `n/a`。
@@ -717,20 +757,24 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - 校验失败 422，`fields` 给出 `{ "NUWA_INTERVAL": "必须是 1–86400 的整数" }`。
 - 成功返回 `{ "changed": ["NUWA_INTERVAL"], "restart_required": true }`。
 - 每个变更 key 写 `config_changed` 事件（actor=owner，detail=key）。
-- 检测到历史小写键时，写回前自动迁移并写 `config_migrated`。
+- 历史小写已知键随保存规范化，变更/迁移键以键名 `config_changed` 审计；不记录值。
+- 非空 PUT 为 unversioned/不一致文件建立新随机 UUID revision，即使 `changed=[]`；一致且无变更/迁移的 no-op 保留 revision、`restart_required=false`，空 PUT 不建立版本。保存不改启动 env_store、Secrets 或 live auth，`restart_required` 不是激活完成证明。
+- 同 DB 保存串行，文件及 `.bak` 受保护同目录 tempfile + sync + persist 原子替换（Windows 同样适用；Unix 写入前 0600、Windows ACL 所有者负责）。文件与 DB **不原子**：替换后失败/任务结果不明为 500 `config_save_indeterminate`，重新读取再复核，不盲目回滚；file/DB 不一致是 unknown。
 
 `POST /settings/test`
 
-```json
-{ "target": "github", "values": { "NUWA_GITHUB_TOKEN": "…" } }   // values 可选
-```
+<augment_code_snippet mode="EXCERPT">
+````json
+{ "target": "github", "candidate": "saved" }
+````
+</augment_code_snippet>
 
-- `values` 可携带尚未保存的字段值用于测试；缺省用当前 env。测试值不落盘、不写日志；未知键 422；每个已知键的取值只接受字符串/数字/布尔（env 标量），对象/数组/null 422。
+- 显式 `candidate=saved` 取文件+默认，不允许 draft values；`draft` 取同一次文件读取+草稿 values（旧请求默认 draft）。**不回退 live env/key**，测试不保存、不证明激活；未知键/非标量 422，已知值只接受字符串/数字/布尔，对象/数组/null 422。
 - github：`GET https://api.github.com/rate_limit`（只验证令牌有效与可达，不耗配额）。显式空 token 直接 422，不回落环境变量。
 - llm：调用 provider 的轻量端点；若需真实生成，body 明确 `max_tokens=1`，UI 二次确认并提示可能产生极小费用。
-  - 空 `NUWA_MODEL` / `NUWA_BASE_URL` / `NUWA_PROVIDER` 表示"未设置"：回退环境变量，再回退 provider 默认值（provider 默认 `anthropic`）。
-  - zai：默认 base `https://open.bigmodel.cn/api/coding/paas/v4`、默认模型 `glm-5.3-flash`；`ZAI_API_KEY` 显式空值 422。
-  - anthropic：base 固定 `https://api.anthropic.com`（运行时忽略 `NUWA_BASE_URL`），模型必须取自 vendored catalog，未知或缺失回退 catalog 首项；`ANTHROPIC_API_KEY` 显式空值 422。
+  - 空 `NUWA_MODEL` / `NUWA_BASE_URL` / `NUWA_PROVIDER` 表示未设置，使用 provider 默认（provider 默认 `anthropic`），不回退运行中环境。
+  - zai：默认 base `https://open.bigmodel.cn/api/coding/paas/v4`、默认模型 `glm-5.3-flash`；`ZAI_API_KEY` 显式空值 422。改变 base URL 必须显式提供草稿 key，不把保存/活进程 key 带到另一 host。
+  - anthropic：探测 base 固定 `https://api.anthropic.com`，catalog 未知或缺失回退首项；`ANTHROPIC_API_KEY` 显式空值 422。**探测的未知模型回退不代表实际 runner 行为**：实际 resolver 对显式未知模型报错，启动证据保留请求且不虚构已解析 model/base；缺省才选 catalog 首项。
   - faux：完全离线，无需 key 与网络。
 - 探测总超时 10s；返回 `{ ok, detail }`；网络失败/非 2xx/超时 502 `upstream_error`，不回显 provider 响应体（可能引用请求）。
 
@@ -750,6 +794,8 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 #### 系统
 
 `GET /system`
+
+Batch3 additive `configuration: ProcessConfigDto`（§7.10）只报告**此 serve 进程**的启动证据，不替所有 work 作结论；设置 `processes[]` 汇总实例与配置但未上报的 unit，runner 页面逐行显示各自证据。
 
 ```json
 {
@@ -825,13 +871,15 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 侧栏：
 
-- **本页内容**：主列五个区块的锚点导航（时间线/证据/堆栈/运行记录/会话转录）。问题详情读取 `ci_watch`（state/最近检查/下次检查/错误）并显示一行“CI 持续观察”；watch 由 serve 调度，页面只读。
+- **本页内容**：主列五个区块的锚点导航（时间线/证据/堆栈/运行记录/会话转录）。问题详情读取 `ci_watch`（state/最近检查/下次检查/错误）并显示一行“CI 持续观察”；页面只读，无手动推进按钮。watch 的前台等待与 serve 后台共用租约/持久计划，前台结束后持续推进仍需 serve；`head_changed` 表示原交付 head 已被替换、停止观察，不跟随新 head。
 - 最近 run 摘要：状态、耗时、tokens、turns、provider/model、runner。
 - 相似问题：同 title 的指纹列表与状态。
 - 原始元数据：完整指纹、state_changed_at、owner runner。
 - 无 run 时显示"等待 runner 领取"。
 
 头部「返回」链接走浏览器历史（`navigate(-1)`），保留来源列表的筛选与页码；直接深链进入时回落到 `/issues`。详情页头部标注刷新节奏（每 15 秒，隐藏暂停，聚焦即刷）。
+
+**Batch5 本地聚焦验证（父任务提供，手动 disabled 撤销修正后）**：web typecheck、lint、IssueObservations + IssueDetailPage **23 测试通过**、build 通过；`ts-export` **78 通过**（已知 serde 警告），生成文件 whitespace 修正后 TS 重新导出及 diff 检查通过。完整 web 套件未在 Batch5 重跑，也不代表本批 E2E/axe 或部署验证；其余证据与 Batch4 失败历史见 docs/07 §D。
 
 ### 10.6 运行器
 
@@ -840,7 +888,7 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - 状态语义：
   - `启动中`：刚注册，按在线处理；
   - `待命`：队列空；
-  - `配额待命`：今日配额用完，UTC 次日恢复；
+  - `配额待命`：准入/用量或 provider 等原因待命；UTC 新日不退款旧 pending，具体原因看 last_error；
   - `异常`：最近错误（预检/环境）；
   - `离线`：心跳超过 90s。
 - 动作：查看当前单、重启 unit（二次确认，提示活动 run 影响）、复制 runner id。
@@ -858,11 +906,11 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 ### 10.8 设置
 
 - 四个视图：`/settings/connection`（凭据、模型）、`/settings/execution`（runner）、`/settings/governance`（安全、事件与通知）、`/settings/environment`（服务编排、env 文件）；`/settings` 重定向到连接。一个视图只编辑本区字段，各自一个保存。
-- 布局：标签列 + 面板。标签列给出保存后的运行行为、将改变的键、将写入的 env 行，以及运行中值与重启提示；面板按 schema 渲染字段（label、env key、帮助、单位、校验），宽屏两列。
-- 保存模型：每个视图一个保存，按钮放在页头右侧、仅在存在未保存更改时出现（长面板下仍保证首屏可点）；只提交本区变更键；保存后显示 changed 与 restart_required；`effective_diff` 在字段与标签列同时提示运行中仍用旧值。离开未保存视图走统一确认。
+- 布局：标签列 + 面板。标签列明确是草稿/已保存候选预览，不是运行时事实，列将改变的键/文件行；另列保存状态与相关逐实例启动证据、适用非密钥实际值/来源。配置状态按整个输入版本判定，非按本区字段猜测；面板按 schema 渲染，宽屏两列。
+- 保存模型：每个视图一个保存，按钮在页头右侧、仅脏时出现；只提交本区变更键。显示 changed/restart_required，但成功不表示激活；所有 schema 项需重启。各实例 active/stale/unknown 与 online/offline/unreported 分离，CLI 覆盖不随同命令重启消失。`restart_pending/effective_diff` 仅兼容保留，不驱动字段或全局生效提示；离开未保存视图统一确认。
 - 密钥：已设置 + 末 4 位；"更换"后出现输入框；空值保持；连接视图提供 GitHub token 与模型配置探测。更改控制台令牌并重启会使当前会话失效，连接视图明确提示。
 - 读取：env 文件路径、权限、未知键名、最近变更在环境视图只读展示；迁移提示保留。
-- 服务动作与运行时状态移出设置：`/system` 展示版本/构建/uptime/DB/鉴权模式、unit 状态、GitHub 对账、重启与关于。重启对话框：活动 run 列表；force 需勾选确认；恢复后轮询 `/health` 与 `/auth/me`。
+- 服务动作位于 `/system`：版本/构建/uptime/DB/鉴权模式、unit 状态、GitHub 对账、重启与关于；另显示此 serve 的启动证据，runner 页面显示各自实例证据，不选最新 runner 为权威。设置保留相关实例与未上报 unit 的证据视图。重启对话框仍含活动 run/force 确认，恢复后轮询 `/health` 与 `/auth/me`，恢复可达不等于所有进程 revision 已激活。
 - 仓库登记：设置页不再承载；项目台账提供"登记仓库"与"已登记 · 等待首个心跳"列表，项目工位编辑/取消登记；仓库内容仍只读。
 - 关于：`/system` 底部。
 
@@ -890,8 +938,13 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 ### 10.12 项目修复记忆
 
 - 路由 `/projects/:repo/memory`（项目工位「修复记忆」卡进入）；数据来自 `GET /api/v1/projects/{repo}/memory?limit=&offset=`，按 `recorded_at` 倒序，展示问题单标题/状态、根因、改动、commit/PR 与时间来源。
-- 所有者动作：`PATCH .../memory/{fp}` 停用/启用（停用后不再注入，但保留来源证据）；`DELETE .../memory/{fp}` 删除。两者均要求 CSRF，并写 `memory_updated`/`memory_deleted` owner 审计事件。
-- 记忆只由 runner 在“验证门绿 + CI 绿（或 branch-only 已推送）”后写入；每仓最多 50 条，注入最多最近 3 条并排除当前问题单。
+- 列表响应为 `data/total/limit/offset`（默认 20、最大 100）；每条除了原有字段，新增 `evidence_valid`、`verification_source`、`revoked_at_ms`（可空）、`revocation_reason`（可空），`disabled` 单独表示手动停用。展示来源优先选择有效证据，否则展示最新无效证据；台账不是逐条完整证据历史。
+- 所有者动作：`PATCH .../memory/{fp}` 仅设置 `disabled`；停用保留来源、下轮不再注入，启用只清除手动停用，**不恢复已撤销证据，不让 legacy_unknown 生效**，自动写入也不清除此偏好。`DELETE .../memory/{fp}` 同事务删除摘要及关联证据/tombstone；保留撤销记录应使用停用。两者均要求 CSRF，并写 `memory_updated`/`memory_deleted` owner 审计事件。
+- 分别显示「未停用/已停用」与「证据有效/证据未验证/证据已撤销/证据无效」，附来源、撤销时间/原因和「可用于/不用于后续提示」；筛选为全部/生效中/已停用/证据无效（作用于当前页），生效中要求有效、未撤销且未手动停用。启用无效记录的反馈明确只清除了人工偏好。记忆是提示参考，不是权威。
+- 验证门后的 PR 记忆由同 SHA 的 green+open/merged 观察发布；closed/head_changed 不发布，红灯撤销精确 CI 来源并保留 tombstone。branch-only 的 `local_verification` 来源绑定 run；独立来源/其他提交不被旧 CI 结果一并抹除。普通摘要裁剪不删证据，迟到 green 不复活已撤销来源；来源精确性见 §7.9。
+- Batch5 运行期可信回归按匹配 repo/fingerprint/完整 release SHA 撤销证据，要求明确环境且采集时间有效、晚于证据 recorded_at；**手动 disabled 不阻止证据失效**，启用仍不复活，不波及独立提交。来源授信与 delayed/duplicate/muted 排除规则见 §7.11，不把该撤销显示成部署/恢复结论。
+- 每仓保留最近 50 条未停用摘要、停用摘要另保留；注入最多最近 3 条同仓其他问题单的有效且未撤销来源，排除当前问题单与手动停用。迁移旧记忆 `legacy_unknown` 可见但不可注入，重新启用不能补成验证证据。
+- **Batch2 已提供的聚焦结果（本次文档更新未重跑）**：Store `cargo test -p shanhaijing --offline` **148 通过**；`cargo clippy -p nuwa -p shanhaijing --all-targets --no-deps --offline -- -D warnings` 通过；Nuwa `ci` 过滤 **50 通过、371 filtered**（最终 summary 修正前，不是修正后复测）；`export_bindings` **72 通过**；`npm.cmd run typecheck` 通过；memory 页面 **6 通过**。不是完整 Nuwa/workspace/web 或 lint/build/E2E/axe 通过的声明，未执行生产迁移/部署、真实 GitHub/API 或付费模型测试。
 
 ### 10.13 修复基准
 
@@ -998,21 +1051,30 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 
 ### 13.1 规范键
 
+当前 schema 29 键全部 `requires_restart=true`（含只读路径项）；内部 `NUWA_CONFIG_REVISION` 不属于可编辑 schema。下表是保存默认值，不替代各进程实际解析/来源：zai 默认 `glm-5.3-flash` 与 coding endpoint；Anthropic 缺省 catalog 首项及其 base，显式未知模型报错；faux 从实际离线 provider 取 model/base。serve 的 TTL、sync、retention、stuck、unit 等在真实启动路径解析/限幅并标 `default/derived`，不从保存预览猜测。
+
 | key | 分组 | 类型 | 默认 | scope | 密钥 | 校验/说明 |
 |---|---|---|---|---|---|---|
 | `NUWA_GITHUB_TOKEN` | 凭据 | secret | — | both | 是 | 非空；GitHub 细粒度 PAT |
 | `ZAI_API_KEY` | 凭据 | secret | — | work | 是 | 智谱 Key |
 | `ANTHROPIC_API_KEY` | 凭据 | secret | — | work | 是 | v2 设置页缺失，本版补上 |
 | `NUWA_INGEST_TOKEN` | 凭据 | secret | — | serve | 是 | 空 = 本地模式 |
-| `NUWA_UI_TOKEN` | 凭据 | secret | — | serve | 是 | 空则 fallback 上报令牌 |
+| `NUWA_UI_TOKEN` | 凭据 | secret | — | serve | 是 | 独立控制台令牌，不回退上报令牌；非回环监听缺失则拒绝启动 |
+| `NUWA_WEBHOOK_URL` | 运维 | url | 空 | serve | 否 | 状态 webhook 地址 |
+| `NUWA_WEBHOOK_SECRET` | 运维 | secret | — | serve | 是 | HMAC 签名密钥 |
+| `NUWA_WEBHOOK_EVENTS` | 运维 | csv | schema 事件列表 | serve | 否 | 启动解析默认订阅另含 runner_error，以快照实际值为准 |
 | `NUWA_PROVIDER` | 模型 | enum | `anthropic` | work | 否 | `zai|anthropic|faux` |
 | `NUWA_MODEL` | 模型 | string | 空 | work | 否 | 由 provider 决定 |
 | `NUWA_BASE_URL` | 模型 | url | 空 | work | 否 | http/https；zai 可覆盖 |
+| `NUWA_PUBLIC_BASE_URL` | 模型 | url | 空 | work | 否 | PR 中的控制台链接，空则省略 |
 | `NUWA_INTERVAL` | Runner | int | `30` | work | 否 | 1–86400 秒 |
 | `NUWA_CI_TIMEOUT` | Runner | int | `600` | work | 否 | 1–86400 秒 |
+| `NUWA_SYNC_INTERVAL` | 运维 | int | `600` | serve | 否 | 60–86400 秒 |
 | `NUWA_DAILY_PR_LIMIT` | Runner | int | `5` | work | 否 | 1–100 |
 | `NUWA_MAX_TURNS` | Runner | int | `30` | work | 否 | 1–1000 |
 | `NUWA_MAX_TOKENS` | Runner | int | `1500000` | work | 否 | 1–100000000 |
+| `NUWA_DAILY_TOKEN_LIMIT` | Runner | int | `5000000` | work | 否 | 1–1000000000 |
+| `NUWA_MONTHLY_TOKEN_LIMIT` | Runner | int | `50000000` | work | 否 | 滚动 30 天，1–10000000000 |
 | `NUWA_RUNNER_ID` | Runner | string | `host:repo` | work | 否 | `[A-Za-z0-9._:-]`，≤128 |
 | `NUWA_SERVICE_UNIT` | Runner | string | `nuwa-work` | work | 否 | systemd unit 白名单 |
 | `NUWA_SERVE_UNIT` | 服务 | string | `nuwa-serve` | serve | 否 | 白名单 |
@@ -1028,21 +1090,12 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 ### 13.2 读取、迁移与写回
 
 - 解析：逐行 `KEY=VALUE`；忽略空行与以 `#` 开头的整行；不在值内解析注释；保留未知键与注释。
-- 大小写迁移：
-  - 已知键统一转大写；
-  - 若同时存在 `nuwa_x` 与 `NUWA_X`，大写优先，删除小写；
-  - 记录 `config_migrated`（detail 为 key 列表）；
-  - 只有 serve 启动时执行一次（幂等）；work 不做文件迁移（env 由 systemd 注入，work 只读）。
-- 写回：
-  - 保留文件顺序与注释；更新已存在键；新键追加到对应分组末尾。
-  - Unix：同目录临时文件写入 → chmod 600 → rename；失败则报错，不留下半文件。
-  - 非 Unix：直接写回（开发环境），权限提示不适用。
-- 校验在写回前完成；任一字段失败则整体不写。
-- 密钥空值 = 保持；非密钥空值按类型处理（字符串允许空，数值不允许）。
-- 保存成功后写 `config_changed`（每个 key 一条，detail=key，actor=owner）。
-- `restart_pending` 由「最近一次 config_changed 之后是否重启过」判断；`effective_diff` 由 runner 心跳的实际配置对比文件值。
-- 更改 `NUWA_UI_TOKEN` 并重启会使当前会话失效，连接视图明确提示"重启后需重新登录"；密钥不参与 `effective_diff`，统一显示"重启后生效"。
-- env 文件不存在时保存将创建它；迁移时文件不存在或不可写只记警告，不阻止 serve/work 启动。
+- 保存迁移已知小写键，大写重复优先；保留顺序、注释、未知键，更新既有行/追加新行。变更与迁移键以 `config_changed` 逐键审计，仅 detail=key。独立 `migrate-env` 会重排文件、写前备份；serve 启动保留兼容调用，work 不迁移。
+- **手工/迁移来源契约**：所有者 out-of-band 编辑必须移除/使 `NUWA_CONFIG_REVISION` 失效，再非空 PUT 建立新版本。保留 marker 的人工编辑不能被认证或可靠检测；这是 owner-controlled 来源约定，不是密码学证明，随机 UUID 不是内容/密钥 hash。`migrate-env` 只有实际重写才移除 marker，无改写保持不变；它不参加保存事务，须停写离线运行，**不得并发设置保存**，启动兼容迁移也须遵守此维护窗口。
+- 写回先整体校验，失败不改文件；空密钥保持。全部 schema 项需重启；保存不改启动 env_store、Secrets、live auth/会话。文件及 `.bak` 均以受保护同目录 tempfile 写入、sync、persist 原子替换，Windows 不再直接截断写；Unix 首个敏感字节前设置 0600，Windows ACL 由所有者配置，权限提示仍 n/a。
+- `BEGIN IMMEDIATE` 跨 Store/进程串行化同 DB 协作保存，GET values/revision 共享事务快照；文件与 DB commit 不原子，替换后失败/任务结果不明返回 `config_save_indeterminate`，先重新 GET 复核而非盲目回滚，mismatch 为 unknown。
+- 非空成功 PUT 可采用 unversioned/不一致文件，即使无值变更也新建 revision；一致无变更/迁移的 no-op 保留 revision，空 PUT 不制造版本。文件缺失可创建，但创建/保存不证明任何进程已经加载。
+- 启动证明与三轴状态以 §7.10 为准；不能从最近 config_changed、旧 `effective_diff` 或最新 runner 推导激活。显式 CLI 覆盖可保留 loaded input revision，但实际值仍标 cli，重启不抹除覆盖。更改 UI token 后保存不影响当前鉴权，重启 serve 才切换；每次 serve 重启旧会话均失效。
 
 ### 13.3 重启编排
 
@@ -1125,8 +1178,10 @@ attention 排序：escalated > stuck > rejected > pr_open 且最近 24h 有 `ci_
 - 迁移：v0 fixture → v1；列、回填、索引、幂等；WAL/busy_timeout 生效。
 - 会话：签名/过期/篡改/轮换；本地模式；CSRF 缺失/错误/跨源；限速。
 - API：筛选/排序/分页、attention 排序、stuck 判定、reopen/requeue 状态约束、401/409/422/429。
-- 设置：大小写迁移、注释/未知键保留、原子写、chmod（unix）、密钥不回显、effective_diff。
+- 设置：保留旧迁移/注释/未知键/密钥不回显测试；Batch3 覆盖跨 Store 保存、无值变更采用文件/一致 no-op、提交不明、GET values/revision 同快照、精确启动输入/CLI 来源、pool 共享进程与独立租约实例、旧代际拒写及候选无 live fallback。legacy effective_diff 只验证兼容，不作为激活权威；已执行结果时点见 docs/07 §D，不把测试清单当作通过声明。
 - 遥测：runner 心跳、run 阶段、interrupted、signal_daily 累加、配额待命。
+- Batch5 检查范围：schema v13 增量/失败回滚与不伪造历史，元数据字节限制/不反射错误，HTTP 鉴权及 payload 不能授信、CLI 所有者确认，迟到严格边界、有限去重/冲突与每回执计数、逐回执事务及运行期部分接收、按接收时间保留、disabled 下仍撤销精确版本证据；API/UI 回执及部署/恢复 unknown。修正后本地聚焦验证完成，实际结果见 docs/07 §D 与 §10.5；此清单不扩大为完整 workspace/web 或平台验证通过声明。
+- Batch6 检查范围：跨连接最后槽位竞争、claim 旧代际拒写/接管、跨午夜/无 TTL 退款、supersede 转移、同 repo + PR URL 归并/完成回滚、v14 迁移/回滚与未知创建时间；真实交付 prepush/final gates/响应丢失/postpush 证据；失败 work/独立 fix 用量、token 边界/单调性；API/UI 槽位与历史观察分离。仅有的早期 Store/quota 结果见 §7.12，delivery 42 项及最终检查待确认，测试清单不等于通过。
 - 转录：未知记录忽略、截断、分页、路径不可由客户端控制。
 - 静态：SPA fallback、缓存头、安全头、API 404 不被 index.html 吞掉。
 - 保留既有测试；新增预计 30+。
@@ -1278,13 +1333,15 @@ v3 的实现把「仓库」做成了**字段**（表格里的一列、卡片里�
   "attention": 1, "worst_severity": "critical",
   "queued": 0, "running": 1, "pr_open": 0, "escalated": 0, "ignored": 0,
   "merged": 0, "rejected": 0,
-  "runners": 1, "runners_online": 1, "prs_today": 0, "pr_limit": 5,
+  "runners": 1, "runners_online": 1, "prs_today": 0, "pr_slots_today": 1, "pr_limit": 5,
   "ci_green": 0, "ci_red": 0, "reports_24h": 22, "tokens_24h": 0,
   "last_signal_ms": 0, "last_delivery_ms": null, "last_pr_url": null
 } ] }
 ```
 
 排序：需处理 → 运行中 → 队列 → 最近信号 → 仓库名。
+
+Batch6 的 `pr_slots_today` 是准入进度；`prs_today` 仍为创建/历史本地观察，`pr_limit` 仅各 runner 上报值的观测最大值，不是统一限额。项目 UI 明示分母来源及进程策略可能不同（§8.6）。
 
 ### 21.4 视觉系统调整
 

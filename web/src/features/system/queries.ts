@@ -7,6 +7,7 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 
 import { apiFetch } from "../../lib/api";
+import { backoffInterval } from "../../lib/polling";
 import type { RestartServicesRequest, SystemResponse } from "./types";
 
 export const SYSTEM_STALE_MS = 30_000;
@@ -18,6 +19,8 @@ export function useSystemQuery() {
     queryKey: systemQueryKey,
     queryFn: ({ signal }) => apiFetch<SystemResponse>("/system", { signal }),
     staleTime: SYSTEM_STALE_MS,
+    refetchInterval: backoffInterval(SYSTEM_STALE_MS),
+    refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
   });
 }

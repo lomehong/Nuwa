@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 
-use crate::{now_ms, parse_signals, report_one, Shared};
+use crate::{now_ms, parse_signals, report_one, validate_observations, Shared};
 
 /// Strict CSP for every route (API, SPA and redirects): no inline script or
 /// style.
@@ -59,6 +59,8 @@ const RETENTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(24 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<shanhaijing::Store>,
+    /// Immutable, secret-free evidence of this process's startup inputs.
+    pub startup_config: Arc<crate::config_activation::StartupConfig>,
     /// Effective console token: `NUWA_UI_TOKEN`, else the ingest token.
     pub ui_token: Arc<Option<String>>,
     pub ingest_token: Arc<Option<String>>,
@@ -204,6 +206,9 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
 /// POST /ingest with one envelope JSON or JSONL body; GET /health for checks.
 /// v0 binds localhost by default: the collector runs on the same trust domain.
 pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
+    let environment = crate::env_store::vars();
+    let process_instance_id = uuid::Uuid::new_v4().to_string();
+    let started_at_ms = now_ms();
     crate::webhook::init_from_env();
     let mut db_path = std::path::PathBuf::from("shanhaijing.db");
     let mut listen = String::from("127.0.0.1:7321");
@@ -229,7 +234,13 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
         shanhaijing::Store::open(&db_path)
             .with_context(|| format!("open db {}", db_path.display()))?,
     );
-    let event_days = event_retention_days();
+    let (state, event_days, sync_interval) = startup_state(
+        Arc::clone(&store),
+        db_path,
+        &environment,
+        process_instance_id,
+        started_at_ms,
+    );
     report_prune(prune_retention(&store, now_ms(), event_days));
     // A long-running serve must not grow forever between restarts: re-run the
     // same sweep daily from the tokio runtime. The returned handle is dropped
@@ -237,42 +248,15 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
     spawn_daily_prune(Arc::clone(&store), event_days, RETENTION_PERIOD);
     // pr_open issues no longer depend on the owner remembering to click
     // "sync"; the same reconciler also feeds sync_error webhooks.
-    let sync_token = crate::env_store::var("NUWA_GITHUB_TOKEN")
-        .or_else(|| crate::env_store::var("GITHUB_TOKEN"))
+    let sync_token = environment
+        .get("NUWA_GITHUB_TOKEN")
+        .or_else(|| environment.get("GITHUB_TOKEN"))
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty());
-    spawn_reconciler(Arc::clone(&store), sync_token, sync_interval_from_env());
+    spawn_reconciler(Arc::clone(&store), sync_token, sync_interval);
     spawn_heartbeat_monitor(Arc::clone(&store));
     crate::ci_watch::spawn(Arc::clone(&store));
-    let env_path = crate::settings::env_file_path();
-    let tokens = serve_tokens(&crate::env_store::vars());
-    let ingest_token = tokens.ingest;
-    let ui_token = tokens.console;
-    let ttl_ms = session_ttl_ms(crate::env_store::var("NUWA_SESSION_TTL_SECS").as_deref());
-    let cookie_mode = crate::env_store::var("NUWA_COOKIE_SECURE");
-    let cookie_secure = cookie_mode.as_deref() == Some("always");
-    // `never` is an explicit opt-out that also beats a proxy's
-    // `X-Forwarded-Proto: https`.
-    let cookie_secure_never = cookie_mode.as_deref() == Some("never");
-    let serve_unit = serve_unit_from_env(crate::env_store::var("NUWA_SERVE_UNIT").as_deref());
-    let runner_units = runner_units_from_env(crate::env_store::var("NUWA_RUNNER_UNITS").as_deref());
-    let state = AppState {
-        store: Arc::clone(&store),
-        ui_token: Arc::clone(&ui_token),
-        ingest_token: Arc::clone(&ingest_token),
-        session: Arc::new(crate::session::SessionManager::new(
-            ui_token.as_deref().unwrap_or(""),
-            ttl_ms,
-        )),
-        limiter: Arc::new(crate::session::LoginLimiter::new()),
-        started_at_ms: now_ms(),
-        env_path,
-        db_path,
-        cookie_secure,
-        cookie_secure_never,
-        serve_unit,
-        runner_units,
-    };
+    let ingest_token = Arc::clone(&state.ingest_token);
     let local_mode = state.local_mode();
     let app = build_app(state);
 
@@ -305,6 +289,139 @@ pub async fn run_serve(args: Vec<String>) -> anyhow::Result<()> {
     )
     .await
     .context("serve")
+}
+
+/// Resolve once from the original startup environment, after migration and DB
+/// open. The same resolved values drive both runtime consumers and evidence.
+fn startup_state(
+    store: Arc<shanhaijing::Store>,
+    db_path: PathBuf,
+    environment: &std::collections::BTreeMap<String, String>,
+    process_instance_id: String,
+    started_at_ms: i64,
+) -> (AppState, u32, std::time::Duration) {
+    use crate::api::common::{
+        DEFAULT_STUCK_FLOOR_SECS, STUCK_FLOOR_MAX_SECS, STUCK_FLOOR_MIN_SECS,
+    };
+
+    let raw = |key: &str| environment.get(key).map(String::as_str);
+    let env_path = crate::startup_env_path(environment);
+    let mut snapshot = crate::config_activation::StartupConfig::capture(
+        &store,
+        &env_path,
+        "serve",
+        process_instance_id,
+        started_at_ms,
+        environment,
+    );
+    let tokens = serve_tokens(environment);
+    let ttl_ms = session_ttl_ms(raw("NUWA_SESSION_TTL_SECS"));
+    let sync_interval = sync_interval_from_secs(raw("NUWA_SYNC_INTERVAL"));
+    let event_days = retention_days_from_env(raw("NUWA_EVENT_RETENTION_DAYS"));
+    let stuck_secs = raw("NUWA_STUCK_AFTER_SECS")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|secs| secs.clamp(STUCK_FLOOR_MIN_SECS, STUCK_FLOOR_MAX_SECS))
+        .unwrap_or(DEFAULT_STUCK_FLOOR_SECS);
+    let cookie_mode = match raw("NUWA_COOKIE_SECURE") {
+        Some("always") => "always",
+        Some("never") => "never",
+        _ => "auto",
+    };
+    let serve_unit = serve_unit_from_env(raw("NUWA_SERVE_UNIT"));
+    let runner_units = runner_units_from_env(raw("NUWA_RUNNER_UNITS"));
+    let webhook_url = raw("NUWA_WEBHOOK_URL")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let webhook_events = raw("NUWA_WEBHOOK_EVENTS")
+        .map(crate::webhook::parse_events)
+        .filter(|events| !events.is_empty());
+    let events_from_env = webhook_events.is_some();
+    let webhook_events = webhook_events.unwrap_or_else(|| {
+        crate::webhook::DEFAULT_EVENTS
+            .iter()
+            .map(|event| (*event).to_string())
+            .collect()
+    });
+    for (key, value, valid_env) in [
+        (
+            "NUWA_SESSION_TTL_SECS",
+            Some((ttl_ms / 1000).to_string()),
+            raw("NUWA_SESSION_TTL_SECS").is_some_and(|v| v.parse::<i64>().is_ok()),
+        ),
+        (
+            "NUWA_SYNC_INTERVAL",
+            Some(sync_interval.as_secs().to_string()),
+            raw("NUWA_SYNC_INTERVAL").is_some_and(|v| v.parse::<u64>().is_ok()),
+        ),
+        (
+            "NUWA_EVENT_RETENTION_DAYS",
+            Some(event_days.to_string()),
+            raw("NUWA_EVENT_RETENTION_DAYS").is_some_and(|v| v.trim().parse::<i64>().is_ok()),
+        ),
+        (
+            "NUWA_STUCK_AFTER_SECS",
+            Some(stuck_secs.to_string()),
+            raw("NUWA_STUCK_AFTER_SECS").is_some_and(|v| v.trim().parse::<u64>().is_ok()),
+        ),
+        (
+            "NUWA_COOKIE_SECURE",
+            Some(cookie_mode.to_string()),
+            raw("NUWA_COOKIE_SECURE").is_some_and(|v| matches!(v, "auto" | "always" | "never")),
+        ),
+        (
+            "NUWA_SERVE_UNIT",
+            Some(serve_unit.clone()),
+            raw("NUWA_SERVE_UNIT").is_some_and(|v| !v.trim().is_empty()),
+        ),
+        (
+            "NUWA_RUNNER_UNITS",
+            Some(runner_units.join(",")),
+            raw("NUWA_RUNNER_UNITS")
+                .is_some_and(|v| v.split(',').any(|unit| !unit.trim().is_empty())),
+        ),
+        (
+            "NUWA_ENV_FILE",
+            Some(env_path.to_string_lossy().into_owned()),
+            environment.contains_key("NUWA_ENV_FILE"),
+        ),
+        (
+            "NUWA_WEBHOOK_URL",
+            webhook_url.clone(),
+            webhook_url.is_some(),
+        ),
+        (
+            "NUWA_WEBHOOK_EVENTS",
+            Some(webhook_events.into_iter().collect::<Vec<_>>().join(",")),
+            events_from_env,
+        ),
+    ] {
+        crate::set_startup_effective(
+            &mut snapshot,
+            key,
+            value,
+            if valid_env { "environment" } else { "default" },
+        );
+    }
+    let state = AppState {
+        store,
+        startup_config: Arc::new(snapshot),
+        ui_token: Arc::clone(&tokens.console),
+        ingest_token: tokens.ingest,
+        session: Arc::new(crate::session::SessionManager::new(
+            tokens.console.as_deref().unwrap_or(""),
+            ttl_ms,
+        )),
+        limiter: Arc::new(crate::session::LoginLimiter::new()),
+        started_at_ms,
+        env_path,
+        db_path,
+        cookie_secure: cookie_mode == "always",
+        cookie_secure_never: cookie_mode == "never",
+        serve_unit,
+        runner_units,
+    };
+    (state, event_days, sync_interval)
 }
 
 /// The two server credentials.
@@ -375,11 +492,6 @@ fn runner_units_from_env(raw: Option<&str>) -> Vec<String> {
 }
 
 /// `NUWA_EVENT_RETENTION_DAYS` — normal events roll off after this many days.
-fn event_retention_days() -> u32 {
-    retention_days_from_env(crate::env_store::var("NUWA_EVENT_RETENTION_DAYS").as_deref())
-}
-
-/// `NUWA_EVENT_RETENTION_DAYS` — normal events roll off after this many days.
 /// Malformed values fall back to the documented 90-day default; out-of-range
 /// values (including negatives) clamp to 1–3650.
 pub(crate) fn retention_days_from_env(raw: Option<&str>) -> u32 {
@@ -418,11 +530,6 @@ fn report_prune(result: anyhow::Result<u64>) {
 /// as a hung run for the webhook (the console's requeue floor stays shorter).
 const HEARTBEAT_STALE_MS: i64 = 15 * 60_000;
 const HEARTBEAT_MONITOR_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
-
-fn sync_interval_from_env() -> std::time::Duration {
-    let raw = crate::env_store::var("NUWA_SYNC_INTERVAL");
-    sync_interval_from_secs(raw.as_deref())
-}
 
 fn sync_interval_from_secs(raw: Option<&str>) -> std::time::Duration {
     let secs = raw
@@ -634,16 +741,35 @@ async fn ingest_endpoint(
             )
         }
     };
+    if validate_observations(&signals, None).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid signal observation".to_string(),
+        );
+    }
     let now = now_ms();
     let mut lines = Vec::with_capacity(signals.len());
     for signal in &signals {
+        // The token gate authenticates collectors, not observation authority.
         match report_one(&store, signal, now) {
             Ok(line) => lines.push(line),
             Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("store: {e:#}"),
-                )
+                let (status, message) = if matches!(
+                    e.downcast_ref::<shanhaijing::ShanError>(),
+                    Some(shanhaijing::ShanError::InvalidObservation)
+                ) {
+                    (StatusCode::BAD_REQUEST, "invalid signal observation")
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "store error")
+                };
+                // JSONL is not atomic. Keep earlier receipts in the response
+                // and disclose the committed count without exposing metadata.
+                let committed = lines.len();
+                lines.push(format!(
+                    "ingest stopped after {committed}/{} signals; earlier receipts remain committed: {message}",
+                    signals.len()
+                ));
+                return (status, lines.join("\n"));
             }
         }
     }
@@ -661,28 +787,178 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("s.db");
         let store = Arc::new(shanhaijing::Store::open(&db_path).expect("open"));
-        let ui_token = Arc::new(ui_token.map(str::to_string));
-        let session_key = ui_token.as_deref().unwrap_or("");
-        let state = AppState {
+        let mut environment = std::collections::BTreeMap::from([
+            (
+                "NUWA_ENV_FILE".into(),
+                dir.path().join("nuwa.env").display().to_string(),
+            ),
+            ("NUWA_INGEST_TOKEN".into(), "ingest-secret".into()),
+        ]);
+        if let Some(token) = ui_token {
+            environment.insert("NUWA_UI_TOKEN".into(), token.into());
+        }
+        let (state, _, _) = startup_state(
             store,
-            ui_token: Arc::clone(&ui_token),
-            ingest_token: Arc::new(Some("ingest-secret".into())),
-            session: Arc::new(crate::session::SessionManager::new(session_key, 86_400_000)),
-            limiter: Arc::new(crate::session::LoginLimiter::new()),
-            started_at_ms: crate::now_ms(),
-            env_path: dir.path().join("nuwa.env"),
             db_path,
-            cookie_secure: false,
-            cookie_secure_never: false,
-            serve_unit: "nuwa-serve".to_string(),
-            runner_units: vec!["nuwa-work".to_string()],
-        };
+            &environment,
+            "synthetic-serve".into(),
+            crate::now_ms(),
+        );
         (dir, state)
     }
 
     fn test_app() -> (tempfile::TempDir, Router) {
         let (dir, state) = test_state(Some("secret"));
         (dir, build_app(state))
+    }
+
+    #[test]
+    fn startup_snapshot_records_resolved_facts_without_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("startup.db");
+        let store = Arc::new(shanhaijing::Store::open(&db_path).expect("store"));
+        let env_path = dir.path().join("nuwa.env");
+        let mut environment = std::collections::BTreeMap::from([
+            ("NUWA_ENV_FILE".into(), env_path.display().to_string()),
+            ("NUWA_SESSION_TTL_SECS".into(), i64::MAX.to_string()),
+            ("NUWA_SYNC_INTERVAL".into(), "1".into()),
+            ("NUWA_EVENT_RETENTION_DAYS".into(), "-8".into()),
+            ("NUWA_STUCK_AFTER_SECS".into(), "0".into()),
+            ("NUWA_COOKIE_SECURE".into(), "never".into()),
+            ("NUWA_SERVE_UNIT".into(), " nuwa-console ".into()),
+            ("NUWA_RUNNER_UNITS".into(), " work-a, ,work-b ".into()),
+            (
+                "NUWA_UI_TOKEN".into(),
+                "synthetic-console-credential".into(),
+            ),
+            (
+                "NUWA_INGEST_TOKEN".into(),
+                "synthetic-collector-credential".into(),
+            ),
+            (
+                "NUWA_GITHUB_TOKEN".into(),
+                "synthetic-repository-credential".into(),
+            ),
+            (
+                "NUWA_WEBHOOK_SECRET".into(),
+                "synthetic-signing-credential".into(),
+            ),
+        ]);
+        let (state, event_days, sync_interval) = startup_state(
+            store,
+            db_path,
+            &environment,
+            "synthetic-serve-process".into(),
+            123,
+        );
+        let snapshot = &state.startup_config;
+        assert_eq!(snapshot.started_at_ms, state.started_at_ms);
+        assert_eq!(snapshot.started_at_ms, 123);
+        assert_eq!(snapshot.process_instance_id, "synthetic-serve-process");
+        assert_eq!(snapshot.role, "serve");
+        assert!(snapshot.runner_id.is_none());
+        assert!(snapshot.runner_instance_id.is_none());
+        assert_eq!(event_days, 1);
+        assert_eq!(sync_interval.as_secs(), 60);
+        assert!(!state.cookie_secure);
+        assert!(state.cookie_secure_never);
+        assert_eq!(state.serve_unit, "nuwa-console");
+        assert_eq!(state.runner_units, ["work-a", "work-b"]);
+        for (key, expected, source) in [
+            ("NUWA_SESSION_TTL_SECS", "2592000", "derived"),
+            ("NUWA_SYNC_INTERVAL", "60", "derived"),
+            ("NUWA_EVENT_RETENTION_DAYS", "1", "derived"),
+            ("NUWA_STUCK_AFTER_SECS", "60", "derived"),
+            ("NUWA_COOKIE_SECURE", "never", "environment"),
+            ("NUWA_SERVE_UNIT", "nuwa-console", "derived"),
+            ("NUWA_RUNNER_UNITS", "work-a,work-b", "derived"),
+        ] {
+            assert_eq!(
+                snapshot.values[key].value.as_deref(),
+                Some(expected),
+                "{key}"
+            );
+            assert_eq!(snapshot.values[key].source, source, "{key}");
+        }
+        assert_eq!(
+            snapshot.values["NUWA_ENV_FILE"].value.as_deref(),
+            env_path.to_str()
+        );
+        for key in crate::secrets::KNOWN_SECRET_KEYS {
+            assert!(!snapshot.values.contains_key(*key));
+        }
+        let before = serde_json::to_string(snapshot.as_ref()).expect("snapshot");
+        for secret in [
+            "synthetic-console-credential",
+            "synthetic-collector-credential",
+            "synthetic-repository-credential",
+            "synthetic-signing-credential",
+        ] {
+            assert!(!before.contains(secret));
+        }
+        environment.insert("NUWA_COOKIE_SECURE".into(), "always".into());
+        std::fs::write(&env_path, "NUWA_COOKIE_SECURE=always\n").expect("saved change");
+        assert_eq!(
+            serde_json::to_string(state.startup_config.as_ref()).expect("snapshot"),
+            before
+        );
+        assert!(state.cookie_secure_never);
+    }
+
+    #[test]
+    fn startup_snapshot_uses_defaults_for_empty_or_invalid_inputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("defaults.db");
+        let store = Arc::new(shanhaijing::Store::open(&db_path).expect("store"));
+        let mut environment = std::collections::BTreeMap::from([(
+            "NUWA_ENV_FILE".into(),
+            dir.path().join("nuwa.env").display().to_string(),
+        )]);
+        for (key, raw) in [
+            ("NUWA_SESSION_TTL_SECS", ""),
+            ("NUWA_SYNC_INTERVAL", "invalid"),
+            ("NUWA_EVENT_RETENTION_DAYS", "invalid"),
+            ("NUWA_STUCK_AFTER_SECS", "-1"),
+            ("NUWA_COOKIE_SECURE", "ALWAYS"),
+            ("NUWA_SERVE_UNIT", "   "),
+            ("NUWA_RUNNER_UNITS", " , "),
+            ("NUWA_WEBHOOK_EVENTS", " , "),
+        ] {
+            environment.insert(key.into(), raw.into());
+        }
+        let (state, days, sync_interval) = startup_state(
+            store,
+            db_path,
+            &environment,
+            "synthetic-serve-defaults".into(),
+            456,
+        );
+        for (key, expected) in [
+            ("NUWA_SESSION_TTL_SECS", "86400"),
+            ("NUWA_SYNC_INTERVAL", "600"),
+            ("NUWA_EVENT_RETENTION_DAYS", "90"),
+            ("NUWA_STUCK_AFTER_SECS", "300"),
+            ("NUWA_COOKIE_SECURE", "auto"),
+            ("NUWA_SERVE_UNIT", "nuwa-serve"),
+            ("NUWA_RUNNER_UNITS", "nuwa-work"),
+        ] {
+            assert_eq!(
+                state.startup_config.values[key].value.as_deref(),
+                Some(expected),
+                "{key}"
+            );
+            assert_eq!(state.startup_config.values[key].source, "default", "{key}");
+        }
+        assert_eq!(days, 90);
+        assert_eq!(sync_interval.as_secs(), 600);
+        assert!(!state.cookie_secure);
+        assert!(!state.cookie_secure_never);
+        assert!(state.startup_config.values["NUWA_WEBHOOK_EVENTS"]
+            .value
+            .as_deref()
+            .expect("default subscriptions")
+            .split(',')
+            .any(|event| event == "runner_error"));
     }
 
     async fn body_text(response: Response) -> String {
@@ -723,6 +999,7 @@ mod tests {
                     message: None,
                     log_window: Vec::new(),
                     stack_trace: "boom".into(),
+                    ..Default::default()
                 },
                 1,
             )
@@ -786,6 +1063,8 @@ mod tests {
             provider: crate::repair::ProviderKind::Faux,
             max_turns: 3,
             repo_config: None,
+            owner: None,
+            base: None,
             secrets: Arc::clone(&secrets),
             progress: None,
             faux_script: Some(
@@ -798,6 +1077,7 @@ mod tests {
             ),
             run_id: None,
         })
+        .await
         .expect("prepare");
         let root = prepared.session_dir().to_path_buf();
         std::fs::create_dir_all(&root).expect("session root");
@@ -830,20 +1110,18 @@ mod tests {
             )
             .expect("session dir");
 
-        let app = build_app(AppState {
-            store: Arc::clone(&store),
-            ui_token: Arc::new(None),
-            ingest_token: Arc::new(None),
-            session: Arc::new(crate::session::SessionManager::new("", 86_400_000)),
-            limiter: Arc::new(crate::session::LoginLimiter::new()),
-            started_at_ms: crate::now_ms(),
-            env_path: dir.path().join("nuwa.env"),
+        let environment = std::collections::BTreeMap::from([(
+            "NUWA_ENV_FILE".into(),
+            dir.path().join("nuwa.env").display().to_string(),
+        )]);
+        let (state, _, _) = startup_state(
+            Arc::clone(&store),
             db_path,
-            cookie_secure: false,
-            cookie_secure_never: false,
-            serve_unit: "nuwa-serve".to_string(),
-            runner_units: vec!["nuwa-work".to_string()],
-        });
+            &environment,
+            "synthetic-serve".into(),
+            crate::now_ms(),
+        );
+        let app = build_app(state);
         let response = app
             .clone()
             .oneshot(
@@ -863,6 +1141,8 @@ mod tests {
             .expect("old JSONL must not block a new CLI repair");
         assert_eq!(report.root_cause_text, "successful repair");
         assert!(repo.join("fixed.marker").is_file());
+        let checkout = crate::pipeline::CheckoutLease::acquire(&store, &repo, "test", None)
+            .expect("checkout authority");
         let delivered = crate::pipeline::deliver(crate::pipeline::DeliveryRequest {
             repo: &repo,
             issue: prepared.issue(),
@@ -873,9 +1153,12 @@ mod tests {
             public_base_url: None,
             draft: false,
             secrets: &secrets,
-            store: None,
+            store: Some(&store),
             run_id: None,
             repo_id: "",
+            checkout_claim: Some(&checkout.claim),
+            verification: prepared.verification(),
+            limits: Default::default(),
         })
         .await
         .expect("a successful repair must remain deliverable");
@@ -1444,6 +1727,135 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body_text(response).await.contains("new issue"));
+    }
+
+    async fn post_ingest(app: &Router, raw: String) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ingest")
+                    .header("x-nuwa-token", "ingest-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(raw))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    #[tokio::test]
+    async fn ingest_invalid_metadata_is_400_and_prevalidates_all_jsonl_lines() {
+        let (_dir, state) = test_state(Some("secret"));
+        let store = Arc::clone(&state.store);
+        let app = build_app(state);
+        let valid = serde_json::to_value(overview_signal("ingest", "example.com/app", "high"))
+            .expect("signal");
+        for (field, value) in [
+            ("environment", " ".to_string()),
+            (
+                "environment",
+                "x".repeat(shanhaijing::MAX_ENVIRONMENT_BYTES + 1),
+            ),
+            ("release_sha", "BATCH5_PRIVATE_METADATA\n".to_string()),
+            (
+                "release_sha",
+                "x".repeat(shanhaijing::MAX_RELEASE_SHA_BYTES + 1),
+            ),
+            ("source_event_id", "".to_string()),
+            (
+                "source_event_id",
+                "x".repeat(shanhaijing::MAX_SOURCE_EVENT_ID_BYTES + 1),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value.into();
+            for raw in [invalid.to_string(), format!("{valid}\n{invalid}")] {
+                let response = post_ingest(&app, raw).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(body_text(response).await, "invalid signal observation");
+                assert!(store.list_issues().expect("no partial receipts").is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_parse_errors_are_400_without_payload_reflection_or_partial_receipts() {
+        let (_dir, state) = test_state(Some("secret"));
+        let store = Arc::clone(&state.store);
+        let app = build_app(state);
+        let valid = serde_json::to_value(overview_signal("ingest", "example.com/app", "high"))
+            .expect("signal");
+        let mut invalid = valid.clone();
+        invalid["observed_at"] = "BATCH5_PRIVATE_METADATA".into();
+        for raw in [
+            "BATCH5_PRIVATE_METADATA: malformed JSON".to_string(),
+            invalid.to_string(),
+            format!("{valid}\n{invalid}"),
+        ] {
+            let response = post_ingest(&app, raw).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let message = body_text(response).await;
+            assert!(message.starts_with("bad payload: invalid Signal JSON/JSONL at line "));
+            assert!(!message.contains("BATCH5_PRIVATE_METADATA"));
+            assert!(store.list_issues().expect("no partial receipts").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_token_auth_and_forged_authority_do_not_trust_observer_time() {
+        for terminal in [shanhaijing::State::Merged, shanhaijing::State::Rejected] {
+            let (_dir, state) = test_state(Some("secret"));
+            let store = Arc::clone(&state.store);
+            let signal = shanhaijing::Signal {
+                observed_at: Some(150),
+                environment: Some("production".into()),
+                release_sha: Some("a".repeat(40)),
+                source_event_id: Some("incident-1".into()),
+                ..overview_signal("ingest", "example.com/app", "high")
+            };
+            store
+                .report_signal_with_source(&signal, 175, Some("owner-import"))
+                .expect("trusted seed");
+            let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
+            for next in [
+                shanhaijing::State::Triggered,
+                shanhaijing::State::Fixing,
+                shanhaijing::State::PrOpen,
+                terminal,
+            ] {
+                store.set_state(&fp, next, 200, None).expect("transition");
+            }
+            let mut payload = serde_json::to_value(&signal).expect("signal");
+            payload["trusted_source"] = "owner-import".into();
+            payload["authority"] = serde_json::json!({"trusted": true, "source": "owner-import"});
+            let response = build_app(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/ingest")
+                        .header("x-nuwa-token", "ingest-secret")
+                        .header(header::AUTHORIZATION, "Bearer synthetic-bearer")
+                        .body(Body::from(payload.to_string()))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(body_text(response).await.contains("REGRESSION"));
+            let issue = store.list_issues().expect("issues").remove(0);
+            assert_eq!(issue.state, "new");
+            assert_eq!(issue.occurrences, 2);
+            let observations = store.observations_for(&fp, 100).expect("receipts");
+            assert_eq!(observations[0].disposition, "regression");
+            assert_eq!(observations[0].observed_at_ms, Some(150));
+            assert_eq!(observations[0].environment.as_deref(), Some("production"));
+            assert_eq!(observations[0].release_sha, signal.release_sha);
+            assert_eq!(observations[0].source_event_id, signal.source_event_id);
+            assert_eq!(observations[0].time_status, "untrusted");
+            assert_eq!(observations[0].trusted_source, None);
+            assert_eq!(observations[0].duplicate_of, None);
+        }
     }
 
     #[tokio::test]
@@ -2189,6 +2601,7 @@ mod tests {
                 title.replace(' ', "_"),
                 title.replace(' ', "_"),
             ),
+            ..Default::default()
         }
     }
 
@@ -2864,6 +3277,7 @@ mod tests {
                 title.replace(' ', "_"),
                 title.replace(' ', "_"),
             ),
+            ..Default::default()
         }
     }
 

@@ -19,6 +19,9 @@ use crate::api::common::{
     configured_units, parse_json_body, restart_lock, schedule_restart, valid_systemd_unit,
 };
 use crate::api::{ApiError, ErrorBody, ErrorDetail};
+use crate::config_activation::{
+    self, ProcessConfigDto, SavedConfigDto, StartupConfig, REVISION_KEY,
+};
 use crate::serve::AppState;
 use crate::settings::{self, SettingSpec};
 
@@ -60,12 +63,16 @@ pub struct SettingsResponse {
     pub values: BTreeMap<String, SettingValueDto>,
     pub env_path: String,
     pub env_exists: bool,
-    /// `None` when the file is missing; `n/a` on non-Unix hosts.
+    // `None` when the file is missing; `n/a` on non-Unix hosts.
     pub env_permissions: Option<String>,
     pub needs_migration: bool,
+    pub saved: SavedConfigDto,
+    pub processes: Vec<ProcessConfigDto>,
+    // Deprecated historical audit comparison, not activation authority.
     pub restart_pending: bool,
+    // Deprecated merged legacy telemetry, not per-process activation evidence.
     pub effective_diff: BTreeMap<String, DiffDto>,
-    /// Names only — values of unrecognized keys are never returned.
+    // Names only — values of unrecognized keys are never returned.
     pub unknown_keys: Vec<String>,
     pub last_changes: Vec<LastChangeDto>,
 }
@@ -182,10 +189,22 @@ pub struct PutSettingsResponse {
 pub struct TestSettingsRequest {
     #[serde(default)]
     pub target: Option<String>,
-    /// Unsaved candidate values; an explicit entry wins over the environment
-    /// so the console tests exactly what the operator typed (docs/09 §9.2).
+    // Legacy requests default to draft overrides of the saved file.
+    #[serde(default)]
+    pub candidate: ProbeCandidate,
+    // Never falls back to the live process environment.
     #[serde(default)]
     pub values: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub enum ProbeCandidate {
+    #[default]
+    Draft,
+    Saved,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,7 +247,13 @@ pub async fn get(State(state): State<AppState>) -> Response {
     let path = state.env_path.clone();
     let started_at_ms = state.started_at_ms;
     let store = Arc::clone(&state.store);
-    match tokio::task::spawn_blocking(move || read_settings(&store, &path, started_at_ms)).await {
+    let startup = Arc::clone(&state.startup_config);
+    let runner_units = state.runner_units.clone();
+    match tokio::task::spawn_blocking(move || {
+        read_settings(&store, &path, started_at_ms, &startup, &runner_units)
+    })
+    .await
+    {
         Ok(Ok(body)) => Json(body).into_response(),
         Ok(Err(error)) => {
             eprintln!("settings: {error}");
@@ -259,10 +284,9 @@ pub async fn put(
     {
         Ok(Ok(body)) => Json(body).into_response(),
         Ok(Err(error)) => error.into_response(),
-        Err(error) => {
-            eprintln!("settings: blocking task failed: {error}");
-            internal_error("failed to write settings").into_response()
-        }
+        // A failed task may already have replaced the file. Its outcome cannot
+        // be reconstructed safely from a join error.
+        Err(_) => indeterminate_save_error().into_response(),
     }
 }
 
@@ -275,7 +299,10 @@ fn internal_error(message: &'static str) -> ApiError {
 /// `POST /api/v1/settings/test` — probe the GitHub token or the LLM endpoint
 /// with unsaved candidate values (docs/09 §9.2). Nothing is persisted and no
 /// value is ever logged.
-pub async fn test(payload: Result<Json<TestSettingsRequest>, JsonRejection>) -> Response {
+pub async fn test(
+    State(state): State<AppState>,
+    payload: Result<Json<TestSettingsRequest>, JsonRejection>,
+) -> Response {
     let request = match parse_json_body(payload) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
@@ -287,14 +314,65 @@ pub async fn test(payload: Result<Json<TestSettingsRequest>, JsonRejection>) -> 
     if let Err(error) = validate_values(&request.values) {
         return error.into_response();
     }
+    let values = match probe_candidates(&state.env_path, request.candidate, &request.values) {
+        Ok(values) => values,
+        Err(error) => return error.into_response(),
+    };
     let result = match target {
-        "github" => probe_github(&request.values).await,
-        _ => probe_llm(&request.values).await,
+        "github" => probe_github(&values).await,
+        _ => probe_llm(&values).await,
     };
     match result {
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+/// Resolve credentials and endpoints together from a single saved-file read.
+/// A draft host override cannot borrow a saved or live credential; only an
+/// explicitly supplied draft key may follow it.
+fn probe_candidates(
+    path: &Path,
+    candidate: ProbeCandidate,
+    draft: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, Value>, ApiError> {
+    if candidate == ProbeCandidate::Saved && !draft.is_empty() {
+        return Err(field_error(
+            "values",
+            "saved candidate cannot include draft overrides",
+        ));
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return Err(internal_error("failed to read probe candidate")),
+    };
+    let (file, _) = settings::normalize_known_keys(&settings::parse_env(&text));
+    let mut values: BTreeMap<String, Value> = settings::SETTINGS_SCHEMA
+        .iter()
+        .map(|spec| {
+            (
+                spec.key.to_string(),
+                Value::String(
+                    file.get(spec.key)
+                        .cloned()
+                        .unwrap_or_else(|| spec.default.unwrap_or("").to_string()),
+                ),
+            )
+        })
+        .collect();
+    let saved_base = resolve_llm_setting(&values, "NUWA_BASE_URL", None, ZAI_DEFAULT_BASE_URL)?;
+    values.extend(draft.clone());
+    let provider = resolve_llm_setting(&values, "NUWA_PROVIDER", None, "anthropic")?;
+    if provider == "zai" {
+        let requested_base = llm_base(&values, ZAI_DEFAULT_BASE_URL)?;
+        let explicit_key = provided_value(draft, "ZAI_API_KEY")?.is_some_and(|key| !key.is_empty());
+        if requested_base != saved_base.trim_end_matches('/') && !explicit_key {
+            return Err(field_error("ZAI_API_KEY",
+                "required when probing another base URL — a saved or running process key is never sent to a different host"));
+        }
+    }
+    Ok(values)
 }
 
 /// Every `values` key is validated before any probe: unknown keys and
@@ -338,8 +416,8 @@ fn field_error(field: &str, message: impl Into<String>) -> ApiError {
     ApiError::validation(fields)
 }
 
-/// An explicit `values` entry wins over the environment, even when empty: the
-/// operator is testing the value on screen, not the running process default.
+/// An explicit candidate entry wins, even when empty: the operator is testing
+/// the saved/draft value, never the running process's credentials.
 /// Credentials and the GitHub token use this rule; the LLM model/base/provider
 /// fall through on empty instead (see [`resolve_llm_setting`]).
 fn provided_value(values: &BTreeMap<String, Value>, key: &str) -> Result<Option<String>, ApiError> {
@@ -352,14 +430,7 @@ fn provided_value(values: &BTreeMap<String, Value>, key: &str) -> Result<Option<
     }
 }
 
-fn env_value(key: &str) -> Option<String> {
-    crate::env_store::var(key)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-/// Candidate value, else process env, else `default`; an explicit empty entry
-/// still wins (credentials must never fall back to the environment).
+/// Candidate value, else `default`; credentials never borrow live environment.
 fn resolve_value(
     values: &BTreeMap<String, Value>,
     key: &str,
@@ -368,12 +439,12 @@ fn resolve_value(
     if let Some(value) = provided_value(values, key)? {
         return Ok(value);
     }
-    Ok(env_value(key).unwrap_or_else(|| default.to_string()))
+    Ok(default.to_string())
 }
 
 /// Candidate value, else `env`, else `default`, where an empty candidate means
 /// "unset". The runtime filters empty `NUWA_PROVIDER` / `NUWA_MODEL` /
-/// `NUWA_BASE_URL` (`main.rs::env_d` / `env_provider_default`), so the console
+/// `NUWA_BASE_URL` (`provider_from_environment`), so the console
 /// must fall through to the provider default instead of rejecting a 422.
 /// `env` is injected so the rule is testable without touching the process
 /// environment.
@@ -393,7 +464,7 @@ fn test_http_client() -> Result<reqwest::Client, ApiError> {
     reqwest::Client::builder()
         .timeout(TEST_TIMEOUT)
         .build()
-        .map_err(|error| ApiError::upstream(format!("HTTP client setup failed: {error}")))
+        .map_err(|_| ApiError::upstream("HTTP client setup failed"))
 }
 
 /// Send one probe with a hard timeout; non-2xx is a 502, never a body echo
@@ -401,11 +472,7 @@ fn test_http_client() -> Result<reqwest::Client, ApiError> {
 async fn send_probe(service: &str, request: reqwest::RequestBuilder) -> Result<Value, ApiError> {
     let response = match tokio::time::timeout(TEST_TIMEOUT, request.send()).await {
         Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            return Err(ApiError::upstream(format!(
-                "{service} is unreachable: {error}"
-            )))
-        }
+        Ok(Err(_)) => return Err(ApiError::upstream(format!("{service} is unreachable"))),
         Err(_) => return Err(ApiError::upstream(format!("{service} check timed out"))),
     };
     let status = response.status();
@@ -419,12 +486,7 @@ async fn send_probe(service: &str, request: reqwest::RequestBuilder) -> Result<V
 
 /// `GET /rate_limit` proves the token itself; it spends no API quota.
 async fn probe_github(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
-    let token = match provided_value(values, "NUWA_GITHUB_TOKEN")? {
-        Some(token) => token,
-        None => env_value("NUWA_GITHUB_TOKEN")
-            .or_else(|| env_value("GITHUB_TOKEN"))
-            .unwrap_or_default(),
-    };
+    let token = provided_value(values, "NUWA_GITHUB_TOKEN")?.unwrap_or_default();
     if token.is_empty() {
         return Err(field_error("NUWA_GITHUB_TOKEN", "token is required"));
     }
@@ -451,12 +513,7 @@ async fn probe_github(values: &BTreeMap<String, Value>) -> Result<TestSettingsRe
 }
 
 async fn probe_llm(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
-    let provider = resolve_llm_setting(
-        values,
-        "NUWA_PROVIDER",
-        env_value("NUWA_PROVIDER"),
-        "anthropic",
-    )?;
+    let provider = resolve_llm_setting(values, "NUWA_PROVIDER", None, "anthropic")?;
     match provider.as_str() {
         "faux" => Ok(TestSettingsResponse {
             ok: true,
@@ -480,46 +537,15 @@ fn llm_key(values: &BTreeMap<String, Value>, key: &str) -> Result<String, ApiErr
 }
 
 fn llm_model(values: &BTreeMap<String, Value>, default: &str) -> Result<String, ApiError> {
-    resolve_llm_setting(values, "NUWA_MODEL", env_value("NUWA_MODEL"), default)
+    resolve_llm_setting(values, "NUWA_MODEL", None, default)
 }
 
 fn llm_base(values: &BTreeMap<String, Value>, default: &str) -> Result<String, ApiError> {
-    let base = resolve_llm_setting(values, "NUWA_BASE_URL", env_value("NUWA_BASE_URL"), default)?;
+    let base = resolve_llm_setting(values, "NUWA_BASE_URL", None, default)?;
     if !valid_http_url(&base) {
         return Err(field_error("NUWA_BASE_URL", "must be an http(s) URL"));
     }
     Ok(base.trim_end_matches('/').to_string())
-}
-
-/// The credential a probe sends, and the host it may be sent to.
-///
-/// The running process's key may only travel to the base URL the process is
-/// configured with. As soon as the request names a different host, the key
-/// has to be supplied on screen — otherwise a console user could point the
-/// probe at their own host and read the running key off the wire.
-fn probe_credential(
-    values: &BTreeMap<String, Value>,
-    key: &str,
-    requested_base: Option<&str>,
-    process_base: &str,
-) -> Result<String, ApiError> {
-    if let Some(value) = provided_value(values, key)?.filter(|value| !value.is_empty()) {
-        return Ok(value);
-    }
-    let process_base = process_base.trim_end_matches('/');
-    if let Some(requested) = requested_base {
-        if requested.trim_end_matches('/') != process_base {
-            return Err(field_error(
-                key,
-                "required when probing another base URL — the running process's key is never sent to a different host",
-            ));
-        }
-    }
-    let value = env_value(key).unwrap_or_default();
-    if value.is_empty() {
-        return Err(field_error(key, "API key is required"));
-    }
-    Ok(value)
 }
 
 /// Resolve the anthropic probe target exactly like `repair::run`: the public
@@ -546,17 +572,7 @@ fn resolve_anthropic_probe(
 async fn probe_zai(values: &BTreeMap<String, Value>) -> Result<TestSettingsResponse, ApiError> {
     let model = llm_model(values, ZAI_DEFAULT_MODEL)?;
     let base = llm_base(values, ZAI_DEFAULT_BASE_URL)?;
-    let process_base =
-        env_value("NUWA_BASE_URL").unwrap_or_else(|| ZAI_DEFAULT_BASE_URL.to_string());
-    let requested_base = provided_value(values, "NUWA_BASE_URL")?
-        .map(|value| value.trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty());
-    let key = probe_credential(
-        values,
-        "ZAI_API_KEY",
-        requested_base.as_deref(),
-        &process_base,
-    )?;
+    let key = llm_key(values, "ZAI_API_KEY")?;
     let request = test_http_client()?
         .post(format!("{base}/chat/completions"))
         .bearer_auth(key)
@@ -577,7 +593,7 @@ async fn probe_anthropic(
     values: &BTreeMap<String, Value>,
 ) -> Result<TestSettingsResponse, ApiError> {
     let key = llm_key(values, "ANTHROPIC_API_KEY")?;
-    let (base, model) = resolve_anthropic_probe(values, env_value("NUWA_MODEL"))?;
+    let (base, model) = resolve_anthropic_probe(values, None)?;
     let request = test_http_client()?
         .post(format!("{base}/v1/messages"))
         .header("x-api-key", key)
@@ -730,12 +746,25 @@ fn read_settings(
     store: &Store,
     path: &Path,
     started_at_ms: i64,
+    startup: &StartupConfig,
+    runner_units: &[String],
 ) -> Result<SettingsResponse, String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => Some(text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("read {}: {error}", path.display())),
-    };
+    read_settings_with_snapshot_hook(store, path, started_at_ms, startup, runner_units, || {})
+}
+
+fn read_settings_with_snapshot_hook(
+    store: &Store,
+    path: &Path,
+    started_at_ms: i64,
+    startup: &StartupConfig,
+    runner_units: &[String],
+    after_snapshot: impl FnOnce(),
+) -> Result<SettingsResponse, String> {
+    let (text, saved) = config_activation::read_saved_file(store, path)
+        .map_err(|error| error.reason.to_string())?;
+    // The transaction has ended; audit rows and runner telemetry may be newer,
+    // but values and saved revision must keep describing this same snapshot.
+    after_snapshot();
     let env_exists = text.is_some();
     let (map, migrated) =
         settings::normalize_known_keys(&settings::parse_env(text.as_deref().unwrap_or("")));
@@ -794,12 +823,42 @@ fn read_settings(
 
     let unknown_keys = map
         .keys()
-        .filter(|key| settings::setting_spec(key).is_none())
+        .filter(|key| {
+            settings::setting_spec(key).is_none() && !key.eq_ignore_ascii_case(REVISION_KEY)
+        })
         .cloned()
         .collect();
     let runners = store
         .list_runners()
         .map_err(|error| format!("runners: {error}"))?;
+    let now = crate::now_ms();
+    let mut processes = vec![config_activation::project_process(
+        Some(startup.clone()),
+        &saved,
+        "online",
+        Some(now),
+    )];
+    processes.extend(
+        runners
+            .iter()
+            .map(|runner| config_activation::runner_configuration(runner, &saved, now)),
+    );
+    for unit in configured_units("", runner_units) {
+        if valid_systemd_unit(&unit)
+            && !runners.iter().any(|runner| {
+                runner
+                    .service_unit
+                    .as_deref()
+                    .map(|reported| reported.trim_end_matches(".service"))
+                    == Some(unit.trim_end_matches(".service"))
+            })
+        {
+            let mut process = config_activation::project_process(None, &saved, "unreported", None);
+            process.role = "work".to_string();
+            process.reason = Some(format!("configured_unit_unreported:{unit}"));
+            processes.push(process);
+        }
+    }
 
     Ok(SettingsResponse {
         schema: settings::SETTINGS_SCHEMA
@@ -811,6 +870,8 @@ fn read_settings(
         env_exists,
         env_permissions: env_permissions(path),
         needs_migration: !migrated.is_empty(),
+        saved,
+        processes,
         restart_pending: changes
             .first()
             .is_some_and(|event| event.ts > started_at_ms),
@@ -828,11 +889,24 @@ fn read_settings(
     })
 }
 
-/// Serializes the whole settings read-modify-write. Two concurrent PUTs that
-/// each read the old file and write back their own change would otherwise lose
-/// one update (last writer wins) and race on the temp file. A blocking mutex is
-/// fine here: `write_settings` already runs on the blocking pool.
-static SETTINGS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Keep database errors value-free. The caller tracks whether file replacement
+/// has happened, including when `with_config_save` itself fails to commit.
+enum ConfigSaveError {
+    Api(ApiError),
+    Database,
+}
+
+impl From<shanhaijing::ShanError> for ConfigSaveError {
+    fn from(_: shanhaijing::ShanError) -> Self {
+        Self::Database
+    }
+}
+
+impl From<ApiError> for ConfigSaveError {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
+}
 
 fn write_settings(
     store: &Store,
@@ -840,88 +914,112 @@ fn write_settings(
     updates: &BTreeMap<String, Value>,
     now: i64,
 ) -> Result<PutSettingsResponse, ApiError> {
-    // Hold the lock across read → validate → backup → write → audit so the file
-    // is never a torn merge of two requests. A poisoned lock (a prior panic)
-    // must not wedge settings forever.
-    let _write_guard = SETTINGS_WRITE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            eprintln!("settings: read {}: {error}", path.display());
-            return Err(internal_error("failed to write settings"));
-        }
-    };
-    let (map, migrated) = settings::normalize_known_keys(&settings::parse_env(&text));
-    let (new_map, changed) = validate_updates(&map, updates).map_err(ApiError::validation)?;
-
-    // Write only the lines that actually change (plus lowercase keys being
-    // migrated), so comments, order, unknown keys and untouched values stay
-    // byte for byte (docs/09 §13.2).
-    let mut write_map: BTreeMap<String, String> = BTreeMap::new();
-    for key in &migrated {
-        if let Some(value) = map.get(key) {
-            write_map.insert(key.clone(), value.clone());
-        }
-    }
-    for key in &changed {
-        if let Some(value) = new_map.get(key) {
-            write_map.insert(key.clone(), value.clone());
-        }
-    }
-
-    if !write_map.is_empty() {
-        // Validate everything first: an invalid field never touches the file.
-        // A `.bak` also covers an ordinary PUT, not just migration.
-        settings::backup_env_file(path).map_err(|error| {
-            eprintln!("settings: {error}");
-            internal_error("failed to write settings")
-        })?;
-        let updated = settings::update_env_text(&text, &write_map);
-        settings::write_env_atomic(path, &updated).map_err(|error| {
-            eprintln!("settings: write failed: {error}");
-            internal_error("failed to write settings")
-        })?;
-        // Apply to the runtime store, not the process environment: a settings
-        // save must not race a child spawn (docs/07 CI hang).
-        for (key, value) in &write_map {
-            crate::env_store::set(key, Some(value));
-        }
-    }
-
-    if !migrated.is_empty() {
-        // One audit row for the lowercase -> uppercase rewrite (detail = key
-        // list, docs/09 §13.2), alongside the per-key config_changed rows.
-        if let Err(error) = store.record_event(
-            "__config__",
-            now,
-            None,
-            "owner",
-            "config_migrated",
-            &migrated.join(","),
-        ) {
-            eprintln!("settings: migration audit failed: {error}");
-        }
-    }
-    for key in &changed {
-        // The file is the source of truth; a failed audit row must not turn a
-        // successful save into an error.
-        if let Err(error) =
-            store.record_event("__config__", now, None, "owner", "config_changed", key)
-        {
-            eprintln!("settings: audit failed for {key}: {error}");
-        }
-    }
-
-    let restart_required = changed
-        .iter()
-        .any(|key| settings::setting_spec(key).is_some_and(|spec| spec.requires_restart));
-    Ok(PutSettingsResponse {
-        changed,
-        restart_required,
+    write_settings_with_audit(store, path, updates, now, |tx, revision, at, keys| {
+        tx.record_saved(revision, at, keys)
     })
+}
+
+fn write_settings_with_audit(
+    store: &Store,
+    path: &Path,
+    updates: &BTreeMap<String, Value>,
+    now: i64,
+    record: impl FnOnce(
+        &shanhaijing::ConfigSaveTx<'_>,
+        &str,
+        i64,
+        &[String],
+    ) -> shanhaijing::ShanResult<()>,
+) -> Result<PutSettingsResponse, ApiError> {
+    // An empty PUT must not migrate or manufacture a revision.
+    if updates.is_empty() {
+        return Ok(PutSettingsResponse {
+            changed: Vec::new(),
+            restart_required: false,
+        });
+    }
+    let env_id = config_activation::env_identity(path)
+        .map_err(|_| internal_error("failed to write settings"))?;
+    // Resolve symlink aliases to the same destination as the transaction key.
+    let destination = std::path::PathBuf::from(&env_id);
+    let mut replaced = false;
+    let result: Result<_, ConfigSaveError> = store.with_config_save(&env_id, |tx| {
+        // IMMEDIATE spans the entire read → validate → backup → replace → audit
+        // operation across independent Stores/processes. Never reenter Store.
+        let text = match std::fs::read_to_string(&destination) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return Err(internal_error("failed to write settings").into()),
+        };
+        let current = tx.current()?;
+        let consistent = config_activation::proven_file(&text).is_some_and(|file| {
+            current
+                .as_ref()
+                .is_some_and(|row| file.get(REVISION_KEY) == Some(&row.revision))
+        });
+        let (map, migrated) = settings::normalize_known_keys(&settings::parse_env(&text));
+        let (new_map, changed) = validate_updates(&map, updates).map_err(ApiError::validation)?;
+        if consistent && changed.is_empty() && migrated.is_empty() {
+            return Ok(PutSettingsResponse {
+                changed,
+                restart_required: false,
+            });
+        }
+        let mut write_map = BTreeMap::new();
+        let mut audit_keys = changed.clone();
+        for key in &migrated {
+            if !audit_keys.contains(key) {
+                audit_keys.push(key.clone());
+            }
+        }
+        for key in &audit_keys {
+            if let Some(value) = new_map.get(key) {
+                write_map.insert(key.clone(), value.clone());
+            }
+        }
+        let revision = uuid::Uuid::new_v4().to_string();
+        write_map.insert(REVISION_KEY.to_string(), revision.clone());
+        let updated = settings::update_env_text(&text, &write_map);
+        settings::backup_env_file(&destination)
+            .map_err(|_| internal_error("failed to back up settings"))?;
+        settings::write_env_atomic(&destination, &updated)
+            .map_err(|_| internal_error("failed to write settings"))?;
+        replaced = true;
+        record(tx, &revision, now, &audit_keys)?;
+        Ok(PutSettingsResponse {
+            changed,
+            restart_required: true,
+        })
+    });
+    finish_config_save(result, replaced)
+}
+
+fn finish_config_save(
+    result: Result<PutSettingsResponse, ConfigSaveError>,
+    replaced: bool,
+) -> Result<PutSettingsResponse, ApiError> {
+    result.map_err(|error| {
+        if replaced {
+            // The filesystem and SQLite do not share a transaction. Do not
+            // claim success or roll back over a possibly committed save.
+            indeterminate_save_error()
+        } else {
+            match error {
+                ConfigSaveError::Api(error) => error,
+                ConfigSaveError::Database => {
+                    internal_error("failed to save configuration revision")
+                }
+            }
+        }
+    })
+}
+
+fn indeterminate_save_error() -> ApiError {
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "config_save_indeterminate",
+        "configuration save outcome is unknown; reload saved configuration before retrying",
+    )
 }
 
 /// New map + changed keys, or the 422 field map.
@@ -1127,9 +1225,11 @@ fn env_permissions(path: &Path) -> Option<String> {
     }
 }
 
-/// Compare the latest runner-reported `config_json` against the file values.
+/// Legacy observation: compare the latest runner-reported `config_json`
+/// against the file values, not a central policy or activation authority.
 /// Runners are considered newest heartbeat first: the freshest runtime value
-/// wins, and a key already listed is not repeated by an older runner.
+/// wins, and a key already listed is not repeated by an older runner. Other
+/// processes may differ; the creating process resolves admission policy.
 fn effective_diff(
     runners: &[RunnerRow],
     values: &BTreeMap<String, (String, &'static str)>,
@@ -1189,8 +1289,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        audit_then_schedule, last_four, llm_key, probe_credential, resolve_anthropic_probe,
-        resolve_llm_setting, restart_unavailable_message,
+        audit_then_schedule, last_four, llm_key, probe_candidates,
+        read_settings_with_snapshot_hook, resolve_anthropic_probe, resolve_llm_setting,
+        restart_unavailable_message, write_settings, write_settings_with_audit, ProbeCandidate,
     };
     use crate::api::common::restart_test_guard;
     use crate::serve::{build_app, AppState};
@@ -1255,6 +1356,14 @@ mod tests {
         let db_path = dir.path().join("s.db");
         let store = Arc::new(Store::open(&db_path).expect("open"));
         let state = AppState {
+            startup_config: Arc::new(crate::config_activation::StartupConfig::capture(
+                &store,
+                &env_path,
+                "serve",
+                uuid::Uuid::new_v4().to_string(),
+                started_at_ms,
+                &std::collections::BTreeMap::new(),
+            )),
             store: Arc::clone(&store),
             ui_token: Arc::new(None),
             ingest_token: Arc::new(None),
@@ -1438,6 +1547,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_explains_admission_slots_and_token_check_boundaries() {
+        let (_dir, app, _store, _env_path) = test_app(None);
+        let value = json_body(get(&app, "/api/v1/settings").await).await;
+        let schema = value["schema"].as_array().expect("schema");
+        let field = |key: &str| {
+            schema
+                .iter()
+                .find(|entry| entry["key"] == key)
+                .expect("field")
+        };
+        let pr = field("NUWA_DAILY_PR_LIMIT");
+        assert_eq!(pr["label"], "Daily PR admission slots (UTC)");
+        let help = pr["help"].as_str().expect("help");
+        for text in [
+            "UTC",
+            "在途",
+            "结果不明",
+            "重试沿用原准入日",
+            "创建进程",
+            "并非中心统一硬上限",
+        ] {
+            assert!(help.contains(text), "missing PR semantics: {text}");
+        }
+        let single = field("NUWA_MAX_TOKENS");
+        assert_eq!(single["label"], "Per-repair token delivery gate");
+        assert!(single["help"]
+            .as_str()
+            .expect("help")
+            .contains("不会实时中断模型调用"));
+        for key in ["NUWA_DAILY_TOKEN_LIMIT", "NUWA_MONTHLY_TOKEN_LIMIT"] {
+            let help = field(key)["help"].as_str().expect("help");
+            for text in [
+                "准入及交付前",
+                "已记录用量",
+                "失败尝试",
+                "并发或在途",
+                "不是运行时或 provider 硬上限",
+            ] {
+                assert!(help.contains(text), "missing {key} semantics: {text}");
+            }
+        }
+        assert_eq!(
+            field("NUWA_MONTHLY_TOKEN_LIMIT")["label"],
+            "Rolling 30-day token admission / delivery budget"
+        );
+        assert!(field("NUWA_MONTHLY_TOKEN_LIMIT")["help"]
+            .as_str()
+            .expect("help")
+            .contains("非自然月"));
+    }
+
+    #[tokio::test]
     async fn get_returns_schema_masked_values_and_metadata() {
         let file = "# managed by test\n\
                     NUWA_GITHUB_TOKEN=ghp_secretvalue1234\n\
@@ -1530,6 +1691,16 @@ mod tests {
         #[cfg(not(unix))]
         assert_eq!(value["env_permissions"], "n/a");
         assert_eq!(value["needs_migration"], true);
+        assert_eq!(value["saved"]["state"], "unversioned");
+        let unreported = value["processes"]
+            .as_array()
+            .expect("processes")
+            .iter()
+            .find(|process| process["freshness"] == "unreported")
+            .expect("unreported configured unit");
+        assert_eq!(unreported["activation"], "unknown");
+        assert!(unreported["snapshot"].is_null());
+        assert!(unreported["last_seen_at_ms"].is_null());
         assert_eq!(value["unknown_keys"], serde_json::json!(["LEGACY_KEY"]));
         assert_eq!(value["restart_pending"], false);
         assert!(value["effective_diff"]
@@ -1614,8 +1785,8 @@ mod tests {
             .collect();
         assert_eq!(
             changed_events.len(),
-            3,
-            "one config_changed per changed key"
+            4,
+            "one transactional config_changed per changed or migrated key"
         );
         let details: BTreeSet<&str> = changed_events
             .iter()
@@ -1623,21 +1794,21 @@ mod tests {
             .collect();
         assert_eq!(
             details,
-            BTreeSet::from(["NUWA_INTERVAL", "NUWA_MODEL", "NUWA_UI_TOKEN"])
+            BTreeSet::from([
+                "NUWA_INTERVAL",
+                "NUWA_MODEL",
+                "NUWA_UI_TOKEN",
+                "NUWA_PROVIDER"
+            ])
         );
         for event in &changed_events {
             assert_eq!(event.actor.as_deref(), Some("owner"));
             assert!(event.repo.is_empty(), "config events are repo-less");
         }
 
-        let migrated_events: Vec<_> = events
-            .iter()
-            .filter(|event| event.kind == "config_migrated")
-            .collect();
-        assert_eq!(migrated_events.len(), 1, "one config_migrated per PUT");
-        assert_eq!(migrated_events[0].detail, "NUWA_PROVIDER");
-        assert_eq!(migrated_events[0].actor.as_deref(), Some("owner"));
-        assert!(migrated_events[0].repo.is_empty());
+        let saved = crate::config_activation::saved_config(&store, &env_path);
+        assert_eq!(saved.state, "saved");
+        assert!(saved.revision.is_some());
     }
 
     #[tokio::test]
@@ -1665,8 +1836,13 @@ mod tests {
             serde_json::json!(["NUWA_INTERVAL", "NUWA_MAX_TURNS"])
         );
 
+        let updated = std::fs::read_to_string(&env_path).expect("read env");
+        let without_marker: String = updated
+            .split_inclusive('\n')
+            .filter(|line| !line.starts_with("NUWA_CONFIG_REVISION="))
+            .collect();
         assert_eq!(
-            std::fs::read_to_string(&env_path).expect("read env"),
+            without_marker,
             "# operator note\n\
              NUWA_GITHUB_TOKEN=old-token-9999\n\
              \n\
@@ -1809,6 +1985,7 @@ mod tests {
             r#"{"values":{
                 "NUWA_INTERVAL":"60",
                 "NOPE":"x",
+                "NUWA_CONFIG_REVISION":"not-editable",
                 "NUWA_ENV_FILE":"/tmp/evil.env"
             }}"#,
             Some(&csrf),
@@ -1818,6 +1995,7 @@ mod tests {
         let value = json_body(response).await;
         assert_eq!(value["error"]["code"], "validation_failed");
         assert!(value["error"]["fields"]["NOPE"].is_string(), "{value}");
+        assert!(value["error"]["fields"]["NUWA_CONFIG_REVISION"].is_string());
         assert!(
             value["error"]["fields"]["NUWA_ENV_FILE"].is_string(),
             "{value}"
@@ -1986,6 +2164,340 @@ mod tests {
     }
 
     #[test]
+    fn saves_version_explicit_unversioned_noops_but_preserve_consistent_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("save.db")).expect("store");
+        let path = dir.path().join("nuwa.env");
+        std::fs::write(&path, "nuwa_interval=30\n").expect("file");
+        let empty = BTreeMap::new();
+        assert!(
+            !write_settings(&store, &path, &empty, 1)
+                .expect("empty")
+                .restart_required
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged"),
+            "nuwa_interval=30\n"
+        );
+        assert!(!path.with_extension("env.bak").exists());
+        let updates =
+            BTreeMap::from([("NUWA_INTERVAL".to_string(), Value::String("30".to_string()))]);
+        let first = write_settings(&store, &path, &updates, 2).expect("version unversioned file");
+        assert!(first.changed.is_empty());
+        assert!(first.restart_required);
+        let saved = crate::config_activation::saved_config(&store, &path);
+        assert_eq!(saved.state, "saved");
+        let text = std::fs::read_to_string(&path).expect("first");
+        let again = write_settings(&store, &path, &updates, 3).expect("consistent noop");
+        assert!(!again.restart_required);
+        assert_eq!(std::fs::read_to_string(&path).expect("second"), text);
+        assert_eq!(
+            crate::config_activation::saved_config(&store, &path).revision,
+            saved.revision
+        );
+        let inconsistent = text.replace(
+            saved.revision.as_deref().expect("revision"),
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        std::fs::write(&path, inconsistent).expect("external edit");
+        assert_eq!(
+            crate::config_activation::saved_config(&store, &path).state,
+            "unknown"
+        );
+        assert!(
+            write_settings(&store, &path, &updates, 4)
+                .expect("reversion")
+                .restart_required
+        );
+        let recovered = crate::config_activation::saved_config(&store, &path);
+        assert_eq!(recovered.state, "saved");
+        assert_ne!(recovered.revision, saved.revision);
+    }
+
+    #[test]
+    fn settings_snapshot_keeps_values_and_revision_together_across_independent_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("save.db");
+        let path = dir.path().join("nuwa.env");
+        let reader = Store::open(&db).expect("reader");
+        let writer = Store::open(&db).expect("independent writer");
+        let updates = BTreeMap::from([("NUWA_INTERVAL".to_string(), Value::String("30".into()))]);
+        write_settings(&writer, &path, &updates, 1).expect("first revision");
+        let original = crate::config_activation::saved_config(&reader, &path);
+        let startup = crate::config_activation::StartupConfig::capture(
+            &reader,
+            &path,
+            "serve",
+            "snapshot-reader".to_string(),
+            0,
+            &BTreeMap::new(),
+        );
+
+        let response = read_settings_with_snapshot_hook(&reader, &path, 0, &startup, &[], || {
+            // Force an independent save after the file snapshot and before
+            // response projection, without reentering a Store transaction.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let updates = BTreeMap::from([(
+                            "NUWA_INTERVAL".to_string(),
+                            Value::String("60".to_string()),
+                        )]);
+                        write_settings(&writer, &path, &updates, 2).expect("second revision");
+                    })
+                    .join()
+                    .expect("writer thread");
+            });
+        })
+        .expect("coherent settings response");
+        let response = serde_json::to_value(response).expect("response");
+        assert_eq!(response["values"]["NUWA_INTERVAL"]["value"], "30");
+        assert_eq!(response["saved"]["state"], "saved");
+        assert_eq!(
+            response["saved"]["revision"],
+            serde_json::json!(&original.revision)
+        );
+        assert_eq!(response["last_changes"][0]["ts_ms"], 2);
+
+        let (text, latest) = crate::config_activation::read_saved_file(&writer, &path)
+            .expect("latest coherent snapshot");
+        let values = crate::settings::parse_env(&text.expect("saved file"));
+        assert_eq!(values.get("NUWA_INTERVAL").map(String::as_str), Some("60"));
+        assert_eq!(
+            latest.revision.as_ref(),
+            values.get(crate::config_activation::REVISION_KEY)
+        );
+        assert_ne!(latest.revision, original.revision);
+    }
+
+    #[test]
+    fn independent_stores_serialize_full_read_modify_write_without_lost_updates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("save.db");
+        let path = dir.path().join("nuwa.env");
+        let first = Store::open(&db).expect("first");
+        let second = Store::open(&db).expect("second");
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for (store, key, value) in [
+                (&first, "NUWA_INTERVAL", "60"),
+                (&second, "NUWA_MAX_TURNS", "50"),
+            ] {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let updates =
+                        BTreeMap::from([(key.to_string(), Value::String(value.to_string()))]);
+                    barrier.wait();
+                    write_settings(store, path, &updates, 10).expect("serialized save");
+                });
+            }
+        });
+        let text = std::fs::read_to_string(&path).expect("file");
+        let values = crate::settings::parse_env(&text);
+        assert_eq!(values.get("NUWA_INTERVAL").map(String::as_str), Some("60"));
+        assert_eq!(values.get("NUWA_MAX_TURNS").map(String::as_str), Some("50"));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("NUWA_CONFIG_REVISION="))
+                .count(),
+            1
+        );
+        assert_eq!(
+            crate::config_activation::saved_config(&first, &path).state,
+            "saved"
+        );
+        let events = first.events_for("__config__", 10).expect("audit");
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| matches!(event.detail.as_str(), "NUWA_INTERVAL" | "NUWA_MAX_TURNS")));
+    }
+
+    #[test]
+    fn file_replacement_then_audit_failure_is_indeterminate_and_never_saved_proof() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("save.db")).expect("store");
+        let path = dir.path().join("nuwa.env");
+        let updates =
+            BTreeMap::from([("NUWA_INTERVAL".to_string(), Value::String("60".to_string()))]);
+        write_settings(&store, &path, &updates, 1).expect("initial save");
+        let previous = crate::config_activation::saved_config(&store, &path);
+        let updates =
+            BTreeMap::from([("NUWA_INTERVAL".to_string(), Value::String("90".to_string()))]);
+        let error =
+            write_settings_with_audit(&store, &path, &updates, 2, |tx, revision, at, keys| {
+                tx.record_saved(revision, at, keys)?;
+                Err(shanhaijing::ShanError::OwnershipLost)
+            })
+            .expect_err("failure after replacement");
+        assert_eq!(error.code, "config_save_indeterminate");
+        assert!(error.fields.is_none());
+        assert!(!error.message.contains("90"));
+        let saved = crate::config_activation::saved_config(&store, &path);
+        assert_eq!(saved.state, "unknown");
+        assert!(saved.revision.is_none());
+        let committed = store
+            .saved_config(&previous.env_id)
+            .expect("committed")
+            .expect("previous");
+        assert_eq!(Some(committed.revision), previous.revision);
+        assert_eq!(
+            store
+                .events_for("__config__", 10)
+                .expect("audit rollback")
+                .len(),
+            1
+        );
+        let environment =
+            crate::settings::parse_env(&std::fs::read_to_string(&path).expect("file"));
+        let snapshot = crate::config_activation::StartupConfig::capture(
+            &store,
+            &path,
+            "work",
+            "after-failure".into(),
+            3,
+            &environment,
+        );
+        assert!(snapshot.loaded_revision.is_none());
+    }
+
+    #[test]
+    fn protected_backup_failure_leaves_original_file_and_revision_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("save.db")).expect("store");
+        let path = dir.path().join("nuwa.env");
+        let updates =
+            BTreeMap::from([("NUWA_INTERVAL".to_string(), Value::String("60".to_string()))]);
+        write_settings(&store, &path, &updates, 1).expect("initial");
+        let original = std::fs::read_to_string(&path).expect("before");
+        let saved = crate::config_activation::saved_config(&store, &path);
+        std::fs::create_dir(path.with_extension("env.bak")).expect("blocked backup destination");
+        let updates =
+            BTreeMap::from([("NUWA_INTERVAL".to_string(), Value::String("90".to_string()))]);
+        let error = write_settings(&store, &path, &updates, 2).expect_err("backup failure");
+        assert_ne!(error.code, "config_save_indeterminate");
+        assert_eq!(std::fs::read_to_string(&path).expect("after"), original);
+        assert_eq!(
+            crate::config_activation::saved_config(&store, &path).revision,
+            saved.revision
+        );
+    }
+
+    #[tokio::test]
+    async fn save_does_not_mutate_runtime_snapshot_environment_or_secret_auth() {
+        let (_dir, app, _store, _path) = test_app(Some("NUWA_INTERVAL=30\n"));
+        let before = json_body(get(&app, "/api/v1/settings").await).await;
+        let runtime_before: Vec<_> = crate::settings::ENV_KEYS
+            .iter()
+            .map(|key| crate::env_store::var(key))
+            .collect();
+        let csrf = csrf_token(&app).await;
+        let response = put_json(
+            &app,
+            r#"{"values":{
+            "NUWA_INTERVAL":"60", "NUWA_UI_TOKEN":"synthetic-new-console-token",
+            "NUWA_INGEST_TOKEN":"synthetic-new-ingest-token",
+            "ANTHROPIC_API_KEY":"synthetic-new-provider-key"
+        }}"#,
+            Some(&csrf),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let runtime_after: Vec<_> = crate::settings::ENV_KEYS
+            .iter()
+            .map(|key| crate::env_store::var(key))
+            .collect();
+        assert!(
+            runtime_before == runtime_after,
+            "save must not alter any live configuration input"
+        );
+        let after = json_body(get(&app, "/api/v1/settings").await).await;
+        assert_eq!(
+            before["processes"][0]["snapshot"],
+            after["processes"][0]["snapshot"]
+        );
+        assert_eq!(after["saved"]["state"], "saved");
+        assert_eq!(after["processes"][0]["activation"], "unknown");
+        assert_eq!(after["unknown_keys"], serde_json::json!([]));
+        let auth = json_body(get(&app, "/api/v1/auth/me").await).await;
+        assert_eq!(
+            auth["local_mode"], true,
+            "saving an auth token must not change live authentication"
+        );
+    }
+
+    #[test]
+    fn old_proven_startup_snapshot_stays_immutable_across_save_and_becomes_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("save.db")).expect("store");
+        let path = dir.path().join("nuwa.env");
+        let updates =
+            BTreeMap::from([("NUWA_INTERVAL".to_string(), Value::String("60".to_string()))]);
+        write_settings(&store, &path, &updates, 1).expect("initial");
+        let environment =
+            crate::settings::parse_env(&std::fs::read_to_string(&path).expect("file"));
+        let snapshot = crate::config_activation::StartupConfig::capture(
+            &store,
+            &path,
+            "work",
+            "old-process".to_string(),
+            2,
+            &environment,
+        );
+        let old = serde_json::to_string(&snapshot).expect("snapshot");
+        let saved = crate::config_activation::saved_config(&store, &path);
+        assert_eq!(
+            crate::config_activation::project_process(
+                Some(snapshot.clone()),
+                &saved,
+                "online",
+                Some(2)
+            )
+            .activation,
+            "active"
+        );
+        let updates =
+            BTreeMap::from([("NUWA_INTERVAL".to_string(), Value::String("90".to_string()))]);
+        write_settings(&store, &path, &updates, 3).expect("next revision");
+        assert_eq!(serde_json::to_string(&snapshot).expect("unchanged"), old);
+        let saved = crate::config_activation::saved_config(&store, &path);
+        assert_eq!(
+            crate::config_activation::project_process(Some(snapshot), &saved, "offline", Some(2))
+                .activation,
+            "stale"
+        );
+    }
+
+    #[test]
+    fn probes_use_saved_or_draft_credentials_and_never_borrow_for_another_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nuwa.env");
+        std::fs::write(&path, "NUWA_PROVIDER=zai\nNUWA_BASE_URL=https://saved.example.test/v1\nZAI_API_KEY=synthetic-saved-key\n")
+            .expect("candidate");
+        let candidates =
+            probe_candidates(&path, ProbeCandidate::Saved, &BTreeMap::new()).expect("saved");
+        assert_eq!(candidates["ZAI_API_KEY"], "synthetic-saved-key");
+        let mut draft = BTreeMap::from([(
+            "NUWA_BASE_URL".to_string(),
+            Value::String("https://another.example.test/v1".to_string()),
+        )]);
+        assert!(probe_candidates(&path, ProbeCandidate::Draft, &draft).is_err());
+        draft.insert(
+            "ZAI_API_KEY".to_string(),
+            Value::String("synthetic-draft-key".to_string()),
+        );
+        assert!(probe_candidates(&path, ProbeCandidate::Saved, &draft).is_err());
+        let candidates =
+            probe_candidates(&path, ProbeCandidate::Draft, &draft).expect("explicit key");
+        assert_eq!(candidates["ZAI_API_KEY"], "synthetic-draft-key");
+        let missing = dir.path().join("absent.env");
+        let candidates =
+            probe_candidates(&missing, ProbeCandidate::Saved, &BTreeMap::new()).expect("no file");
+        assert!(llm_key(&candidates, "ANTHROPIC_API_KEY").is_err());
+    }
+
+    #[test]
     fn empty_llm_model_base_and_provider_mean_unset() {
         let mut values = BTreeMap::new();
         values.insert("NUWA_MODEL".to_string(), Value::String("  ".to_string()));
@@ -2045,50 +2557,6 @@ mod tests {
                 .map(String::as_str),
             Some("API key is required")
         );
-    }
-
-    #[test]
-    fn probe_credential_refuses_the_process_key_for_another_host() {
-        // No key on screen, but the request names another host: the running
-        // process's key must not be used — that is the exfiltration path.
-        let mut values = BTreeMap::new();
-        values.insert(
-            "NUWA_BASE_URL".to_string(),
-            Value::String("https://attacker.example.test".to_string()),
-        );
-        let error = probe_credential(
-            &values,
-            "ZAI_API_KEY",
-            Some("https://attacker.example.test"),
-            "https://open.bigmodel.cn/api/coding/paas/v4",
-        )
-        .expect_err("another host must not borrow the process key");
-        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(
-            error
-                .fields
-                .as_ref()
-                .and_then(|fields| fields.get("ZAI_API_KEY"))
-                .map(String::as_str)
-                .unwrap_or_default()
-                .contains("never sent to a different host"),
-            "{error:?}"
-        );
-
-        // A key typed on screen always wins, whatever the host.
-        let mut values = BTreeMap::new();
-        values.insert(
-            "ZAI_API_KEY".to_string(),
-            Value::String("pasted-key".to_string()),
-        );
-        let key = probe_credential(
-            &values,
-            "ZAI_API_KEY",
-            Some("https://attacker.example.test"),
-            "https://open.bigmodel.cn/api/coding/paas/v4",
-        )
-        .expect("pasted key");
-        assert_eq!(key, "pasted-key");
     }
 
     #[test]
@@ -2386,6 +2854,7 @@ mod tests {
             log_window: Vec::new(),
             stack_trace: "panic: restart guard\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/app.go:1 +0x1"
                 .to_string(),
+            ..Default::default()
         };
         let fingerprint = match store.report_signal(&signal, now).expect("signal") {
             ReportOutcome::NewIssue { fingerprint } => fingerprint,

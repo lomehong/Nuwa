@@ -182,7 +182,8 @@ export function ProjectsPage() {
                 <TableHeaderCell className="text-right">运行中</TableHeaderCell>
                 <TableHeaderCell className="text-right">PR 待合并</TableHeaderCell>
                 <TableHeaderCell className="text-right">运行器</TableHeaderCell>
-                <TableHeaderCell className="text-right">今日 PR</TableHeaderCell>
+                <TableHeaderCell className="text-right">UTC 今日确认 PR（记录）</TableHeaderCell>
+                <TableHeaderCell className="text-right">UTC 准入槽位</TableHeaderCell>
                 <TableHeaderCell className="text-right">CI 24h</TableHeaderCell>
                 <TableHeaderCell>最近信号</TableHeaderCell>
               </TableRow>
@@ -212,6 +213,11 @@ export function ProjectsPage() {
                   </TableCell>
                   <TableCell className="text-right">
                     <Cell value={project.prs_today} />
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <span title="含在途、结果不明及已消耗；重试保留原准入日">
+                      <Cell value={project.pr_slots_today} />
+                    </span>
                   </TableCell>
                   <TableCell className="text-right">
                     <span className="ledger__num text-body-sm text-text-secondary">

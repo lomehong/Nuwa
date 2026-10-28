@@ -19,6 +19,8 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationMode {
+    /// Nuwa froze and proved an owner oracle before the first repair write.
+    OwnerTrusted,
     /// `reproduce_check` is configured: it must be red on base, green on the
     /// branch.
     Configured,
@@ -34,6 +36,7 @@ pub enum VerificationMode {
 impl VerificationMode {
     pub fn as_str(self) -> &'static str {
         match self {
+            VerificationMode::OwnerTrusted => "owner_trusted",
             VerificationMode::Configured => "configured",
             VerificationMode::FailingCheck => "failing_check",
             VerificationMode::Reproducer => "reproducer",
@@ -115,6 +118,13 @@ impl Issue {
 
     pub fn system_prompt(&self, repo_display: &str) -> String {
         let verify_rule = match self.verification_mode {
+            VerificationMode::OwnerTrusted => format!(
+                "3. Nuwa has frozen an owner-provided oracle and confirmed it fails on the base. \
+                 Fix the application code and run `{}` until it passes. Do not modify protected \
+                 oracle inputs or configuration. Nuwa independently runs the same immutable oracle \
+                 on base and candidate; agent-created reproducers and your report are not trusted proof.",
+                self.failing_check.command
+            ),
             VerificationMode::Reproducer => format!(
                 "3. `{check}` already PASSES on the base commit — the bug only shows up at runtime. \
                  Add a self-contained reproducer at `.nuwa/repro.sh` (Windows: `.nuwa/repro.cmd`) \
@@ -166,6 +176,12 @@ impl Issue {
                 .join("\n")
         };
         let closing = match self.verification_mode {
+            VerificationMode::OwnerTrusted => format!(
+                "The owner oracle failed on the pinned base. Locate and fix the root cause, and run `{}`. \
+                 The normal check may already be green. Leave owner oracle inputs unchanged; Nuwa \
+                 verifies the fix independently using its frozen oracle, not an agent-created proof.\n",
+                self.failing_check.command
+            ),
             VerificationMode::Reproducer => format!(
                 "`{check}` passes on this base commit, so it cannot prove the bug. Write a self-contained reproducer at `.nuwa/repro.sh` (`.nuwa/repro.cmd` on Windows) that fails before your change and passes after it, fix the root cause, and keep iterating until both the reproducer and `{check}` are green.\n",
                 check = self.failing_check.command
@@ -330,5 +346,16 @@ mod tests {
         assert!(prompt.contains("must fail before your change"), "{prompt}");
         let system = issue.system_prompt("/repo");
         assert!(system.contains("must fail before your change"), "{system}");
+    }
+
+    #[test]
+    fn trusted_mode_never_requests_agent_generated_proof() {
+        let mut issue = issue("");
+        issue.verification_mode = VerificationMode::OwnerTrusted;
+        for prompt in [issue.system_prompt("/repo"), issue.user_prompt()] {
+            assert!(prompt.contains("oracle"));
+            assert!(!prompt.contains(".nuwa/repro"));
+            assert!(!prompt.contains("currently fails"));
+        }
     }
 }

@@ -2,7 +2,11 @@
 import type { CiWatchDto } from "./CiWatchDto";
 import type { IssueListItem } from "./IssueListItem";
 import type { RunDto } from "./RunDto";
+import type { SignalObservationDto } from "./SignalObservationDto";
 import type { SimilarIssues } from "./SimilarIssues";
 import type { TimelineItem } from "./TimelineItem";
 
-export type IssueDetailResponse = { issue: IssueListItem, stack_sample: string, timeline: Array<TimelineItem>, runs: Array<RunDto>, similar: SimilarIssues, ci_watch: CiWatchDto | null, };
+/**
+ * PR/CI evidence does not establish deployment or runtime health.
+ */
+export type IssueDetailResponse = { issue: IssueListItem, stack_sample: string, timeline: Array<TimelineItem>, observations: Array<SignalObservationDto>, deployment_status: string, recovery_status: string, runs: Array<RunDto>, similar: SimilarIssues, ci_watch: CiWatchDto | null, };

@@ -192,10 +192,13 @@ jobs:
         env:
           TS_RS_EXPORT_DIR: ${{ github.workspace }}/web/src/lib/api-types
         run: cargo test -p nuwa --features ts-export export_bindings
-      - name: normalize 64-bit integers
-        # ts-rs 把 u64/i64 映射成 `bigint`，但 JSON 里它们是 number（JSON.parse
-        # 永远给 number）。不做这步，前端所有计数/时间戳都会类型错误。
-        run: grep -rl 'bigint' web/src/lib/api-types | xargs -r sed -i 's/\bbigint\b/number/g'
+      - name: normalize generated types
+        # ts-rs maps u64/i64 to `bigint`, while JSON always yields numbers; its
+        # commented-field formatting can also leave trailing spaces. Both must
+        # be normalized so the committed generated baseline stays reproducible.
+        run: |
+          grep -rl 'bigint' web/src/lib/api-types | xargs -r sed -i 's/\bbigint\b/number/g'
+          sed -i 's/[[:space:]]\+$//' web/src/lib/api-types/*.ts
       - name: commit on main / verify on PR
         run: |
           # 首次生成的文件是 untracked，`git diff` 看不见它们——必须先 add。

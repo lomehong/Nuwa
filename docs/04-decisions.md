@@ -2,6 +2,8 @@
 
 格式：编号 / 状态 / 背景 / 决策 / 理由 / 被否决的备选。日期均为 2026-10-15。
 
+当前批次快照（2026-10-27）：main 基线 v0.17.0；Batch5 observations/schema v13 已本地实现并完成聚焦验证（ADR-027）；Batch6 reservations/schema v14 已本地实现，最终检查完成（2026-10-28，ADR-028）。未升版、发版或执行生产操作；前序 ADR 的 schema 与验证数字保留为各批时点记录，不代表当前完整验证或生产升级已完成。
+
 ---
 
 ## ADR-001 · 基于 pi-rust fork 构建自用修复 Agent
@@ -197,8 +199,8 @@
 - 状态：已接受（2026-10-23）
 - 背景：`revive_orphaned_fixing` 按 `owner_runner_id` 复活启动前的在途单；两个**同 id** 的活进程会在各自启动时把对方的活单当孤儿回收，重复修复并双推同一 `agent/fix/*` 分支。claim 的原子 owner 只能挡住异 id 抢占，挡不住同 id 复活。
 - 决策：schema v8 在 `runners` 增加 `instance_id` / `lease_until`。`nuwa work` 启动时以随机实例 id 在同一事务内完成「租约检查 + checkout 占用检查 + runner 注册」：租约被其他实例持有则等待至多 TTL+10s（覆盖崩溃重启），仍失败则拒绝启动；**不同 runner id 也不能共用同一份 canonical checkout**（两个进程会互相 reset/fetch），直接拒绝并给出占用者 id。心跳每 5–15s 续租；续租失败（被接管）以退出码 0 终止，让新持有者继续而不是让 systemd 再起第三个竞争者；正常退出或收到 SIGTERM 时释放租约（否则 systemd 重启要等满 TTL）。`revive_orphaned_fixing` 语义不变，由租约保证它只在独占时运行。
-- 边界：这是单写者**前置条件**，不是分布式锁——不做 fencing token；进程长时间暂停/分区后可能出现短暂重叠，由续租失败退出收敛。租约 TTL 60s，崩溃后最迟一个 TTL 可被接管。
-- 并发拓扑：同一 SQLite 队列支持两种形态——多进程（不同 `--runner-id` + 独立 clone）与单进程池 `--pool N`（#1 主 checkout，#2..N detached worktree；每 worker 独立 id/租约/心跳/trusted，共享 DB 与 fetch 锁）。单进程池是异步并发，不是 OS 进程隔离；崩溃残留 worktree 需 prune。镜像矩阵已提供 Dockerfile（base/go/rust/node/python，CI 构建验证）；registry 推送是所有者动作。
+- 边界：这是 schema v8 的单写者**前置条件**，当时不做 fencing token；租约 TTL 60s，过期后可被接管。**Batch1 补充（2026-10-27，ADR-023）**：schema v10 的 delivery/checkout 操作新增 token、generation 与 expiry 校验；runner checkout 还绑定实际实例。不能再把“续租失败后退出”当成交付与清理的唯一守卫，也不因此承诺外部副作用 exactly-once。
+- 并发拓扑：同一 SQLite 队列支持两种形态——多进程（不同 `--runner-id` + 独立 clone）与单进程池 `--pool N`（#1 主 checkout，#2..N detached worktree；每 worker 独立 id/租约/心跳/trusted，共享 DB 与 fetch 锁）。单进程池是异步并发，不是 OS 进程隔离；Batch1 的保守 teardown 与中断残留人工复核规则见 ADR-023，不自动清除现场。镜像矩阵已提供 Dockerfile（base/go/rust/node/python，CI 构建验证）；registry 推送是所有者动作。
 - 被否决备选：仅比较 heartbeat 新鲜度（启动时刚写入的心跳无法区分死进程与新进程）；见到同 id 直接失败不等待（崩溃重启会与自己的旧租约冲突，systemd 反复失败）；引入外部锁服务（单机单库部署，超出边界）。
 
 ---
@@ -225,8 +227,8 @@
 - 背景：修复进程只在一个有限窗口内消费 CI；PR 创建响应丢失时可能误删远端分支；issue-level 失败一律升级、attempt cap 等下一次领取才生效，无法形成稳定的无人值守策略。所有者的 token 套餐不要求新增预算控制，现有预算闸保留但不在本决策范围内扩展。
 - 决策：
   1. **失败策略统一入口**：issue-level 修复/验证失败原子累加 attempts；低于 `max_attempts` 时回 `new` 并设置冷却，达到上限立即 `ignored`。provider 瞬时故障、环境故障不计数；人工关闭 PR 仍进入 `rejected` 且不自动重试；provider 配置错误仍升级。状态、attempts、冷却与审计同事务。
-  2. **交付 intent 与恢复**：推送前持久化 `delivery`（repo/branch/base/head SHA/run），依次记录 pushed、pr_requested、pr_created。PR 创建失败时先按 head 分支查 GitHub；找到则采用，找不到才清理孤儿分支；查询不确定则保留分支并标记 ambiguous。`nuwa work` 启动及每轮领单前对账，恢复“GitHub 已成功、本地未落库”的断点，同一分支/提交不重复创建 PR。
-  3. **持续 CI**：新增 `ci_watches`，由 serve 单实例后台调度；watch 持久化 head SHA、CLI 结论、下次检查、退避与记忆来源，重启后继续。green 不是终态，继续观察重跑。PR 仍 open 且 head 未变转红时关 PR 并按失败策略计数/重试/忽略；PR 已 merged 或已关闭时只记录 `ci_red` 告警，不自动重开、不自动回滚。CI 不可读/未完成不是终态，指数退避并保留 watch；超过 30 天过期。
+  2. **交付 intent 与恢复**：推送前持久化 `delivery`（repo/branch/base/head SHA/run），依次记录 pushed、pr_requested、pr_created。PR 创建失败时先查 GitHub，只有 open PR 的 head/base 精确匹配才采用；查询不确定则保留分支并标记 ambiguous。`nuwa work` 启动及每轮领单前对账，恢复“GitHub 已成功、本地未落库”的断点；这是减少重复副作用的恢复机制，**不保证 exactly-once**。schema v10 的 claim、原子完成与条件孤儿删除以 ADR-023 为准；已关闭/不匹配 PR 不等于零 PR。
+  3. **持续 CI（schema v9 原始决策）**：新增 `ci_watches`，由 serve 单实例后台调度；watch 持久化 head SHA、CI 结论、下次检查、退避与记忆来源，重启后继续。green 不是终态，继续观察重跑。PR 仍 open 且 head 未变转红时关 PR 并按失败策略计数/重试/忽略；PR 已 merged 或已关闭时只记录 `ci_red` 告警，不自动重开、不自动回滚。CI 不可读/未完成不是终态，指数退避并保留 watch；超过 30 天过期。**schema v11 引入且在当前 v14 继续有效的 SHA 快照、共享租约、终态和 CI 记忆撤销契约以 ADR-024 为准**，不能沿用旧实现把 closed+green 当作可发布记忆；运行期观察的证据撤销见 ADR-027。
   4. **控制台**：问题详情透出 watch 状态、最近检查、下次检查和错误；只读，不提供手工推进 watch 的按钮。
   5. schema v9 新增 `deliveries`、`ci_watches`；所有恢复/收敛写操作走 Store 事务。
 - 取舍：持续 CI 依赖部署中的 serve 常驻；不做外部队列、分布式锁、自动回滚或自动重开已合并问题。CI 重跑导致已合并后转红只能告警，根因/部署版本关联仍是后续能力。
@@ -237,6 +239,7 @@
 ## ADR-022 · 运行期配置不改进程环境（env_store）
 
 - 状态：已接受（2026-10-26）
+- **Batch3 修订（2026-10-27，ADR-025）**：本条的“不再运行期改 OS env”继续有效；以下“保存更新 store / 即时生效”仅为当时实现的历史记录，现已撤销。保存只更新文件与版本元数据，不改启动 `env_store`、凭证或鉴权状态，全部 schema 项均需重启相关进程。
 - 背景：`setenv`/`unsetenv` 与 `getenv`、`environ` 迭代、`fork`/`exec` 并发在 glibc 下不保证线程安全；测试与设置页的运行期 env 改写会与派生的 `git`/`go`/`node`/`cargo` 子进程竞争。表现为**间歇挂死**（同进程并行测试），挂死后内层 `timeout` 与 CI step/取消都难以收尾（docs/07「CI 测试卡死」，2026-10-26 探针复现）。
 - 决策：新增 `env_store`（`RwLock` 单例）。`main()` 在任何线程派生之前**单线程**快照 OS 环境，并由 `Secrets::scrub_os_env()` 擦除已知密钥的 OS 副本；此后运行期读取走 `env_store::var/vars`（未覆盖的键回退 OS 环境），设置保存只写 `nuwa.env` 并更新 store（不再 `set_var`），测试用 `env_store::set` 而非 `std::env::set_var`。`Secrets::load()` 从快照读取密钥；子进程白名单由 store 快照 + `SAFE_ENV` 白名单构造（密钥不在白名单内，不会下发）。
 - 取舍：设置保存对运行中进程**即时生效**（旧实现只写文件、要重启才生效——这是顺带修正的行为）；`env_store` 是进程内单例，测试写入仍自行串行（保留 `env_guard`）；不再支持「运行期改 OS env 让第三方库看到」（本来也不安全）。
@@ -251,3 +254,117 @@
 - 决策：问题语言为 `go` 且干净 base worktree 根有 `go.mod` 时，验证门额外运行 `go vet ./...` 与 `go build ./...`，各自独立超时（复用 `failing_check.timeout_secs`）。base 绿 → 分支必须绿，否则拒绝交付；base 红/超时/工具不可用 → 跳过并在证据中注明（默认分支已坏，不能归因本次修复）。深检不替代复现门：base 绿且无 `reproduce_check` 时仍要求 `.nuwa/repro.sh`。结果写入 `verification_detail` 与 PR 正文。
 - 边界：只对根 `go.mod` 的 Go 仓库自动启用；无根 `go.mod` 的多模块仓不猜测命令。其他语言暂不自动推导（`cargo check`/`npm build` 的仓库差异过大），需要时用 `reproduce_check` 显式配置。
 - 被否决备选：对所有语言自动推导构建命令（误报率高）；把深检当复现门（vet/build 不能证明运行时 bug 被修复）；base 红也强制分支绿（把既有债算到本次修复）。
+
+---
+
+## ADR-023 · Batch1：精确交付所有权、原子完成与保守清理
+
+- 状态：已接受（2026-10-27）；Batch1/schema v10 已完成，下述结果是该批完成时的历史验证快照；Batch2/schema v11 见 ADR-024，Batch3/schema v12 见 ADR-025，Batch5/schema v13 见 ADR-027，当前 Batch6/schema v14 见 ADR-028。代码基线 v0.17.0，不代表本批已发布，未执行生产迁移或部署。追溯：DES-023 → REQ-005、REQ-008（docs/10）。
+- 背景：runner id 不区分进程代际；独立 fix、恢复任务与活跃交付可能竞争同一 checkout/intent。PR 响应丢失、基线合并改变 head、完成记账分步写入，以及无条件分支清理会误收养结果、留下半完成状态或删除他人的证据。ADR-018/020 的原有租约与恢复约束不足以覆盖这些边界。
+- 决策：
+  1. **schema v10 所有权**：delivery claim 使用随机 token、递增 generation 与 expiry；领取原子仲裁，续租/状态迁移/完成须匹配当前有效 claim。canonical checkout 有独立 claim，与 runner 占用互斥；runner 路径还校验实际存活的 `instance_id`，同名 id 不能继承后继实例的权限。独立 `nuwa fix --db` 默认 `shanhaijing.db`，与 work 共用同一 Store/数据库，使用自己的 checkout claim，不伪造 runner 身份；租约覆盖修复和网络等待。不同数据库不能协调同一 checkout。
+  2. **有界恢复与续租**：pending intent 在 Store 内原子领取，恢复调用每次最多一条，不预领一批后串行等待。delivery/checkout claim 的 TTL 60s，等待期间每 10s 续租；等待前后及副作用边界重新检查权限，续租失败或失权则停止后续副作用/写回。已经发出的远端请求可能仍生效，不宣称可撤回。
+  3. **精确 head 与原子完成**：基线合并产生新 head 时，旧 intent 原子进入 `superseded` 并领取新 head 身份，保留旧 head 历史而非覆写。创建/采用 PR 后，delivery、关联 issue/run 和 CI watch 在同一 Store 事务内完成；独立 fix 无关联 issue/run 时不虚构记录。仅 open 且 head SHA/base 精确匹配的 PR 可以采用。
+  4. **默认保留、条件删除**：只有查询明确证明零 PR，且仍拥有交付权限，才允许以 expected SHA + `force-with-lease` 条件删除孤儿远端 ref；tip 改变或删除结果不明仍保留证据。PR 已关闭、head/base 不符、响应畸形、分页不完整及任何未知结果都不是“无 PR”，不得据此删分支。本地清理必须同时持有 checkout，且分支与 tip 符合预期；失权/不匹配不强制 reset 或删除。
+  5. **收紧自动维护**：脏树 preflight 拒绝，不再自动破坏性 reset/clean；stale/terminal 分支自动清理禁用，保留给所有者复核。此项覆盖此前自动恢复/终态扫除策略，不取消有完整所有权与 branch/tip 证据的交付局部清理。变更判定与 staging 的 `:(exclude)nuwa.repo.json` 契约不变。
+  6. **直接交付路径可测**：PR 正文在内存构造并直接传给 GitHub，不写 `.git` 临时文件；测试替换实际交付路径的 GitHub 接口，Git 使用真实本地 bare remote 和 linked worktree（`.git` 为文件），覆盖响应丢失、崩溃、续租/接管、supersede、完成回滚及条件清理，而非仅旁路 helper。
+  7. **detached 池工作树保真**：保留逻辑 PR base，交付后安全恢复到预先固定的 detached HEAD，而不是切到 base 分支。pool teardown 保留脏树或附着分支的 worktree 证据，只对干净且 detached 的 worktree 调用不带 `--force` 的 `git worktree remove`；进程骤停可能留下 worktree，须由所有者人工复核，不能自动清除现场。
+  8. **仅推分支的持久语义**：branch-only 路径在 push 前持久写入 `branch_only`，排除在 PR 自动恢复之外；崩溃后由所有者人工复核，不因没有 PR 自动删除分支。只有 push 成功且经验证、checkout 安全恢复后，才进入终态 `branch_pushed`。
+- 升级契约（Batch1 历史 v9 → v10；当前升至 v14 见 ADR-028/docs/08）：必须由所有者停止全部旧写者及自动重启入口，确认无在途写入，一致备份 DB/WAL 与 env 后再由新版打开 Store。迁移后的旧 intent 无 owner、可以被领取，**仅在停旧写者升级的前提下安全**；不支持新旧写者混跑，不把无 owner 等同于无人执行。生产迁移尚未进行。
+- 验证状态（Batch1 历史本地限定范围）：`cargo clippy -p nuwa -p shanhaijing --all-targets --no-deps --offline -- -D warnings` 通过；`cargo test -p shanhaijing --offline` **132 通过**；`cargo test -p nuwa --bin nuwa --offline -- --test-threads=4 --skip benchmark::tests` **388 通过、1 ignored、9 个 benchmark 测试被过滤**。不构成 workspace、web、当前 Batch3 完整套件或真实 GitHub/生产部署验证结论。
+- 取舍与边界：宁可保留 ambiguous intent/分支并等待所有者，也不猜测远端结果或丢弃中断修复。claim 是协作写者的本地权限约束，不是 OS 沙箱，不能隔离绕过 Store 的进程或保证 GitHub exactly-once。本决策只覆盖 Batch1；“Batch2–Batch6 均未实现”是该批完成时的历史结论，当前顺序与状态见 ADR-028，不预记更高批次或部署成功。
+- 被否决备选：仅凭 runner id/问题单终态清理；PR 请求失败或不匹配就删除；无条件远端删除；脏树自动 reset/clean；预领整批 intent 后串行网络恢复；伪造 runner 登记供独立 fix 借权；新旧写者混跑升级。
+
+---
+
+## ADR-024 · Batch2：SHA 绑定 CI 观察与可撤销记忆证据
+
+- 状态：已接受、已实现（2026-10-27）；以下为 Batch2/schema v11 完成时的历史快照；当前代码基线 v0.17.0、schema v14 见 ADR-028。不代表已发布或完整套件通过。未执行生产迁移、部署、真实 GitHub/API 或付费模型测试。追溯：DES-024 → REQ-005、REQ-008、NFR-007（docs/10）。
+- 背景：按 PR 号读生命周期不能证明结论属于交付 SHA；用下次检查时间充当租约会把排程和所有权混在一起。前台独立轮询、旧代际迟到写回及“同指纹覆盖一行记忆”会污染新交付、恢复已撤销来源，或让手动启用把无效证据重新送入提示。
+- 决策：
+  1. **精确身份与独立租约**：watch 以 `(slug, pr_number, head_sha)` 唯一，repo/fingerprint/run/PR URL 的关联不得挪用；重复登记不复活终态。schema v11 新增随机 claim token、递增 generation、expiry，独立于 `next_check_at`；领取、续租、完成及错误写回均核验有效所有权。后台一轮最多 20 条、逐条领取而非预领排队；TTL 120s，每 10s 续租，覆盖网络等待与最终事务，失权停止后续请求/写回。
+  2. **前后台共用一条观察路径**：`work` 前台 `wait_for_delivery` 只等待所交付 PR/SHA，和 serve 共用 Store claim、持久检查计划及处理器，不提前绕过退避或活跃持有者。前台预算耗尽/取消仅停止等待，watch 持久保留；未注册/未完成的 CI、不可读响应与超时不是红灯。pending 30s、green 5min 后复查，错误指数退避至多 1h，观察超过 30 天过期；持续推进仍需 serve 常驻。
+  3. **SHA 快照与保守关闭**：PR 快照同时严格解析 state/merged/head SHA；未知或不一致响应报错退避，不猜测状态。head 改变进入终态 `head_changed`，不跟随替换 head。green+open 继续观察，green+merged 终态可发布记忆，closed 即使 CI green 也不发布。红灯关闭前重读 open/同 SHA 并检查当前 issue/run/delivery 归属，关闭后再确认 closed/同 SHA 才允许失败计数与重试；外部关闭/合并只记录结果，不自动重开或回滚。
+  4. **本地后果同事务**：`finish_ci_watch_owned` 在有效 claim 下原子提交 watch、精确关联 run 的 CI 结论、适用时的 issue 失败收敛、记忆发布/撤销及必要审计；任何一步失败整体回滚，旧 watch 不能拒绝新一轮交付。watch 用 green/red，run/API 保持 success/failure 词汇，不混写。
+  5. **来源精确、撤销单调**：`repair_memory_evidence` 保存 `(repo, fingerprint, source_kind, source_id, commit_sha)` 的独立内容并校验 PR URL；CI 来源为 `ci_green`、`source_id=watch.id`，branch-only 本地验证来源为 `local_verification`、`source_id=run_id`。red/closed/head_changed 为该精确 watch/SHA/PR 来源保留撤销 tombstone（即使从未见绿），不抹除其他提交或独立来源。迟到 green 不得复活、刷新已撤销来源的摘要；直接红灯不创建摘要、不触发摘要淘汰。普通摘要裁剪保留证据/tombstone，新的有效来源可独立入选。
+  6. **人工偏好不等于证据**：迁移的旧记忆是 `legacy_unknown`，可见但视为未验证、不得注入。仅有效、未撤销的 `local_verification`/`ci_green` 且未手动 `disabled` 才能进入同仓提示；重新启用只清除手动停用，自动写入也不清除此偏好。API/页面分别展示证据有效性、验证来源、撤销时间/原因及手动停用。每仓保留最近 50 条未停用摘要（停用摘要另保留），不以此裁剪证据；显式删除会在同事务删除该记忆摘要及证据，不是保留 tombstone 的停用操作。
+- **外部竞态限制**：GitHub close API 不支持原子 expected-head 条件；关前/关后快照和本地租约只能缩小、发现部分检查后使用（TOCTOU）竞态，不能阻止已发出的 close 与 push/merge 竞争。除非不执行自动 close，否则无法消除此残余风险；本批没有新增“关闭自动 close”的配置开关，不保证远端 exactly-once 或“绝不误关”。
+- 升级契约（Batch2 历史目标 v11；当前目标 v14 见 ADR-028）：从 v9 经 v10、或从 v10 升级，都必须先停全部旧写者与自动重启入口、一致备份 DB/WAL 与 env，再由新版打开 Store。v10 → v11 增加 CI claims/唯一身份及记忆证据表，旧记忆保留内容与 disabled、标为 `legacy_unknown`；旧 watch 初始无 claim 仅在停旧写者前提下可安全领取。拒绝高于支持版本的数据库，不支持新旧写者混跑或让旧版直接写升级库。生产操作尚未执行，规程见 docs/08。
+- 验证证据（已有本地聚焦结果，本次文档更新未重跑）：`cargo test -p shanhaijing --offline` **148 通过**；`cargo clippy -p nuwa -p shanhaijing --all-targets --no-deps --offline -- -D warnings` 通过；Nuwa `ci` 过滤 **50 通过、371 filtered**（最终 summary 修正前的结果，不能充当该修正后的复测）；`export_bindings` **72 通过**；`npm.cmd run typecheck` 通过；memory 页面 **6 通过**。不外推为完整 Nuwa、workspace 或完整 web/lint/build 验证。
+- 批次顺序：本条完成时的“Batch3 下一批”已由后续 ADR 更新；Batch1/schema v10、Batch2/schema v11 已完成，Batch3 配置/schema v12、Batch4 可信验证/路径护栏已本地实现；Batch5/schema v13 已本地实现并完成聚焦验证；**当前 Batch6/schema v14 已本地实现并完成本地最终检查（2026-10-28，ADR-028）**。不把旧 A-3 池/镜像当作后续批次完成证据。
+- 被否决备选：以 PR 号或字符串状态代替 SHA 快照；用检查计划充当租约；前台绕过后台调度；未知/超时作红灯；分步写 watch/run/issue/记忆；按 fingerprint 撤销全部来源；迟到 green 覆盖 tombstone；人工启用恢复证据；声称 GitHub close 可用本地 fencing 消除竞态。
+
+---
+
+## ADR-025 · Batch3：保存版本与不可变启动输入证据
+
+- 状态：已接受、已本地实现（2026-10-27）；代码基线 v0.17.0，schema v12；未升版、发版、执行生产迁移或部署。追溯：DES-025 → NFR-003、NFR-004（docs/10）。已有验证的时点与范围见 docs/07 §D，不预记最终聚焦复测。
+- 背景：文件保存、进程实际配置与心跳是不同事实；运行期更新 `env_store` 会制造部分热更新，而“最近 runner”或审计时间不足以证明 serve/各 worker 加载了哪版输入，密钥也不能靠明文遥测对比。
+- 决策：
+  1. **只保存，不热更新**：29 键 schema 全部 `requires_restart=true`，包括只读路径项。PUT 不改 OS env、启动 `env_store`、已加载 Secrets、serve 鉴权/会话或其他活配置；重启相关进程后以其独立启动证据确认。此项覆盖 ADR-022 当时的“保存更新 store / 即时生效”。
+  2. **版本身份而非内容摘要**：schema v12 新增 `config_saved(env_id, revision, saved_at_ms)` 与 `runners.startup_config_json`。`env_id` 为解析符号链接后的绝对文件身份（缺失文件解析最近存在祖先；Windows 规范为小写）；revision 为随机 UUID，不是密钥、密钥 hash 或内容 hash。DB 版本表只存元数据，审计只存键名；快照只存脱敏非密钥值，绝不落库密钥或原始输入。
+  3. **协作保存串行，但跨介质不原子**：同一 DB 的 `BEGIN IMMEDIATE` 覆盖读、校验、备份、文件替换、revision 与逐键审计；GET 的文件值与 saved revision 也来自共享保存事务中的同一读快照。文件替换与 DB commit **不构成一个原子提交**；替换后失败或任务结果不明返回 500 `config_save_indeterminate`，要求重新读取而非报告成功/盲目回滚。file/DB marker 不一致为 persistence `unknown`，activation 也不能证明。
+  4. **建立与保留版本**：成功的非空 PUT 即使无值变更，也会为 unversioned/不一致文件建立新 revision；一致且无变更/迁移的 no-op 保留 revision，`restart_required=false`。空 PUT 不迁移、不建立版本。文件及 `.bak` 都经同目录受保护临时文件、sync、`persist` 原子替换，Windows 不再截断原文件；Unix 写入前设 0600，Windows ACL 仍由所有者配置。
+  5. **启动输入证明**：从启动环境快照取 `NUWA_CONFIG_REVISION`，须等于文件 marker、已提交 DB revision，且该角色全部适用可写 schema 输入与文件**精确一致（含缺失/存在与密钥，在内存比较）**，才能设置 `loaded_revision`。歧义语法、重复/旧拼写、缺启动环境 marker 的外部注入即使值相同、或外部 `GITHUB_TOKEN` fallback 都不能猜测为已加载。该证明绑定 managed input revision，不承诺最终 effective 值等于文件：显式 CLI 覆盖可保留输入证明，逐键标 `cli`，同命令重启不会消除覆盖；已知规范化/限幅标 `derived`，来源不明或无法解释的覆盖使证明失效。
+  6. **不可变且分实例**：`serve::startup_state` 与 `run_work_with_environment` 在真实启动路径记录解析后的值/来源；work 在派生 worker 或等待租约前只取一次证据。每个 OS 进程一个随机 `process_instance_id`，pool worker 共享它，但 runner id/`runner_instance_id` 各自独立。runner 快照仅允许当前未过期租约实例首次设置（完全相同重试可接受），接管清空旧快照；心跳/配置刷新不覆写启动事实。provider/model/base 来自实际 resolver：zai 缺省 `glm-5.3-flash` 与 coding endpoint，Anthropic 缺省 catalog 首项且显式未知模型不伪装成已解析默认，faux 取实际离线 provider 默认，不使用旧显示标签代替事实。
+  7. **三轴展示，不选最新 runner 当权威**：持久化 `saved/unversioned/unknown`；逐进程 activation `active/stale/unknown`（同文件身份且输入 revision 相等/旧版/未获证明）；liveness `online/offline/unreported` 各自独立。offline 可保留历史 active 证据，但不代表仍运行；配置 unit 未上报与旧 runner 无快照均不能推断生效。设置、system、runner 视图展示适用非密钥实际值与显式来源；`restart_pending/effective_diff` 只作为 additive API 的已弃用兼容字段，不再驱动 UI 生效结论。
+  8. **候选探测不是活进程证据**：显式 `candidate=saved` 使用文件+默认且不允许 draft values；`draft` 使用同一次文件读取+草稿（旧请求默认 draft），绝不回退 live env/key。更改 zai base URL 必须显式提供该草稿 key，不能携带保存/运行中的 key 去新 host；探测不保存、不证明激活。
+- **所有者来源契约（不是密码学证明）**：带 marker 文件由所有者控制；任何 out-of-band 手工编辑**必须移除/使 revision marker 失效**，再经非空 PUT 重新建立版本。保留 marker 的人工改写不能被本机制认证或可靠检测；UUID 不是内容签名，不宣称防篡改。`migrate-env` 真正重写时移除 marker，无改写则保留；它不参加保存事务，只能停写、离线维护，**不得与设置保存并发**。
+- 升级契约：schema v12 只能停全部旧写者与自动重启入口后，一致备份 DB/WAL、env/其备份与必要现场，再在隔离副本验证并由新版迁移；v11 → v12 不编造旧配置版本或旧 runner 启动证明，迁移后需受控保存/重启。详见 docs/08；此处是待执行规程，没有执行迁移、systemd 或平台部署验证。
+- 批次顺序（当前以 ADR-028 为准）：Batch1/2 已完成（结果保留为历史快照）→ **Batch3/schema v12 已本地实现** → **Batch4 可信验证/路径护栏已本地实现、限定检查完成，该批未新增 schema** → **Batch5 observations/schema v13 已本地实现并完成聚焦验证** → **Batch6 reservations/schema v14 已本地实现并完成本地最终检查（2026-10-28）**。
+- 被否决备选：保存热改 env_store/auth；以文件 marker、相同值、最新 runner、心跳在线或审计时间代替启动证明；存密钥 hash；跨文件/DB 假称原子；把 active 当作 CLI 值等于文件；把所有者可改 marker 当作密码学认证。
+
+---
+
+## ADR-026 · Batch4：冻结所有者 oracle 与真实文件系统路径护栏
+
+- 状态：已接受、已本地实现（2026-10-27）；代码基线 v0.17.0，**schema 仍为 v12**，限定检查完成（Batch4 sidecar 45/45 历史；完整 workspace nextest 2026-10-28 通过）；未升版、发版、生产迁移或部署。追溯：DES-026 → REQ-003、REQ-006、REQ-007、NFR-003、NFR-007（docs/10）。分时点验证见 docs/07 §D，不宣称全绿。
+- 背景：候选可修改的复现脚本、测试或辅助输入不能自行成为可信证明；只在工具 hook 检查字符串不能覆盖递归读取、路径别名及实际 I/O。冻结来源与路径授权必须接入真实修复/验证/交付路径，同时不能冒称 OS 隔离。
+- 决策：
+  1. **显式策略，不静默切换**：`nuwa.repo.json` 的 `verification_policy` 默认 `compatibility`；未配置 owner oracle 时沿用较弱门禁，证据明确为 `legacy_untrusted`，不自动升级 strict。显式 `strict` 缺少 `trusted_verification` 在模型、创建本地交付分支、staging、push、PR 前拒绝；任何策略只要配置 oracle 就必须通过它，不允许失败后降级。issue/模型输出不得建立 owner 权威。
+  2. **所有者维护的完整闭包**：`trusted_verification.check` 启动字面量受保护入口；`protected_inputs` 显式穷举入口、helper、fixture、配置等全部验证依赖。修复前从固定 base 的 tracked 文件，或私有 owner 配置对应的预置 untracked 文件捕获 bytes、文件类型、Git/native mode 与 manifest，冻结在 checkout 外。闭包完整性由所有者负责，不自动发现依赖；入口若再从候选加载断言/helper，就不满足本契约。任意故障程序退出 1 不会在数学上证明业务 bug，owner 必须把预期缺陷退出码设计为 1、通过为 0、意外 setup/运行故障为 2+；超时/缺命令/缺输入均不作 red。
+  3. **同址导出、独立入口**：base 与候选轮流导出到同一物理 `NUWA_VERIFY_ROOT`，每侧重建 target/home/tmp/cache，不携带 Git 元数据或 base/branch 标签；最小固定环境不继承 agent 扩展、凭证、代理、候选环境或 `PYTHONPATH`。入口从外部冻结目录启动，不从候选树启动；先在修复前证明 base exit 1，再要求候选 owner exit 0，候选 `failing_check` 与适用的 base-green 深检也须绿。模型 `.nuwa/repro.*`、修改测试或自述不能替代 oracle。
+  4. **冻结上下文贯穿交付**：同一个 `VerificationContext` 绑定 base SHA 与完整 candidate tree；本地交付也须在副作用边界复核。移动 base 后保留原上下文重验，不采用新 oracle；tracked owner 内容/模式变化仍拒绝。池从权威配置根冻结全部输入后、模型前，仅向工作树补缺失的私有 untracked 输入，不收养候选 bytes、不覆盖已有篡改。private 路径在 staging、candidate tree、diff 采用一致的精确文件排除，保留 `:(exclude)nuwa.repo.json`；tracked oracle 不被排除，不能隐藏篡改。
+  5. **读禁区与禁改分离**：`forbidden_paths` 禁写但可由内置文件工具读取；`denied_read_paths` 及内建凭证/Git/私有验证/会话/DB 规则禁读且禁写。`guard/local_env.rs` 包装实际执行环境，递归 list/find/grep 与文件读写均先授权，目录移动/删除检查后代；不是仅依赖 `before_tool_call` hook。路径必须留在 canonical checkout 内，符号链接、Windows junction/reparse、特殊条目拒绝，不能以别名绕过。
+  6. **证据与验收**：验证 detail/PR 记录 `owner_trusted` 或 `legacy_untrusted`、base/candidate tree、owner 来源与摘要、manifest 摘要和退出结果；不公开冻结输入内容或私有原始输出。`nuwa benchmark batch4 --output <新建临时 JSON>` 使用密封 manifest 的计算摘要、15 场景 × 3 次 = 45 条 faux 记录，仅写安全元数据/摘要/声明/实际结果 sidecar，不打开默认业务 DB、不跑 live model；证明的是流水线/门禁，不是模型修复能力。CLI 首次在 trials 前栈溢出，装箱后 sidecar 45/45 预期满足，但早于最后私有 seed cleanup 修正；完整 Nuwa 483 通过、3 失败、2 ignored 及后续聚焦复测保留在 docs/07 §D，不宣称完整套件全绿。
+- **安全边界**：这是来源/完整性与内置文件工具授权，不是 OS 沙箱。shell、检查命令及候选程序仍有宿主运行用户权限；最小 env 不能阻止自行访问宿主文件/网络。路径复核存在 TOCTOU，hardlink 不能靠 link/reparse 标记隔离。当前 runner Docker 非执行/交付权限分离；独立低权限执行用户、不挂宿主 HOME/发布密钥、限制可写挂载与网络出口的方案需要平台授权，**未实现/未验证**，不是本批安全承诺。
+- 批次顺序：Batch4 已本地实现、限定检查完成；后续 Batch5 observations/schema v13 **已本地实现并完成聚焦验证（ADR-027）**，Batch6 reservations/schema v14 **已本地实现并完成本地最终检查（2026-10-28，ADR-028）**。没有生产、真实 GitHub、systemd、付费模型、部署或 Unix 验证结论。
+- 被否决备选：把 agent reproducer 当 owner oracle；从候选重新读取权威；missing oracle 静默回退；把任意非零都算 bug；排除 tracked oracle 隐藏篡改；只做 hook 字符串过滤；把 env 白名单、Docker 或路径复核声称为 OS 权限隔离。
+
+---
+
+## ADR-027 · Batch5：可审计信号观察与仅调用方可授予的权威
+
+- 状态：已接受、已本地实现并完成聚焦验证（2026-10-27）；代码基线 v0.17.0，**该批 schema v13**；未升版、发版、执行生产迁移或部署。追溯：DES-027 → REQ-004、REQ-005、REQ-008、NFR-003（docs/10）。后续 Batch6/schema v14 已本地实现并完成本地最终检查（2026-10-28，ADR-028）；以下 Batch5 证据不变。
+- 背景：接收时间不等于故障发生时间；迟到报告不能仅凭自报时钟推翻终态，HTTP 鉴权也不能证明来源事件与环境/发布版本关系。问题单聚合、有限回执去重、记忆证据有效性与人工停用必须分开审计，PR 合并不能充当部署或恢复证据。
+- 决策：
+  1. **兼容信封，独立回执**：`Signal` 增加默认缺省的可选 `observed_at`（epoch 毫秒）、`environment`、`release_sha`、`source_event_id`；不改指纹，旧 payload 沿用原回归行为。schema v13 增 `signal_observations`，分别保存服务端 `received_at_ms`、原始采集时间与元数据、来源授信、时间状态、处置及重复关联。每问题单仅保留按 `received_at_ms DESC, id DESC` 排序的最近 100 条，另按接收时间清理超过 30 天的回执，不按采集时间清理。
+  2. **身份拒绝，不截断**：`environment`/`release_sha`/调用方 `trusted_source` 分别最多 128 UTF-8 字节，`source_event_id` 最多 256 字节；提供时拒绝空白、控制字符和超长值，不截断身份。缺失时间标 `missing`，非正数标 `invalid`，晚于本次接收时间标 `future`；无效/未来整数仍保留但不授予时间权威，合法时间无来源授信为 `untrusted`，二者均满足才为 `trusted`。
+  3. **仅调用方授权**：`Store::report_signal_with_source` 的来源由调用方传入，不从 JSON 自报读取。CLI 只有所有者显式使用 `nuwa ingest --trust-observations <source-id>` 才授信；这是 **OWNER ATTESTATION（所有者确认）**：已核验导入时钟、来源事件 ID，以及环境与精确发布版本的关系，不是密码学认证或普通导入选项。HTTP bearer/token 鉴权永远不建立观察权威，payload 不能自授信。
+  4. **迟到判定从严**：仅对 `merged/rejected`，在终态 `state_changed_at` 已知且为正、合法可信采集时间**严格早于**该时间时标 `delayed`，不重开。相等、终态时间未知、采集时间缺失/无效/未来或未授信，均沿用原回归规则；ignored/escalated 不因此自动重开。重复事件另按下一条处理，不是新的回归证据。
+  5. **有界去重，不保证全局一次**：仅在保留的同 fingerprint、调用方可信 source/event 身份中比对 `observed_at`、environment 与 release 的精确元数据；匹配标 `duplicate`，冲突拒绝，不静默覆盖。完整 40/64 位十六进制 SHA 统一小写，不截短、不把分支名当 SHA。每个成功接收的回执（包括 delayed/duplicate）仍累计 occurrences 与接收日 `signal_daily`；回执裁剪/过期后不能保证再次识别，不宣称全局 exactly-once。
+  6. **证据撤销与人工开关独立**：有效可信观察携带明确 environment、完整 40/64 位十六进制精确 release，且采集时间严格晚于 `evidence.recorded_at` 时，适用的回归证据撤销匹配 repo/fingerprint/SHA 的记忆证据；delayed/duplicate/muted 不作为新的撤销依据。即使记忆已手动 `disabled`，仍须撤销该证据；不清除 disabled，不波及独立提交，重新启用也不能复活证据。环境/版本关系由所有者授信承担，不因此新增部署集成。
+  7. **展示未知，不推断恢复**：问题详情 API/UI 展示有界回执、来源授信与时间状态，`deployment_status`、`recovery_status` 均为 `unknown`；尚无部署/健康集成，merged、CI green 或上报 release 都不等于已部署/已恢复。
+  8. **每回执事务，不是批原子**：单回执的聚合计数、状态、观察与适用证据撤销同事务。HTTP 元数据错误返回有界、通用 400，不回显 payload/元数据值；预校验不代表整个 JSONL 原子，后续运行期失败前已提交的回执保留，响应说明已提交数量，不报告整批回滚或全局一次处理。
+- 升级契约：v12 → v13 是增量事务迁移，建表/索引及 `user_version` 同事务；旧问题单不从 first_seen/last_seen 等字段伪造 observations，失败保留 v12。所有者授权后先停全部旧写者/自动重启入口、一致备份 DB/WAL 与 env，在隔离副本验证再受控升级；不支持混跑或旧版写 v13，规程见 docs/08。**未执行生产操作**。
+- 验证证据（父任务提供，本次仅文档；均为“手动 disabled 仍撤销证据”修正后）：Store **173 全部通过（含迁移）**；Nuwa `ingest` 过滤 **11 通过**、issues API **15 通过**、`ts-export` **78 通过**（已知 serde 警告）；`cargo clippy -p nuwa -p shanhaijing --all-targets --no-deps -- -D warnings` 通过。web typecheck/lint、IssueObservations + IssueDetailPage 聚焦 **23 通过**、build 通过；架构 **17 模块 / 6 crate / 2 条债**、追溯 **16 需求 / 27 设计、零缺口**通过；生成文件 whitespace 已修正，TS 重新导出及 diff 检查通过。
+- 验证边界：Batch5 的最终 workspace/web 套件已在 2026-10-28 最终检查中通过；不覆盖或抹去 Batch4 的历史失败与聚焦复测记录，不声称跨平台、真实 GitHub/API、systemd、付费模型或生产验证通过。完整时点见 docs/07 §D。
+- 被否决备选：把 bearer 鉴权/JSON 自报当授信；按采集时间淘汰回执；截断身份；迟到判定包含相等或未知时间；去重后不计回执；把有限历史宣称全局 exactly-once；因 disabled 跳过证据撤销或启用复活证据；把 merged 当已部署/恢复；预校验即宣称 JSONL 批原子；迁移伪造旧观察。
+
+---
+
+## ADR-028 · Batch6：持久 PR 准入槽位与最终 token 闸
+
+- 状态：已接受、已本地实现（2026-10-27），**schema v14，最终检查完成（2026-10-28）**；main 基线 v0.17.0，未升版、发版或执行生产操作。追溯：DES-028 → REQ-003、REQ-005、REQ-008、NFR-003（docs/10）。
+- 背景：先读已开 PR 数再创建会被并发越过；租约过期、跨午夜或响应丢失不能证明没有远端副作用。token 已花费事实也不能靠交付拒绝撤回。
+- 决策：
+  1. **原子准入、沿用交付权限**：schema v14 新增 `pr_slots` / `pr_slot_deliveries`；按 repo 与 UTC 准入日，在 `BEGIN IMMEDIATE` 内核验 delivery claim 的 token/generation/expiry 并计数、预留。`reserved/requested/ambiguous/consumed` 计入，`released` 不计；没有独立槽位 token。
+  2. **持久而非 TTL 退款**：释放/过期 claim、重启、遥测清理均不退款；跨午夜与接管重试复用同一槽位和原准入日。仅请求前的安全 head supersede 可在同事务转移预留，不能转移 requested/ambiguous；确认同 repo + PR URL 的重复交付归并为一个 consumed 槽位。
+  3. **所有创建入口共闸**：work、pool、独立 fix 的真实交付在 push 尝试前预留，请求前再幂等核验并持久写 requested。预 push PR 配额拒绝释放问题单、冷却/待命，不计 attempt；branch-only 不占 PR 槽位。push 后门禁拒绝保留精确分支、intent/run 与槽位恢复证据，不因取消/响应丢失退款；恢复先查精确 head/base，只有确认无 PR 才允许终结/释放及条件清理，不确定保持 ambiguous。此机制**不保证 GitHub 外部 exactly-once**。
+  4. **分开三个时钟**：准入时间/UTC 日不随确认改变；GitHub `created_at` 解析为可选 `created_at_ms`，本地采用/完成时间为 `confirmed_at_ms`。旧 `pr_opened_at` 是本地观察，迁移不得伪造 GitHub 创建时间；缺失/无效 API 时间保持 unknown，不阻止采用身份有效的 PR。完成时槽位消费、适用 issue/run/watch 同事务。
+  5. **保守迁移**：v13 → v14 的表/索引/历史归并/版本同事务，失败保留 v13；历史 runs/issues/已完成 deliveries 按 repo + PR URL 去重，无 URL 保留独立证据。未确认的 requested/ambiguous 保守占位，不把旧 intent/pushed 或确认时间伪作创建证据。
+  6. **token 是观察闸，不是预留硬封顶**：模型前已知仓库用量 `>=` 日/滚动 30 天限额即拒绝；最终个体/仓库闸仅在 `>` 时拒绝。最终用量取当前 run 各 cached/uncached 分量的持久值与报告最大值，扣除已计当前 run 后再加入，含跨窗口当前修复；失败 work 与独立 fix 也持久记账。窗口按 run started_at 聚合，monthly 是滚动 30 天而非自然月。运行中/并发、provider 部分或未知 usage 仍可超支；没有 token reservations 或费用硬 cap，拒绝交付不能撤回已花 token。
+  7. **UI/API 不混用指标**：projects/runners additive `pr_slots_today` 是仓库 UTC 准入槽位，`prs_today` 保留按 PR URL 去重的创建/历史本地观察指标，不作准入依据。runner `daily_pr_limit` 是该进程上报值，project `pr_limit` 是上报值观测最大值；不是中心统一限额，各创建进程配置可能不同。
+- 运维：v9–v13 升至 v14 必须停全部旧写者/自动重启入口、WAL 一致备份、核对 pending deliveries/slots 并先验证隔离副本；v14 重开亦须检查 pending。不混跑、不直接降级、不按 TTL 或人工猜测退款，详见 docs/08。未执行生产操作、付费模型或平台隔离验证。
+- 现有证据仅为 **Store 186 通过（timestamp/CLI refinements 前）与 quota 过滤 3 通过（refinements 前）**；不能视为当前最终复测。delivery 42 项运行结果待确认；最终格式/clippy、后端/迁移/CLI/API、TS 导出、web、架构/追溯与 diff gates 均待记录。本次仅文档；Batch5 已有结果与 Batch4 完整套件失败证据保留在 docs/07 §D。
+- 被否决备选：以 PR 历史计数代替原子预留；租约 TTL/午夜自动退款；请求后 supersede 挪用槽位；把确认时间当 GitHub 创建时间；把 runner 观测值当统一限额；声称 token 闸可硬封顶费用或撤回消费。

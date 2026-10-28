@@ -5,7 +5,7 @@
  * stay `null` instead of guessing a default: the console must show what the
  * runner actually runs with.
  */
-export type EffectiveConfig = { interval_secs: number | null, ci_timeout_secs: number | null, max_turns: number | null, max_tokens: number | null, failing_check: string | null, reproduce_check: string | null, forbidden_paths_count: number | null, max_attempts: number | null, draft_first_n: number | null, 
+export type EffectiveConfig = { interval_secs: number | null, ci_timeout_secs: number | null, max_turns: number | null, max_tokens: number | null, failing_check: string | null, reproduce_check: string | null, forbidden_paths_count: number | null, max_attempts: number | null, draft_first_n: number | null,
 /**
  * `nuwa.repo.json` 的 skills 白名单；空数组 = 自动选择。
  */

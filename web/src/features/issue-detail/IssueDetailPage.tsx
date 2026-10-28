@@ -2,6 +2,7 @@ import { useCallback } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 
 import { Badge } from "../../components/ui";
+import { IssueObservations } from "../issues/IssueObservations";
 import { TranscriptPanel } from "../transcript/TranscriptPanel";
 import { IssueDetailError, IssueDetailSkeleton, IssueDetailStaleNotice, IssueNotFound } from "./IssueDetailStates";
 import { IssueEvidence } from "./IssueEvidence";
@@ -149,6 +150,7 @@ export function IssueDetailPage() {
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] lg:items-start">
         <div className="min-w-0 space-y-6">
           <IssueTimeline items={data.timeline} />
+          <IssueObservations detail={data} />
           <IssueEvidence run={evidenceRun} attempt={evidenceAttempt} />
           <StackSample text={data.stack_sample} />
           <IssueRuns

@@ -660,6 +660,14 @@ mod tests {
         }
 
         let state = AppState {
+            startup_config: Arc::new(crate::config_activation::StartupConfig::capture(
+                &store,
+                &dir.path().join("nuwa.env"),
+                "serve",
+                uuid::Uuid::new_v4().to_string(),
+                crate::now_ms(),
+                &std::collections::BTreeMap::new(),
+            )),
             store,
             ui_token: Arc::new(None),
             ingest_token: Arc::new(None),
@@ -823,6 +831,7 @@ mod tests {
             stack_trace: format!(
                 "panic: {title}\ngoroutine 1 [running]:\nexample.com/transcript.F()\n\t/app/transcript.go:1 +0x1"
             ),
+            ..Default::default()
         }
     }
 

@@ -1,8 +1,8 @@
 //! `/api/v1/projects/{repo}/memory` — the repair-memory ledger.
 //!
-//! Memory is written by the runner only after verification + CI proof. The
-//! owner can disable a row (it stops entering prompts but keeps its provenance)
-//! or delete it outright. Both actions are audited as owner events.
+//! Verified memories carry evidence; legacy or revoked rows remain visible.
+//! The owner can disable a row or delete it outright. Enabling only clears the
+//! owner preference and never restores invalid evidence. Both actions are audited.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -59,6 +59,11 @@ pub struct MemoryDto {
     #[serde(rename = "recorded_at_ms")]
     pub recorded_at: i64,
     pub disabled: bool,
+    pub evidence_valid: bool,
+    pub verification_source: String,
+    #[serde(rename = "revoked_at_ms")]
+    pub revoked_at: Option<i64>,
+    pub revocation_reason: Option<String>,
 }
 
 impl From<RepairMemoryView> for MemoryDto {
@@ -74,6 +79,10 @@ impl From<RepairMemoryView> for MemoryDto {
             files: row.files,
             recorded_at: row.recorded_at,
             disabled: row.disabled,
+            evidence_valid: row.evidence_valid,
+            verification_source: row.verification_source,
+            revoked_at: row.revoked_at,
+            revocation_reason: row.revocation_reason,
         }
     }
 }
@@ -122,7 +131,7 @@ pub async fn list(
     }
 }
 
-/// `PATCH /api/v1/projects/{repo}/memory/{fp}` — disable/enable a memory.
+/// `PATCH /api/v1/projects/{repo}/memory/{fp}` — set owner preference, not evidence validity.
 pub async fn update(
     State(state): State<AppState>,
     Path((repo, fingerprint)): Path<(String, String)>,
@@ -271,18 +280,26 @@ mod tests {
     use super::*;
     use shanhaijing::{RepairMemoryEntry, Store};
 
+    fn memory_entry(fingerprint: &str) -> RepairMemoryEntry {
+        RepairMemoryEntry {
+            repo: "example.com/app".into(),
+            fingerprint: fingerprint.into(),
+            commit_sha: "0123456789abcdef".into(),
+            pr_url: Some("https://github.com/acme/app/pull/1".into()),
+            root_cause: "ROOT CAUSE: loop bound".into(),
+            change_stat: "calc.go | 2 +-".into(),
+            files: 1,
+            recorded_at: 10,
+        }
+    }
+
     fn seed(store: &Store) {
         store
-            .record_repair_memory(&RepairMemoryEntry {
-                repo: "example.com/app".into(),
-                fingerprint: "fp-a".into(),
-                commit_sha: "0123456789abcdef".into(),
-                pr_url: Some("https://github.com/acme/app/pull/1".into()),
-                root_cause: "ROOT CAUSE: loop bound".into(),
-                change_stat: "calc.go | 2 +-".into(),
-                files: 1,
-                recorded_at: 10,
-            })
+            .record_verified_repair_memory(
+                &memory_entry("fp-a"),
+                "local_verification",
+                "fixture-run",
+            )
             .expect("memory");
     }
 
@@ -300,8 +317,16 @@ mod tests {
         assert!(dto.pr_url.is_some());
         assert_eq!(dto.files, 1);
         assert!(!dto.disabled);
+        assert!(dto.evidence_valid);
+        assert_eq!(dto.verification_source, "local_verification");
+        assert_eq!(dto.revoked_at, None);
+        assert_eq!(dto.revocation_reason, None);
         // The issue was never ingested, so the join leaves the title empty.
         assert_eq!(dto.title, "");
+        let value = serde_json::to_value(dto).expect("serialize");
+        assert_eq!(value["recorded_at_ms"], 10);
+        assert_eq!(value["revoked_at_ms"], serde_json::Value::Null);
+        assert!(value.get("revoked_at").is_none());
     }
 
     mod routes {
@@ -322,6 +347,14 @@ mod tests {
             let store = Arc::new(Store::open(&db_path).expect("open"));
             super::seed(&store);
             let state = AppState {
+                startup_config: Arc::new(crate::config_activation::StartupConfig::capture(
+                    &store,
+                    &dir.path().join("nuwa.env"),
+                    "serve",
+                    uuid::Uuid::new_v4().to_string(),
+                    crate::now_ms(),
+                    &std::collections::BTreeMap::new(),
+                )),
                 store: Arc::clone(&store),
                 ui_token: Arc::new(None),
                 ingest_token: Arc::new(None),
@@ -411,6 +444,16 @@ mod tests {
             assert_eq!(value["total"], 1);
             assert_eq!(value["data"][0]["fingerprint"], "fp-a");
             assert_eq!(value["data"][0]["disabled"], false);
+            assert_eq!(value["data"][0]["evidence_valid"], true);
+            assert_eq!(
+                value["data"][0]["verification_source"],
+                "local_verification"
+            );
+            assert_eq!(value["data"][0]["revoked_at_ms"], serde_json::Value::Null);
+            assert_eq!(
+                value["data"][0]["revocation_reason"],
+                serde_json::Value::Null
+            );
 
             // Mutations require the CSRF token even in local mode.
             let path = format!("{MEMORY}/fp-a");
@@ -428,6 +471,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
             let value = json_body(request(&app, "GET", MEMORY, None, None).await).await;
             assert_eq!(value["data"][0]["disabled"], true);
+            assert_eq!(value["data"][0]["evidence_valid"], true);
 
             let response = request(
                 &app,
@@ -454,6 +498,68 @@ mod tests {
             assert!(events.iter().any(|event| {
                 event.kind == "memory_deleted" && event.actor.as_deref() == Some("owner")
             }));
+        }
+
+        #[tokio::test]
+        async fn enabling_legacy_or_revoked_memory_does_not_restore_evidence() {
+            let (_dir, app, store) = test_app();
+            let csrf = csrf_token(&app).await;
+            let legacy = super::memory_entry("fp-legacy");
+            store.record_repair_memory(&legacy).expect("legacy memory");
+            let revoked = super::memory_entry("fp-revoked");
+            store
+                .record_verified_repair_memory(&revoked, "local_verification", "fixture-run")
+                .expect("verified memory");
+            store
+                .revoke_repair_memory_evidence(
+                    &revoked.repo,
+                    &revoked.fingerprint,
+                    &revoked.commit_sha,
+                    revoked.pr_url.as_deref(),
+                    "CI failed",
+                    20,
+                )
+                .expect("revoke evidence");
+
+            for (fingerprint, source, revoked_at, reason) in [
+                ("fp-legacy", "legacy_unknown", None, None),
+                (
+                    "fp-revoked",
+                    "local_verification",
+                    Some(20_i64),
+                    Some("CI failed"),
+                ),
+            ] {
+                let path = format!("{MEMORY}/{fingerprint}");
+                for disabled in [true, false] {
+                    let body = serde_json::json!({ "disabled": disabled }).to_string();
+                    let response = request(&app, "PATCH", &path, Some(&csrf), Some(&body)).await;
+                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                    let value = json_body(request(&app, "GET", MEMORY, None, None).await).await;
+                    let row = value["data"]
+                        .as_array()
+                        .expect("rows")
+                        .iter()
+                        .find(|row| row["fingerprint"] == fingerprint)
+                        .expect("memory remains visible");
+                    assert_eq!(row["disabled"], disabled);
+                    assert_eq!(row["evidence_valid"], false);
+                    assert_eq!(row["verification_source"], source);
+                    assert_eq!(row["revoked_at_ms"], serde_json::json!(revoked_at));
+                    assert_eq!(row["revocation_reason"], serde_json::json!(reason));
+                    assert!(row.get("revoked_at").is_none());
+                }
+            }
+
+            let eligible = store
+                .recent_repair_memory("example.com/app", "other-issue", 10)
+                .expect("prompt memories");
+            assert_eq!(
+                eligible.len(),
+                1,
+                "enabling must not revive invalid evidence"
+            );
+            assert_eq!(eligible[0].fingerprint, "fp-a");
         }
 
         #[tokio::test]

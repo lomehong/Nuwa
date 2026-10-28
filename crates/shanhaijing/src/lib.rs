@@ -13,8 +13,18 @@
 //!
 //! Storage is SQLite (one file per deployment), matching docs/07 A-1.
 
+mod config_state;
 pub mod fingerprint;
 mod migration;
+mod observations;
+mod pr_slots;
+
+pub use config_state::{ConfigSaveTx, SavedConfigRevision};
+pub use observations::{
+    SignalObservation, MAX_ENVIRONMENT_BYTES, MAX_RELEASE_SHA_BYTES, MAX_SOURCE_EVENT_ID_BYTES,
+    MAX_TRUSTED_SOURCE_BYTES, SIGNAL_OBSERVATIONS_KEEP, SIGNAL_OBSERVATIONS_RETENTION_MS,
+};
+pub use pr_slots::PrSlotRow;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -28,7 +38,7 @@ pub const REPAIR_MEMORY_KEEP: usize = 50;
 
 /// A raw collector report. One signal per incident batch; dedup happens here,
 /// never at the collector.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Signal {
     pub repo: String,
     pub language: String,
@@ -45,6 +55,15 @@ pub struct Signal {
     /// sees the stack and nothing else about the failure.
     #[serde(default)]
     pub log_window: Vec<String>,
+    /// Collector observation time in epoch milliseconds, not receipt time.
+    #[serde(default)]
+    pub observed_at: Option<i64>,
+    #[serde(default)]
+    pub environment: Option<String>,
+    #[serde(default)]
+    pub release_sha: Option<String>,
+    #[serde(default)]
+    pub source_event_id: Option<String>,
 }
 
 fn default_severity() -> String {
@@ -126,8 +145,22 @@ pub fn can_transition(from: State, to: State) -> bool {
 pub enum ShanError {
     #[error("db: {0}")]
     Db(#[from] rusqlite::Error),
-    #[error("invalid transition {} -> {}", from.as_str(), to.as_str())]
-    InvalidTransition { from: State, to: State },
+    #[error("invalid transition {from} -> {to}")]
+    InvalidTransition { from: String, to: String },
+    #[error("claim ownership lost")]
+    OwnershipLost,
+    #[error("delivery identity mismatch")]
+    DeliveryIdentityMismatch,
+    #[error("invalid PR reservation")]
+    InvalidPrReservation,
+    #[error("CI watch identity mismatch")]
+    CiWatchIdentityMismatch,
+    #[error("invalid repair memory verification source")]
+    InvalidMemorySource,
+    #[error("invalid signal observation")]
+    InvalidObservation,
+    #[error("unsupported database schema version {0}")]
+    UnsupportedSchema(i64),
     #[error("unknown issue {0}")]
     UnknownIssue(String),
     #[error("unknown state string {0}")]
@@ -167,6 +200,16 @@ pub enum ReportOutcome {
     },
     /// Owner-muted or attempt-capped; reports are counted but never reopen it.
     Muted {
+        fingerprint: String,
+        occurrences: u64,
+    },
+    /// Trusted observation predates the terminal-state boundary; counted only.
+    Delayed {
+        fingerprint: String,
+        occurrences: u64,
+    },
+    /// Retained trusted source/event identity was already received; counted only.
+    Duplicate {
         fingerprint: String,
         occurrences: u64,
     },
@@ -270,6 +313,10 @@ pub struct RepairMemoryView {
     pub files: i64,
     pub recorded_at: i64,
     pub disabled: bool,
+    pub evidence_valid: bool,
+    pub verification_source: String,
+    pub revoked_at: Option<i64>,
+    pub revocation_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -448,6 +495,8 @@ pub struct RunnerRow {
     pub repo_path: Option<String>,
     pub service_unit: Option<String>,
     pub config_json: String,
+    /// Immutable, secret-free startup snapshot for the current lease instance.
+    pub startup_config_json: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -561,33 +610,44 @@ pub struct FailureOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryState {
     Intent,
+    /// Branch-only push may be in flight; never infer its outcome from PR absence.
+    BranchOnly,
+    /// Branch-only remote tip verified and checkout safely restored.
+    BranchPushed,
     Pushed,
     PrRequested,
     PrCreated,
     Ambiguous,
     Failed,
+    Superseded,
 }
 
 impl DeliveryState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Intent => "intent",
+            Self::BranchOnly => "branch_only",
+            Self::BranchPushed => "branch_pushed",
             Self::Pushed => "pushed",
             Self::PrRequested => "pr_requested",
             Self::PrCreated => "pr_created",
             Self::Ambiguous => "ambiguous",
             Self::Failed => "failed",
+            Self::Superseded => "superseded",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "intent" => Self::Intent,
+            "branch_only" => Self::BranchOnly,
+            "branch_pushed" => Self::BranchPushed,
             "pushed" => Self::Pushed,
             "pr_requested" => Self::PrRequested,
             "pr_created" => Self::PrCreated,
             "ambiguous" => Self::Ambiguous,
             "failed" => Self::Failed,
+            "superseded" => Self::Superseded,
             _ => return None,
         })
     }
@@ -622,6 +682,42 @@ pub struct DeliveryRow {
     pub updated_at: i64,
 }
 
+/// Authority to mutate one exact delivery identity. Never log the token.
+#[derive(Clone)]
+pub struct DeliveryClaim {
+    pub delivery: DeliveryRow,
+    pub token: String,
+    pub generation: i64,
+}
+
+impl std::fmt::Debug for DeliveryClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeliveryClaim")
+            .field("delivery", &self.delivery)
+            .field("token", &"[redacted]")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+/// Authority to use a canonical checkout path, excluding live runners.
+#[derive(Clone)]
+pub struct CheckoutClaim {
+    pub path: String,
+    pub token: String,
+    pub generation: i64,
+}
+
+impl std::fmt::Debug for CheckoutClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckoutClaim")
+            .field("path", &self.path)
+            .field("token", &"[redacted]")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CiWatchState {
     Pending,
@@ -630,6 +726,7 @@ pub enum CiWatchState {
     Merged,
     Closed,
     Expired,
+    HeadChanged,
 }
 
 impl CiWatchState {
@@ -641,6 +738,7 @@ impl CiWatchState {
             Self::Merged => "merged",
             Self::Closed => "closed",
             Self::Expired => "expired",
+            Self::HeadChanged => "head_changed",
         }
     }
 
@@ -652,6 +750,7 @@ impl CiWatchState {
             "merged" => Self::Merged,
             "closed" => Self::Closed,
             "expired" => Self::Expired,
+            "head_changed" => Self::HeadChanged,
             _ => return None,
         })
     }
@@ -659,7 +758,7 @@ impl CiWatchState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Red | Self::Merged | Self::Closed | Self::Expired
+            Self::Red | Self::Merged | Self::Closed | Self::Expired | Self::HeadChanged
         )
     }
 }
@@ -703,6 +802,33 @@ pub struct CiWatchRow {
     pub change_stat: Option<String>,
     pub memory_written: bool,
     pub max_attempts: u64,
+}
+
+#[derive(Clone)]
+pub struct CiWatchClaim {
+    pub watch: CiWatchRow,
+    pub token: String,
+    pub generation: i64,
+}
+
+impl std::fmt::Debug for CiWatchClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CiWatchClaim")
+            .field("watch", &self.watch)
+            .field("token", &"[redacted]")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CiWatchUpdate<'a> {
+    pub state: CiWatchState,
+    pub last_verdict: Option<&'a str>,
+    pub next_check_at: i64,
+    pub last_error: Option<&'a str>,
+    pub terminal_at: Option<i64>,
+    pub reject_open_pr: bool,
 }
 
 pub struct Store {
@@ -808,7 +934,8 @@ const RUN_COLUMNS: &str =
         context_window, messages";
 
 /// Runner telemetry upsert shared by the plain path and the lease acquisition,
-/// so both keep the same column list. Lease columns are never written here.
+/// so both keep the same column list. Lease columns and the immutable startup
+/// snapshot are never written here.
 fn upsert_runner_on(conn: &Connection, r: &RunnerUpsert) -> ShanResult<()> {
     conn.execute(
         "INSERT INTO runners(id, repo, host, pid, started_at, heartbeat_at, status,
@@ -863,21 +990,35 @@ impl Store {
     /// the first sighting writes a `reported` event (dedup must not spam the
     /// activity feed).
     pub fn report_signal(&self, signal: &Signal, now_ms: i64) -> ShanResult<ReportOutcome> {
+        self.report_signal_with_source(signal, now_ms, None)
+    }
+
+    /// A source is an explicit caller attestation of the observation metadata,
+    /// including the exact environment/release relation. JSON fields and HTTP
+    /// bearer authentication must never grant this authority by themselves.
+    pub fn report_signal_with_source(
+        &self,
+        signal: &Signal,
+        now_ms: i64,
+        trusted_source: Option<&str>,
+    ) -> ShanResult<ReportOutcome> {
         let fp = fingerprint::compute(
             &signal.repo,
             &signal.language,
             signal.message.as_deref(),
             &signal.stack_trace,
         );
+        let mut observation = SignalObservation::new(&fp, signal, now_ms, trusted_source)?;
         let mut conn = self.lock();
         // Serialize before reading the state: a concurrent owner mute must not
         // be reopened using a stale terminal-state observation.
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let existing: Option<(String, u64, i64, String)> = tx
+        observation.check_duplicate_on(&tx)?;
+        let existing: Option<(String, u64, i64, String, i64)> = tx
             .query_row(
-                "SELECT state, occurrences, cooldown_until, severity FROM issues WHERE fingerprint = ?1",
+                "SELECT state, occurrences, cooldown_until, severity, state_changed_at FROM issues WHERE fingerprint = ?1",
                 [&fp],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .map(Some)
             .or_else(|e| match e {
@@ -885,7 +1026,9 @@ impl Store {
                 other => Err(other),
             })?;
 
-        let Some((state, occurrences, cooldown_until, current_severity)) = existing else {
+        let Some((state, occurrences, cooldown_until, current_severity, state_changed_at)) =
+            existing
+        else {
             tx.execute(
                 "INSERT INTO issues(fingerprint, title, language, severity, state, occurrences, first_seen, last_seen, cooldown_until, repo, stack_sample, log_sample)
                  VALUES (?1, ?2, ?3, ?4, 'new', 1, ?5, ?5, 0, ?6, ?7, ?8)",
@@ -910,6 +1053,9 @@ impl Store {
                 "reported",
                 "first sighting",
             )?;
+            observation.disposition = "new".into();
+            observation.revoke_memory_on(&tx, &signal.repo)?;
+            observation.persist_on(&tx)?;
             tx.commit()?;
             return Ok(ReportOutcome::NewIssue { fingerprint: fp });
         };
@@ -920,7 +1066,7 @@ impl Store {
         // downgrading is an explicit owner action, not a side effect of noise.
         let severity = higher_severity(&current_severity, &signal.severity);
         tx.execute(
-            "UPDATE issues SET occurrences = occurrences + 1, last_seen = ?2, stack_sample = ?3,
+            "UPDATE issues SET occurrences = occurrences + 1, last_seen = MAX(last_seen, ?2), stack_sample = ?3,
                 severity = ?4, log_sample = COALESCE(?5, log_sample)
              WHERE fingerprint = ?1",
             rusqlite::params![
@@ -935,8 +1081,26 @@ impl Store {
         let occurrences = occurrences + 1;
 
         let state = State::parse(&state).ok_or(ShanError::UnknownState(state))?;
-        let outcome = if state == State::Ignored {
+        let outcome = if observation.duplicate_of.is_some() {
+            observation.disposition = "duplicate".into();
+            ReportOutcome::Duplicate {
+                fingerprint: fp,
+                occurrences,
+            }
+        } else if state == State::Ignored {
+            observation.disposition = "muted".into();
             ReportOutcome::Muted {
+                fingerprint: fp,
+                occurrences,
+            }
+        } else if matches!(state, State::Merged | State::Rejected)
+            && state_changed_at > 0
+            && observation
+                .trusted_time()
+                .is_some_and(|at| at < state_changed_at)
+        {
+            observation.disposition = "delayed".into();
+            ReportOutcome::Delayed {
                 fingerprint: fp,
                 occurrences,
             }
@@ -958,22 +1122,27 @@ impl Store {
                 "state_changed",
                 "regression: terminal issue reported again",
             )?;
+            observation.disposition = "regression".into();
             ReportOutcome::Regression {
                 fingerprint: fp,
                 occurrences,
             }
         } else if now_ms < cooldown_until {
+            observation.disposition = "cooldown".into();
             ReportOutcome::CooldownActive {
                 fingerprint: fp,
                 occurrences,
                 retry_after_ms: cooldown_until - now_ms,
             }
         } else {
+            observation.disposition = "deduped".into();
             ReportOutcome::Deduped {
                 fingerprint: fp,
                 occurrences,
             }
         };
+        observation.revoke_memory_on(&tx, &signal.repo)?;
+        observation.persist_on(&tx)?;
         tx.commit()?;
         Ok(outcome)
     }
@@ -1238,8 +1407,8 @@ impl Store {
         let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state))?;
         if !matches!(from, State::Triggered | State::Fixing) {
             return Err(ShanError::InvalidTransition {
-                from,
-                to: State::New,
+                from: from.as_str().into(),
+                to: State::New.as_str().into(),
             });
         }
         conn.execute(
@@ -1327,8 +1496,8 @@ impl Store {
         let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state))?;
         if !matches!(from, State::Escalated | State::Rejected | State::Ignored) {
             return Err(ShanError::InvalidTransition {
-                from,
-                to: State::New,
+                from: from.as_str().into(),
+                to: State::New.as_str().into(),
             });
         }
         conn.execute(
@@ -1381,8 +1550,8 @@ impl Store {
         let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state))?;
         if !matches!(from, State::Triggered | State::Fixing) {
             return Err(ShanError::InvalidTransition {
-                from,
-                to: State::New,
+                from: from.as_str().into(),
+                to: State::New.as_str().into(),
             });
         }
         conn.execute(
@@ -1464,6 +1633,7 @@ impl Store {
         for kind in ["state_changed", "rejected"] {
             record_event_on(&tx, fingerprint, now_ms, Some(&repo), actor, kind, detail)?;
         }
+        revoke_pr_evidence_on(&tx, &repo, fingerprint, expected_pr_url, detail, now_ms)?;
         tx.commit()?;
         Ok(true)
     }
@@ -1491,8 +1661,8 @@ impl Store {
         let from = State::parse(&state).ok_or_else(|| ShanError::UnknownState(state.clone()))?;
         if !matches!(from, State::Triggered | State::Fixing) {
             return Err(ShanError::InvalidTransition {
-                from,
-                to: State::New,
+                from: from.as_str().into(),
+                to: State::New.as_str().into(),
             });
         }
         let attempts = attempts + 1;
@@ -1508,7 +1678,10 @@ impl Store {
             rusqlite::params![fingerprint, to.as_str(), attempts, cooldown, now_ms, state],
         )?;
         if changed == 0 {
-            return Err(ShanError::InvalidTransition { from, to });
+            return Err(ShanError::InvalidTransition {
+                from: from.as_str().into(),
+                to: to.as_str().into(),
+            });
         }
         record_event_on(&tx, fingerprint, now_ms, Some(&repo), actor, kind, detail)?;
         tx.commit()?;
@@ -1539,123 +1712,317 @@ impl Store {
     ) -> ShanResult<FailureOutcome> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (repo, attempts): (String, u64) = tx.query_row(
-            "SELECT repo, attempts FROM issues
-             WHERE fingerprint=?1 AND state='pr_open' AND pr_url=?2",
-            rusqlite::params![fingerprint, expected_pr_url],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        record_event_on(
+        let outcome = record_ci_rejection_on(
             &tx,
             fingerprint,
+            expected_pr_url,
             now_ms,
-            Some(&repo),
-            actor,
-            "rejected",
+            max_attempts,
+            cooldown_until_ms,
             detail,
+            actor,
         )?;
-        let attempts = attempts + 1;
-        let (to, kind, cooldown) = if attempts >= max_attempts {
-            (State::Ignored, "ignored", 0)
-        } else {
-            (State::New, "state_changed", cooldown_until_ms)
-        };
-        tx.execute(
-            "UPDATE issues SET state=?2, attempts=?3, cooldown_until=?4,
-                owner_runner_id=NULL, state_changed_at=?5, pr_url=NULL, pr_opened_at=NULL
-             WHERE fingerprint=?1 AND state='pr_open' AND pr_url=?6",
-            rusqlite::params![
-                fingerprint,
-                to.as_str(),
-                attempts,
-                cooldown,
-                now_ms,
-                expected_pr_url
-            ],
-        )?;
-        record_event_on(&tx, fingerprint, now_ms, Some(&repo), actor, kind, detail)?;
         tx.commit()?;
-        Ok(FailureOutcome {
-            disposition: if to == State::Ignored {
-                FailureDisposition::Ignored
-            } else {
-                FailureDisposition::Retry
-            },
-            state: to,
-            attempts,
-        })
+        Ok(outcome)
     }
 
-    /// Record a delivery intent before any network side effect. Repeated calls
-    /// for the same (repo, branch, head_sha) return the existing record, so a
-    /// crash cannot create a second delivery identity.
+    /// Insert/read an intent without refreshing any existing fields. Network
+    /// side effects and subsequent writes require a fenced delivery claim.
     pub fn begin_delivery(&self, start: &DeliveryStart) -> ShanResult<DeliveryRow> {
         let conn = self.lock();
-        conn.execute(
-            "INSERT INTO deliveries
-                (id, run_id, fingerprint, repo, branch, base, head_sha, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'intent', ?8, ?8)
-             ON CONFLICT(repo, branch, head_sha) DO UPDATE SET
-                updated_at=excluded.updated_at,
-                run_id=COALESCE(deliveries.run_id, excluded.run_id)",
-            rusqlite::params![
-                start.id,
-                start.run_id,
-                start.fingerprint,
-                start.repo,
-                start.branch,
-                start.base,
-                start.head_sha,
-                start.now,
-            ],
-        )?;
-        let row = conn.query_row(
-            "SELECT id, run_id, fingerprint, repo, branch, base, head_sha, state,
-                    pr_url, pr_number, detail, created_at, updated_at
-             FROM deliveries WHERE repo=?1 AND branch=?2 AND head_sha=?3",
-            rusqlite::params![start.repo, start.branch, start.head_sha],
-            delivery_from_row,
-        )?;
-        Ok(row)
+        begin_delivery_on(&conn, start)
     }
 
-    pub fn update_delivery_head(&self, id: &str, head_sha: &str, now_ms: i64) -> ShanResult<()> {
+    /// Atomically create/read the exact intent and claim it if unfinished and
+    /// unowned or expired. Even the same owner must wait or use its token.
+    pub fn claim_delivery(
+        &self,
+        start: &DeliveryStart,
+        owner: &str,
+        ttl_ms: i64,
+    ) -> ShanResult<Option<DeliveryClaim>> {
+        if ttl_ms <= 0 || owner.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let delivery = begin_delivery_on(&tx, start)?;
+        validate_delivery_start(&delivery, start)?;
+        let claim = claim_delivery_on(&tx, delivery, owner, start.now, ttl_ms)?;
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    /// Claim a bounded PR recovery batch under one write lock. Interrupted
+    /// branch-only pushes require manual review, never absent-PR cleanup.
+    pub fn claim_pending_deliveries(
+        &self,
+        repo: &str,
+        owner: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+        limit: u32,
+    ) -> ShanResult<Vec<DeliveryClaim>> {
+        if ttl_ms <= 0 || limit == 0 || owner.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let deliveries = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {DELIVERY_COLUMNS} FROM deliveries
+                 WHERE repo=?1 AND state IN ('intent','pushed','pr_requested','ambiguous')
+                   AND (claim_token IS NULL OR claim_until <= ?2)
+                 ORDER BY created_at, id LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params![repo, now_ms, limit], delivery_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut claims = Vec::with_capacity(deliveries.len());
+        for delivery in deliveries {
+            if let Some(claim) = claim_delivery_on(&tx, delivery, owner, now_ms, ttl_ms)? {
+                claims.push(claim);
+            }
+        }
+        tx.commit()?;
+        Ok(claims)
+    }
+
+    pub fn renew_delivery_claim(
+        &self,
+        claim: &DeliveryClaim,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> ShanResult<bool> {
+        if ttl_ms <= 0 {
+            return Ok(false);
+        }
         let conn = self.lock();
         let changed = conn.execute(
-            "UPDATE deliveries SET head_sha=?2, updated_at=?3 WHERE id=?1",
-            rusqlite::params![id, head_sha, now_ms],
+            "UPDATE deliveries SET claim_until=?5
+             WHERE id=?1 AND claim_token=?2 AND claim_generation=?3 AND claim_until > ?4
+               AND state IN ('intent','branch_only','pushed','pr_requested','ambiguous')",
+            rusqlite::params![
+                claim.delivery.id,
+                claim.token,
+                claim.generation,
+                now_ms,
+                now_ms.saturating_add(ttl_ms),
+            ],
         )?;
-        if changed == 0 {
-            return Err(ShanError::UnknownIssue(id.to_string()));
-        }
-        Ok(())
+        Ok(changed == 1)
     }
 
-    pub fn mark_delivery(
+    pub fn delivery_claim_valid(&self, claim: &DeliveryClaim, now_ms: i64) -> ShanResult<bool> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM deliveries
+             WHERE id=?1 AND claim_token=?2 AND claim_generation=?3 AND claim_until > ?4
+               AND state IN ('intent','branch_only','pushed','pr_requested','ambiguous'))",
+            rusqlite::params![claim.delivery.id, claim.token, claim.generation, now_ms],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn release_delivery_claim(&self, claim: &DeliveryClaim, now_ms: i64) -> ShanResult<bool> {
+        let conn = self.lock();
+        Ok(conn.execute(
+            "UPDATE deliveries SET claim_owner=NULL, claim_token=NULL, claim_until=0
+             WHERE id=?1 AND claim_token=?2 AND claim_generation=?3 AND claim_until > ?4
+               AND state IN ('intent','branch_only','pushed','pr_requested','ambiguous')",
+            rusqlite::params![claim.delivery.id, claim.token, claim.generation, now_ms],
+        )? == 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_delivery_owned(
         &self,
-        id: &str,
+        claim: &DeliveryClaim,
         state: DeliveryState,
         pr_url: Option<&str>,
         pr_number: Option<u64>,
         detail: Option<&str>,
         now_ms: i64,
     ) -> ShanResult<()> {
-        let conn = self.lock();
-        let changed = conn.execute(
-            "UPDATE deliveries SET state=?2,
-                pr_url=COALESCE(?3, pr_url), pr_number=COALESCE(?4, pr_number),
-                detail=COALESCE(?5, detail), updated_at=?6
-             WHERE id=?1",
-            rusqlite::params![id, state.as_str(), pr_url, pr_number, detail, now_ms],
-        )?;
-        if changed == 0 {
-            return Err(ShanError::UnknownIssue(id.to_string()));
-        }
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        mark_delivery_owned_on(&tx, claim, state, pr_url, pr_number, detail, now_ms)?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Unfinished deliveries for one repo, oldest first. The runner uses this
+    /// Rebase creates a new identity, never rewrites the old intent's head.
+    /// If the new identity cannot be claimed the entire supersession rolls back.
+    pub fn supersede_delivery_owned(
+        &self,
+        claim: &DeliveryClaim,
+        head_sha: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> ShanResult<DeliveryClaim> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let old = owned_delivery_on(&tx, claim, now_ms)?;
+        if head_sha == old.head_sha
+            || head_sha.is_empty()
+            || ttl_ms <= 0
+            || !delivery_transition_allowed(old.state, DeliveryState::Superseded)
+        {
+            return Err(ShanError::InvalidTransition {
+                from: old.state.as_str().into(),
+                to: DeliveryState::Superseded.as_str().into(),
+            });
+        }
+        let owner: String = tx.query_row(
+            "SELECT claim_owner FROM deliveries WHERE id=?1",
+            [&old.id],
+            |row| row.get(0),
+        )?;
+        let start = DeliveryStart {
+            id: uuid::Uuid::new_v4().to_string(),
+            run_id: old.run_id,
+            fingerprint: old.fingerprint,
+            repo: old.repo,
+            branch: old.branch,
+            base: old.base,
+            head_sha: head_sha.into(),
+            now: now_ms,
+        };
+        let delivery = begin_delivery_on(&tx, &start)?;
+        validate_delivery_start(&delivery, &start)?;
+        if delivery.run_id != start.run_id {
+            return Err(ShanError::DeliveryIdentityMismatch);
+        }
+        if delivery.state != DeliveryState::Intent {
+            return Err(ShanError::InvalidTransition {
+                from: delivery.state.as_str().into(),
+                to: DeliveryState::Intent.as_str().into(),
+            });
+        }
+        let next = claim_delivery_on(&tx, delivery, &owner, now_ms, ttl_ms)?
+            .ok_or(ShanError::OwnershipLost)?;
+        pr_slots::transfer_owned_on(&tx, claim, &next, now_ms)?;
+        mark_delivery_owned_on(
+            &tx,
+            claim,
+            DeliveryState::Superseded,
+            None,
+            None,
+            None,
+            now_ms,
+        )?;
+        tx.commit()?;
+        Ok(next)
+    }
+
+    /// Persist all local consequences of finding/creating a PR together. A
+    /// standalone delivery need not have an issue or run in this database.
+    /// `now_ms` is local confirmation time, not evidence of GitHub creation;
+    /// existing API creation evidence is preserved, otherwise unknown.
+    pub fn complete_delivery_owned(
+        &self,
+        claim: &DeliveryClaim,
+        pr_url: &str,
+        pr_number: u64,
+        watch: Option<&CiWatchInput>,
+        now_ms: i64,
+    ) -> ShanResult<()> {
+        self.complete_delivery_owned_at(claim, pr_url, pr_number, watch, None, now_ms)
+    }
+
+    /// Complete with optional GitHub creation evidence, atomically with the
+    /// delivery, canonical PR slot, issue, run and CI watch. Explicit evidence
+    /// must be positive and agree with any previously confirmed timestamp.
+    pub fn complete_delivery_owned_at(
+        &self,
+        claim: &DeliveryClaim,
+        pr_url: &str,
+        pr_number: u64,
+        watch: Option<&CiWatchInput>,
+        created_at_ms: Option<i64>,
+        now_ms: i64,
+    ) -> ShanResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let delivery = owned_delivery_on(&tx, claim, now_ms)?;
+        if created_at_ms.is_some_and(|created| created <= 0) {
+            return Err(ShanError::InvalidPrReservation);
+        }
+        if pr_url.trim().is_empty()
+            || pr_number == 0
+            || delivery.pr_url.as_deref().is_some_and(|url| url != pr_url)
+            || delivery.pr_number.is_some_and(|number| number != pr_number)
+            || watch.is_some_and(|watch| {
+                watch.run_id != delivery.run_id
+                    || watch.fingerprint != delivery.fingerprint
+                    || watch.repo != delivery.repo
+                    || watch.head_sha != delivery.head_sha
+                    || watch.pr_url != pr_url
+                    || watch.pr_number != pr_number
+            })
+        {
+            return Err(ShanError::DeliveryIdentityMismatch);
+        }
+        mark_delivery_owned_on(
+            &tx,
+            claim,
+            DeliveryState::PrCreated,
+            Some(pr_url),
+            Some(pr_number),
+            None,
+            now_ms,
+        )?;
+        let slot =
+            pr_slots::for_delivery_on(&tx, &delivery.id)?.ok_or(ShanError::InvalidPrReservation)?;
+        if let Some(created) = created_at_ms {
+            if slot
+                .created_at_ms
+                .is_some_and(|existing| existing != created)
+            {
+                return Err(ShanError::InvalidPrReservation);
+            }
+            tx.execute(
+                "UPDATE pr_slots SET created_at_ms=?2 WHERE id=?1",
+                rusqlite::params![slot.id, created],
+            )?;
+        }
+        let created_at_ms = created_at_ms.or(slot.created_at_ms);
+        adopt_delivered_pr_on(&tx, &delivery.fingerprint, pr_url, now_ms, created_at_ms)?;
+        if let Some(run_id) = &delivery.run_id {
+            tx.execute(
+                "UPDATE runs SET branch=?2, commit_sha=?3, pr_url=?4,
+                    pr_opened_at=CASE WHEN pr_url=?4 THEN COALESCE(pr_opened_at,?5) ELSE ?5 END
+                 WHERE id=?1",
+                rusqlite::params![
+                    run_id,
+                    delivery.branch,
+                    delivery.head_sha,
+                    pr_url,
+                    created_at_ms
+                ],
+            )?;
+        }
+        if let Some(watch) = watch {
+            upsert_ci_watch_on(
+                &tx,
+                &CiWatchInput {
+                    run_id: delivery.run_id,
+                    fingerprint: delivery.fingerprint,
+                    repo: delivery.repo,
+                    pr_url: pr_url.into(),
+                    pr_number,
+                    head_sha: delivery.head_sha,
+                    ..watch.clone()
+                },
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Unfinished PR deliveries for one repo, oldest first. The runner uses this
     /// at startup to adopt a PR that GitHub created before the process died.
+    /// Branch-only pushes are excluded even if interrupted: no PR is expected.
     pub fn pending_deliveries(&self, repo: &str) -> ShanResult<Vec<DeliveryRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -1672,6 +2039,7 @@ impl Store {
     /// Recovery path: a PR was found for an unfinished delivery. Move the
     /// issue to `pr_open` without requiring the normal fixing→pr_open sequence,
     /// because the process may have died before the fixing transition landed.
+    #[cfg(test)]
     pub fn adopt_delivered_pr(
         &self,
         fingerprint: &str,
@@ -1680,76 +2048,315 @@ impl Store {
     ) -> ShanResult<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let Some((state, repo)): Option<(String, String)> = tx
+        let adopted = adopt_delivered_pr_on(&tx, fingerprint, pr_url, now_ms, Some(now_ms))?;
+        tx.commit()?;
+        Ok(adopted)
+    }
+
+    pub fn upsert_ci_watch(&self, input: &CiWatchInput) -> ShanResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        upsert_ci_watch_on(&tx, input)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Claim one exact watch through the same ownership fence as the scheduler.
+    pub fn claim_ci_watch_owned(
+        &self,
+        id: i64,
+        now: i64,
+        lease_ms: i64,
+    ) -> ShanResult<Option<CiWatchClaim>> {
+        if lease_ms <= 0 {
+            return Ok(None);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let watch = tx
             .query_row(
-                "SELECT state, repo FROM issues WHERE fingerprint=?1",
-                [fingerprint],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                &format!(
+                    "SELECT {CI_WATCH_COLUMNS} FROM ci_watches
+                WHERE id=?1 AND state IN ('pending','green') AND next_check_at<=?2
+                  AND (claim_token IS NULL OR claim_until<=?2)"
+                ),
+                rusqlite::params![id, now],
+                ci_watch_from_row,
             )
-            .optional()?
-        else {
-            return Err(ShanError::UnknownIssue(fingerprint.to_string()));
+            .optional()?;
+        let claim = watch
+            .map(|watch| claim_ci_watch_on(&tx, watch, now, lease_ms))
+            .transpose()?;
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    /// Claim due work without changing its independently scheduled next check.
+    pub fn claim_due_ci_watches_owned(
+        &self,
+        now_ms: i64,
+        limit: u32,
+        lease_ms: i64,
+    ) -> ShanResult<Vec<CiWatchClaim>> {
+        if lease_ms <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let watches = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {CI_WATCH_COLUMNS} FROM ci_watches
+                 WHERE state IN ('pending','green') AND next_check_at<=?1
+                   AND (claim_token IS NULL OR claim_until<=?1)
+                 ORDER BY next_check_at,id LIMIT ?2"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params![now_ms, limit], ci_watch_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()?
         };
-        let state = State::parse(&state).ok_or(ShanError::UnknownState(state))?;
-        if matches!(
-            state,
-            State::Merged | State::Rejected | State::Escalated | State::Ignored
-        ) {
+        let mut claims = Vec::with_capacity(watches.len());
+        for watch in watches {
+            claims.push(claim_ci_watch_on(&tx, watch, now_ms, lease_ms)?);
+        }
+        tx.commit()?;
+        Ok(claims)
+    }
+
+    pub fn renew_ci_watch_claim(
+        &self,
+        claim: &CiWatchClaim,
+        now: i64,
+        ttl: i64,
+    ) -> ShanResult<bool> {
+        if ttl <= 0 {
+            return Ok(false);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if ci_watch_owned_on(&tx, claim, now)?.is_none() {
             return Ok(false);
         }
         tx.execute(
-            "UPDATE issues SET state='pr_open', pr_url=?2, pr_opened_at=?3,
-                state_changed_at=?3, owner_runner_id=NULL
-             WHERE fingerprint=?1",
-            rusqlite::params![fingerprint, pr_url, now_ms],
-        )?;
-        record_event_on(
-            &tx,
-            fingerprint,
-            now_ms,
-            Some(&repo),
-            "runner",
-            "state_changed",
-            "delivery recovered: PR adopted from GitHub",
+            "UPDATE ci_watches SET claim_until=MAX(claim_until,?2) WHERE id=?1",
+            rusqlite::params![claim.watch.id, now.saturating_add(ttl)],
         )?;
         tx.commit()?;
         Ok(true)
     }
 
-    pub fn upsert_ci_watch(&self, input: &CiWatchInput) -> ShanResult<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO ci_watches
-                (run_id, fingerprint, repo, pr_url, slug, pr_number, head_sha,
-                 state, next_check_at, created_at, updated_at, root_cause, change_stat,
-                 max_attempts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9, ?10, ?11, ?12)
-             ON CONFLICT(repo, pr_url, head_sha) DO UPDATE SET
-                updated_at=excluded.updated_at,
-                next_check_at=MIN(ci_watches.next_check_at, excluded.next_check_at),
-                run_id=COALESCE(ci_watches.run_id, excluded.run_id),
-                root_cause=COALESCE(ci_watches.root_cause, excluded.root_cause),
-                change_stat=COALESCE(ci_watches.change_stat, excluded.change_stat)",
+    pub fn ci_watch_claim_valid(&self, claim: &CiWatchClaim, now: i64) -> ShanResult<bool> {
+        Ok(ci_watch_owned_on(&self.lock(), claim, now)?.is_some())
+    }
+
+    /// Check immediately before closing the remote PR. Finalization repeats the
+    /// issue ownership check because a newer delivery may supersede this watch.
+    pub fn ci_watch_can_reject_issue(&self, claim: &CiWatchClaim, now: i64) -> ShanResult<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let Some(watch) = ci_watch_owned_on(&tx, claim, now)? else {
+            return Ok(false);
+        };
+        let can_reject = ci_watch_owns_issue_on(&tx, &watch)?;
+        tx.commit()?;
+        Ok(can_reject)
+    }
+
+    /// Commit every local consequence under the same fence and write lock.
+    /// On red rejection, `next_check_at` also supplies the issue retry cooldown.
+    pub fn finish_ci_watch_owned(
+        &self,
+        claim: &CiWatchClaim,
+        update: &CiWatchUpdate<'_>,
+        now: i64,
+    ) -> ShanResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let watch = ci_watch_owned_on(&tx, claim, now)?.ok_or(ShanError::OwnershipLost)?;
+        if update.reject_open_pr && update.state != CiWatchState::Red {
+            return Err(ShanError::InvalidTransition {
+                from: watch.state.as_str().into(),
+                to: update.state.as_str().into(),
+            });
+        }
+        let source_id = watch.id.to_string();
+        let publish = matches!(update.state, CiWatchState::Green | CiWatchState::Merged);
+        let revoke = matches!(
+            update.state,
+            CiWatchState::Red | CiWatchState::Closed | CiWatchState::HeadChanged
+        );
+        if publish && watch.root_cause.is_some() && watch.change_stat.is_some() {
+            record_repair_memory_on(
+                &tx,
+                &RepairMemoryEntry {
+                    repo: watch.repo.clone(),
+                    fingerprint: watch.fingerprint.clone(),
+                    commit_sha: watch.head_sha.clone(),
+                    pr_url: Some(watch.pr_url.clone()),
+                    root_cause: watch.root_cause.clone().unwrap_or_default(),
+                    change_stat: watch.change_stat.clone().unwrap_or_default(),
+                    files: 0,
+                    recorded_at: now,
+                },
+                "ci_green",
+                &source_id,
+            )?;
+        }
+        if revoke {
+            // Keep a source tombstone even if green was never observed, without
+            // creating, refreshing, or pruning any visible memory summary.
+            tx.execute(
+                "INSERT INTO repair_memory_evidence
+                    (repo,fingerprint,source_kind,source_id,commit_sha,pr_url,root_cause,
+                     change_stat,files,recorded_at,valid,revoked_at,revocation_reason)
+                 VALUES (?1,?2,'ci_green',?3,?4,?5,?6,?7,0,?8,0,?8,?9)
+                 ON CONFLICT(repo,fingerprint,source_kind,source_id,commit_sha) DO NOTHING",
+                rusqlite::params![
+                    watch.repo,
+                    watch.fingerprint,
+                    source_id,
+                    watch.head_sha,
+                    watch.pr_url,
+                    watch.root_cause.as_deref().unwrap_or_default(),
+                    watch.change_stat.as_deref().unwrap_or_default(),
+                    now,
+                    update.state.as_str()
+                ],
+            )?;
+            tx.execute(
+                "UPDATE repair_memory_evidence SET valid=0,
+                    revoked_at=COALESCE(revoked_at,?6),revocation_reason=COALESCE(revocation_reason,?7)
+                 WHERE repo=?1 AND fingerprint=?2 AND source_kind='ci_green' AND source_id=?3
+                   AND commit_sha=?4 AND pr_url=?5",
+                rusqlite::params![watch.repo,watch.fingerprint,source_id,watch.head_sha,
+                    watch.pr_url,now,update.state.as_str()],
+            )?;
+        }
+        let memory_written: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM repair_memory_evidence
+             WHERE repo=?1 AND fingerprint=?2 AND source_kind='ci_green' AND source_id=?3
+               AND commit_sha=?4 AND pr_url=?5 AND valid=1 AND revoked_at IS NULL)",
             rusqlite::params![
-                input.run_id,
-                input.fingerprint,
-                input.repo,
-                input.pr_url,
-                input.slug,
-                input.pr_number,
-                input.head_sha,
-                input.next_check_at,
-                input.now,
-                input.root_cause,
-                input.change_stat,
-                input.max_attempts,
+                watch.repo,
+                watch.fingerprint,
+                source_id,
+                watch.head_sha,
+                watch.pr_url
+            ],
+            |row| row.get(0),
+        )?;
+        // Watch observation vocabulary is not the run/API verdict vocabulary.
+        let run_verdict = update.last_verdict.map(|verdict| match verdict {
+            "green" => "success",
+            "red" => "failure",
+            other => other,
+        });
+        if let Some(run_id) = &watch.run_id {
+            tx.execute(
+                "UPDATE runs SET ci_verdict=COALESCE(?6,ci_verdict)
+                 WHERE id=?1 AND repo=?2 AND fingerprint=?3 AND commit_sha=?4 AND pr_url=?5",
+                rusqlite::params![
+                    run_id,
+                    watch.repo,
+                    watch.fingerprint,
+                    watch.head_sha,
+                    watch.pr_url,
+                    run_verdict
+                ],
+            )?;
+        }
+        if update.reject_open_pr && ci_watch_owns_issue_on(&tx, &watch)? {
+            record_ci_rejection_on(
+                &tx,
+                &watch.fingerprint,
+                &watch.pr_url,
+                now,
+                watch.max_attempts.max(1),
+                update.next_check_at,
+                update.last_error.unwrap_or("ci_red"),
+                "ci_watch",
+            )?;
+        }
+        tx.execute(
+            "UPDATE ci_watches SET state=?2,last_verdict=COALESCE(?3,last_verdict),
+                next_check_at=?4,last_error=?5,terminal_at=?6,last_checked_at=?7,updated_at=?7,
+                memory_written=?8,check_attempts=0,claim_token=NULL,claim_until=0 WHERE id=?1",
+            rusqlite::params![
+                watch.id,
+                update.state.as_str(),
+                update.last_verdict,
+                update.next_check_at,
+                update.last_error,
+                if update.state.is_terminal() {
+                    Some(update.terminal_at.unwrap_or(now))
+                } else {
+                    None
+                },
+                now,
+                memory_written
             ],
         )?;
+        let observation_kind = match run_verdict {
+            Some("success") => Some("ci_green"),
+            Some("failure") => Some("ci_red"),
+            _ => None,
+        };
+        if let Some(kind) = observation_kind {
+            record_event_on(
+                &tx,
+                &watch.fingerprint,
+                now,
+                Some(&watch.repo),
+                "ci_watch",
+                kind,
+                &format!("PR #{} head {}: {}", watch.pr_number, watch.head_sha, kind),
+            )?;
+        }
+        record_event_on(
+            &tx,
+            &watch.fingerprint,
+            now,
+            Some(&watch.repo),
+            "ci_watch",
+            "ci_watch",
+            &format!(
+                "watch {}: {} -> {}",
+                watch.id,
+                watch.state.as_str(),
+                update.state.as_str()
+            ),
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Atomically claim due watches by pushing their next check out. A second
-    /// serve process cannot poll the same watch concurrently.
+    pub fn record_ci_watch_error_owned(
+        &self,
+        claim: &CiWatchClaim,
+        next: i64,
+        error: &str,
+        now: i64,
+    ) -> ShanResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let watch = ci_watch_owned_on(&tx, claim, now)?.ok_or(ShanError::OwnershipLost)?;
+        tx.execute(
+            "UPDATE ci_watches SET next_check_at=?2,last_error=?3,last_checked_at=?4,updated_at=?4,
+                check_attempts=check_attempts+1,claim_token=NULL,claim_until=0 WHERE id=?1",
+            rusqlite::params![watch.id, next, error, now],
+        )?;
+        record_event_on(
+            &tx,
+            &watch.fingerprint,
+            now,
+            Some(&watch.repo),
+            "ci_watch",
+            "ci_watch_error",
+            error,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn claim_due_ci_watches(
         &self,
         now_ms: i64,
@@ -1788,6 +2395,7 @@ impl Store {
         Ok(out)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn update_ci_watch(
         &self,
@@ -1821,6 +2429,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn record_ci_watch_error(
         &self,
         id: i64,
@@ -1849,6 +2458,26 @@ impl Store {
              FROM ci_watches WHERE fingerprint=?1
              ORDER BY created_at DESC, id DESC LIMIT 1",
             [fingerprint],
+            ci_watch_from_row,
+        )
+        .optional()
+        .map_err(ShanError::from)
+    }
+
+    /// Exact remote identity lookup; never substitute the issue's newest watch.
+    pub fn ci_watch_for_identity(
+        &self,
+        slug: &str,
+        pr_number: u64,
+        head_sha: &str,
+    ) -> ShanResult<Option<CiWatchRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            &format!(
+                "SELECT {CI_WATCH_COLUMNS} FROM ci_watches
+                WHERE slug=?1 AND pr_number=?2 AND head_sha=?3"
+            ),
+            rusqlite::params![slug, pr_number, head_sha],
             ci_watch_from_row,
         )
         .optional()
@@ -1924,7 +2553,10 @@ impl Store {
             })?;
         let from = State::parse(&from).ok_or_else(|| ShanError::UnknownState(from))?;
         if !can_transition(from, to) {
-            return Err(ShanError::InvalidTransition { from, to });
+            return Err(ShanError::InvalidTransition {
+                from: from.as_str().into(),
+                to: to.as_str().into(),
+            });
         }
         // Compare-and-swap: the UPDATE only lands if the state is still the one
         // we validated. Two processes (a runner and the owner, or two runners)
@@ -1953,7 +2585,10 @@ impl Store {
                     other => ShanError::Db(other),
                 })?;
             let current = State::parse(&current).ok_or_else(|| ShanError::UnknownState(current))?;
-            return Err(ShanError::InvalidTransition { from: current, to });
+            return Err(ShanError::InvalidTransition {
+                from: current.as_str().into(),
+                to: to.as_str().into(),
+            });
         }
         if to == State::New {
             conn.execute(
@@ -2055,6 +2690,8 @@ impl Store {
         Ok(count.max(0) as u64)
     }
 
+    /// Historical creation metric, excluding PRs with unknown creation time.
+    /// Admission quota uses `pr_slots_used`, not this observation.
     pub fn prs_opened_since(&self, repo: &str, since_ms: i64) -> ShanResult<u64> {
         let conn = self.lock();
         let count: u64 = conn.query_row(
@@ -2076,8 +2713,9 @@ impl Store {
     /// events (`config_changed` / `config_migrated` / `restart_requested`)
     /// after `audit_days` (callers pass `event_days.max(365)` so audit history
     /// is never shorter than normal telemetry), runs after `run_days`, and
-    /// runner rows whose last heartbeat is older than 30 days. Callers
-    /// schedule this (M1b/M2).
+    /// runner rows whose last heartbeat is older than 30 days. Observations
+    /// expire after 30 days: retained history is not global exactly-once proof.
+    /// Callers schedule this (M1b/M2).
     pub fn prune(
         &self,
         now_ms: i64,
@@ -2105,6 +2743,10 @@ impl Store {
         deleted += conn.execute(
             "DELETE FROM runners WHERE heartbeat_at < ?1",
             [runner_cutoff],
+        )? as u64;
+        deleted += conn.execute(
+            "DELETE FROM signal_observations WHERE received_at_ms < ?1",
+            [now_ms.saturating_sub(SIGNAL_OBSERVATIONS_RETENTION_MS)],
         )? as u64;
         Ok(deleted)
     }
@@ -2514,38 +3156,50 @@ impl Store {
         })
     }
 
-    /// 记录一条已验证的修复。同一 (repo, fingerprint) 只保留最新一次，
-    /// 每仓库最多 [`REPAIR_MEMORY_KEEP`] 条——记忆是参考，不是账本。
+    /// Compatibility writes have unknown verification and are never prompt eligible.
     pub fn record_repair_memory(&self, entry: &RepairMemoryEntry) -> ShanResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        record_repair_memory_on(&tx, entry, "legacy_unknown", &entry.recorded_at.to_string())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_verified_repair_memory(
+        &self,
+        entry: &RepairMemoryEntry,
+        source_kind: &str,
+        source_id: &str,
+    ) -> ShanResult<()> {
+        if !matches!(source_kind, "local_verification" | "ci_green")
+            || source_id.trim().is_empty()
+            || entry.commit_sha.trim().is_empty()
+        {
+            return Err(ShanError::InvalidMemorySource);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        record_repair_memory_on(&tx, entry, source_kind, source_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Revoke only the exact commit and PR (None matches only evidence without a PR).
+    pub fn revoke_repair_memory_evidence(
+        &self,
+        repo: &str,
+        fingerprint: &str,
+        commit: &str,
+        pr_url: Option<&str>,
+        reason: &str,
+        now: i64,
+    ) -> ShanResult<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO repair_memory
-                (repo, fingerprint, commit_sha, pr_url, root_cause, change_stat, files, recorded_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-             ON CONFLICT(repo, fingerprint) DO UPDATE SET
-                commit_sha=excluded.commit_sha,
-                pr_url=excluded.pr_url,
-                root_cause=excluded.root_cause,
-                change_stat=excluded.change_stat,
-                files=excluded.files,
-                recorded_at=excluded.recorded_at",
-            rusqlite::params![
-                entry.repo,
-                entry.fingerprint,
-                entry.commit_sha,
-                entry.pr_url,
-                entry.root_cause,
-                entry.change_stat,
-                entry.files,
-                entry.recorded_at,
-            ],
-        )?;
-        conn.execute(
-            "DELETE FROM repair_memory WHERE repo = ?1 AND fingerprint NOT IN (
-                SELECT fingerprint FROM repair_memory WHERE repo = ?1
-                ORDER BY recorded_at DESC LIMIT ?2
-             )",
-            rusqlite::params![entry.repo, REPAIR_MEMORY_KEEP as i64],
+            "UPDATE repair_memory_evidence SET valid=0,
+                revoked_at=COALESCE(revoked_at,?6), revocation_reason=COALESCE(revocation_reason,?5)
+             WHERE repo=?1 AND fingerprint=?2 AND commit_sha=?3 AND pr_url IS ?4",
+            rusqlite::params![repo, fingerprint, commit, pr_url, reason, now],
         )?;
         Ok(())
     }
@@ -2559,10 +3213,16 @@ impl Store {
     ) -> ShanResult<Vec<RepairMemoryRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT fingerprint, commit_sha, pr_url, root_cause, change_stat, files, recorded_at
-             FROM repair_memory
-             WHERE repo = ?1 AND fingerprint != ?2 AND disabled = 0
-             ORDER BY recorded_at DESC LIMIT ?3",
+            "WITH eligible AS (
+                SELECT e.*, ROW_NUMBER() OVER (
+                    PARTITION BY e.fingerprint ORDER BY e.recorded_at DESC,e.id DESC) AS rank
+                FROM repair_memory_evidence e JOIN repair_memory m
+                  ON m.repo=e.repo AND m.fingerprint=e.fingerprint
+                WHERE e.repo=?1 AND e.fingerprint!=?2 AND m.disabled=0
+                  AND e.valid=1 AND e.revoked_at IS NULL
+                  AND e.source_kind IN ('local_verification','ci_green')
+             ) SELECT fingerprint,commit_sha,pr_url,root_cause,change_stat,files,recorded_at
+             FROM eligible WHERE rank=1 ORDER BY recorded_at DESC,fingerprint LIMIT ?3",
         )?;
         let rows = stmt.query_map(rusqlite::params![repo, exclude_fingerprint, limit], |row| {
             Ok(RepairMemoryRow {
@@ -2593,10 +3253,17 @@ impl Store {
         )?;
         let mut stmt = conn.prepare(
             "SELECT m.fingerprint, COALESCE(i.title, ''), COALESCE(i.state, ''),
-                    m.commit_sha, m.pr_url, m.root_cause, m.change_stat, m.files,
-                    m.recorded_at, m.disabled
+                    e.commit_sha, e.pr_url, e.root_cause, e.change_stat, e.files,
+                    e.recorded_at, m.disabled,
+                    e.valid=1 AND e.revoked_at IS NULL AND e.source_kind!='legacy_unknown',
+                    e.source_kind,e.revoked_at,e.revocation_reason
              FROM repair_memory m
-             LEFT JOIN issues i ON i.fingerprint = m.fingerprint
+             JOIN repair_memory_evidence e ON e.id=(
+                SELECT x.id FROM repair_memory_evidence x
+                WHERE x.repo=m.repo AND x.fingerprint=m.fingerprint
+                ORDER BY (x.valid=1 AND x.revoked_at IS NULL AND x.source_kind!='legacy_unknown') DESC,
+                    x.recorded_at DESC,x.id DESC LIMIT 1)
+             LEFT JOIN issues i ON i.fingerprint = m.fingerprint AND i.repo=m.repo
              WHERE m.repo = ?1
              ORDER BY m.recorded_at DESC LIMIT ?2 OFFSET ?3",
         )?;
@@ -2612,6 +3279,10 @@ impl Store {
                 files: row.get(7)?,
                 recorded_at: row.get(8)?,
                 disabled: row.get::<_, i64>(9)? != 0,
+                evidence_valid: row.get(10)?,
+                verification_source: row.get(11)?,
+                revoked_at: row.get(12)?,
+                revocation_reason: row.get(13)?,
             })
         })?;
         Ok((rows.collect::<Result<_, _>>()?, total as u64))
@@ -2634,11 +3305,17 @@ impl Store {
 
     /// 删除一条记忆。返回 false 表示该记忆不存在。
     pub fn delete_repair_memory(&self, repo: &str, fingerprint: &str) -> ShanResult<bool> {
-        let conn = self.lock();
-        let changed = conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM repair_memory_evidence WHERE repo=?1 AND fingerprint=?2",
+            rusqlite::params![repo, fingerprint],
+        )?;
+        let changed = tx.execute(
             "DELETE FROM repair_memory WHERE repo = ?1 AND fingerprint = ?2",
             rusqlite::params![repo, fingerprint],
         )?;
+        tx.commit()?;
         Ok(changed > 0)
     }
 
@@ -2898,6 +3575,146 @@ impl Store {
         upsert_runner_on(&conn, r)
     }
 
+    pub fn claim_checkout(
+        &self,
+        path: &str,
+        owner: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> ShanResult<Option<CheckoutClaim>> {
+        self.claim_checkout_for(path, owner, None, now_ms, ttl_ms)
+    }
+
+    /// Acquire separate checkout authority for the exact live runner instance.
+    /// A runner id alone must never confer a successor process's authority.
+    /// `path` must match the caller's canonical, case-normalized registration.
+    pub fn claim_runner_checkout(
+        &self,
+        path: &str,
+        runner_id: &str,
+        instance_id: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> ShanResult<Option<CheckoutClaim>> {
+        self.claim_checkout_for(path, runner_id, Some(instance_id), now_ms, ttl_ms)
+    }
+
+    fn claim_checkout_for(
+        &self,
+        path: &str,
+        owner: &str,
+        instance_id: Option<&str>,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> ShanResult<Option<CheckoutClaim>> {
+        if ttl_ms <= 0 || path.is_empty() || owner.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(instance) = instance_id {
+            let matching: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runners
+                 WHERE id=?1 AND instance_id=?2 AND repo_path=?3 AND lease_until > ?4)",
+                rusqlite::params![owner, instance, path, now_ms],
+                |row| row.get(0),
+            )?;
+            if !matching {
+                return Ok(None);
+            }
+        }
+        let runner_active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runners WHERE repo_path=?1 AND lease_until > ?2
+             AND NOT (id=?3 AND COALESCE(instance_id=?4, 0)))",
+            rusqlite::params![path, now_ms, owner, instance_id],
+            |row| row.get(0),
+        )?;
+        if runner_active {
+            return Ok(None);
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        let changed = tx.execute(
+            "INSERT INTO checkout_leases
+                (path, owner, token, generation, lease_until, runner_id, runner_instance_id)
+             VALUES (?1, ?2, ?3, 1, ?4, ?6, ?7)
+             ON CONFLICT(path) DO UPDATE SET owner=excluded.owner, token=excluded.token,
+                generation=checkout_leases.generation+1, lease_until=excluded.lease_until,
+                runner_id=excluded.runner_id, runner_instance_id=excluded.runner_instance_id
+             WHERE checkout_leases.token IS NULL OR checkout_leases.lease_until <= ?5",
+            rusqlite::params![
+                path,
+                owner,
+                token,
+                now_ms.saturating_add(ttl_ms),
+                now_ms,
+                instance_id.map(|_| owner),
+                instance_id
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let generation = tx.query_row(
+            "SELECT generation FROM checkout_leases WHERE path=?1",
+            [path],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(Some(CheckoutClaim {
+            path: path.into(),
+            token,
+            generation,
+        }))
+    }
+
+    pub fn renew_checkout_claim(
+        &self,
+        claim: &CheckoutClaim,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> ShanResult<bool> {
+        if ttl_ms <= 0 {
+            return Ok(false);
+        }
+        let conn = self.lock();
+        Ok(conn.execute(
+            &format!(
+                "UPDATE checkout_leases SET lease_until=?5
+                WHERE {CHECKOUT_CLAIM_PREDICATE}"
+            ),
+            rusqlite::params![
+                claim.path,
+                claim.token,
+                claim.generation,
+                now_ms,
+                now_ms.saturating_add(ttl_ms)
+            ],
+        )? == 1)
+    }
+
+    pub fn checkout_claim_valid(&self, claim: &CheckoutClaim, now_ms: i64) -> ShanResult<bool> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM checkout_leases
+                WHERE {CHECKOUT_CLAIM_PREDICATE})"
+            ),
+            rusqlite::params![claim.path, claim.token, claim.generation, now_ms],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn release_checkout_claim(&self, claim: &CheckoutClaim, now_ms: i64) -> ShanResult<bool> {
+        let conn = self.lock();
+        Ok(conn.execute(
+            &format!(
+                "UPDATE checkout_leases SET owner=NULL, token=NULL, lease_until=0,
+                runner_id=NULL, runner_instance_id=NULL WHERE {CHECKOUT_CLAIM_PREDICATE}"
+            ),
+            rusqlite::params![claim.path, claim.token, claim.generation, now_ms],
+        )? == 1)
+    }
+
     /// Take the single-process lease for `r.id` and register the runner in one
     /// transaction. False means a live process still holds the lease; a bare
     /// [`upsert_runner`] would clobber that process's identity, so contenders
@@ -2938,9 +3755,20 @@ impl Store {
         if let Some(holder) = checkout_holder {
             return Ok(RunnerLeaseOutcome::CheckoutInUse(holder));
         }
+        let checkout_owner: Option<String> = tx
+            .query_row(
+                "SELECT owner FROM checkout_leases WHERE path=?1 AND lease_until > ?2",
+                rusqlite::params![r.repo_path, now_ms],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(owner) = checkout_owner {
+            return Ok(RunnerLeaseOutcome::CheckoutInUse(owner));
+        }
         upsert_runner_on(&tx, r)?;
         tx.execute(
-            "UPDATE runners SET instance_id = ?2, lease_until = ?3 WHERE id = ?1",
+            "UPDATE runners SET instance_id = ?2, lease_until = ?3,
+                startup_config_json = NULL WHERE id = ?1",
             rusqlite::params![r.id, instance_id, now_ms.saturating_add(ttl_ms)],
         )?;
         tx.commit()?;
@@ -2957,10 +3785,19 @@ impl Store {
         now_ms: i64,
         ttl_ms: i64,
     ) -> ShanResult<bool> {
+        if ttl_ms <= 0 {
+            return Ok(false);
+        }
         let conn = self.lock();
         let changed = conn.execute(
-            "UPDATE runners SET lease_until = ?3 WHERE id = ?1 AND instance_id = ?2",
-            rusqlite::params![runner_id, instance_id, now_ms.saturating_add(ttl_ms)],
+            "UPDATE runners SET lease_until = ?3
+             WHERE id = ?1 AND instance_id = ?2 AND lease_until > ?4",
+            rusqlite::params![
+                runner_id,
+                instance_id,
+                now_ms.saturating_add(ttl_ms),
+                now_ms
+            ],
         )?;
         Ok(changed == 1)
     }
@@ -3016,7 +3853,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, repo, host, pid, started_at, heartbeat_at, status,
                     current_fingerprint, phase, provider, model, daily_pr_limit,
-                    repo_path, service_unit, config_json, last_error, progress_at
+                    repo_path, service_unit, config_json, last_error, progress_at,
+                    startup_config_json
              FROM runners ORDER BY heartbeat_at DESC, id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -3037,6 +3875,7 @@ impl Store {
                 repo_path: row.get(12)?,
                 service_unit: row.get(13)?,
                 config_json: row.get(14)?,
+                startup_config_json: row.get(17)?,
                 last_error: row.get(15)?,
             })
         })?;
@@ -3134,7 +3973,26 @@ impl Store {
     pub fn start_run(&self, r: &RunStart) -> ShanResult<()> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        tx.execute(
+        Self::insert_run_on(&tx, r)?;
+        let changed = tx.execute(
+            "UPDATE issues SET owner_runner_id = ?2 WHERE fingerprint = ?1",
+            rusqlite::params![r.fingerprint, r.runner_id],
+        )?;
+        if changed == 0 {
+            return Err(ShanError::UnknownIssue(r.fingerprint.clone()));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Standalone CLI bookkeeping only: no issue is required, created or
+    /// claimed. The caller must still hold the checkout lease for any work.
+    pub fn start_standalone_run(&self, r: &RunStart) -> ShanResult<()> {
+        Self::insert_run_on(&self.lock(), r)
+    }
+
+    fn insert_run_on(conn: &Connection, r: &RunStart) -> ShanResult<()> {
+        conn.execute(
             "INSERT INTO runs(id, fingerprint, runner_id, repo, started_at, phase, provider, model)
              VALUES (?1, ?2, ?3, ?4, ?5, 'claim', ?6, ?7)",
             rusqlite::params![
@@ -3147,14 +4005,6 @@ impl Store {
                 r.model
             ],
         )?;
-        let changed = tx.execute(
-            "UPDATE issues SET owner_runner_id = ?2 WHERE fingerprint = ?1",
-            rusqlite::params![r.fingerprint, r.runner_id],
-        )?;
-        if changed == 0 {
-            return Err(ShanError::UnknownIssue(r.fingerprint.clone()));
-        }
-        tx.commit()?;
         Ok(())
     }
 
@@ -3325,6 +4175,17 @@ impl Store {
         }
     }
 
+    /// Exact primary-key lookup, including standalone runs without an issue.
+    pub fn run_by_id(&self, id: &str) -> ShanResult<Option<RunRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!("SELECT {RUN_COLUMNS} FROM runs WHERE id=?1"))?;
+        let mut rows = stmt.query([id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::run_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
     /// One run by id, scoped to its issue. Unlike `runs_for(.., N)` this is
     /// not limited to a recent-run window, so an old run stays addressable.
     pub fn run_for(&self, fingerprint: &str, id: &str) -> ShanResult<Option<RunRow>> {
@@ -3416,6 +4277,510 @@ impl Store {
     ) -> ShanResult<()> {
         record_event_on(&self.lock(), fingerprint, now_ms, repo, actor, kind, detail)
     }
+}
+
+const DELIVERY_COLUMNS: &str = "id, run_id, fingerprint, repo, branch, base, head_sha, state,
+    pr_url, pr_number, detail, created_at, updated_at";
+
+// Runner-backed checkout authority lasts only as long as that exact runner's
+// registration. Standalone claims have neither runner identity field populated.
+const CHECKOUT_CLAIM_PREDICATE: &str = "path=?1 AND token=?2 AND generation=?3 AND lease_until > ?4
+    AND ((runner_id IS NULL AND runner_instance_id IS NULL)
+        OR EXISTS(SELECT 1 FROM runners
+            WHERE runners.id=checkout_leases.runner_id
+              AND runners.instance_id=checkout_leases.runner_instance_id
+              AND runners.repo_path=checkout_leases.path AND runners.lease_until > ?4))";
+
+fn validate_delivery_start(delivery: &DeliveryRow, start: &DeliveryStart) -> ShanResult<()> {
+    if delivery.fingerprint != start.fingerprint
+        || delivery.base != start.base
+        || matches!(
+            (delivery.run_id.as_deref(), start.run_id.as_deref()),
+            (Some(original), Some(requested)) if original != requested
+        )
+    {
+        return Err(ShanError::DeliveryIdentityMismatch);
+    }
+    // Missing legacy provenance is never backfilled from a later claimant.
+    Ok(())
+}
+
+fn begin_delivery_on(conn: &Connection, start: &DeliveryStart) -> ShanResult<DeliveryRow> {
+    conn.execute(
+        "INSERT INTO deliveries
+            (id, run_id, fingerprint, repo, branch, base, head_sha, state, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'intent', ?8, ?8)
+         ON CONFLICT(repo, branch, head_sha) DO NOTHING",
+        rusqlite::params![
+            start.id,
+            start.run_id,
+            start.fingerprint,
+            start.repo,
+            start.branch,
+            start.base,
+            start.head_sha,
+            start.now,
+        ],
+    )?;
+    Ok(conn.query_row(
+        &format!(
+            "SELECT {DELIVERY_COLUMNS} FROM deliveries
+             WHERE repo=?1 AND branch=?2 AND head_sha=?3"
+        ),
+        rusqlite::params![start.repo, start.branch, start.head_sha],
+        delivery_from_row,
+    )?)
+}
+
+fn claim_delivery_on(
+    conn: &Connection,
+    delivery: DeliveryRow,
+    owner: &str,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> ShanResult<Option<DeliveryClaim>> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let changed = conn.execute(
+        "UPDATE deliveries SET claim_owner=?2, claim_token=?3,
+            claim_generation=claim_generation+1, claim_until=?4
+         WHERE id=?1 AND state IN ('intent','branch_only','pushed','pr_requested','ambiguous')
+           AND (claim_token IS NULL OR claim_until <= ?5)",
+        rusqlite::params![
+            delivery.id,
+            owner,
+            token,
+            now_ms.saturating_add(ttl_ms),
+            now_ms
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    let generation = conn.query_row(
+        "SELECT claim_generation FROM deliveries WHERE id=?1",
+        [&delivery.id],
+        |row| row.get(0),
+    )?;
+    Ok(Some(DeliveryClaim {
+        delivery,
+        token,
+        generation,
+    }))
+}
+
+fn owned_delivery_on(
+    conn: &Connection,
+    claim: &DeliveryClaim,
+    now_ms: i64,
+) -> ShanResult<DeliveryRow> {
+    conn.query_row(
+        &format!(
+            "SELECT {DELIVERY_COLUMNS} FROM deliveries
+             WHERE id=?1 AND claim_token=?2 AND claim_generation=?3 AND claim_until > ?4"
+        ),
+        rusqlite::params![claim.delivery.id, claim.token, claim.generation, now_ms],
+        delivery_from_row,
+    )
+    .optional()?
+    .ok_or(ShanError::OwnershipLost)
+}
+
+fn delivery_transition_allowed(from: DeliveryState, to: DeliveryState) -> bool {
+    use DeliveryState::*;
+    match from {
+        Intent => matches!(
+            to,
+            BranchOnly | Pushed | Ambiguous | Failed | Superseded | PrCreated
+        ),
+        BranchOnly => to == BranchPushed,
+        Pushed => matches!(
+            to,
+            PrRequested | Ambiguous | Failed | Superseded | PrCreated
+        ),
+        PrRequested => matches!(to, Ambiguous | Failed | PrCreated),
+        // A reconciler can retry only after checking the remote outcome.
+        Ambiguous => matches!(to, PrRequested | Failed | PrCreated),
+        BranchPushed | PrCreated | Failed | Superseded => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_delivery_owned_on(
+    conn: &Connection,
+    claim: &DeliveryClaim,
+    state: DeliveryState,
+    pr_url: Option<&str>,
+    pr_number: Option<u64>,
+    detail: Option<&str>,
+    now_ms: i64,
+) -> ShanResult<()> {
+    let delivery = owned_delivery_on(conn, claim, now_ms)?;
+    if !delivery_transition_allowed(delivery.state, state) {
+        return Err(ShanError::InvalidTransition {
+            from: delivery.state.as_str().into(),
+            to: state.as_str().into(),
+        });
+    }
+    pr_slots::sync_owned_on(conn, claim, state, pr_url, now_ms)?;
+    let terminal = matches!(
+        state,
+        DeliveryState::BranchPushed
+            | DeliveryState::PrCreated
+            | DeliveryState::Failed
+            | DeliveryState::Superseded
+    );
+    let changed = conn.execute(
+        "UPDATE deliveries SET state=?2, pr_url=COALESCE(?3, pr_url),
+            pr_number=COALESCE(?4, pr_number), detail=COALESCE(?5, detail), updated_at=?6,
+            claim_owner=CASE WHEN ?10 THEN NULL ELSE claim_owner END,
+            claim_token=CASE WHEN ?10 THEN NULL ELSE claim_token END,
+            claim_until=CASE WHEN ?10 THEN 0 ELSE claim_until END
+         WHERE id=?1 AND claim_token=?7 AND claim_generation=?8 AND claim_until > ?6
+           AND state=?9",
+        rusqlite::params![
+            delivery.id,
+            state.as_str(),
+            pr_url,
+            pr_number,
+            detail,
+            now_ms,
+            claim.token,
+            claim.generation,
+            delivery.state.as_str(),
+            terminal
+        ],
+    )?;
+    if changed == 0 {
+        return Err(ShanError::OwnershipLost);
+    }
+    Ok(())
+}
+
+fn adopt_delivered_pr_on(
+    conn: &Connection,
+    fingerprint: &str,
+    pr_url: &str,
+    now_ms: i64,
+    created_at_ms: Option<i64>,
+) -> ShanResult<bool> {
+    let issue: Option<(String, String)> = conn
+        .query_row(
+            "SELECT state, repo FROM issues WHERE fingerprint=?1",
+            [fingerprint],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((state, repo)) = issue else {
+        return Ok(false);
+    };
+    let state = State::parse(&state).ok_or(ShanError::UnknownState(state))?;
+    if matches!(
+        state,
+        State::Merged | State::Rejected | State::Escalated | State::Ignored
+    ) {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE issues SET state='pr_open', pr_url=?2,
+            pr_opened_at=CASE WHEN pr_url=?2 THEN COALESCE(pr_opened_at,?4) ELSE ?4 END,
+            state_changed_at=?3, owner_runner_id=NULL WHERE fingerprint=?1",
+        rusqlite::params![fingerprint, pr_url, now_ms, created_at_ms],
+    )?;
+    record_event_on(
+        conn,
+        fingerprint,
+        now_ms,
+        Some(&repo),
+        "runner",
+        "state_changed",
+        "delivery recovered: PR adopted from GitHub",
+    )?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_ci_rejection_on(
+    conn: &Connection,
+    fingerprint: &str,
+    expected_pr_url: &str,
+    now_ms: i64,
+    max_attempts: u64,
+    cooldown_until_ms: i64,
+    detail: &str,
+    actor: &str,
+) -> ShanResult<FailureOutcome> {
+    let (repo, attempts): (String, u64) = conn.query_row(
+        "SELECT repo,attempts FROM issues WHERE fingerprint=?1 AND state='pr_open' AND pr_url=?2",
+        rusqlite::params![fingerprint, expected_pr_url],
+        |row| Ok((row.get(0)?, row.get::<_, u64>(1)? + 1)),
+    )?;
+    let (to, kind, cooldown) = if attempts >= max_attempts {
+        (State::Ignored, "ignored", 0)
+    } else {
+        (State::New, "state_changed", cooldown_until_ms)
+    };
+    conn.execute(
+        "UPDATE issues SET state=?2,attempts=?3,cooldown_until=?4,owner_runner_id=NULL,
+            state_changed_at=?5,pr_url=NULL,pr_opened_at=NULL
+         WHERE fingerprint=?1 AND state='pr_open' AND pr_url=?6",
+        rusqlite::params![
+            fingerprint,
+            to.as_str(),
+            attempts,
+            cooldown,
+            now_ms,
+            expected_pr_url
+        ],
+    )?;
+    for event in ["rejected", kind] {
+        record_event_on(conn, fingerprint, now_ms, Some(&repo), actor, event, detail)?;
+    }
+    Ok(FailureOutcome {
+        disposition: if to == State::Ignored {
+            FailureDisposition::Ignored
+        } else {
+            FailureDisposition::Retry
+        },
+        state: to,
+        attempts,
+    })
+}
+
+/// The caller holds an IMMEDIATE transaction and has selected eligible work.
+fn claim_ci_watch_on(
+    conn: &Connection,
+    watch: CiWatchRow,
+    now: i64,
+    lease_ms: i64,
+) -> ShanResult<CiWatchClaim> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let generation = conn.query_row(
+        "UPDATE ci_watches SET claim_token=?2,claim_generation=claim_generation+1,
+            claim_until=?3 WHERE id=?1 RETURNING claim_generation",
+        rusqlite::params![watch.id, token, now.saturating_add(lease_ms)],
+        |row| row.get(0),
+    )?;
+    Ok(CiWatchClaim {
+        watch,
+        token,
+        generation,
+    })
+}
+
+fn ci_watch_owned_on(
+    conn: &Connection,
+    claim: &CiWatchClaim,
+    now: i64,
+) -> ShanResult<Option<CiWatchRow>> {
+    let saved = conn
+        .query_row(
+            &format!(
+                "SELECT {CI_WATCH_COLUMNS} FROM ci_watches
+            WHERE id=?1 AND claim_token=?2 AND claim_generation=?3 AND claim_until>?4
+              AND state IN ('pending','green')"
+            ),
+            rusqlite::params![claim.watch.id, claim.token, claim.generation, now],
+            ci_watch_from_row,
+        )
+        .optional()?;
+    Ok(saved.filter(|watch| {
+        watch.run_id == claim.watch.run_id
+            && watch.repo == claim.watch.repo
+            && watch.fingerprint == claim.watch.fingerprint
+            && watch.pr_url == claim.watch.pr_url
+            && watch.slug == claim.watch.slug
+            && watch.pr_number == claim.watch.pr_number
+            && watch.head_sha == claim.watch.head_sha
+    }))
+}
+
+/// URL alone is insufficient: the most recent associated run/delivery must
+/// still belong to this watch, even if a later delivery reuses the PR and SHA.
+fn ci_watch_owns_issue_on(conn: &Connection, watch: &CiWatchRow) -> ShanResult<bool> {
+    let open: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM issues WHERE fingerprint=?1 AND repo=?2
+         AND state='pr_open' AND pr_url=?3)",
+        rusqlite::params![watch.fingerprint, watch.repo, watch.pr_url],
+        |row| row.get(0),
+    )?;
+    if !open {
+        return Ok(false);
+    }
+    let latest_run: Option<(String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT id,commit_sha,pr_url FROM runs WHERE fingerprint=?1 AND repo=?2
+         ORDER BY started_at DESC,rowid DESC LIMIT 1",
+            rusqlite::params![watch.fingerprint, watch.repo],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    match (watch.run_id.as_deref(), latest_run) {
+        (Some(id), Some((saved, sha, pr)))
+            if saved == id
+                && sha.as_deref() == Some(watch.head_sha.as_str())
+                && pr.as_deref() == Some(watch.pr_url.as_str()) => {}
+        (None, None) => {}
+        _ => return Ok(false),
+    }
+    let latest_delivery: Option<(Option<String>, String, Option<String>)> = conn
+        .query_row(
+            "SELECT run_id,head_sha,pr_url FROM deliveries WHERE fingerprint=?1 AND repo=?2
+         ORDER BY created_at DESC,rowid DESC LIMIT 1",
+            rusqlite::params![watch.fingerprint, watch.repo],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(latest_delivery.is_none_or(|(run, sha, pr)| {
+        // A delivery without run provenance cannot prove which cycle owns the
+        // issue. Observation still finishes, but issue rejection is withheld.
+        watch.run_id.is_some()
+            && run == watch.run_id
+            && sha == watch.head_sha
+            && pr.as_deref() == Some(watch.pr_url.as_str())
+    }))
+}
+
+fn record_repair_memory_on(
+    conn: &Connection,
+    entry: &RepairMemoryEntry,
+    source_kind: &str,
+    source_id: &str,
+) -> ShanResult<()> {
+    let saved_evidence: Option<(Option<String>, bool)> = conn
+        .query_row(
+            "SELECT pr_url,valid=1 AND revoked_at IS NULL FROM repair_memory_evidence
+         WHERE repo=?1 AND fingerprint=?2 AND source_kind=?3 AND source_id=?4 AND commit_sha=?5",
+            rusqlite::params![
+                entry.repo,
+                entry.fingerprint,
+                source_kind,
+                source_id,
+                entry.commit_sha
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((pr, valid)) = saved_evidence {
+        if pr != entry.pr_url {
+            return Err(ShanError::InvalidMemorySource);
+        }
+        // A late replay must not recreate or refresh a revoked source's summary.
+        if !valid {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        "INSERT INTO repair_memory_evidence
+            (repo,fingerprint,source_kind,source_id,commit_sha,pr_url,root_cause,change_stat,files,recorded_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(repo,fingerprint,source_kind,source_id,commit_sha) DO NOTHING",
+        rusqlite::params![entry.repo, entry.fingerprint, source_kind, source_id, entry.commit_sha,
+            entry.pr_url, entry.root_cause, entry.change_stat, entry.files, entry.recorded_at],
+    )?;
+    conn.execute(
+        "INSERT INTO repair_memory
+            (repo,fingerprint,commit_sha,pr_url,root_cause,change_stat,files,recorded_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(repo,fingerprint) DO UPDATE SET
+            commit_sha=excluded.commit_sha,pr_url=excluded.pr_url,root_cause=excluded.root_cause,
+            change_stat=excluded.change_stat,files=excluded.files,recorded_at=excluded.recorded_at
+         WHERE excluded.recorded_at >= repair_memory.recorded_at",
+        rusqlite::params![
+            entry.repo,
+            entry.fingerprint,
+            entry.commit_sha,
+            entry.pr_url,
+            entry.root_cause,
+            entry.change_stat,
+            entry.files,
+            entry.recorded_at
+        ],
+    )?;
+    // Bound the visible summaries, not the evidence: pruning must not erase a
+    // revoked source's tombstone and let a late green observation revive it.
+    conn.execute(
+        "DELETE FROM repair_memory WHERE repo=?1 AND disabled=0 AND fingerprint NOT IN (
+            SELECT fingerprint FROM repair_memory WHERE repo=?1 AND disabled=0
+            ORDER BY recorded_at DESC,fingerprint LIMIT ?2)",
+        rusqlite::params![entry.repo, REPAIR_MEMORY_KEEP as i64],
+    )?;
+    Ok(())
+}
+
+fn revoke_pr_evidence_on(
+    conn: &Connection,
+    repo: &str,
+    fingerprint: &str,
+    pr_url: &str,
+    reason: &str,
+    now: i64,
+) -> ShanResult<()> {
+    conn.execute(
+        "UPDATE repair_memory_evidence SET valid=0,
+            revoked_at=COALESCE(revoked_at,?5),revocation_reason=COALESCE(revocation_reason,?4)
+         WHERE repo=?1 AND fingerprint=?2 AND pr_url=?3",
+        rusqlite::params![repo, fingerprint, pr_url, reason, now],
+    )?;
+    Ok(())
+}
+
+const CI_WATCH_COLUMNS: &str = "id,run_id,fingerprint,repo,pr_url,slug,pr_number,head_sha,
+    state,last_verdict,last_checked_at,next_check_at,check_attempts,created_at,updated_at,
+    terminal_at,last_error,root_cause,change_stat,memory_written,max_attempts";
+
+fn upsert_ci_watch_on(conn: &Connection, input: &CiWatchInput) -> ShanResult<()> {
+    conn.execute(
+        "INSERT INTO ci_watches
+            (run_id, fingerprint, repo, pr_url, slug, pr_number, head_sha,
+             state, next_check_at, created_at, updated_at, root_cause, change_stat, max_attempts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?9, ?10, ?11, ?12)
+         ON CONFLICT DO NOTHING",
+        rusqlite::params![
+            input.run_id,
+            input.fingerprint,
+            input.repo,
+            input.pr_url,
+            input.slug,
+            input.pr_number,
+            input.head_sha,
+            input.next_check_at,
+            input.now,
+            input.root_cause,
+            input.change_stat,
+            input.max_attempts
+        ],
+    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CI_WATCH_COLUMNS} FROM ci_watches
+         WHERE (slug=?1 AND pr_number=?2 AND head_sha=?3)
+            OR (repo=?4 AND pr_url=?5 AND head_sha=?3)"
+    ))?;
+    let watches = stmt
+        .query_map(
+            rusqlite::params![
+                input.slug,
+                input.pr_number,
+                input.head_sha,
+                input.repo,
+                input.pr_url
+            ],
+            ci_watch_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if watches.len() != 1
+        || watches.iter().any(|watch| {
+            watch.repo != input.repo
+                || watch.fingerprint != input.fingerprint
+                || watch.run_id != input.run_id
+                || watch.pr_url != input.pr_url
+                || watch.slug != input.slug
+                || watch.pr_number != input.pr_number
+                || watch.head_sha != input.head_sha
+        })
+    {
+        return Err(ShanError::CiWatchIdentityMismatch);
+    }
+    Ok(())
 }
 
 fn delivery_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRow> {
@@ -3554,7 +4919,7 @@ mod tests {
         example.com/spike-target.Average(...)\n\
         \t/app/calc.go:17 +0x8c";
 
-    fn signal() -> Signal {
+    pub(super) fn signal() -> Signal {
         Signal {
             repo: "example.com/spike-target".to_string(),
             language: "go".to_string(),
@@ -3563,6 +4928,7 @@ mod tests {
             message: None,
             log_window: Vec::new(),
             stack_trace: TRACE.to_string(),
+            ..Signal::default()
         }
     }
 
@@ -3608,7 +4974,7 @@ mod tests {
         }
     }
 
-    fn abort_event(store: &Store, kind: &str) {
+    pub(super) fn abort_event(store: &Store, kind: &str) {
         store
             .lock()
             .execute_batch(&format!(
@@ -3618,9 +4984,9 @@ mod tests {
             .expect("trigger");
     }
 
-    const TEST_PR_URL: &str = "https://example.com/pull/1";
+    pub(super) const TEST_PR_URL: &str = "https://example.com/pull/1";
 
-    fn advance_to_pr(store: &Store, fp: &str) {
+    pub(super) fn advance_to_pr(store: &Store, fp: &str) {
         for state in [State::Triggered, State::Fixing, State::PrOpen] {
             store.set_state(fp, state, 2, None).expect("advance to PR");
         }
@@ -3851,6 +5217,1009 @@ mod tests {
         assert_eq!(store.list_issues().expect("issues")[0].state, "ignored");
     }
 
+    fn delivery_start() -> DeliveryStart {
+        DeliveryStart {
+            id: "delivery-claim".into(),
+            run_id: None,
+            fingerprint: "fp-delivery".into(),
+            repo: "example.com/app".into(),
+            branch: "agent/fix/fp".into(),
+            base: "main".into(),
+            head_sha: "abc123".into(),
+            now: 10,
+        }
+    }
+
+    #[test]
+    fn delivery_claim_rejects_conflicting_provenance_without_changing_original() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("provenance.db");
+        let first = Store::open(&path).expect("first");
+        let second = Store::open(&path).expect("second");
+        let start = DeliveryStart {
+            run_id: Some("original-run".into()),
+            ..delivery_start()
+        };
+        first.begin_delivery(&start).expect("original");
+        for field in ["fingerprint", "base", "run_id"] {
+            let mut conflicting = start.clone();
+            match field {
+                "fingerprint" => conflicting.fingerprint = "another-issue".into(),
+                "base" => conflicting.base = "release".into(),
+                "run_id" => conflicting.run_id = Some("another-run".into()),
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    second.claim_delivery(&conflicting, "other", 100),
+                    Err(ShanError::DeliveryIdentityMismatch)
+                ),
+                "{field}"
+            );
+            let untouched: (i64, bool) = first
+                .lock()
+                .query_row(
+                    "SELECT claim_generation,claim_token IS NULL FROM deliveries WHERE id=?1",
+                    [&start.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("unchanged claim");
+            assert_eq!(untouched, (0, true));
+        }
+        let claim = second
+            .claim_delivery(
+                &DeliveryStart {
+                    run_id: None,
+                    ..start.clone()
+                },
+                "recovery",
+                100,
+            )
+            .expect("recover original provenance")
+            .expect("claimed");
+        assert_eq!(claim.delivery.run_id, start.run_id);
+        assert_eq!(claim.delivery.fingerprint, start.fingerprint);
+        assert_eq!(claim.delivery.base, start.base);
+
+        let legacy = DeliveryStart {
+            id: "legacy".into(),
+            head_sha: "legacy-head".into(),
+            run_id: None,
+            ..start
+        };
+        first.begin_delivery(&legacy).expect("legacy intent");
+        let claim = second
+            .claim_delivery(
+                &DeliveryStart {
+                    run_id: Some("later-run".into()),
+                    ..legacy.clone()
+                },
+                "later",
+                100,
+            )
+            .expect("legacy claim")
+            .expect("claimed");
+        assert!(claim.delivery.run_id.is_none());
+        assert!(first
+            .begin_delivery(&legacy)
+            .expect("legacy unchanged")
+            .run_id
+            .is_none());
+    }
+
+    #[test]
+    fn delivery_claims_fence_expired_replaced_and_released_owners() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("claims.db");
+        let first = Store::open(&path).expect("first connection");
+        let second = Store::open(&path).expect("second connection");
+        let start = delivery_start();
+        let old = first
+            .claim_delivery(&start, "owner-a", 10)
+            .expect("claim")
+            .expect("won");
+        assert!(!format!("{old:?}").contains(&old.token));
+        let unchanged = first
+            .begin_delivery(&DeliveryStart {
+                id: "duplicate".into(),
+                run_id: Some("must-not-fill".into()),
+                now: 11,
+                ..start.clone()
+            })
+            .expect("read existing intent");
+        assert!(unchanged.run_id.is_none());
+        assert_eq!(unchanged.updated_at, 10);
+        assert!(second
+            .claim_delivery(&start, "owner-a", 10)
+            .expect("contend")
+            .is_none());
+        assert!(first.renew_delivery_claim(&old, 19, 10).expect("renew"));
+        assert!(second
+            .claim_pending_deliveries(&start.repo, "b", 20, 10, 1)
+            .expect("still held")
+            .is_empty());
+        assert!(!first.delivery_claim_valid(&old, 29).expect("expired"));
+        assert!(!first
+            .renew_delivery_claim(&old, 29, 10)
+            .expect("no resurrection"));
+        assert!(!first
+            .release_delivery_claim(&old, 29)
+            .expect("expired release"));
+        assert!(matches!(
+            first.mark_delivery_owned(&old, DeliveryState::Pushed, None, None, None, 29),
+            Err(ShanError::OwnershipLost)
+        ));
+        assert!(matches!(
+            first.complete_delivery_owned(&old, TEST_PR_URL, 1, None, 29),
+            Err(ShanError::OwnershipLost)
+        ));
+        assert!(matches!(
+            first.supersede_delivery_owned(&old, "next", 29, 10),
+            Err(ShanError::OwnershipLost)
+        ));
+        let next = second
+            .claim_pending_deliveries(&start.repo, "owner-b", 29, 10, 1)
+            .expect("takeover")
+            .pop()
+            .expect("claimed");
+        assert!(next.generation > old.generation);
+        assert!(next.token != old.token);
+        assert_eq!(next.delivery.id, old.delivery.id);
+        assert!(!first
+            .renew_delivery_claim(&old, 30, 10)
+            .expect("stale renew"));
+        assert!(!first
+            .release_delivery_claim(&old, 30)
+            .expect("stale release"));
+        assert!(matches!(
+            first.mark_delivery_owned(&old, DeliveryState::Failed, None, None, None, 30),
+            Err(ShanError::OwnershipLost)
+        ));
+        let mut wrong_generation = next.clone();
+        wrong_generation.generation += 1;
+        assert!(!first
+            .delivery_claim_valid(&wrong_generation, 30)
+            .expect("fence"));
+        assert!(second.release_delivery_claim(&next, 30).expect("release"));
+        assert!(!second
+            .release_delivery_claim(&next, 30)
+            .expect("release once"));
+        assert!(!second
+            .renew_delivery_claim(&next, 30, 10)
+            .expect("released"));
+        let third = first
+            .claim_delivery(&DeliveryStart { now: 31, ..start }, "owner-a", 10)
+            .expect("reacquire")
+            .expect("claim");
+        assert!(third.generation > next.generation);
+    }
+
+    #[test]
+    fn branch_only_claims_fence_stale_owners_without_entering_pr_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("branch-only-claims.db");
+        let first = Store::open(&path).expect("first connection");
+        let second = Store::open(&path).expect("second connection");
+        let start = delivery_start();
+        let old = first
+            .claim_delivery(&start, "owner-a", 10)
+            .expect("claim")
+            .expect("won");
+        first
+            .mark_delivery_owned(&old, DeliveryState::BranchOnly, None, None, None, 11)
+            .expect("persist branch-only mode");
+        let row = second.begin_delivery(&start).expect("durable mode");
+        assert_eq!(row.state, DeliveryState::BranchOnly);
+        assert_eq!(row.state.as_str(), "branch_only");
+        assert!(second.delivery_claim_valid(&old, 11).expect("live claim"));
+        assert!(second
+            .claim_delivery(
+                &DeliveryStart {
+                    now: 11,
+                    ..start.clone()
+                },
+                "owner-b",
+                10,
+            )
+            .expect("contend")
+            .is_none());
+        assert!(first.renew_delivery_claim(&old, 19, 10).expect("renew"));
+        assert!(second.delivery_claim_valid(&old, 20).expect("renewed"));
+        assert!(!first.delivery_claim_valid(&old, 29).expect("expired"));
+        assert!(!first
+            .renew_delivery_claim(&old, 29, 10)
+            .expect("no resurrection"));
+        assert!(!first
+            .release_delivery_claim(&old, 29)
+            .expect("expired release"));
+        assert!(second
+            .pending_deliveries(&start.repo)
+            .expect("pending")
+            .is_empty());
+        assert!(second
+            .claim_pending_deliveries(&start.repo, "reconciler", 29, 10, 10)
+            .expect("expired branch-only is not recoverable")
+            .is_empty());
+        let next = second
+            .claim_delivery(
+                &DeliveryStart {
+                    now: 29,
+                    ..start.clone()
+                },
+                "owner-b",
+                10,
+            )
+            .expect("explicit takeover")
+            .expect("won");
+        assert_eq!(next.delivery.state, DeliveryState::BranchOnly);
+        assert_eq!(next.delivery.id, old.delivery.id);
+        assert!(next.generation > old.generation);
+        assert!(next.token != old.token);
+        assert!(!first.delivery_claim_valid(&old, 30).expect("stale claim"));
+        assert!(!first
+            .renew_delivery_claim(&old, 30, 10)
+            .expect("stale renew"));
+        assert!(!first
+            .release_delivery_claim(&old, 30)
+            .expect("stale release"));
+        assert!(matches!(
+            first.mark_delivery_owned(&old, DeliveryState::BranchPushed, None, None, None, 30),
+            Err(ShanError::OwnershipLost)
+        ));
+        let mut wrong_generation = next.clone();
+        wrong_generation.generation += 1;
+        assert!(!first
+            .delivery_claim_valid(&wrong_generation, 30)
+            .expect("generation fence"));
+        assert!(second.release_delivery_claim(&next, 30).expect("release"));
+        assert!(!second
+            .release_delivery_claim(&next, 30)
+            .expect("release once"));
+        assert!(!second
+            .renew_delivery_claim(&next, 30, 10)
+            .expect("released renew"));
+        assert!(first
+            .claim_pending_deliveries(&start.repo, "reconciler", 31, 10, 10)
+            .expect("released branch-only is not recoverable")
+            .is_empty());
+        let third = first
+            .claim_delivery(
+                &DeliveryStart {
+                    now: 31,
+                    ..start.clone()
+                },
+                "owner-c",
+                10,
+            )
+            .expect("explicit reacquire")
+            .expect("won");
+        assert!(third.generation > next.generation);
+        assert_eq!(
+            second.begin_delivery(&start).expect("preserved").state,
+            DeliveryState::BranchOnly
+        );
+    }
+
+    #[test]
+    fn branch_only_terminal_transition_revokes_claim_and_cannot_join_pr_flow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("branch-only-terminal.db");
+        let store = Store::open(&path).expect("store");
+        let observer = Store::open(&path).expect("observer");
+        let start = delivery_start();
+        let claim = store
+            .claim_delivery(&start, "owner", 100)
+            .expect("claim")
+            .expect("won");
+        assert!(matches!(
+            store.mark_delivery_owned(&claim, DeliveryState::BranchPushed, None, None, None, 11),
+            Err(ShanError::InvalidTransition { .. })
+        ));
+        store
+            .mark_delivery_owned(&claim, DeliveryState::BranchOnly, None, None, None, 11)
+            .expect("branch-only mode");
+        for state in [
+            DeliveryState::Intent,
+            DeliveryState::BranchOnly,
+            DeliveryState::Pushed,
+            DeliveryState::PrRequested,
+            DeliveryState::PrCreated,
+            DeliveryState::Ambiguous,
+            DeliveryState::Failed,
+            DeliveryState::Superseded,
+        ] {
+            assert!(
+                matches!(
+                    store.mark_delivery_owned(&claim, state, None, None, None, 12),
+                    Err(ShanError::InvalidTransition { .. })
+                ),
+                "branch-only cannot transition to {state:?}"
+            );
+        }
+        assert!(matches!(
+            store.complete_delivery_owned(&claim, TEST_PR_URL, 1, None, 12),
+            Err(ShanError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            store.supersede_delivery_owned(&claim, "another-head", 12, 100),
+            Err(ShanError::InvalidTransition { .. })
+        ));
+        assert!(observer
+            .pending_deliveries(&start.repo)
+            .expect("no leaked intent")
+            .is_empty());
+        assert!(observer
+            .delivery_claim_valid(&claim, 12)
+            .expect("still live"));
+        store
+            .mark_delivery_owned(&claim, DeliveryState::BranchPushed, None, None, None, 13)
+            .expect("branch-only completed");
+        let row = observer
+            .begin_delivery(&start)
+            .expect("read terminal identity");
+        assert_eq!(row.id, claim.delivery.id);
+        assert_eq!(row.state, DeliveryState::BranchPushed);
+        assert_eq!(row.state.as_str(), "branch_pushed");
+        assert_eq!(row.head_sha, start.head_sha);
+        assert!(row.pr_url.is_none());
+        assert!(row.pr_number.is_none());
+        assert!(!observer.delivery_claim_valid(&claim, 14).expect("terminal"));
+        assert!(!observer
+            .renew_delivery_claim(&claim, 14, 100)
+            .expect("terminal renew"));
+        assert!(!observer
+            .release_delivery_claim(&claim, 14)
+            .expect("terminal release"));
+        assert!(matches!(
+            store.mark_delivery_owned(&claim, DeliveryState::BranchPushed, None, None, None, 14),
+            Err(ShanError::OwnershipLost)
+        ));
+        assert!(observer
+            .claim_delivery(
+                &DeliveryStart {
+                    now: 14,
+                    ..start.clone()
+                },
+                "other",
+                100,
+            )
+            .expect("terminal claim")
+            .is_none());
+        assert!(observer
+            .pending_deliveries(&start.repo)
+            .expect("pending")
+            .is_empty());
+        assert!(observer
+            .claim_pending_deliveries(&start.repo, "reconciler", 1_000, 100, 10)
+            .expect("no terminal recovery")
+            .is_empty());
+    }
+
+    #[test]
+    fn delivery_claim_competition_uses_independent_connections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("competition.db");
+        let stores = [
+            Store::open(&path).expect("a"),
+            Store::open(&path).expect("b"),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = stores
+            .into_iter()
+            .enumerate()
+            .map(|(i, store)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .claim_delivery(&delivery_start(), &format!("owner-{i}"), 100)
+                        .expect("claim")
+                })
+            })
+            .collect();
+        let winners = threads
+            .into_iter()
+            .filter_map(|t| t.join().expect("join"))
+            .count();
+        assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn pending_delivery_batches_are_bounded_disjoint_and_repo_scoped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("batches.db");
+        let store = Store::open(&path).expect("seed");
+        for i in 0..5 {
+            store
+                .begin_delivery(&DeliveryStart {
+                    id: format!("d-{i}"),
+                    head_sha: format!("head-{i}"),
+                    ..delivery_start()
+                })
+                .expect("intent");
+        }
+        store
+            .begin_delivery(&DeliveryStart {
+                id: "other-repo".into(),
+                repo: "example.com/other".into(),
+                ..delivery_start()
+            })
+            .expect("other repo");
+        let stores = [
+            Store::open(&path).expect("a"),
+            Store::open(&path).expect("b"),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = stores
+            .into_iter()
+            .enumerate()
+            .map(|(i, store)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .claim_pending_deliveries("example.com/app", &format!("o-{i}"), 10, 100, 2)
+                        .expect("batch")
+                })
+            })
+            .collect();
+        let mut ids = BTreeSet::new();
+        for thread in threads {
+            let claims = thread.join().expect("join");
+            assert_eq!(claims.len(), 2);
+            for claim in claims {
+                assert!(ids.insert(claim.delivery.id));
+            }
+        }
+        assert_eq!(ids.len(), 4);
+        assert!(store
+            .claim_pending_deliveries("example.com/app", "last", 10, 100, 0)
+            .expect("zero limit")
+            .is_empty());
+        assert_eq!(
+            store
+                .claim_pending_deliveries("example.com/app", "last", 10, 100, 10)
+                .expect("remainder")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn owned_delivery_transitions_reject_backwards_and_terminal_replay() {
+        let store = Store::open(":memory:").expect("store");
+        let start = delivery_start();
+        let claim = store
+            .claim_delivery(&start, "owner", 100)
+            .expect("claim")
+            .expect("won");
+        assert!(matches!(
+            store.mark_delivery_owned(&claim, DeliveryState::PrRequested, None, None, None, 11),
+            Err(ShanError::InvalidTransition { .. })
+        ));
+        store
+            .mark_delivery_owned(&claim, DeliveryState::Pushed, None, None, None, 11)
+            .expect("pushed");
+        for state in [DeliveryState::BranchOnly, DeliveryState::BranchPushed] {
+            assert!(matches!(
+                store.mark_delivery_owned(&claim, state, None, None, None, 12),
+                Err(ShanError::InvalidTransition { .. })
+            ));
+        }
+        assert!(matches!(
+            store.mark_delivery_owned(&claim, DeliveryState::Intent, None, None, None, 12),
+            Err(ShanError::InvalidTransition { .. })
+        ));
+        assert!(store
+            .reserve_pr_slot_owned(&claim, 10, 12)
+            .expect("reserve"));
+        store
+            .mark_delivery_owned(&claim, DeliveryState::PrRequested, None, None, None, 12)
+            .expect("requested");
+        assert!(matches!(
+            store.mark_delivery_owned(&claim, DeliveryState::Pushed, None, None, None, 13),
+            Err(ShanError::InvalidTransition { .. })
+        ));
+        store
+            .mark_delivery_owned(&claim, DeliveryState::Ambiguous, None, None, None, 13)
+            .expect("uncertain");
+        store
+            .complete_delivery_owned(&claim, TEST_PR_URL, 1, None, 14)
+            .expect("standalone completion");
+        assert!(matches!(
+            store.complete_delivery_owned(&claim, TEST_PR_URL, 1, None, 15),
+            Err(ShanError::OwnershipLost)
+        ));
+        assert!(!store.delivery_claim_valid(&claim, 15).expect("terminal"));
+        assert!(!store
+            .renew_delivery_claim(&claim, 15, 100)
+            .expect("terminal renew"));
+        assert!(!store
+            .release_delivery_claim(&claim, 15)
+            .expect("terminal release"));
+        assert!(store
+            .claim_delivery(&start, "other", 100)
+            .expect("terminal claim")
+            .is_none());
+        let failed = DeliveryStart {
+            id: "failed".into(),
+            head_sha: "failed-head".into(),
+            ..start
+        };
+        let claim = store
+            .claim_delivery(&failed, "owner", 100)
+            .expect("claim")
+            .expect("won");
+        store
+            .mark_delivery_owned(
+                &claim,
+                DeliveryState::Failed,
+                None,
+                None,
+                Some("failed"),
+                15,
+            )
+            .expect("fail");
+        assert!(store
+            .claim_delivery(&failed, "other", 100)
+            .expect("terminal")
+            .is_none());
+    }
+
+    #[test]
+    fn delivery_completion_rolls_back_every_local_consequence_on_watch_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("completion.db");
+        let store = Store::open(&path).expect("store");
+        let observer = Store::open(&path).expect("independent observer");
+        store.report_signal(&signal(), 1).expect("signal");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        store
+            .start_run(&RunStart {
+                id: "run-atomic".into(),
+                fingerprint: fp.clone(),
+                runner_id: "runner".into(),
+                repo: signal().repo,
+                started_at: 2,
+                provider: None,
+                model: None,
+            })
+            .expect("run");
+        let start = DeliveryStart {
+            run_id: Some("run-atomic".into()),
+            fingerprint: fp.clone(),
+            repo: signal().repo,
+            ..delivery_start()
+        };
+        let claim = store
+            .claim_delivery(&start, "owner", 100)
+            .expect("claim")
+            .expect("won");
+        let watch = CiWatchInput {
+            run_id: start.run_id.clone(),
+            fingerprint: fp.clone(),
+            repo: start.repo.clone(),
+            pr_url: TEST_PR_URL.into(),
+            slug: "o/r".into(),
+            pr_number: 1,
+            head_sha: start.head_sha.clone(),
+            root_cause: None,
+            change_stat: None,
+            now: 20,
+            next_check_at: 20,
+            max_attempts: 3,
+        };
+        let events_before = store.events_for(&fp, 100).expect("events").len();
+        for field in [
+            "run_id",
+            "fingerprint",
+            "repo",
+            "head_sha",
+            "pr_url",
+            "pr_number",
+        ] {
+            let mut mismatched = watch.clone();
+            match field {
+                "run_id" => mismatched.run_id = Some("unrelated-run".into()),
+                "fingerprint" => mismatched.fingerprint = "unrelated-issue".into(),
+                "repo" => mismatched.repo = "example.com/other".into(),
+                "head_sha" => mismatched.head_sha = "unrelated-head".into(),
+                "pr_url" => mismatched.pr_url = "https://github.com/o/r/pull/2".into(),
+                "pr_number" => mismatched.pr_number = 2,
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    store.complete_delivery_owned(&claim, TEST_PR_URL, 1, Some(&mismatched), 20),
+                    Err(ShanError::DeliveryIdentityMismatch)
+                ),
+                "{field}"
+            );
+        }
+        for (url, number) in [("", 1), ("  ", 1), (TEST_PR_URL, 0)] {
+            assert!(matches!(
+                store.complete_delivery_owned(&claim, url, number, None, 20),
+                Err(ShanError::DeliveryIdentityMismatch)
+            ));
+        }
+        assert_eq!(
+            observer
+                .begin_delivery(&start)
+                .expect("unchanged intent")
+                .state,
+            DeliveryState::Intent
+        );
+        assert!(observer
+            .delivery_claim_valid(&claim, 20)
+            .expect("unchanged claim"));
+        let issue = observer.list_issues().expect("unchanged issue").remove(0);
+        assert_eq!(issue.state, "new");
+        assert!(issue.pr_url.is_none());
+        let run = observer.runs_for(&fp, 10).expect("unchanged run").remove(0);
+        assert!(run.commit_sha.is_none());
+        assert!(run.branch.is_none());
+        assert!(run.pr_url.is_none());
+        assert_eq!(
+            observer
+                .events_for(&fp, 100)
+                .expect("unchanged events")
+                .len(),
+            events_before
+        );
+        assert!(observer.ci_watch_for(&fp).expect("no watch").is_none());
+        store
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_ci BEFORE INSERT ON ci_watches
+            BEGIN SELECT RAISE(ABORT, 'synthetic watch failure'); END;",
+            )
+            .expect("failure injection");
+        assert!(matches!(
+            store.complete_delivery_owned_at(&claim, TEST_PR_URL, 1, Some(&watch), Some(7), 20),
+            Err(ShanError::Db(_))
+        ));
+        assert_eq!(
+            store.begin_delivery(&start).expect("intent").state,
+            DeliveryState::Intent
+        );
+        assert!(store
+            .delivery_claim_valid(&claim, 20)
+            .expect("claim rolled back"));
+        assert!(observer
+            .pr_slot_for_delivery(&start.id)
+            .expect("slot adoption rolled back")
+            .is_none());
+        assert_eq!(
+            observer.pr_slots_used(&start.repo, 0).expect("no charge"),
+            0
+        );
+        let issue = store.list_issues().expect("issues").remove(0);
+        assert_eq!(issue.state, "new");
+        assert!(issue.pr_url.is_none());
+        let runs = store.runs_for(&fp, 10).expect("runs");
+        assert!(runs[0].commit_sha.is_none());
+        assert!(runs[0].branch.is_none());
+        assert!(runs[0].pr_url.is_none());
+        assert_eq!(
+            store.events_for(&fp, 100).expect("events").len(),
+            events_before
+        );
+        assert!(store.ci_watch_for(&fp).expect("watch").is_none());
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER fail_ci")
+            .expect("remove fixture failure");
+        store
+            .complete_delivery_owned_at(&claim, TEST_PR_URL, 1, Some(&watch), Some(7), 21)
+            .expect("complete");
+        let row = store.begin_delivery(&start).expect("delivery");
+        assert_eq!(row.state, DeliveryState::PrCreated);
+        assert_eq!(row.pr_number, Some(1));
+        let issue = store.list_issues().expect("issues").remove(0);
+        assert_eq!(issue.state, "pr_open");
+        assert_eq!(issue.pr_url.as_deref(), Some(TEST_PR_URL));
+        let runs = store.runs_for(&fp, 10).expect("runs");
+        assert_eq!(runs[0].commit_sha.as_deref(), Some(start.head_sha.as_str()));
+        assert_eq!(runs[0].branch.as_deref(), Some(start.branch.as_str()));
+        assert_eq!(runs[0].pr_url.as_deref(), Some(TEST_PR_URL));
+        assert_eq!(
+            runs[0].pr_opened_at,
+            Some(7),
+            "API evidence, not confirmation time"
+        );
+        let slot = observer
+            .pr_slot_for_delivery(&start.id)
+            .expect("slot")
+            .expect("consumed in completion transaction");
+        assert_eq!(slot.state, "consumed");
+        assert_eq!(slot.created_at_ms, Some(7));
+        assert_eq!(slot.confirmed_at_ms, Some(21));
+        assert_eq!(
+            observer.pr_slots_used(&start.repo, 0).expect("one charge"),
+            1
+        );
+        assert_eq!(
+            observer
+                .prs_opened_since(&start.repo, 0)
+                .expect("API creation evidence"),
+            1
+        );
+        assert!(store.ci_watch_for(&fp).expect("watch").is_some());
+    }
+
+    #[test]
+    fn delivery_completion_uses_persisted_identity_and_refuses_conflicting_pr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("completion-identity.db");
+        let store = Store::open(&path).expect("store");
+        let observer = Store::open(&path).expect("observer");
+        let start = delivery_start();
+        let mut claim = store
+            .claim_delivery(&start, "owner", 100)
+            .expect("claim")
+            .expect("won");
+        store
+            .mark_delivery_owned(
+                &claim,
+                DeliveryState::Pushed,
+                Some(TEST_PR_URL),
+                Some(1),
+                None,
+                11,
+            )
+            .expect("persist PR identity");
+        for (url, number) in [("https://github.com/o/r/pull/2", 1), (TEST_PR_URL, 2)] {
+            assert!(matches!(
+                store.complete_delivery_owned(&claim, url, number, None, 12),
+                Err(ShanError::DeliveryIdentityMismatch)
+            ));
+            assert_eq!(
+                observer
+                    .begin_delivery(&start)
+                    .expect("unchanged delivery")
+                    .state,
+                DeliveryState::Pushed
+            );
+            assert!(observer
+                .delivery_claim_valid(&claim, 12)
+                .expect("still owned"));
+        }
+        let mut watch = CiWatchInput {
+            run_id: None,
+            fingerprint: start.fingerprint.clone(),
+            repo: start.repo.clone(),
+            pr_url: TEST_PR_URL.into(),
+            slug: "o/r".into(),
+            pr_number: 1,
+            head_sha: start.head_sha.clone(),
+            root_cause: None,
+            change_stat: None,
+            now: 12,
+            next_check_at: 12,
+            max_attempts: 3,
+        };
+        watch.run_id = Some("later-run".into());
+        assert!(matches!(
+            store.complete_delivery_owned(&claim, TEST_PR_URL, 1, Some(&watch), 12),
+            Err(ShanError::DeliveryIdentityMismatch)
+        ));
+        watch.run_id = None;
+        claim.delivery.run_id = Some("forged-run".into());
+        claim.delivery.fingerprint = "forged-issue".into();
+        claim.delivery.repo = "example.com/forged".into();
+        claim.delivery.head_sha = "forged-head".into();
+        store
+            .complete_delivery_owned(&claim, TEST_PR_URL, 1, Some(&watch), 13)
+            .expect("persisted identity is authoritative");
+        let saved = observer
+            .ci_watch_for(&start.fingerprint)
+            .expect("watch")
+            .expect("saved");
+        assert!(saved.run_id.is_none());
+        assert_eq!(saved.repo, start.repo);
+        assert_eq!(saved.head_sha, start.head_sha);
+        assert_eq!(saved.pr_url, TEST_PR_URL);
+        assert_eq!(saved.pr_number, 1);
+    }
+
+    #[test]
+    fn supersession_is_atomic_and_preserves_exact_head_identities() {
+        let store = Store::open(":memory:").expect("store");
+        let start = delivery_start();
+        let old = store
+            .claim_delivery(&start, "owner", 100)
+            .expect("claim")
+            .expect("won");
+        let next_start = DeliveryStart {
+            id: "next".into(),
+            head_sha: "rebased".into(),
+            ..start.clone()
+        };
+        let blocker = store
+            .claim_delivery(&next_start, "other", 100)
+            .expect("blocker")
+            .expect("won");
+        assert!(matches!(
+            store.supersede_delivery_owned(&old, "rebased", 11, 100),
+            Err(ShanError::OwnershipLost)
+        ));
+        assert_eq!(
+            store.begin_delivery(&start).expect("old preserved").state,
+            DeliveryState::Intent
+        );
+        assert!(store.delivery_claim_valid(&old, 11).expect("still owned"));
+        store.release_delivery_claim(&blocker, 11).expect("unblock");
+        let next = store
+            .supersede_delivery_owned(&old, "rebased", 12, 100)
+            .expect("supersede");
+        assert_eq!(next.delivery.id, blocker.delivery.id);
+        assert!(next.generation > blocker.generation);
+        assert!(next.token != old.token);
+        assert_eq!(next.delivery.head_sha, "rebased");
+        let historical = store.begin_delivery(&start).expect("historical intent");
+        assert_eq!(historical.state, DeliveryState::Superseded);
+        assert_eq!(historical.head_sha, start.head_sha);
+        assert!(!store.delivery_claim_valid(&old, 12).expect("old invalid"));
+        assert!(!store.release_delivery_claim(&old, 12).expect("old release"));
+        assert!(store
+            .claim_delivery(&start, "other", 100)
+            .expect("old terminal")
+            .is_none());
+        assert!(store.delivery_claim_valid(&next, 12).expect("new owned"));
+        let fresh = store
+            .supersede_delivery_owned(&next, "fresh-head", 13, 100)
+            .expect("fresh intent");
+        assert_eq!(fresh.delivery.state, DeliveryState::Intent);
+        assert!(fresh.delivery.id != next.delivery.id);
+        assert!(matches!(
+            store.supersede_delivery_owned(&fresh, "abc123", 14, 100),
+            Err(ShanError::InvalidTransition { .. })
+        ));
+        assert!(store
+            .delivery_claim_valid(&fresh, 14)
+            .expect("terminal target rolled back"));
+        assert_eq!(
+            store
+                .pending_deliveries(&start.repo)
+                .expect("pending")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn supersession_refuses_remote_effects_and_conflicting_target_provenance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for case in [
+            "pushed",
+            "pr_requested",
+            "ambiguous",
+            "fingerprint",
+            "base",
+            "run_id",
+            "null_run",
+        ] {
+            let path = dir.path().join(format!("supersession-{case}.db"));
+            let store = Store::open(&path).expect("store");
+            let observer = Store::open(&path).expect("independent observer");
+            let start = DeliveryStart {
+                run_id: Some("original-run".into()),
+                ..delivery_start()
+            };
+            let old = store
+                .claim_delivery(&start, "owner", 100)
+                .expect("old")
+                .expect("won");
+            let mut target = DeliveryStart {
+                id: "target".into(),
+                head_sha: "rebased".into(),
+                ..start.clone()
+            };
+            match case {
+                "fingerprint" => target.fingerprint = "another-issue".into(),
+                "base" => target.base = "release".into(),
+                "run_id" => target.run_id = Some("another-run".into()),
+                "null_run" => target.run_id = None,
+                _ => {}
+            }
+            let target_claim = observer
+                .claim_delivery(&target, "other", 100)
+                .expect("target")
+                .expect("won");
+            let state = match case {
+                "pushed" | "pr_requested" => {
+                    observer
+                        .mark_delivery_owned(
+                            &target_claim,
+                            DeliveryState::Pushed,
+                            None,
+                            None,
+                            None,
+                            11,
+                        )
+                        .expect("remote push");
+                    if case == "pr_requested" {
+                        assert!(observer
+                            .reserve_pr_slot_owned(&target_claim, 10, 11)
+                            .expect("reserve"));
+                        observer
+                            .mark_delivery_owned(
+                                &target_claim,
+                                DeliveryState::PrRequested,
+                                None,
+                                None,
+                                None,
+                                11,
+                            )
+                            .expect("remote PR request");
+                        DeliveryState::PrRequested
+                    } else {
+                        DeliveryState::Pushed
+                    }
+                }
+                "ambiguous" => {
+                    observer
+                        .mark_delivery_owned(
+                            &target_claim,
+                            DeliveryState::Ambiguous,
+                            None,
+                            None,
+                            None,
+                            11,
+                        )
+                        .expect("remote uncertain");
+                    DeliveryState::Ambiguous
+                }
+                _ => DeliveryState::Intent,
+            };
+            assert!(observer
+                .release_delivery_claim(&target_claim, 11)
+                .expect("release target"));
+            let error = store
+                .supersede_delivery_owned(&old, "rebased", 12, 100)
+                .expect_err("unsafe target refused");
+            if state == DeliveryState::Intent {
+                assert!(
+                    matches!(error, ShanError::DeliveryIdentityMismatch),
+                    "{case}"
+                );
+            } else {
+                assert!(
+                    matches!(error, ShanError::InvalidTransition { .. }),
+                    "{case}"
+                );
+            }
+            assert_eq!(
+                observer
+                    .begin_delivery(&start)
+                    .expect("old preserved")
+                    .state,
+                DeliveryState::Intent
+            );
+            assert!(observer
+                .delivery_claim_valid(&old, 12)
+                .expect("old still owned"));
+            let saved = observer.begin_delivery(&target).expect("target preserved");
+            assert_eq!(saved.state, state);
+            assert_eq!(saved.run_id, target.run_id);
+            assert_eq!(saved.fingerprint, target.fingerprint);
+            assert_eq!(saved.base, target.base);
+            let untouched: (i64, bool) = observer
+                .lock()
+                .query_row(
+                    "SELECT claim_generation,claim_token IS NULL FROM deliveries WHERE id=?1",
+                    [&target.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("target not claimed");
+            assert_eq!(untouched, (target_claim.generation, true));
+        }
+    }
+
     #[test]
     fn delivery_intent_is_idempotent_and_pending_until_pr_created() {
         let store = Store::open(":memory:").expect("open");
@@ -3869,10 +6238,13 @@ mod tests {
             .begin_delivery(&DeliveryStart {
                 id: "delivery-2".into(),
                 now: 11,
-                ..start
+                run_id: Some("must-not-refresh".into()),
+                ..start.clone()
             })
             .expect("second");
         assert_eq!(first.id, second.id, "same branch/head keeps the identity");
+        assert_eq!(first.updated_at, second.updated_at);
+        assert_eq!(first.run_id, second.run_id);
         assert_eq!(
             store
                 .pending_deliveries("example.com/app")
@@ -3880,15 +6252,12 @@ mod tests {
                 .len(),
             1
         );
+        let claim = store
+            .claim_delivery(&start, "owner", 100)
+            .expect("claim")
+            .expect("won");
         store
-            .mark_delivery(
-                &first.id,
-                DeliveryState::PrCreated,
-                Some("https://github.com/o/r/pull/1"),
-                Some(1),
-                None,
-                20,
-            )
+            .complete_delivery_owned(&claim, "https://github.com/o/r/pull/1", 1, None, 20)
             .expect("created");
         assert!(store
             .pending_deliveries("example.com/app")
@@ -4201,7 +6570,16 @@ mod tests {
                 .lock()
                 .busy_handler(Some(wait_for_test_writer))
                 .expect("busy handler");
-            reporter.report_signal(&signal(), 5)
+            reporter.report_signal_with_source(
+                &Signal {
+                    observed_at: Some(5),
+                    environment: Some("production".into()),
+                    release_sha: Some("a".repeat(40)),
+                    ..signal()
+                },
+                5,
+                Some("owner-import"),
+            )
         });
         blocked_rx
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -4218,6 +6596,10 @@ mod tests {
         );
         assert_eq!(owner.list_issues().expect("issues")[0].state, "ignored");
         assert_eq!(owner.reports_on(&utc_day(5)).expect("daily"), 2);
+        let observations = owner.observations_for(&fp, 100).expect("observations");
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].disposition, "muted");
+        assert_eq!(observations[0].time_status, "trusted");
         assert!(!owner
             .events_for(&fp, 100)
             .expect("events")
@@ -5450,6 +7832,45 @@ mod tests {
             .runs_for("does-not-exist", 10)
             .expect("runs")
             .is_empty());
+    }
+
+    #[test]
+    fn standalone_run_neither_requires_nor_claims_an_issue() {
+        let store = Store::open(":memory:").expect("store");
+        let mut start = RunStart {
+            id: "standalone-missing".into(),
+            fingerprint: "missing-issue".into(),
+            runner_id: "cli".into(),
+            repo: "example.com/spike-target".into(),
+            started_at: 1,
+            provider: Some("faux".into()),
+            model: Some("faux".into()),
+        };
+        store.start_standalone_run(&start).expect("standalone");
+        assert!(store.list_issues().expect("issues").is_empty());
+        let run = store.run_by_id(&start.id).expect("lookup").expect("run");
+        assert_eq!(run.fingerprint, start.fingerprint);
+        assert_eq!(run.repo, start.repo);
+        assert_eq!(run.provider, start.provider);
+        assert_eq!(run.model, start.model);
+        assert_eq!(run.phase, "claim");
+        assert!(store.run_by_id("missing").expect("lookup").is_none());
+
+        store.report_signal(&signal(), 2).expect("signal");
+        let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
+        start.id = "owned-run".into();
+        start.fingerprint = fp;
+        start.runner_id = "owner".into();
+        store.start_run(&start).expect("normal run claims issue");
+        let before = store.list_issues().expect("before").remove(0);
+        start.id = "standalone-known".into();
+        start.runner_id = "cli".into();
+        store.start_standalone_run(&start).expect("standalone");
+        let after = store.list_issues().expect("after").remove(0);
+        assert_eq!(after.owner_runner_id.as_deref(), Some("owner"));
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.attempts, before.attempts);
+        assert_eq!(after.state_changed_at, before.state_changed_at);
     }
 
     #[test]
@@ -6806,6 +9227,7 @@ mod heartbeat_tests {
             message: None,
             log_window: Vec::new(),
             stack_trace: trace.into(),
+            ..Signal::default()
         };
         store.report_signal(&sig, 1).expect("report");
         let fp = store
@@ -6900,6 +9322,423 @@ mod runner_tests {
             repo_path: Some("/opt/nuwa/repo".into()),
             service_unit: Some("nuwa-work".into()),
             config_json: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn startup_snapshots_are_immutable_fenced_and_reset_only_on_acquisition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("startup.db");
+        let first = Store::open(&path).expect("first");
+        let second = Store::open(&path).expect("independent connection");
+        let runner = registration(1, 10);
+        let original = r#"{"model":"original"}"#;
+        let next = r#"{"model":"next"}"#;
+        first
+            .upsert_runner(&runner)
+            .expect("register without lease");
+        assert!(!first
+            .set_runner_startup_config(&runner.id, "a", original, 10)
+            .expect("no lease"));
+        assert_eq!(
+            first
+                .try_acquire_runner_lease(&runner, "a", 10, 10)
+                .expect("acquire"),
+            RunnerLeaseOutcome::Acquired
+        );
+        let snapshot = || {
+            first
+                .list_runners()
+                .expect("list")
+                .remove(0)
+                .startup_config_json
+        };
+        assert!(snapshot().is_none());
+        assert!(!second
+            .set_runner_startup_config("missing", "a", original, 11)
+            .expect("missing runner"));
+        assert!(!second
+            .set_runner_startup_config(&runner.id, "b", original, 11)
+            .expect("wrong instance cannot initialize"));
+        assert!(first
+            .set_runner_startup_config(&runner.id, "a", original, 11)
+            .expect("first write"));
+        assert!(second
+            .set_runner_startup_config(&runner.id, "a", original, 12)
+            .expect("identical retry"));
+        assert!(!first
+            .set_runner_startup_config(&runner.id, "a", next, 12)
+            .expect("immutable"));
+        second
+            .upsert_runner(&registration(99, 12))
+            .expect("telemetry upsert");
+        second
+            .heartbeat_runner(
+                &runner.id,
+                &RunnerHeartbeat {
+                    heartbeat_at: 13,
+                    status: "idle".into(),
+                    current_fingerprint: None,
+                    phase: None,
+                    config_json: Some(next.into()),
+                    last_error: Some("telemetry error".into()),
+                },
+            )
+            .expect("heartbeat");
+        let row = first.list_runners().expect("mapped row").remove(0);
+        assert_eq!(row.startup_config_json.as_deref(), Some(original));
+        assert_eq!(row.config_json, next);
+        assert_eq!(row.progress_at, 12);
+        assert_eq!(row.last_error.as_deref(), Some("telemetry error"));
+        assert_eq!(
+            second
+                .try_acquire_runner_lease(&registration(2, 13), "b", 13, 10)
+                .expect("contender"),
+            RunnerLeaseOutcome::HeldByRunner
+        );
+        assert!(first
+            .renew_runner_lease(&runner.id, "a", 13, 10)
+            .expect("renew"));
+        assert_eq!(snapshot().as_deref(), Some(original));
+        assert!(!first
+            .set_runner_startup_config(&runner.id, "a", original, 23)
+            .expect("exact expiry rejects even identical retry"));
+        assert_eq!(
+            second
+                .try_acquire_runner_lease(&registration(2, 23), "b", 23, 10)
+                .expect("takeover"),
+            RunnerLeaseOutcome::Acquired
+        );
+        assert!(snapshot().is_none());
+        assert!(!first
+            .set_runner_startup_config(&runner.id, "a", original, 24)
+            .expect("stale instance cannot initialize successor"));
+        assert!(second
+            .set_runner_startup_config(&runner.id, "b", next, 24)
+            .expect("successor snapshot"));
+        assert!(!first
+            .set_runner_startup_config(&runner.id, "a", next, 24)
+            .expect("stale instance cannot retry successor snapshot"));
+        second
+            .release_runner_lease(&runner.id, "b")
+            .expect("release");
+        assert!(!second
+            .set_runner_startup_config(&runner.id, "b", next, 25)
+            .expect("released instance"));
+        assert_eq!(snapshot().as_deref(), Some(next));
+        drop(first);
+        drop(second);
+        let reopened = Store::open(&path).expect("reopen");
+        assert_eq!(
+            reopened.list_runners().expect("durable snapshot")[0]
+                .startup_config_json
+                .as_deref(),
+            Some(next)
+        );
+        assert_eq!(
+            reopened
+                .try_acquire_runner_lease(&registration(3, 25), "c", 25, 10)
+                .expect("restart"),
+            RunnerLeaseOutcome::Acquired
+        );
+        assert!(reopened.list_runners().expect("reset")[0]
+            .startup_config_json
+            .is_none());
+        assert!(reopened
+            .set_runner_startup_config(&runner.id, "c", original, 25)
+            .expect("restart snapshot"));
+        assert_eq!(
+            reopened
+                .try_acquire_runner_lease(&registration(3, 26), "c", 26, 10)
+                .expect("same-instance acquisition"),
+            RunnerLeaseOutcome::Acquired
+        );
+        assert!(reopened.list_runners().expect("all acquisitions reset")[0]
+            .startup_config_json
+            .is_none());
+    }
+
+    #[test]
+    fn checkout_claims_fence_stale_owners_and_exclude_runner_leases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("checkout.db");
+        let first = Store::open(&path).expect("first");
+        let second = Store::open(&path).expect("second");
+        let runner = registration(1, 10);
+        let checkout = runner.repo_path.as_deref().expect("path");
+        let old = first
+            .claim_checkout(checkout, "delivery", 10, 10)
+            .expect("claim")
+            .expect("won");
+        assert!(!format!("{old:?}").contains(&old.token));
+        assert!(second
+            .claim_checkout(checkout, "delivery", 11, 10)
+            .expect("contend")
+            .is_none());
+        assert_eq!(
+            second
+                .try_acquire_runner_lease(&runner, "instance", 11, 10)
+                .expect("runner"),
+            RunnerLeaseOutcome::CheckoutInUse("delivery".into())
+        );
+        assert!(second
+            .list_runners()
+            .expect("no registration on loss")
+            .is_empty());
+        assert!(first.renew_checkout_claim(&old, 19, 10).expect("renew"));
+        assert!(first.checkout_claim_valid(&old, 20).expect("valid"));
+        assert!(!first.checkout_claim_valid(&old, 29).expect("expired"));
+        assert!(!first
+            .renew_checkout_claim(&old, 29, 10)
+            .expect("no resurrection"));
+        assert!(!first
+            .release_checkout_claim(&old, 29)
+            .expect("expired release"));
+        assert_eq!(
+            second
+                .try_acquire_runner_lease(&runner, "instance", 29, 10)
+                .expect("runner"),
+            RunnerLeaseOutcome::Acquired
+        );
+        assert!(first
+            .claim_checkout(checkout, "delivery", 30, 10)
+            .expect("runner active")
+            .is_none());
+        assert!(!second
+            .renew_runner_lease(&runner.id, "instance", 39, 10)
+            .expect("expired runner"));
+        let next = first
+            .claim_checkout(checkout, "next", 39, 10)
+            .expect("takeover")
+            .expect("won");
+        assert!(next.generation > old.generation);
+        assert!(next.token != old.token);
+        assert!(!second
+            .renew_runner_lease(&runner.id, "instance", 40, 10)
+            .expect("cannot revive"));
+        assert!(!first
+            .renew_checkout_claim(&old, 40, 10)
+            .expect("stale renew"));
+        assert!(!first
+            .release_checkout_claim(&old, 40)
+            .expect("stale release"));
+        let mut wrong_generation = next.clone();
+        wrong_generation.generation += 1;
+        assert!(!first
+            .checkout_claim_valid(&wrong_generation, 40)
+            .expect("generation fence"));
+        assert!(!first
+            .release_checkout_claim(&wrong_generation, 40)
+            .expect("generation release"));
+        assert_eq!(
+            second
+                .try_acquire_runner_lease(&runner, "instance", 40, 10)
+                .expect("blocked"),
+            RunnerLeaseOutcome::CheckoutInUse("next".into())
+        );
+        assert!(first.release_checkout_claim(&next, 40).expect("release"));
+        assert!(!first.release_checkout_claim(&next, 40).expect("once"));
+        assert!(!first.renew_checkout_claim(&next, 40, 10).expect("released"));
+        let third = second
+            .claim_checkout(checkout, "third", 41, 10)
+            .expect("reacquire")
+            .expect("won");
+        assert!(third.generation > next.generation);
+    }
+
+    #[test]
+    fn runner_checkout_requires_live_matching_incarnation_for_every_operation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for case in ["instance", "expired", "path", "id", "missing"] {
+            let path = dir.path().join(format!("runner-checkout-{case}.db"));
+            let first = Store::open(&path).expect("first");
+            let second = Store::open(&path).expect("independent runner connection");
+            let runner = registration(1, 10);
+            let checkout = runner.repo_path.as_deref().expect("checkout");
+            assert_eq!(
+                second
+                    .try_acquire_runner_lease(&runner, "original", 10, 100)
+                    .expect("runner lease"),
+                RunnerLeaseOutcome::Acquired
+            );
+            assert!(first
+                .claim_runner_checkout(checkout, &runner.id, "other", 10, 200)
+                .expect("wrong incarnation")
+                .is_none());
+            assert!(first
+                .claim_runner_checkout("/another-checkout", &runner.id, "original", 10, 200)
+                .expect("wrong path")
+                .is_none());
+            let released = first
+                .claim_runner_checkout(checkout, &runner.id, "original", 10, 200)
+                .expect("runner checkout")
+                .expect("won");
+            assert!(first
+                .release_checkout_claim(&released, 11)
+                .expect("live release"));
+            let claim = first
+                .claim_runner_checkout(checkout, &runner.id, "original", 11, 200)
+                .expect("runner checkout again")
+                .expect("won");
+            assert!(claim.generation > released.generation);
+            assert!(first
+                .checkout_claim_valid(&claim, 12)
+                .expect("live checkout"));
+            assert!(first
+                .renew_checkout_claim(&claim, 12, 200)
+                .expect("live renew"));
+            match case {
+                "instance" => {
+                    second
+                        .lock()
+                        .execute(
+                            "UPDATE runners SET instance_id='successor' WHERE id=?1",
+                            [&runner.id],
+                        )
+                        .expect("replace incarnation");
+                }
+                "path" => {
+                    second
+                        .lock()
+                        .execute(
+                            "UPDATE runners SET repo_path='/moved-checkout' WHERE id=?1",
+                            [&runner.id],
+                        )
+                        .expect("move registration");
+                }
+                "id" => {
+                    second
+                        .lock()
+                        .execute(
+                            "UPDATE runners SET id='successor-runner' WHERE id=?1",
+                            [&runner.id],
+                        )
+                        .expect("replace runner id");
+                }
+                "missing" => {
+                    second
+                        .lock()
+                        .execute("DELETE FROM runners WHERE id=?1", [&runner.id])
+                        .expect("remove fixture runner");
+                }
+                "expired" => {}
+                _ => unreachable!(),
+            }
+            let now = if case == "expired" { 110 } else { 20 };
+            let checkout_state = || {
+                second
+                    .lock()
+                    .query_row(
+                        "SELECT lease_until,generation,token=?2,runner_id,runner_instance_id
+                 FROM checkout_leases WHERE path=?1",
+                        rusqlite::params![checkout, claim.token],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .expect("checkout metadata")
+            };
+            let before: (i64, i64, bool, Option<String>, Option<String>) = checkout_state();
+            assert_eq!(
+                before,
+                (
+                    212,
+                    claim.generation,
+                    true,
+                    Some(runner.id.clone()),
+                    Some("original".into())
+                )
+            );
+            assert!(
+                !first
+                    .checkout_claim_valid(&claim, now)
+                    .expect("runner authority lost"),
+                "{case}"
+            );
+            assert!(
+                !first
+                    .renew_checkout_claim(&claim, now, 1_000)
+                    .expect("cannot renew"),
+                "{case}"
+            );
+            assert!(
+                !first
+                    .release_checkout_claim(&claim, now)
+                    .expect("cannot release"),
+                "{case}"
+            );
+            assert_eq!(
+                checkout_state(),
+                before,
+                "{case}: lost runner cannot mutate checkout"
+            );
+
+            let standalone = second
+                .claim_checkout(checkout, "standalone", 212, 100)
+                .expect("expired checkout takeover")
+                .expect("won");
+            assert!(standalone.generation > claim.generation);
+            assert!(second
+                .checkout_claim_valid(&standalone, 213)
+                .expect("standalone valid"));
+            assert!(second
+                .renew_checkout_claim(&standalone, 213, 100)
+                .expect("standalone renew"));
+            assert!(second
+                .release_checkout_claim(&standalone, 214)
+                .expect("standalone release"));
+        }
+    }
+
+    #[test]
+    fn checkout_and_runner_competition_is_atomic_across_connections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for runner_competes in [false, true] {
+            let path = dir.path().join(format!("competition-{runner_competes}.db"));
+            let stores = [
+                Store::open(&path).expect("first"),
+                Store::open(&path).expect("second"),
+            ];
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let threads: Vec<_> = stores
+                .into_iter()
+                .enumerate()
+                .map(|(i, store)| {
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let runner = registration(1, 10);
+                        barrier.wait();
+                        if runner_competes && i == 1 {
+                            store
+                                .try_acquire_runner_lease(&runner, "runner", 10, 100)
+                                .expect("runner")
+                                == RunnerLeaseOutcome::Acquired
+                        } else {
+                            store
+                                .claim_checkout(
+                                    runner.repo_path.as_deref().expect("path"),
+                                    &format!("checkout-{i}"),
+                                    10,
+                                    100,
+                                )
+                                .expect("checkout")
+                                .is_some()
+                        }
+                    })
+                })
+                .collect();
+            let winners = threads
+                .into_iter()
+                .map(|t| t.join().expect("join"))
+                .filter(|won| *won)
+                .count();
+            assert_eq!(winners, 1);
         }
     }
 
@@ -7014,6 +9853,7 @@ mod runner_tests {
 
 #[cfg(test)]
 mod repo_tests {
+    use super::tests::{abort_event, advance_to_pr, signal, TEST_PR_URL};
     use super::*;
 
     fn store() -> (tempfile::TempDir, Store) {
@@ -7033,6 +9873,7 @@ mod repo_tests {
             stack_trace: format!(
                 "panic: {title}\ngoroutine 1 [running]:\nexample.com/spike-target.{symbol}()\n\t/app/a.go:1 +0x1"
             ),
+            ..Signal::default()
         }
     }
 
@@ -7225,6 +10066,1171 @@ mod repo_tests {
         assert_eq!(picked.attempts, 0);
     }
 
+    fn watch_input(fingerprint: &str) -> CiWatchInput {
+        CiWatchInput {
+            run_id: None,
+            fingerprint: fingerprint.into(),
+            repo: signal().repo,
+            pr_url: TEST_PR_URL.into(),
+            slug: "o/r".into(),
+            pr_number: 1,
+            head_sha: format!("sha-{fingerprint}"),
+            root_cause: Some("verified cause".into()),
+            change_stat: Some("one file".into()),
+            now: 10,
+            next_check_at: 10,
+            max_attempts: 3,
+        }
+    }
+
+    fn watch_update(state: CiWatchState, next_check_at: i64) -> CiWatchUpdate<'static> {
+        CiWatchUpdate {
+            state,
+            last_verdict: Some(state.as_str()),
+            next_check_at,
+            last_error: None,
+            terminal_at: None,
+            reject_open_pr: state == CiWatchState::Red,
+        }
+    }
+
+    fn seed_watch_run(store: &Store, input: &CiWatchInput, id: &str, started_at: i64) {
+        store
+            .start_run(&RunStart {
+                id: id.into(),
+                fingerprint: input.fingerprint.clone(),
+                runner_id: "runner".into(),
+                repo: input.repo.clone(),
+                started_at,
+                provider: None,
+                model: None,
+            })
+            .expect("run");
+        store
+            .update_run(
+                id,
+                &RunUpdate {
+                    commit_sha: Some(input.head_sha.clone()),
+                    pr_url: Some(input.pr_url.clone()),
+                    ..RunUpdate::default()
+                },
+            )
+            .expect("run identity");
+    }
+
+    #[test]
+    fn exact_ci_watch_claims_share_scheduler_fences_and_preserve_due_times() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ci-exact.db");
+        let first = Store::open(&path).expect("first");
+        let second = Store::open(&path).expect("independent connection");
+        let mut input = watch_input("exact");
+        input.next_check_at = 20;
+        first.upsert_ci_watch(&input).expect("watch");
+        let mut newer = input.clone();
+        newer.head_sha = "newer-head".into();
+        newer.now = 11;
+        newer.next_check_at = 10;
+        first.upsert_ci_watch(&newer).expect("newer watch");
+        let row = first
+            .ci_watch_for_identity(&input.slug, input.pr_number, &input.head_sha)
+            .expect("exact lookup")
+            .expect("old head");
+        assert_ne!(
+            row.id,
+            first
+                .ci_watch_for(&input.fingerprint)
+                .expect("latest")
+                .expect("newer")
+                .id
+        );
+        for (slug, number, sha) in [
+            ("other/r", input.pr_number, input.head_sha.as_str()),
+            (
+                input.slug.as_str(),
+                input.pr_number + 1,
+                input.head_sha.as_str(),
+            ),
+            (input.slug.as_str(), input.pr_number, "missing-head"),
+        ] {
+            assert!(first
+                .ci_watch_for_identity(slug, number, sha)
+                .expect("no fallback")
+                .is_none());
+        }
+        assert!(first
+            .claim_ci_watch_owned(-1, 20, 10)
+            .expect("unknown watch")
+            .is_none());
+        assert!(first
+            .claim_ci_watch_owned(row.id, 19, 10)
+            .expect("not due")
+            .is_none());
+        for lease in [0, -1] {
+            assert!(first
+                .claim_ci_watch_owned(row.id, 20, lease)
+                .expect("invalid lease")
+                .is_none());
+        }
+        let old = first
+            .claim_ci_watch_owned(row.id, 20, 10)
+            .expect("claim exact")
+            .expect("owned");
+        assert_eq!(old.generation, 1);
+        assert_eq!(old.watch.next_check_at, 20);
+        assert!(second
+            .claim_ci_watch_owned(row.id, 21, 10)
+            .expect("live claim")
+            .is_none());
+        let others = second
+            .claim_due_ci_watches_owned(21, 10, 10)
+            .expect("scheduler skips runner");
+        assert_eq!(others.len(), 1);
+        assert_eq!(others[0].watch.head_sha, newer.head_sha);
+        second
+            .record_ci_watch_error_owned(&others[0], 100, "retry later", 22)
+            .expect("defer other");
+        let current = second
+            .claim_due_ci_watches_owned(30, 1, 100)
+            .expect("expired runner")
+            .remove(0);
+        assert_eq!(current.watch.id, row.id);
+        assert!(current.generation > old.generation);
+        assert!(current.token != old.token);
+        assert!(first
+            .claim_ci_watch_owned(row.id, 31, 10)
+            .expect("scheduler owns")
+            .is_none());
+        assert!(matches!(
+            first.finish_ci_watch_owned(&old, &watch_update(CiWatchState::Green, 40), 31),
+            Err(ShanError::OwnershipLost)
+        ));
+        second
+            .finish_ci_watch_owned(&current, &watch_update(CiWatchState::Green, 40), 31)
+            .expect("green");
+        assert!(first
+            .claim_ci_watch_owned(row.id, 39, 10)
+            .expect("green not due")
+            .is_none());
+        let green = first
+            .claim_ci_watch_owned(row.id, 40, 10)
+            .expect("green due")
+            .expect("owned");
+        assert_eq!(green.watch.state, CiWatchState::Green);
+        assert!(green.generation > current.generation);
+        first
+            .finish_ci_watch_owned(&green, &watch_update(CiWatchState::HeadChanged, 50), 41)
+            .expect("terminal");
+        assert!(second
+            .claim_ci_watch_owned(row.id, 100, 10)
+            .expect("terminal never claimable")
+            .is_none());
+        assert_eq!(
+            second
+                .ci_watch_for_identity(&input.slug, input.pr_number, &input.head_sha)
+                .expect("lookup terminal")
+                .expect("watch")
+                .state,
+            CiWatchState::HeadChanged
+        );
+    }
+
+    #[test]
+    fn ci_owned_claims_skip_live_work_renew_expire_and_fence_every_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ci-fences.db");
+        let first = Store::open(&path).expect("first");
+        let second = Store::open(&path).expect("independent connection");
+        let input = watch_input("old");
+        first.upsert_ci_watch(&input).expect("watch");
+        first.upsert_ci_watch(&watch_input("other")).expect("other");
+        let old = first
+            .claim_due_ci_watches_owned(10, 1, 10)
+            .expect("claim")
+            .remove(0);
+        assert_eq!(old.watch.fingerprint, "old");
+        assert_eq!(
+            old.watch.next_check_at, 10,
+            "claim must not reschedule work"
+        );
+        assert!(!format!("{old:?}").contains(&old.token));
+        let other = second
+            .claim_due_ci_watches_owned(11, 1, 10)
+            .expect("skip live")
+            .remove(0);
+        assert_eq!(other.watch.fingerprint, "other");
+        second
+            .record_ci_watch_error_owned(&other, 100, "transient", 12)
+            .expect("release error");
+        assert!(first.renew_ci_watch_claim(&old, 19, 11).expect("renew"));
+        drop(second);
+        let second = Store::open(&path).expect("reopened independent connection");
+        assert!(second
+            .claim_due_ci_watches_owned(20, 1, 10)
+            .expect("durable renewal")
+            .is_empty());
+        assert!(!first.ci_watch_claim_valid(&old, 30).expect("exact expiry"));
+        assert!(!first
+            .renew_ci_watch_claim(&old, 30, 10)
+            .expect("cannot revive expired"));
+        let current = second
+            .claim_due_ci_watches_owned(30, 1, 10)
+            .expect("takeover")
+            .remove(0);
+        assert!(current.generation > old.generation);
+        assert!(current.token != old.token);
+        assert!(!first
+            .renew_ci_watch_claim(&old, 31, 100)
+            .expect("stale renew"));
+        assert!(matches!(
+            first.finish_ci_watch_owned(&old, &watch_update(CiWatchState::Green, 100), 31),
+            Err(ShanError::OwnershipLost)
+        ));
+        assert!(matches!(
+            first.record_ci_watch_error_owned(&old, 100, "stale", 31),
+            Err(ShanError::OwnershipLost)
+        ));
+        for field in 0..4 {
+            let mut forged = current.clone();
+            match field {
+                0 => forged.watch.head_sha = "forged".into(),
+                1 => forged.watch.repo = "other-repo".into(),
+                2 => forged.generation += 1,
+                _ => forged.token = "not-the-token".into(),
+            }
+            assert!(!first
+                .ci_watch_claim_valid(&forged, 31)
+                .expect("identity fence"));
+            assert!(matches!(
+                first.record_ci_watch_error_owned(&forged, 100, "forged", 31),
+                Err(ShanError::OwnershipLost)
+            ));
+        }
+        abort_event(&second, "ci_watch_error");
+        assert!(second
+            .record_ci_watch_error_owned(&current, 100, "retry", 31)
+            .is_err());
+        assert!(first
+            .ci_watch_claim_valid(&current, 31)
+            .expect("error release rolled back"));
+        let row = first.ci_watch_for("old").expect("read").expect("watch");
+        assert_eq!(row.check_attempts, 0);
+        assert_eq!(row.next_check_at, 10);
+        second
+            .lock()
+            .execute_batch("DROP TRIGGER fail_audit")
+            .expect("unblock error audit");
+        second
+            .record_ci_watch_error_owned(&current, 100, "retry", 31)
+            .expect("current error");
+        let row = first.ci_watch_for("old").expect("row").expect("watch");
+        assert_eq!(row.check_attempts, 1);
+        assert_eq!(row.last_error.as_deref(), Some("retry"));
+        assert_eq!(row.next_check_at, 100);
+        assert!(!first.ci_watch_claim_valid(&current, 32).expect("released"));
+        assert!(first
+            .recent_repair_memory(&input.repo, "", 10)
+            .expect("no stale memory")
+            .is_empty());
+    }
+
+    #[test]
+    fn ci_watch_upsert_rolls_back_inserts_and_conflict_metadata_on_invalid_identity() {
+        let store = Store::open(":memory:").expect("store");
+        let input = watch_input("rollback");
+        store
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER change_watch_identity AFTER INSERT ON ci_watches
+             BEGIN UPDATE ci_watches SET fingerprint='invalid-after-insert' WHERE id=NEW.id; END;",
+            )
+            .expect("invalidate identity after insert");
+        assert!(matches!(
+            store.upsert_ci_watch(&input),
+            Err(ShanError::CiWatchIdentityMismatch)
+        ));
+        let count: i64 = store
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ci_watches", [], |row| row.get(0))
+            .expect("no conflicting row left behind");
+        assert_eq!(count, 0);
+        assert!(store
+            .ci_watch_for_identity(&input.slug, input.pr_number, &input.head_sha)
+            .expect("lookup")
+            .is_none());
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER change_watch_identity")
+            .expect("unblock");
+        store.upsert_ci_watch(&input).expect("retry");
+        let mut incompatible = input.clone();
+        incompatible.run_id = Some("different-run".into());
+        assert!(matches!(
+            store.upsert_ci_watch(&incompatible),
+            Err(ShanError::CiWatchIdentityMismatch)
+        ));
+        let sequence: i64 = store
+            .lock()
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='ci_watches'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failed insert must not advance sequence");
+        assert_eq!(sequence, 1);
+        let row = store
+            .ci_watch_for_identity(&input.slug, input.pr_number, &input.head_sha)
+            .expect("lookup")
+            .expect("original watch");
+        assert_eq!(row.id, 1);
+        assert_eq!(row.fingerprint, input.fingerprint);
+        assert_eq!(row.run_id, input.run_id);
+    }
+
+    #[test]
+    fn ci_watch_upsert_preserves_terminal_identity_and_new_heads_are_distinct() {
+        let store = Store::open(":memory:").expect("store");
+        let input = watch_input("immutable");
+        store.upsert_ci_watch(&input).expect("watch");
+        let claim = store
+            .claim_due_ci_watches_owned(10, 1, 100)
+            .expect("claim")
+            .remove(0);
+        store
+            .finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Merged, 100), 11)
+            .expect("merged");
+        let mut duplicate = input.clone();
+        duplicate.now = 90;
+        duplicate.next_check_at = 1;
+        duplicate.root_cause = Some("must not replace".into());
+        store.upsert_ci_watch(&duplicate).expect("idempotent");
+        let row = store
+            .ci_watch_for(&input.fingerprint)
+            .expect("read")
+            .expect("watch");
+        assert_eq!(row.state, CiWatchState::Merged);
+        assert_eq!(row.updated_at, 11);
+        assert_eq!(row.terminal_at, Some(11));
+        assert_eq!(row.next_check_at, 100);
+        assert!(row.memory_written);
+        assert_eq!(row.root_cause, input.root_cause);
+        for field in 0..4 {
+            let mut incompatible = input.clone();
+            match field {
+                0 => incompatible.repo = "different-repo".into(),
+                1 => incompatible.fingerprint = "different-fingerprint".into(),
+                2 => incompatible.run_id = Some("different-run".into()),
+                _ => incompatible.pr_url = "https://example.com/pull/other".into(),
+            }
+            assert!(matches!(
+                store.upsert_ci_watch(&incompatible),
+                Err(ShanError::CiWatchIdentityMismatch)
+            ));
+        }
+        let mut next = input.clone();
+        next.head_sha = "legitimate-new-head".into();
+        store.upsert_ci_watch(&next).expect("new head");
+        let claims = store
+            .claim_due_ci_watches_owned(20, 10, 100)
+            .expect("only new head");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].watch.head_sha, next.head_sha);
+    }
+
+    #[test]
+    fn ci_outcomes_roll_back_watch_run_memory_issue_and_audit_together() {
+        let store = Store::open(":memory:").expect("store");
+        store.report_signal(&signal(), 1).expect("issue");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        advance_to_pr(&store, &fp);
+        let mut input = watch_input(&fp);
+        input.run_id = Some("ci-run".into());
+        seed_watch_run(&store, &input, "ci-run", 3);
+        store.upsert_ci_watch(&input).expect("watch");
+        let claim = store
+            .claim_due_ci_watches_owned(10, 1, 100)
+            .expect("claim")
+            .remove(0);
+        let before = store.events_for(&fp, 100).expect("events").len();
+        for kind in ["ci_green", "ci_watch"] {
+            abort_event(&store, kind);
+            assert!(store
+                .finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Green, 20), 11)
+                .is_err());
+            assert!(store
+                .ci_watch_claim_valid(&claim, 12)
+                .expect("release rolled back"));
+            assert_eq!(
+                store.ci_watch_for(&fp).expect("read").expect("watch").state,
+                CiWatchState::Pending
+            );
+            assert!(store
+                .latest_run(&fp)
+                .expect("run")
+                .expect("row")
+                .ci_verdict
+                .is_none());
+            assert_eq!(
+                store
+                    .list_repair_memory(&input.repo, 10, 0)
+                    .expect("memory")
+                    .1,
+                0
+            );
+            assert_eq!(store.events_for(&fp, 100).expect("events").len(), before);
+            store
+                .lock()
+                .execute_batch("DROP TRIGGER fail_audit")
+                .expect("unblock");
+        }
+        store
+            .finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Green, 20), 12)
+            .expect("green");
+        let green_events = store.events_for(&fp, 100).expect("green events");
+        let observations: Vec<_> = green_events
+            .iter()
+            .filter(|event| event.kind == "ci_green")
+            .collect();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].actor.as_deref(), Some("ci_watch"));
+        assert_eq!(observations[0].repo, input.repo);
+        assert!(observations[0].detail.contains(&input.head_sha));
+        let claim = store
+            .claim_due_ci_watches_owned(20, 1, 100)
+            .expect("recheck")
+            .remove(0);
+        let green_summary = repair_memory_summary(&store, &input.repo, &fp);
+        assert!(green_summary.is_some());
+        let before = store.events_for(&fp, 100).expect("events").len();
+        for kind in ["ci_red", "ci_watch"] {
+            abort_event(&store, kind);
+            assert!(store
+                .finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Red, 500), 21)
+                .is_err());
+            assert!(store
+                .ci_watch_claim_valid(&claim, 22)
+                .expect("red release rolled back"));
+            assert_eq!(store.attempts_for(&fp).expect("attempts"), 0);
+            assert_eq!(store.list_issues().expect("issues")[0].state, "pr_open");
+            assert_eq!(
+                store
+                    .latest_run(&fp)
+                    .expect("run")
+                    .expect("row")
+                    .ci_verdict
+                    .as_deref(),
+                Some("success")
+            );
+            assert_eq!(
+                store
+                    .recent_repair_memory(&input.repo, "", 10)
+                    .expect("memory")
+                    .len(),
+                1
+            );
+            assert_eq!(store.events_for(&fp, 100).expect("events").len(), before);
+            store
+                .lock()
+                .execute_batch("DROP TRIGGER fail_audit")
+                .expect("unblock");
+        }
+        store
+            .finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Red, 500), 22)
+            .expect("red");
+        let red_events = store.events_for(&fp, 100).expect("red events");
+        let observations: Vec<_> = red_events
+            .iter()
+            .filter(|event| event.kind == "ci_red")
+            .collect();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].actor.as_deref(), Some("ci_watch"));
+        assert_eq!(
+            red_events
+                .iter()
+                .filter(|event| event.kind == "ci_watch")
+                .count(),
+            2
+        );
+        assert_eq!(store.attempts_for(&fp).expect("attempts"), 1);
+        assert_eq!(store.list_issues().expect("issues")[0].state, "new");
+        let row = store.ci_watch_for(&fp).expect("read").expect("watch");
+        assert_eq!(row.state, CiWatchState::Red);
+        assert!(!row.memory_written);
+        assert!(matches!(
+            store.finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Green, 500), 23),
+            Err(ShanError::OwnershipLost)
+        ));
+        assert_eq!(
+            store
+                .latest_run(&fp)
+                .expect("run")
+                .expect("row")
+                .ci_verdict
+                .as_deref(),
+            Some("failure")
+        );
+        let (rows, _) = store
+            .list_repair_memory(&input.repo, 10, 0)
+            .expect("evidence");
+        assert!(!rows[0].evidence_valid);
+        assert_eq!(rows[0].verification_source, "ci_green");
+        assert_eq!(rows[0].revoked_at, Some(22));
+        assert_eq!(rows[0].revocation_reason.as_deref(), Some("red"));
+        assert_eq!(
+            repair_memory_summary(&store, &input.repo, &fp),
+            green_summary
+        );
+        assert!(!store.ci_watch_claim_valid(&claim, 23).expect("released"));
+    }
+
+    #[test]
+    fn old_watch_revocation_preserves_other_sources_and_exact_sha_content() {
+        let store = Store::open(":memory:").expect("store");
+        let input = watch_input("overlap");
+        store.upsert_ci_watch(&input).expect("watch");
+        let claim = store
+            .claim_due_ci_watches_owned(10, 1, 100)
+            .expect("claim")
+            .remove(0);
+        store
+            .finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Green, 20), 11)
+            .expect("green");
+        let mut local = memory_entry(&input.fingerprint, 12);
+        local.pr_url = Some(input.pr_url.clone());
+        local.root_cause = "independent local proof".into();
+        store
+            .record_verified_repair_memory(&local, "local_verification", "local-run")
+            .expect("local proof");
+        let mut newer = local.clone();
+        newer.commit_sha = "new-sha".into();
+        newer.root_cause = "new content".into();
+        newer.change_stat = "new change stat".into();
+        newer.recorded_at = 13;
+        store
+            .record_verified_repair_memory(&newer, "ci_green", "new-watch")
+            .expect("new memory");
+        let claim = store
+            .claim_due_ci_watches_owned(20, 1, 100)
+            .expect("old recheck")
+            .remove(0);
+        store
+            .finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Red, 500), 21)
+            .expect("standalone red");
+        let rows = store
+            .recent_repair_memory(&input.repo, "", 10)
+            .expect("new survives");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].commit_sha, "new-sha");
+        assert_eq!(rows[0].root_cause, "new content");
+        let newer_summary = Some((
+            newer.commit_sha.clone(),
+            newer.root_cause.clone(),
+            newer.change_stat.clone(),
+            newer.recorded_at,
+        ));
+        assert_eq!(
+            repair_memory_summary(&store, &input.repo, &input.fingerprint),
+            newer_summary
+        );
+        store
+            .revoke_repair_memory_evidence(
+                &input.repo,
+                &input.fingerprint,
+                &newer.commit_sha,
+                None,
+                "wrong PR must not revoke",
+                22,
+            )
+            .expect("exact null PR");
+        assert_eq!(
+            store
+                .recent_repair_memory(&input.repo, "", 10)
+                .expect("still valid")[0]
+                .commit_sha,
+            "new-sha"
+        );
+        store
+            .revoke_repair_memory_evidence(
+                &input.repo,
+                &input.fingerprint,
+                &newer.commit_sha,
+                Some(&input.pr_url),
+                "new source revoked",
+                23,
+            )
+            .expect("revoke new");
+        let rows = store
+            .recent_repair_memory(&input.repo, "", 10)
+            .expect("independent fallback");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].commit_sha, input.head_sha);
+        assert_eq!(rows[0].root_cause, "independent local proof");
+        store
+            .revoke_repair_memory_evidence(
+                &input.repo,
+                &input.fingerprint,
+                &input.head_sha,
+                Some(&input.pr_url),
+                "revoke local proof too",
+                24,
+            )
+            .expect("revoke exact");
+        local.recorded_at = 25;
+        store
+            .record_verified_repair_memory(&local, "ci_green", &claim.watch.id.to_string())
+            .expect("late green replay");
+        store
+            .record_verified_repair_memory(&local, "local_verification", "local-run")
+            .expect("local replay");
+        assert!(store
+            .recent_repair_memory(&input.repo, "", 10)
+            .expect("tombstones")
+            .is_empty());
+        assert_eq!(
+            repair_memory_summary(&store, &input.repo, &input.fingerprint),
+            newer_summary
+        );
+    }
+
+    #[test]
+    fn straight_red_without_green_preserves_all_valid_summaries_and_oldest() {
+        let store = Store::open(":memory:").expect("store");
+        for index in 0..REPAIR_MEMORY_KEEP {
+            store
+                .record_verified_repair_memory(
+                    &memory_entry(&format!("valid-{index}"), index as i64),
+                    "local_verification",
+                    &format!("run-{index}"),
+                )
+                .expect("valid memory");
+        }
+        let mut input = watch_input("straight-red");
+        input.root_cause = None;
+        input.change_stat = None;
+        store.upsert_ci_watch(&input).expect("watch");
+        let claim = store
+            .claim_due_ci_watches_owned(10, 1, 100)
+            .expect("claim")
+            .remove(0);
+        store
+            .finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Red, 500), 100)
+            .expect("straight red");
+        let mut late = memory_entry(&input.fingerprint, 101);
+        late.pr_url = Some(input.pr_url.clone());
+        store
+            .record_verified_repair_memory(&late, "ci_green", &claim.watch.id.to_string())
+            .expect("late green cannot revive tombstone");
+        let (rows, total) = store
+            .list_repair_memory(&input.repo, 100, 0)
+            .expect("summaries");
+        assert_eq!(total, REPAIR_MEMORY_KEEP as u64);
+        assert_eq!(rows.len(), REPAIR_MEMORY_KEEP);
+        assert!(rows.iter().all(|row| row.evidence_valid));
+        assert!(rows.iter().any(|row| row.fingerprint == "valid-0"));
+        assert!(repair_memory_summary(&store, &input.repo, "valid-0").is_some());
+        assert!(repair_memory_summary(&store, &input.repo, &input.fingerprint).is_none());
+        let tombstone: (i64, bool, Option<i64>, Option<String>) = store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*),valid,revoked_at,revocation_reason FROM repair_memory_evidence
+                 WHERE repo=?1 AND fingerprint=?2 AND source_kind='ci_green' AND source_id=?3
+                   AND commit_sha=?4 AND pr_url=?5",
+                rusqlite::params![
+                    input.repo,
+                    input.fingerprint,
+                    claim.watch.id.to_string(),
+                    input.head_sha,
+                    input.pr_url
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("source tombstone");
+        assert_eq!(tombstone, (1, false, Some(100), Some("red".into())));
+    }
+
+    #[test]
+    fn closed_and_head_changed_are_terminal_and_never_publish_green_memory() {
+        for state in [CiWatchState::Closed, CiWatchState::HeadChanged] {
+            let store = Store::open(":memory:").expect("store");
+            let input = watch_input("terminal");
+            store.upsert_ci_watch(&input).expect("watch");
+            let claim = store
+                .claim_due_ci_watches_owned(10, 1, 100)
+                .expect("claim")
+                .remove(0);
+            let mut update = watch_update(state, 20);
+            update.last_verdict = Some("green");
+            store
+                .finish_ci_watch_owned(&claim, &update, 11)
+                .expect("terminal");
+            assert!(state.is_terminal());
+            assert_eq!(CiWatchState::parse(state.as_str()), Some(state));
+            assert!(store
+                .recent_repair_memory(&input.repo, "", 10)
+                .expect("no green")
+                .is_empty());
+            assert!(store
+                .claim_due_ci_watches_owned(100, 10, 100)
+                .expect("terminal not due")
+                .is_empty());
+            let (rows, total) = store
+                .list_repair_memory(&input.repo, 10, 0)
+                .expect("no summary");
+            assert!(rows.is_empty());
+            assert_eq!(total, 0);
+            assert!(repair_memory_summary(&store, &input.repo, &input.fingerprint).is_none());
+            let tombstone: (bool, Option<i64>, Option<String>) = store
+                .lock()
+                .query_row(
+                    "SELECT valid,revoked_at,revocation_reason FROM repair_memory_evidence
+                     WHERE repo=?1 AND fingerprint=?2 AND source_kind='ci_green' AND source_id=?3
+                       AND commit_sha=?4 AND pr_url=?5",
+                    rusqlite::params![
+                        input.repo,
+                        input.fingerprint,
+                        claim.watch.id.to_string(),
+                        input.head_sha,
+                        input.pr_url
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("source tombstone");
+            assert_eq!(tombstone, (false, Some(11), Some(state.as_str().into())));
+        }
+    }
+
+    #[test]
+    fn ci_preclose_check_requires_a_live_exact_claim_and_current_open_issue() {
+        let store = Store::open(":memory:").expect("store");
+        store.report_signal(&signal(), 1).expect("issue");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        advance_to_pr(&store, &fp);
+        let mut input = watch_input(&fp);
+        input.run_id = Some("current-run".into());
+        seed_watch_run(&store, &input, "current-run", 3);
+        store.upsert_ci_watch(&input).expect("watch");
+        let row = store
+            .ci_watch_for_identity(&input.slug, input.pr_number, &input.head_sha)
+            .expect("lookup")
+            .expect("watch");
+        let old = store
+            .claim_ci_watch_owned(row.id, 10, 10)
+            .expect("claim")
+            .expect("owned");
+        assert!(store
+            .ci_watch_can_reject_issue(&old, 11)
+            .expect("current issue"));
+        for field in 0..4 {
+            let mut forged = old.clone();
+            match field {
+                0 => forged.watch.head_sha = "other-head".into(),
+                1 => forged.watch.repo = "other-repo".into(),
+                2 => forged.generation += 1,
+                _ => forged.token = "not-the-token".into(),
+            }
+            assert!(!store
+                .ci_watch_can_reject_issue(&forged, 11)
+                .expect("forged claim"));
+        }
+        assert!(!store
+            .ci_watch_can_reject_issue(&old, 20)
+            .expect("exact lease expiry"));
+        let current = store
+            .claim_ci_watch_owned(row.id, 20, 100)
+            .expect("takeover")
+            .expect("owned");
+        assert!(!store
+            .ci_watch_can_reject_issue(&old, 21)
+            .expect("stale owner"));
+        assert!(store
+            .ci_watch_can_reject_issue(&current, 21)
+            .expect("new owner"));
+        store
+            .set_pr(&fp, "https://example.com/pull/other", 22)
+            .expect("different PR");
+        assert!(!store
+            .ci_watch_can_reject_issue(&current, 22)
+            .expect("issue PR changed"));
+        store.set_pr(&fp, &input.pr_url, 23).expect("restore PR");
+        assert!(store
+            .ci_watch_can_reject_issue(&current, 23)
+            .expect("owns restored PR"));
+        store
+            .set_state(&fp, State::Merged, 24, None)
+            .expect("merged");
+        assert!(!store
+            .ci_watch_can_reject_issue(&current, 24)
+            .expect("issue no longer open"));
+        store
+            .finish_ci_watch_owned(&current, &watch_update(CiWatchState::Green, 100), 25)
+            .expect("observe");
+        assert!(!store
+            .ci_watch_can_reject_issue(&current, 26)
+            .expect("released claim"));
+    }
+
+    #[test]
+    fn ci_run_verdicts_are_canonical_without_changing_watch_observations() {
+        for (state, observed, expected) in [
+            (CiWatchState::Green, Some("green"), Some("success")),
+            (CiWatchState::Red, Some("red"), Some("failure")),
+            (CiWatchState::Merged, Some("green"), Some("success")),
+            (CiWatchState::Closed, Some("closed"), Some("closed")),
+            (
+                CiWatchState::HeadChanged,
+                Some("head_changed"),
+                Some("head_changed"),
+            ),
+            (CiWatchState::Expired, Some("expired"), Some("expired")),
+            (CiWatchState::Pending, Some("timed_out"), Some("timed_out")),
+            (CiWatchState::Pending, None, None),
+        ] {
+            let store = Store::open(":memory:").expect("store");
+            store.report_signal(&signal(), 1).expect("issue");
+            let fp = store
+                .ready_issue(1)
+                .expect("ready")
+                .expect("issue")
+                .fingerprint;
+            let mut input = watch_input(&fp);
+            input.run_id = Some("verdict-run".into());
+            seed_watch_run(&store, &input, "verdict-run", 3);
+            store.upsert_ci_watch(&input).expect("watch");
+            let claim = store
+                .claim_due_ci_watches_owned(10, 1, 100)
+                .expect("claim")
+                .remove(0);
+            let mut update = watch_update(state, 100);
+            update.last_verdict = observed;
+            store
+                .finish_ci_watch_owned(&claim, &update, 11)
+                .expect("observe");
+            let run = store.latest_run(&fp).expect("run").expect("row");
+            assert_eq!(run.ci_verdict.as_deref(), expected, "state={state:?}");
+            let watch = store.ci_watch_for(&fp).expect("watch").expect("row");
+            assert_eq!(watch.last_verdict.as_deref(), observed);
+            assert_eq!(watch.state, state);
+            assert_eq!(
+                store
+                    .count_events_since(&["ci_green"], 0)
+                    .expect("green observations"),
+                u64::from(expected == Some("success"))
+            );
+            assert_eq!(
+                store
+                    .count_events_since(&["ci_red"], 0)
+                    .expect("red observations"),
+                u64::from(expected == Some("failure"))
+            );
+        }
+    }
+
+    #[test]
+    fn old_watch_cannot_reject_or_update_a_newer_run_reusing_pr_and_head() {
+        let store = Store::open(":memory:").expect("store");
+        store.report_signal(&signal(), 1).expect("issue");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        advance_to_pr(&store, &fp);
+        let mut input = watch_input(&fp);
+        input.run_id = Some("old-run".into());
+        seed_watch_run(&store, &input, "old-run", 3);
+        store.upsert_ci_watch(&input).expect("old watch");
+        let claim = store
+            .claim_due_ci_watches_owned(10, 1, 100)
+            .expect("claim")
+            .remove(0);
+        assert!(store
+            .ci_watch_can_reject_issue(&claim, 11)
+            .expect("owns original issue"));
+        seed_watch_run(&store, &input, "new-run", 20);
+        assert!(!store
+            .ci_watch_can_reject_issue(&claim, 20)
+            .expect("must not close newer run's PR"));
+        let delivery = store
+            .claim_delivery(
+                &DeliveryStart {
+                    id: "new-delivery".into(),
+                    run_id: Some("new-run".into()),
+                    fingerprint: fp.clone(),
+                    repo: input.repo.clone(),
+                    branch: "agent/fix/new".into(),
+                    base: "main".into(),
+                    head_sha: input.head_sha.clone(),
+                    now: 20,
+                },
+                "new-owner",
+                100,
+            )
+            .expect("new delivery")
+            .expect("owned");
+        store
+            .mark_delivery_owned(&delivery, DeliveryState::Pushed, None, None, None, 21)
+            .expect("pushed");
+        store
+            .complete_delivery_owned(&delivery, &input.pr_url, input.pr_number, None, 22)
+            .expect("delivered same PR/head for new run");
+        assert!(!store
+            .ci_watch_can_reject_issue(&claim, 23)
+            .expect("must not close newer delivery's PR"));
+        store
+            .finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Red, 500), 23)
+            .expect("old red");
+        assert_eq!(store.attempts_for(&fp).expect("not rejected"), 0);
+        assert_eq!(store.list_issues().expect("issue")[0].state, "pr_open");
+        let latest = store.latest_run(&fp).expect("latest").expect("run");
+        assert_eq!(latest.id, "new-run");
+        assert!(latest.ci_verdict.is_none());
+        let old_verdict: String = store
+            .lock()
+            .query_row("SELECT ci_verdict FROM runs WHERE id='old-run'", [], |r| {
+                r.get(0)
+            })
+            .expect("only exact old run updated");
+        assert_eq!(old_verdict, "failure");
+    }
+
+    #[test]
+    fn ci_run_verdict_requires_every_persisted_identity_field() {
+        for sql in [
+            "UPDATE runs SET repo='other-repo' WHERE id='bound-run'",
+            "UPDATE runs SET fingerprint='other-fp' WHERE id='bound-run'",
+            "UPDATE runs SET commit_sha='other-sha' WHERE id='bound-run'",
+            "UPDATE runs SET pr_url='https://example.com/pull/other' WHERE id='bound-run'",
+        ] {
+            let store = Store::open(":memory:").expect("store");
+            store.report_signal(&signal(), 1).expect("issue");
+            let fp = store
+                .ready_issue(1)
+                .expect("ready")
+                .expect("issue")
+                .fingerprint;
+            let mut input = watch_input(&fp);
+            input.run_id = Some("bound-run".into());
+            seed_watch_run(&store, &input, "bound-run", 1);
+            store.upsert_ci_watch(&input).expect("watch");
+            let mut claim = store
+                .claim_due_ci_watches_owned(10, 1, 100)
+                .expect("claim")
+                .remove(0);
+            // Snapshot content is not authority; finish must use the stored watch.
+            claim.watch.root_cause = Some("untrusted snapshot content".into());
+            store
+                .lock()
+                .execute_batch(sql)
+                .expect("change associated run identity");
+            store
+                .finish_ci_watch_owned(&claim, &watch_update(CiWatchState::Green, 100), 11)
+                .expect("observe");
+            let verdict: Option<String> = store
+                .lock()
+                .query_row(
+                    "SELECT ci_verdict FROM runs WHERE id='bound-run'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("run");
+            assert!(verdict.is_none());
+            let rows = store
+                .recent_repair_memory(&input.repo, "", 10)
+                .expect("watch proof");
+            assert_eq!(rows[0].root_cause, "verified cause");
+        }
+    }
+
+    #[test]
+    fn memory_manual_enable_never_revives_revoked_or_legacy_sources() {
+        let store = Store::open(":memory:").expect("store");
+        let entry = memory_entry("manual", 10);
+        store.record_repair_memory(&entry).expect("legacy");
+        assert!(store
+            .recent_repair_memory(&entry.repo, "", 10)
+            .expect("legacy excluded")
+            .is_empty());
+        assert!(
+            !store
+                .list_repair_memory(&entry.repo, 10, 0)
+                .expect("legacy visible")
+                .0[0]
+                .evidence_valid
+        );
+        store
+            .record_verified_repair_memory(&entry, "local_verification", "run")
+            .expect("verified");
+        store
+            .set_repair_memory_disabled(&entry.repo, &entry.fingerprint, true)
+            .expect("disable");
+        let mut next = entry.clone();
+        next.recorded_at = 20;
+        next.commit_sha = "next-sha".into();
+        store
+            .record_verified_repair_memory(&next, "local_verification", "next-run")
+            .expect("new evidence");
+        store
+            .record_repair_memory(&next)
+            .expect("legacy upsert preserves disable");
+        let (rows, _) = store.list_repair_memory(&entry.repo, 10, 0).expect("list");
+        assert!(rows[0].disabled);
+        assert!(rows[0].evidence_valid);
+        assert!(store
+            .recent_repair_memory(&entry.repo, "", 10)
+            .expect("disabled")
+            .is_empty());
+        store
+            .set_repair_memory_disabled(&entry.repo, &entry.fingerprint, false)
+            .expect("enable valid");
+        assert_eq!(
+            store
+                .recent_repair_memory(&entry.repo, "", 10)
+                .expect("valid enabled")[0]
+                .commit_sha,
+            next.commit_sha
+        );
+        store
+            .set_repair_memory_disabled(&entry.repo, &entry.fingerprint, true)
+            .expect("disable again");
+        for memory in [&entry, &next] {
+            store
+                .revoke_repair_memory_evidence(
+                    &memory.repo,
+                    &memory.fingerprint,
+                    &memory.commit_sha,
+                    memory.pr_url.as_deref(),
+                    "invalid evidence",
+                    30,
+                )
+                .expect("revoke");
+        }
+        store
+            .set_repair_memory_disabled(&entry.repo, &entry.fingerprint, false)
+            .expect("enable");
+        assert!(store
+            .recent_repair_memory(&entry.repo, "", 10)
+            .expect("still revoked")
+            .is_empty());
+        store
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON repair_memory
+             BEGIN SELECT RAISE(ABORT,'injected delete failure'); END;",
+            )
+            .expect("delete trigger");
+        assert!(store
+            .delete_repair_memory(&entry.repo, &entry.fingerprint)
+            .is_err());
+        let count: i64 = store
+            .lock()
+            .query_row("SELECT COUNT(*) FROM repair_memory_evidence", [], |r| {
+                r.get(0)
+            })
+            .expect("evidence deletion rolled back");
+        assert_eq!(count, 4);
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER fail_delete")
+            .expect("unblock delete");
+        assert!(store
+            .delete_repair_memory(&entry.repo, &entry.fingerprint)
+            .expect("delete"));
+        let count: i64 = store
+            .lock()
+            .query_row("SELECT COUNT(*) FROM repair_memory_evidence", [], |r| {
+                r.get(0)
+            })
+            .expect("evidence deleted");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn reject_pr_revokes_only_matching_pr_evidence_and_rolls_back_on_failure() {
+        let store = Store::open(":memory:").expect("store");
+        store.report_signal(&signal(), 1).expect("issue");
+        let fp = store
+            .ready_issue(1)
+            .expect("ready")
+            .expect("issue")
+            .fingerprint;
+        advance_to_pr(&store, &fp);
+        let mut old = memory_entry(&fp, 10);
+        old.pr_url = Some(TEST_PR_URL.into());
+        store
+            .record_verified_repair_memory(&old, "local_verification", "old")
+            .expect("old proof");
+        let mut newer = old.clone();
+        newer.commit_sha = "unrelated-sha".into();
+        newer.pr_url = Some("https://example.com/pull/2".into());
+        newer.recorded_at = 20;
+        store
+            .record_verified_repair_memory(&newer, "local_verification", "new")
+            .expect("new proof");
+        store
+            .lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_revoke BEFORE UPDATE ON repair_memory_evidence
+             BEGIN SELECT RAISE(ABORT,'injected revoke failure'); END;",
+            )
+            .expect("trigger");
+        assert!(store
+            .reject_pr(&fp, TEST_PR_URL, 21, "reject", "owner")
+            .is_err());
+        assert_eq!(store.attempts_for(&fp).expect("rolled back"), 0);
+        assert_eq!(store.list_issues().expect("issue")[0].state, "pr_open");
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER fail_revoke")
+            .expect("unblock");
+        assert!(store
+            .reject_pr(&fp, TEST_PR_URL, 22, "reject", "owner")
+            .expect("reject"));
+        let rows = store
+            .recent_repair_memory(&old.repo, "", 10)
+            .expect("unrelated survives");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].commit_sha, newer.commit_sha);
+        store
+            .revoke_repair_memory_evidence(
+                &newer.repo,
+                &fp,
+                &newer.commit_sha,
+                newer.pr_url.as_deref(),
+                "also invalid",
+                23,
+            )
+            .expect("remove survivor");
+        assert!(store
+            .recent_repair_memory(&old.repo, "", 10)
+            .expect("no old fallback")
+            .is_empty());
+    }
+
+    fn repair_memory_summary(
+        store: &Store,
+        repo: &str,
+        fingerprint: &str,
+    ) -> Option<(String, String, String, i64)> {
+        store
+            .lock()
+            .query_row(
+                "SELECT commit_sha,root_cause,change_stat,recorded_at FROM repair_memory
+                 WHERE repo=?1 AND fingerprint=?2",
+                rusqlite::params![repo, fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .expect("summary")
+    }
+
     fn memory_entry(fingerprint: &str, recorded_at: i64) -> RepairMemoryEntry {
         RepairMemoryEntry {
             repo: "example.com/spike-target".to_string(),
@@ -7243,13 +11249,15 @@ mod repo_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store
-            .record_repair_memory(&memory_entry("fp-a", 10))
+            .record_verified_repair_memory(&memory_entry("fp-a", 10), "local_verification", "run-a")
             .expect("first");
         let mut newer = memory_entry("fp-a", 20);
         newer.commit_sha = "sha-a-2".to_string();
-        store.record_repair_memory(&newer).expect("upsert");
         store
-            .record_repair_memory(&memory_entry("fp-b", 30))
+            .record_verified_repair_memory(&newer, "local_verification", "run-a2")
+            .expect("upsert");
+        store
+            .record_verified_repair_memory(&memory_entry("fp-b", 30), "local_verification", "run-b")
             .expect("second");
 
         let rows = store
@@ -7276,7 +11284,11 @@ mod repo_tests {
         let store = Store::open(dir.path().join("s.db")).expect("open");
         for index in 0..(REPAIR_MEMORY_KEEP as i64 + 5) {
             store
-                .record_repair_memory(&memory_entry(&format!("fp-{index}"), index))
+                .record_verified_repair_memory(
+                    &memory_entry(&format!("fp-{index}"), index),
+                    "local_verification",
+                    &format!("run-{index}"),
+                )
                 .expect("record");
         }
         let rows = store
@@ -7294,10 +11306,10 @@ mod repo_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("s.db")).expect("open");
         store
-            .record_repair_memory(&memory_entry("fp-a", 10))
+            .record_verified_repair_memory(&memory_entry("fp-a", 10), "local_verification", "run-a")
             .expect("a");
         store
-            .record_repair_memory(&memory_entry("fp-b", 20))
+            .record_verified_repair_memory(&memory_entry("fp-b", 20), "local_verification", "run-b")
             .expect("b");
 
         assert!(store

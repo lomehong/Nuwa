@@ -1,0 +1,61 @@
+{
+  "fixture_version": 1,
+  "purpose": "faux pipeline/verifier validation, NOT model repair capability",
+  "trials": 3,
+  "provider": "faux",
+  "model": "faux",
+  "turn_cap": 12,
+  "digest_recipe": "sha256 of raw embedded bytes; aggregate: sorted path UTF-8 + NUL + lowercase hex sha256 + LF",
+  "fixture_sha256": {
+    "files": {
+      "batch4/.gitattributes": "2b4a36b3152af89c2af116c71c13e3d20ee2acb0c8cbc4b468d8e2d388727ae0",
+      "batch4/actor.py": "dd4383aff452c6df739d35d2952d4041c24f0f09280529a73f4cdc086bcb5459",
+      "batch4/alwayspass.py": "50a5202b1d8d57dffb63c85c3e745101cc488885316b72af5977cf779c4de4eb",
+      "batch4/genuinefix.py": "b4fbb0e90f32f69b96a51eb729392f1d8610ad59def9c8baa54e52338555523a",
+      "batch4/repo/.gitattributes": "2b4a36b3152af89c2af116c71c13e3d20ee2acb0c8cbc4b468d8e2d388727ae0",
+      "batch4/repo/.gitignore": "7df69b0a8df4de51aa5750f952790b19a5c95b400a7ed5a2b03553467bebff52",
+      "batch4/repo/calc.py": "f62559586c58974625170503e18a4512c45479e0e01a92248d0402e0ffc4d4f4",
+      "batch4/repo/owner_expected.json": "cc99d9aa0f427ea49f911c575a98d14ee1931e6e2ddfeb234dc9762b6f2df787",
+      "batch4/repo/owner_oracle.py": "6a14399ac390c591f87a5a00dd228d88c89674af5cc6577a2280e32e09157e78",
+      "batch4/repo/smoke.py": "cff743fd17e08030944e6a394014363ad1cd573a06747ec06e20454a0824b40e",
+      "batch4/setupfailure.py": "4d42ae4eccc8df483d90e6856acb25578d874612309f4e41a2ad658b8389735b",
+      "batch4/timeout.py": "c69a2d7cd78e6279dec07883e07a5c126b8bcf41e1221168374ee92c73475ca6"
+    },
+    "digest": "e3633320918055c2dadd615b9404dcc513e59980a156a7c1d9ce7dc806757a56"
+  },
+  "oracle_sha256": {
+    "files": {
+      "batch4/repo/owner_expected.json": "cc99d9aa0f427ea49f911c575a98d14ee1931e6e2ddfeb234dc9762b6f2df787",
+      "batch4/repo/owner_oracle.py": "6a14399ac390c591f87a5a00dd228d88c89674af5cc6577a2280e32e09157e78"
+    },
+    "digest": "f1b1156b6e1cce60571c7b741468295cf94a56c10cf6113b947c200e77848832"
+  },
+  "base_commit": {
+    "object_format": "sha1",
+    "branch": "main",
+    "author_name": "nuwa-batch4",
+    "author_email": "batch4@local",
+    "date": "2026-10-27T00:00:00+00:00",
+    "message": "Batch4 deterministic synthetic base",
+    "git_mode": "100644",
+    "config_recipe": "compact serde JSON + LF; repo=batch4/synthetic; strict; timeout=15; launcher python on Windows, python3 elsewhere; protected owner_oracle.py and owner_expected.json; variant selected below",
+    "files": [".gitattributes", ".gitignore", "calc.py", "owner_expected.json", "owner_oracle.py", "smoke.py", "nuwa.repo.json"]
+  },
+  "cases": [
+    {"name": "genuinefix", "owner": "trusted", "expected": "delivered"},
+    {"name": "delete", "owner": "trusted", "expected": "integrity_refused"},
+    {"name": "weakenassert", "owner": "trusted", "expected": "integrity_refused"},
+    {"name": "replacehelper", "owner": "trusted", "expected": "integrity_refused"},
+    {"name": "modechange", "owner": "trusted", "expected": "integrity_refused"},
+    {"name": "swallowexception", "owner": "trusted", "expected": "candidate_refused"},
+    {"name": "reproonly", "owner": "trusted", "expected": "candidate_refused"},
+    {"name": "branchshacheat", "owner": "trusted", "expected": "candidate_refused"},
+    {"name": "noop", "owner": "trusted", "expected": "candidate_refused"},
+    {"name": "alwayspass", "owner": "alwayspass", "expected": "preparation_refused"},
+    {"name": "missingoracle", "owner": "missingoracle", "expected": "preparation_refused"},
+    {"name": "missinginput", "owner": "missinginput", "expected": "preparation_refused"},
+    {"name": "missingcommand", "owner": "missingcommand", "expected": "preparation_refused"},
+    {"name": "setupfailure", "owner": "setupfailure", "expected": "preparation_refused"},
+    {"name": "timeout", "owner": "timeout", "expected": "preparation_refused"}
+  ]
+}

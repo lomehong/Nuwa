@@ -189,6 +189,7 @@ describe("AppShell", () => {
         error: 0,
         reports_today: 4,
         prs_today: 2,
+        pr_slots_today: 0,
       },
     });
 

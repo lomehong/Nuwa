@@ -85,6 +85,7 @@ function richOverview(): OverviewResponse {
       error: 0,
       reports_today: 12,
       prs_today: 2,
+      pr_slots_today: 4,
     },
     ci_24h: { green: 12, red: 1, timeout: 2, pending: 1 },
   });

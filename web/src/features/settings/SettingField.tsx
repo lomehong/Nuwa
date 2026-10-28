@@ -2,7 +2,6 @@ import { clsx } from "clsx";
 import { useId, useState } from "react";
 
 import {
-  formatDiffValue,
   isFullWidthKey,
   secretLabel,
   unitForSpec,
@@ -10,7 +9,6 @@ import {
 import {
   isPlainValue,
   isSecretValue,
-  type DiffDto,
   type SettingDto,
   type SettingValueDto,
 } from "./types";
@@ -18,8 +16,6 @@ import {
 interface SettingFieldProps {
   spec: SettingDto;
   value: SettingValueDto | undefined;
-  /** Runner-reported runtime value when it differs from the env file. */
-  diff?: DiffDto;
   /** Draft text; `undefined` means "show the current value". */
   draft: string | undefined;
   error?: string;
@@ -44,7 +40,6 @@ function placeholderFor(spec: SettingDto): string {
 export function SettingField({
   spec,
   value,
-  diff,
   draft,
   error,
   onChange,
@@ -71,13 +66,7 @@ export function SettingField({
       {changed ? (
         <p className="st-meta">
           <span className="old">{spec.secret ? "已更新" : current || "空"}</span>
-          {spec.requires_restart ? <span className="restart">重启后生效</span> : null}
-        </p>
-      ) : null}
-      {diff ? (
-        <p className="st-meta">
-          文件值 {formatDiffValue(spec, diff.file)} · 运行中{" "}
-          {formatDiffValue(spec, diff.runtime)}
+          {spec.requires_restart ? <span className="restart">需重启进程确认</span> : null}
         </p>
       ) : null}
     </>

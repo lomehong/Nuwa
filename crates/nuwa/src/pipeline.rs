@@ -10,10 +10,121 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use crate::instructions::RepoInstructions;
-use crate::{deliver, guard, issue, repair, secrets, skills};
+use crate::instructions::{RepoInstructions, TrustedInstructions};
+use crate::{deliver, guard, issue, repair, secrets, skills, verify};
 
 pub type ProgressSink = Arc<dyn Fn(repair::RepairProgress) + Send + Sync>;
+
+pub(crate) const CHECKOUT_TTL_MS: i64 = 60_000;
+
+/// Resolve symlinks/junctions before folding Windows' case-insensitive identity.
+/// Failure is not permission to fall back to an unresolved alias.
+pub(crate) fn checkout_identity(repo: &Path) -> anyhow::Result<String> {
+    let path = std::fs::canonicalize(repo)
+        .with_context(|| format!("canonicalize checkout {}", repo.display()))?;
+    let path = path.to_str().context("checkout path is not UTF-8")?;
+    #[cfg(windows)]
+    let path = path.to_lowercase();
+    Ok(path.to_string())
+}
+
+/// A real, renewable checkout claim; never represented by a fabricated runner.
+pub(crate) struct CheckoutLease {
+    store: Arc<shanhaijing::Store>,
+    pub claim: shanhaijing::CheckoutClaim,
+    healthy: std::sync::atomic::AtomicBool,
+}
+
+impl CheckoutLease {
+    pub fn acquire(
+        store: &Arc<shanhaijing::Store>,
+        repo: &Path,
+        owner: &str,
+        instance: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let path = checkout_identity(repo)?;
+        let now = crate::now_ms();
+        let claim = match instance {
+            Some(instance) => {
+                store.claim_runner_checkout(&path, owner, instance, now, CHECKOUT_TTL_MS)?
+            }
+            None => store.claim_checkout(&path, owner, now, CHECKOUT_TTL_MS)?,
+        }
+        .context("checkout is already in use or runner instance is no longer active")?;
+        Ok(Self {
+            store: Arc::clone(store),
+            claim,
+            healthy: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    pub fn ensure(&self) -> anyhow::Result<()> {
+        let result = self
+            .store
+            .checkout_claim_valid(&self.claim, crate::now_ms());
+        match result {
+            Ok(true) if self.healthy.load(std::sync::atomic::Ordering::SeqCst) => Ok(()),
+            result => {
+                self.healthy
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                result?;
+                Err(shanhaijing::ShanError::OwnershipLost.into())
+            }
+        }
+    }
+
+    pub async fn during<T>(
+        &self,
+        future: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        self.during_with_period(Duration::from_secs(10), future)
+            .await
+    }
+
+    async fn during_with_period<T>(
+        &self,
+        period: Duration,
+        future: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        self.ensure()?;
+        let mut ticks = tokio::time::interval(period);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                _ = ticks.tick() => {
+                    match self.store.renew_checkout_claim(&self.claim, crate::now_ms(), CHECKOUT_TTL_MS) {
+                        Ok(true) => {}
+                        result => {
+                            self.healthy.store(false, std::sync::atomic::Ordering::SeqCst);
+                            result?;
+                            return Err(shanhaijing::ShanError::OwnershipLost.into());
+                        }
+                    }
+                }
+                result = &mut future => {
+                    self.ensure()?;
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CheckoutLease {
+    fn drop(&mut self) {
+        if self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+            // The SQL predicate checks token, generation AND unexpired ownership.
+            if let Err(error) = self
+                .store
+                .release_checkout_claim(&self.claim, crate::now_ms())
+            {
+                eprintln!("checkout    : release failed: {error}");
+            }
+        }
+    }
+}
 
 /// 一次修复的完整输入。
 pub struct RepairRequest {
@@ -29,6 +140,10 @@ pub struct RepairRequest {
     pub max_turns: u32,
     /// 仓库指令（notes 与技能白名单）；一次性 CLI 允许缺失。
     pub repo_config: Option<RepoInstructions>,
+    /// Pinned owner authority, never reloaded from the candidate after repair.
+    pub owner: Option<TrustedInstructions>,
+    /// Exact checkout base; `None` pins HEAD before any model execution.
+    pub base: Option<String>,
     pub secrets: Arc<secrets::Secrets>,
     pub progress: Option<ProgressSink>,
     /// benchmark 场景注入的确定性 faux 脚本；普通 runner 为 None。
@@ -43,6 +158,7 @@ pub struct PreparedRepair {
     job: repair::RepairJob,
     session_dir: PathBuf,
     skills_used: Vec<String>,
+    verification: Arc<verify::VerificationContext>,
 }
 
 impl PreparedRepair {
@@ -54,12 +170,18 @@ impl PreparedRepair {
         &self.job.issue
     }
 
+    pub fn verification(&self) -> &verify::VerificationContext {
+        &self.verification
+    }
+
     /// 本次注入的技能（`name@version`），供决策 trace 记录。
     pub fn skills_used(&self) -> &[String] {
         &self.skills_used
     }
 
     pub async fn execute(&self) -> anyhow::Result<repair::RepairReport> {
+        self.verification.assert_delivery_allowed()?;
+        self.verification.assert_integrity(&self.job.repo)?;
         let result = repair::run(&self.job).await;
         // 成功或失败都在 repair 停止写入后发布脱敏快照；serve 永不读取原始日志。
         let dir = match &result {
@@ -117,7 +239,94 @@ fn live_snapshot_progress(
     })
 }
 
-pub fn prepare_repair(req: RepairRequest) -> anyhow::Result<PreparedRepair> {
+pub async fn prepare_repair(mut req: RepairRequest) -> anyhow::Result<PreparedRepair> {
+    let workspace = req.workspace.clone().unwrap_or_else(|| req.repo.clone());
+    let base = crate::git_ops::git(
+        &workspace,
+        &[
+            "rev-parse",
+            "--verify",
+            req.base.as_deref().unwrap_or("HEAD"),
+        ],
+    )?;
+    anyhow::ensure!(
+        crate::git_ops::git(&workspace, &["rev-parse", "HEAD"])? == base,
+        "repair checkout does not match the pinned base"
+    );
+    // A temporary private authority is outside every editable checkout. It is
+    // needed only until prepare() has frozen its own immutable snapshot.
+    let private = tempfile::tempdir().context("private preparation authority")?;
+    let mut owner = req.owner.take();
+    if owner.is_none()
+        && (req.repo.join("nuwa.repo.json").exists()
+            || crate::git_ops::git_raw(&req.repo, &["show", &format!("{base}:nuwa.repo.json")])
+                .is_ok())
+    {
+        owner = Some(TrustedInstructions::load(
+            &req.repo,
+            &req.repo.join("nuwa.repo.json"),
+            &base,
+            private.path(),
+        )?);
+    }
+    if let Some(owner) = &owner {
+        verify::seed_owner_config(&req.repo, &owner.bytes)?;
+        let config = owner.pinned_instructions(&req.repo, &base)?;
+        // A supplied strict/oracle configuration cannot become legacy because
+        // the authoritative source was absent or different.
+        if let Some(supplied) = &req.repo_config {
+            anyhow::ensure!(
+                supplied.verification_policy == config.verification_policy
+                    && supplied.trusted_verification.is_some()
+                        == config.trusted_verification.is_some(),
+                "supplied verification policy differs from owner authority"
+            );
+        }
+        req.repo_config = Some(config);
+    } else if let Some(config) = &req.repo_config {
+        anyhow::ensure!(
+            config.verification_policy == crate::instructions::VerificationPolicy::Compatibility
+                && config.trusted_verification.is_none(),
+            "strict/oracle configuration requires authoritative owner instructions"
+        );
+    }
+    let verification = Arc::new(
+        if checkout_identity(&req.repo)? == checkout_identity(&workspace)? {
+            verify::prepare(&workspace, &base, owner.as_ref(), &req.secrets).await?
+        } else {
+            verify::prepare_workspace(&workspace, &req.repo, &base, owner.as_ref(), &req.secrets)
+                .await?
+        },
+    );
+    if let Some(config) = &req.repo_config {
+        req.issue.failing_check = config.failing_check.clone();
+        req.issue.reproduce_check = config.reproduce_check.clone();
+        req.issue
+            .forbidden_paths
+            .extend(config.forbidden_paths.clone());
+    }
+    req.issue
+        .forbidden_paths
+        .extend(verification.protected_paths());
+    req.issue.forbidden_paths.push("nuwa.repo.json".into());
+    req.issue.forbidden_paths.sort();
+    req.issue.forbidden_paths.dedup();
+    req.issue.verification_mode = if verification.is_trusted() {
+        issue::VerificationMode::OwnerTrusted
+    } else if req.issue.reproduce_check.is_some() {
+        issue::VerificationMode::Configured
+    } else {
+        // Compatibility only: this advisory result is owned by preparation,
+        // not duplicated by entrypoints and never promoted to trusted proof.
+        match verify::probe_working_tree(&workspace, &req.issue.failing_check, &req.secrets).await {
+            Ok(out) if out.ok => issue::VerificationMode::Reproducer,
+            Ok(_) => issue::VerificationMode::FailingCheck,
+            Err(error) => {
+                eprintln!("probe      : {}", req.secrets.redact(&format!("{error:#}")));
+                issue::VerificationMode::FailingCheck
+            }
+        }
+    };
     let session_dir = repair::session_dir_for(&req.sessions_dir, &req.issue, req.run_id.as_deref());
     let session_dir = std::path::absolute(&session_dir)
         .with_context(|| format!("resolve {}", session_dir.display()))?;
@@ -127,7 +336,6 @@ pub fn prepare_repair(req: RepairRequest) -> anyhow::Result<PreparedRepair> {
         .as_ref()
         .map(|config| config.skills.as_slice())
         .unwrap_or(&[]);
-    let workspace = req.workspace.clone().unwrap_or_else(|| req.repo.clone());
     let selection = skills::select(&req.repo, &req.issue, allowlist);
     for warning in &selection.warnings {
         eprintln!("skills    : {warning}");
@@ -143,7 +351,14 @@ pub fn prepare_repair(req: RepairRequest) -> anyhow::Result<PreparedRepair> {
         (true, false) => selection.section.trim_start().to_string(),
         (false, false) => format!("{base_notes}\n{}", selection.section),
     };
-    let guards = Arc::new(guard::Guards::new(req.issue.forbidden_paths.clone()));
+    let guards = Arc::new(guard::Guards::for_checkout(
+        &workspace,
+        req.issue.forbidden_paths.clone(),
+        req.repo_config
+            .as_ref()
+            .map(|c| c.denied_read_paths.clone())
+            .unwrap_or_default(),
+    )?);
     let progress =
         live_snapshot_progress(req.progress, Arc::clone(&req.secrets), session_dir.clone());
     let job = repair::RepairJob {
@@ -163,6 +378,7 @@ pub fn prepare_repair(req: RepairRequest) -> anyhow::Result<PreparedRepair> {
         job,
         session_dir,
         skills_used: selection.used,
+        verification,
     })
 }
 
@@ -178,10 +394,13 @@ pub struct DeliveryRequest<'a> {
     pub public_base_url: Option<&'a str>,
     pub draft: bool,
     pub secrets: &'a secrets::Secrets,
-    /// Durable delivery journal for the work loop. CLI/benchmark pass `None`.
+    /// All delivery modes, including local-only, require this durable journal.
     pub store: Option<&'a shanhaijing::Store>,
     pub run_id: Option<&'a str>,
     pub repo_id: &'a str,
+    pub checkout_claim: Option<&'a shanhaijing::CheckoutClaim>,
+    pub verification: &'a verify::VerificationContext,
+    pub limits: crate::quota::DeliveryLimits,
 }
 
 pub async fn deliver(req: DeliveryRequest<'_>) -> anyhow::Result<deliver::DeliverReport> {
@@ -198,6 +417,9 @@ pub async fn deliver(req: DeliveryRequest<'_>) -> anyhow::Result<deliver::Delive
         req.store,
         req.run_id,
         req.repo_id,
+        req.checkout_claim,
+        req.verification,
+        req.limits,
     )
     .await
 }
@@ -301,6 +523,73 @@ mod tests {
     use super::*;
     use crate::issue::FailingCheck;
 
+    #[tokio::test]
+    async fn checkout_renews_during_a_wait_without_progress_callbacks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(shanhaijing::Store::open(":memory:").expect("store"));
+        let lease = CheckoutLease::acquire(&store, dir.path(), "fix", None).expect("claim");
+        let started = crate::now_ms();
+        lease
+            .during_with_period(Duration::from_millis(5), async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                assert!(store.checkout_claim_valid(&lease.claim, started + CHECKOUT_TTL_MS + 1)?);
+                Ok(())
+            })
+            .await
+            .expect("renewed during provider/tool wait");
+    }
+
+    #[tokio::test]
+    async fn checkout_loss_fails_closed_and_drop_preserves_successor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(shanhaijing::Store::open(":memory:").expect("store"));
+        let lease = CheckoutLease::acquire(&store, dir.path(), "old", None).expect("claim");
+        let path = lease.claim.path.clone();
+        let successor = std::sync::Mutex::new(None);
+        assert!(lease
+            .during(async {
+                *successor.lock().expect("lock") = store.claim_checkout(
+                    &path,
+                    "successor",
+                    crate::now_ms() + CHECKOUT_TTL_MS + 1,
+                    CHECKOUT_TTL_MS,
+                )?;
+                Ok(())
+            })
+            .await
+            .is_err());
+        drop(lease);
+        let claim = successor.lock().expect("lock").take().expect("successor");
+        assert!(store
+            .checkout_claim_valid(&claim, crate::now_ms())
+            .expect("successor preserved"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn checkout_identity_folds_windows_case_after_canonicalization() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alias = PathBuf::from(dir.path().to_str().expect("path").to_uppercase());
+        assert_eq!(
+            checkout_identity(&alias).expect("case alias"),
+            checkout_identity(dir.path()).expect("identity")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_identity_resolves_symlink_aliases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&repo).expect("repo");
+        std::os::unix::fs::symlink(&repo, &alias).expect("symlink");
+        assert_eq!(
+            checkout_identity(&repo).expect("repo"),
+            checkout_identity(&alias).expect("alias")
+        );
+    }
+
     fn issue() -> issue::Issue {
         issue::Issue {
             fingerprint: "abc/def".into(),
@@ -361,6 +650,9 @@ mod tests {
             notes: String::new(),
             skills: Vec::new(),
             reproduce_check: None,
+            denied_read_paths: Vec::new(),
+            verification_policy: Default::default(),
+            trusted_verification: None,
             max_attempts: 3,
             draft_first_n: 0,
         };
@@ -391,33 +683,264 @@ mod tests {
         assert_eq!(format_timestamp(951_782_400_000), "2000-02-29 00:00:00 UTC");
     }
 
-    #[test]
-    fn session_dir_is_per_run_and_absolute() {
+    fn init_repo(repo: &Path) {
+        std::fs::create_dir_all(repo).expect("repo");
+        crate::git_ops::git(repo, &["init", "-b", "main"]).expect("init");
+        crate::git_ops::git(
+            repo,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        )
+        .expect("base");
+    }
+
+    fn preparation_request(repo: &Path, sessions: &Path) -> RepairRequest {
+        let mut issue = issue();
+        issue.failing_check.command = "echo ok".into();
+        RepairRequest {
+            repo: repo.to_path_buf(),
+            workspace: None,
+            issue,
+            sessions_dir: sessions.to_path_buf(),
+            provider: repair::ProviderKind::Faux,
+            max_turns: 1,
+            repo_config: None,
+            owner: None,
+            base: None,
+            secrets: Arc::new(secrets::Secrets::default()),
+            progress: None,
+            faux_script: Some(rpi_ai::providers::faux::FauxScript::new().with_text("done")),
+            run_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_without_oracle_blocks_before_model_even_without_a_config_file() {
+        for on_disk in [false, true] {
+            let dir = tempfile::tempdir().expect("fixture");
+            let repo = dir.path().join("repo");
+            init_repo(&repo);
+            let config = serde_json::json!({
+                "repo": "example.com/strict", "failing_check": {"command": "echo ok"},
+                "verification_policy": "strict",
+            });
+            if on_disk {
+                std::fs::write(repo.join("nuwa.repo.json"), config.to_string()).expect("config");
+            }
+            let sessions = dir.path().join("sessions");
+            let mut req = preparation_request(&repo, &sessions);
+            req.repo_config = Some(serde_json::from_value(config).expect("config"));
+            let tip = crate::git_ops::git(&repo, &["rev-parse", "HEAD"]).expect("tip");
+            let error = prepare_repair(req).await.err().expect("strict refusal");
+            assert!(format!("{error:#}").contains("strict"));
+            assert!(!sessions.exists(), "no model/session effects");
+            assert_eq!(
+                crate::git_ops::git(&repo, &["rev-parse", "HEAD"]).expect("tip"),
+                tip
+            );
+            assert!(
+                crate::git_ops::git(&repo, &["for-each-ref", "refs/heads/agent/fix/"])
+                    .expect("refs")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_workspace_receives_exact_pinned_private_owner_config_before_preparation() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let repo = dir.path().join("config");
+        let workspace = dir.path().join("workspace");
+        init_repo(&repo);
+        crate::git_ops::git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                workspace.to_str().expect("path"),
+                "HEAD",
+            ],
+        )
+        .expect("workspace");
+        let bytes = serde_json::json!({
+            "repo": "example.com/pool", "failing_check": {"command": "echo ok"},
+            "notes": "owner guidance", "denied_read_paths": ["private/**"],
+        })
+        .to_string();
+        std::fs::write(repo.join("nuwa.repo.json"), &bytes).expect("private config");
+        let owner = TrustedInstructions::load(
+            &repo,
+            &repo.join("nuwa.repo.json"),
+            "HEAD",
+            &dir.path().join("authority"),
+        )
+        .expect("owner");
+        let mut req = preparation_request(&repo, &dir.path().join("sessions"));
+        req.workspace = Some(workspace.clone());
+        req.repo_config = Some(owner.instructions.clone());
+        req.owner = Some(owner);
+        assert!(!workspace.join("nuwa.repo.json").exists());
+        let prepared = prepare_repair(req).await.expect("prepare workspace");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("nuwa.repo.json")).expect("seeded"),
+            bytes
+        );
+        assert!(prepared.job.notes.contains("owner guidance"));
+        prepared
+            .verification()
+            .assert_integrity(&workspace)
+            .expect("workspace-bound context");
+        std::fs::write(workspace.join("nuwa.repo.json"), "{}").expect("tamper");
+        assert!(
+            prepared.execute().await.is_err(),
+            "do not refresh authority before model"
+        );
+        assert!(!prepared.session_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn pool_freezes_untracked_oracle_inputs_from_config_root_before_model() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let repo = dir.path().join("config");
+        let workspace = dir.path().join("workspace");
+        init_repo(&repo);
+        crate::git_ops::git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                workspace.to_str().expect("path"),
+                "HEAD",
+            ],
+        )
+        .expect("linked pool worktree");
+        assert!(workspace.join(".git").is_file());
+        std::fs::create_dir(repo.join("checks")).expect("private checks");
+        let oracle = "import os, pathlib, sys\nroot = pathlib.Path(os.environ['NUWA_VERIFY_ROOT'])\nexpected = pathlib.Path(__file__).with_name('expected.txt').read_text()\nfix = root / 'fixed.txt'\nsys.exit(0 if fix.is_file() and fix.read_text() == expected else 1)\n";
+        std::fs::write(repo.join("checks/oracle.py"), oracle).expect("oracle");
+        std::fs::write(repo.join("checks/expected.txt"), "fixed\n").expect("expected");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                repo.join("checks/expected.txt"),
+                std::fs::Permissions::from_mode(0o640),
+            )
+            .expect("private native mode");
+        }
+        let launcher = if cfg!(windows) { "python" } else { "python3" };
+        let config = serde_json::json!({
+            "repo": "example.com/pool", "failing_check": {"command": "echo ok"},
+            "verification_policy": "strict",
+            "trusted_verification": {
+                "check": {"command": format!("{launcher} checks/oracle.py"), "timeout_secs": 10},
+                "protected_inputs": ["checks/oracle.py", "checks/expected.txt"]
+            }
+        });
+        std::fs::write(repo.join("nuwa.repo.json"), config.to_string()).expect("private config");
+        let mut req = preparation_request(&repo, &dir.path().join("sessions"));
+        req.workspace = Some(workspace.clone());
+        let prepared = prepare_repair(req).await.expect("freeze then seed pool");
+        for path in ["nuwa.repo.json", "checks/oracle.py", "checks/expected.txt"] {
+            assert_eq!(
+                std::fs::read(workspace.join(path)).expect("seeded bytes"),
+                std::fs::read(repo.join(path)).expect("source bytes")
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(workspace.join(path))
+                        .expect("seed mode")
+                        .permissions()
+                        .mode(),
+                    std::fs::metadata(repo.join(path))
+                        .expect("source mode")
+                        .permissions()
+                        .mode()
+                );
+            }
+        }
+        std::fs::write(workspace.join("fixed.txt"), "fixed\n").expect("genuine fix");
+        let context = prepared.verification();
+        let evidence = verify::verify(
+            &workspace,
+            prepared.issue(),
+            context.base_sha(),
+            &secrets::Secrets::default(),
+            context,
+        )
+        .await
+        .expect("pool owner-green fix");
+        assert_eq!(evidence.diff.files.len(), 1);
+        assert_eq!(evidence.diff.files[0].path, "fixed.txt");
+        assert!(!repo.join("fixed.txt").exists());
+        std::fs::write(repo.join("checks/expected.txt"), "tampered\n").expect("source tamper");
+        assert!(context.assert_integrity(&workspace).is_err());
+        assert!(verify::verify(
+            &workspace,
+            prepared.issue(),
+            context.base_sha(),
+            &secrets::Secrets::default(),
+            context,
+        )
+        .await
+        .is_err());
+        assert!(
+            prepared.execute().await.is_err(),
+            "no model after source tamper"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("checks/expected.txt")).expect("no restore"),
+            "tampered\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("checks/expected.txt")).expect("frozen seed"),
+            "fixed\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_dir_is_per_run_and_absolute() {
+        let dir = tempfile::tempdir().expect("fixture");
+        init_repo(dir.path());
         let req = RepairRequest {
-            repo: PathBuf::from("."),
+            repo: dir.path().to_path_buf(),
             workspace: None,
             issue: issue(),
             sessions_dir: PathBuf::from("sessions"),
             provider: repair::ProviderKind::Faux,
             max_turns: 1,
             repo_config: None,
+            owner: None,
+            base: None,
             secrets: Arc::new(secrets::Secrets::default()),
             progress: None,
             faux_script: None,
             run_id: Some("run-1".into()),
         };
-        let prepared = prepare_repair(req).expect("prepare");
+        let prepared = prepare_repair(req).await.expect("prepare");
         assert!(prepared.session_dir().is_absolute());
         assert!(prepared.session_dir().ends_with("abc-def/run-1"));
     }
 
-    #[test]
-    fn workspace_is_the_edit_root_not_the_config_root() {
+    #[tokio::test]
+    async fn workspace_is_the_edit_root_not_the_config_root() {
         let dir = tempfile::tempdir().expect("test fixture");
         let config = dir.path().join("config");
         let workspace = dir.path().join("workspace");
-        std::fs::create_dir_all(&config).expect("config");
-        std::fs::create_dir_all(&workspace).expect("workspace");
+        init_repo(&config);
+        init_repo(&workspace);
         let prepared = prepare_repair(RepairRequest {
             repo: config.clone(),
             workspace: Some(workspace.clone()),
@@ -426,11 +949,14 @@ mod tests {
             provider: repair::ProviderKind::Faux,
             max_turns: 1,
             repo_config: None,
+            owner: None,
+            base: None,
             secrets: Arc::new(secrets::Secrets::default()),
             progress: None,
             faux_script: None,
             run_id: Some("workspace-split".into()),
         })
+        .await
         .expect("prepare");
         assert_eq!(
             prepared.job.repo, workspace,
@@ -449,7 +975,8 @@ mod tests {
         assert!(dir.ends_with("abc-def"));
     }
 
-    fn snapshot_repair(dir: &Path, fail: bool) -> PreparedRepair {
+    async fn snapshot_repair(dir: &Path, fail: bool) -> PreparedRepair {
+        init_repo(dir);
         prepare_repair(RepairRequest {
             repo: dir.to_path_buf(),
             workspace: None,
@@ -462,11 +989,14 @@ mod tests {
             },
             max_turns: 1,
             repo_config: None,
+            owner: None,
+            base: None,
             secrets: Arc::new(secrets::Secrets::default()),
             progress: None,
             faux_script: Some(rpi_ai::providers::faux::FauxScript::new().with_text("done")),
             run_id: Some("snapshot-run".into()),
         })
+        .await
         .expect("test fixture")
     }
 
@@ -474,7 +1004,7 @@ mod tests {
     async fn snapshot_is_published_after_success_or_repair_failure() {
         for fail in [false, true] {
             let dir = tempfile::tempdir().expect("test fixture");
-            let prepared = snapshot_repair(dir.path(), fail);
+            let prepared = snapshot_repair(dir.path(), fail).await;
             std::fs::create_dir_all(prepared.session_dir()).expect("test fixture");
             let raw = "{\"text\":\"ghp_abcdefghijklmnopqrstuvwxyz0123456789\"}\n";
             std::fs::write(prepared.session_dir().join("private.jsonl"), raw)
@@ -494,9 +1024,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn progress_publishes_a_live_redacted_snapshot() {
+    #[tokio::test]
+    async fn progress_publishes_a_live_redacted_snapshot() {
         let dir = tempfile::tempdir().expect("test fixture");
+        init_repo(dir.path());
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let inner_calls = Arc::clone(&calls);
         let prepared = prepare_repair(RepairRequest {
@@ -507,6 +1038,8 @@ mod tests {
             provider: repair::ProviderKind::Faux,
             max_turns: 1,
             repo_config: None,
+            owner: None,
+            base: None,
             secrets: Arc::new(secrets::Secrets::default()),
             progress: Some(Arc::new(move |progress| {
                 inner_calls.lock().expect("calls").push(progress);
@@ -514,6 +1047,7 @@ mod tests {
             faux_script: None,
             run_id: Some("live-snapshot".into()),
         })
+        .await
         .expect("test fixture");
         std::fs::create_dir_all(prepared.session_dir()).expect("test fixture");
         std::fs::write(
@@ -544,7 +1078,7 @@ mod tests {
     async fn review_snapshot_failure_preserves_successful_report() {
         for obstructed in [false, true] {
             let dir = tempfile::tempdir().expect("test fixture");
-            let prepared = snapshot_repair(dir.path(), false);
+            let prepared = snapshot_repair(dir.path(), false).await;
             std::fs::create_dir_all(prepared.session_dir()).expect("test fixture");
             std::fs::write(prepared.session_dir().join("private.jsonl"), "invalid JSON")
                 .expect("test fixture");
@@ -569,7 +1103,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn review_snapshot_failure_preserves_original_repair_error() {
         let dir = tempfile::tempdir().expect("test fixture");
-        let prepared = snapshot_repair(dir.path(), true);
+        let prepared = snapshot_repair(dir.path(), true).await;
         let original = repair::run(&prepared.job)
             .await
             .err()

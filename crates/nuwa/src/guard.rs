@@ -1,15 +1,21 @@
 //! 禁改路径 + git/PR 命令护栏 — the day-one guardrails (ADR-003 五件套).
 //!
-//! Enforcement point is the harness `before_tool_call` hook: a vetoed call
-//! never executes, and the model sees the reason as an error tool result, so
-//! it can route around the block instead of derailing.
+//! The hook gives early errors; `local_env` enforces resolved filesystem access
+//! (including recursive tool reads). Shell commands still have host privileges:
+//! neither the hook nor this filesystem policy is an OS sandbox.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rpi_agent::hooks::BeforeToolCall;
 use rpi_agent::types::{BeforeToolCallContext, BeforeToolCallResult};
 use tokio_util::sync::CancellationToken;
+
+pub(crate) mod local_env;
+mod path_policy;
+use path_policy::Access;
+pub use path_policy::PathPolicy;
 
 /// Git subcommands reserved for Nuwa's delivery step (`deliver.rs`): the agent
 /// must never move branches, rewrite history, commit, or re-point the remote.
@@ -65,6 +71,7 @@ const SHELL_TOOLS: &[&str] = &["bash", "powershell"];
 #[derive(Debug, Clone)]
 pub struct Guards {
     forbidden: Vec<String>,
+    policy: Option<Arc<PathPolicy>>,
 }
 
 impl Guards {
@@ -74,11 +81,70 @@ impl Guards {
         if !forbidden.iter().any(|path| path == "nuwa.repo.json") {
             forbidden.push("nuwa.repo.json".to_string());
         }
-        Self { forbidden }
+        Self {
+            forbidden,
+            policy: None,
+        }
+    }
+
+    /// Owner-provided oracle paths must already be in `forbidden_paths`.
+    /// Forbidden files remain readable; denied reads also prohibit writes.
+    pub fn for_checkout(
+        root: &Path,
+        forbidden_paths: Vec<String>,
+        denied_read_paths: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let mut guards = Self::new(forbidden_paths);
+        guards.policy = Some(Arc::new(PathPolicy::new(
+            root,
+            &guards.forbidden,
+            &denied_read_paths,
+        )?));
+        Ok(guards)
+    }
+
+    /// Legacy callers cannot accidentally construct an unrooted repair run.
+    pub(crate) fn rooted_for(&self, root: &Path) -> anyhow::Result<Self> {
+        match &self.policy {
+            Some(policy) => {
+                policy.check_root(root)?;
+                Ok(self.clone())
+            }
+            None => Self::for_checkout(root, self.forbidden.clone(), Vec::new()),
+        }
+    }
+
+    pub(crate) fn policy(&self) -> anyhow::Result<Arc<PathPolicy>> {
+        self.policy
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("unrooted guards"))
+    }
+
+    /// Runtime session locations need protection even when configured inside
+    /// the checkout under an arbitrary name. This does not grant outside access.
+    pub(crate) fn deny_private_path(&mut self, path: &Path) -> anyhow::Result<()> {
+        if let Some(policy) = &mut self.policy {
+            Arc::make_mut(policy).deny_private_path(path)?;
+        }
+        Ok(())
     }
 
     /// `Err(reason)` = block the call; the reason is surfaced to the model.
     pub fn check(&self, tool: &str, args: &serde_json::Value) -> Result<(), String> {
+        if let Some(policy) = &self.policy {
+            if ["read", "edit", "write", "grep", "find", "ls"].contains(&tool) {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                let normalized = rpi_tools::path_utils::normalize_tool_path(path);
+                let access = if PATH_MUTATING_TOOLS.contains(&tool) {
+                    Access::Write
+                } else {
+                    Access::Read
+                };
+                policy
+                    .authorize(&normalized, access)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         if PATH_MUTATING_TOOLS.contains(&tool) {
             if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
                 self.check_path(path)?;
@@ -116,6 +182,15 @@ impl Guards {
     }
 
     fn check_path(&self, path: &str) -> Result<(), String> {
+        if let Some(policy) = &self.policy {
+            return policy
+                .authorize(
+                    &rpi_tools::path_utils::normalize_tool_path(path),
+                    Access::Write,
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+        }
         // Judge the path the tool will actually open, not the raw argument:
         // rpi-tools strips a leading `@` and expands `~` to the home dir before
         // resolving. Without mirroring that, `@/tmp/x` and `~/x` slip past the

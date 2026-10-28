@@ -44,10 +44,11 @@ describe("runner status", () => {
     expect(runnerStatusVariant(makeRunner({ status: "draining" }), NOW)).toBe("neutral");
   });
 
-  it("computes the quota percentage without dividing by zero", () => {
-    expect(runnerQuotaPercent(makeRunner({ prs_today: 2, daily_pr_limit: 5 }))).toBe(40);
-    expect(runnerQuotaPercent(makeRunner({ prs_today: 2, daily_pr_limit: null }))).toBeNull();
-    expect(runnerQuotaPercent(makeRunner({ prs_today: 2, daily_pr_limit: 0 }))).toBeNull();
-    expect(runnerQuotaPercent(makeRunner({ prs_today: 9, daily_pr_limit: 5 }))).toBe(100);
+  it("uses admission slots, not PR observations, without dividing by zero", () => {
+    expect(runnerQuotaPercent(makeRunner({ pr_slots_today: 4, prs_today: 1, daily_pr_limit: 5 }))).toBe(80);
+    expect(runnerQuotaPercent(makeRunner({ pr_slots_today: 0, prs_today: 9, daily_pr_limit: 5 }))).toBe(0);
+    expect(runnerQuotaPercent(makeRunner({ pr_slots_today: 2, daily_pr_limit: null }))).toBeNull();
+    expect(runnerQuotaPercent(makeRunner({ pr_slots_today: 2, daily_pr_limit: 0 }))).toBeNull();
+    expect(runnerQuotaPercent(makeRunner({ pr_slots_today: 9, daily_pr_limit: 5 }))).toBe(100);
   });
 });

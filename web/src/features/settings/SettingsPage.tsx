@@ -116,7 +116,6 @@ function SettingsAreaView({ area }: { area: SettingsAreaDef }) {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [lastSave, setLastSave] = useState<{
     changed: string[];
-    restartRequired: boolean;
   } | null>(null);
   const dirtyRef = useRef(false);
   const probeErrorKeysRef = useRef<string[]>([]);
@@ -248,14 +247,15 @@ function SettingsAreaView({ area }: { area: SettingsAreaDef }) {
         setFieldErrors({});
         setLastSave({
           changed: result.changed,
-          restartRequired: result.restart_required,
         });
         toast({
           title: "设置已保存",
           description:
             result.changed.length > 0
-              ? `变更 ${result.changed.length} 项${result.restart_required ? "，重启后生效。" : "。"}`
-              : "没有字段发生变化。",
+              ? `已写入 ${result.changed.length} 项；保存版本与进程状态以刷新后的服务端数据为准。`
+              : result.restart_required
+                ? "字段值未变，已重新登记保存版本；各进程加载状态以刷新后的数据为准。"
+                : "没有字段发生变化。",
           variant: "success",
         });
       },
@@ -305,13 +305,13 @@ function SettingsAreaView({ area }: { area: SettingsAreaDef }) {
     const token = drafts.NUWA_GITHUB_TOKEN;
     testGithub.mutate(
       token
-        ? { target: "github", values: { NUWA_GITHUB_TOKEN: token } }
-        : { target: "github" },
+        ? { target: "github", candidate: "draft", values: { NUWA_GITHUB_TOKEN: token } }
+        : { target: "github", candidate: "saved" },
       {
         onSuccess: (result) => {
           clearProbeErrors();
           toast({
-            title: "GitHub token 可用",
+            title: "GitHub 候选 token 可用",
             description: result.detail,
             variant: "success",
           });
@@ -325,17 +325,19 @@ function SettingsAreaView({ area }: { area: SettingsAreaDef }) {
     const values: SettingsValues = {};
     for (const key of LLM_PROBE_KEYS) {
       const raw = drafts[key];
-      if (raw) {
+      if (raw !== undefined) {
         values[key] = raw;
       }
     }
     testLlm.mutate(
-      { target: "llm", values },
+      Object.keys(values).length > 0
+        ? { target: "llm", candidate: "draft", values }
+        : { target: "llm", candidate: "saved" },
       {
         onSuccess: (result) => {
           clearProbeErrors();
           toast({
-            title: "模型配置可用",
+            title: "模型候选配置可用",
             description: result.detail,
             variant: "success",
           });
@@ -479,7 +481,6 @@ function SettingsAreaView({ area }: { area: SettingsAreaDef }) {
               data={data}
               specs={specs}
               drafts={drafts}
-              lastSave={lastSave}
               testActions={
                 area.id === "connection" ? (
                   <>
@@ -495,7 +496,7 @@ function SettingsAreaView({ area }: { area: SettingsAreaDef }) {
                       ) : (
                         <ShieldCheck aria-hidden="true" className="size-3.5" />
                       )}
-                      测试 GitHub token
+                      测试 GitHub token（{drafts.NUWA_GITHUB_TOKEN ? "草稿候选" : "已保存候选"}）
                     </button>
                     <button
                       className="st-btn"
@@ -509,7 +510,7 @@ function SettingsAreaView({ area }: { area: SettingsAreaDef }) {
                       ) : (
                         <FlaskConical aria-hidden="true" className="size-3.5" />
                       )}
-                      测试模型配置
+                      测试模型配置（{LLM_PROBE_KEYS.some((key) => drafts[key] !== undefined) ? "草稿候选" : "已保存候选"}）
                     </button>
                   </>
                 ) : undefined
@@ -523,7 +524,6 @@ function SettingsAreaView({ area }: { area: SettingsAreaDef }) {
             drafts={drafts}
             errors={fieldErrors}
             latestChange={latestChange}
-            lastSave={lastSave}
             onChange={handleDraftChange}
           />
         </div>

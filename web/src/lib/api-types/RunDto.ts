@@ -5,7 +5,7 @@
  * the issue fingerprint/runner id are already implied by the response
  * (docs/09 §9.2).
  */
-export type RunDto = { id: string, started_at_ms: number, finished_at_ms: number | null, phase: string, outcome: string | null, ci_verdict: string | null, turns: number, tokens_uncached: number, tokens_cached: number, 
+export type RunDto = { id: string, started_at_ms: number, finished_at_ms: number | null, phase: string, outcome: string | null, ci_verdict: string | null, turns: number, tokens_uncached: number, tokens_cached: number,
 /**
  * 上下文预算：自动压缩次数、模型窗口、最终消息数。
  */

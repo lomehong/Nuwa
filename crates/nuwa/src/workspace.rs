@@ -28,8 +28,8 @@ impl RunWorkspace {
         }
     }
 
-    /// Create a detached worktree at `base`. The primary checkout stays at the
-    /// base branch; dropping this value removes the worktree.
+    /// Create a detached worktree at `base`. Drop removes only an unchanged,
+    /// detached checkout; repair evidence is retained for owner review.
     ///
     /// Not used by the single-run loop yet: the pool first needs the pipeline
     /// to read skills/config from the primary checkout while editing this one.
@@ -66,11 +66,16 @@ impl Drop for RunWorkspace {
         if !self.owned {
             return;
         }
-        if let Some(path) = self.path.to_str() {
-            let _ = git_ops::git(&self.repo, &["worktree", "remove", "--force", path]);
+        // Never let pool teardown bypass delivery's evidence-preserving guard.
+        // A clean agent branch can still identify an unfinished remote effect.
+        if !git_ops::current_branch(&self.path).is_ok_and(|branch| branch == "HEAD") {
+            return;
         }
-        // The worktree may be dirty or already removed; both are fine.
-        let _ = std::fs::remove_dir_all(&self.path);
+        if let Some(path) = self.path.to_str() {
+            // Git refuses dirty/untracked worktrees without --force. A refusal
+            // is evidence to retain, not permission for recursive deletion.
+            let _ = git_ops::git(&self.repo, &["worktree", "remove", path]);
+        }
     }
 }
 
@@ -123,10 +128,6 @@ mod tests {
         assert!(path.join("base.txt").exists());
         assert_ne!(path, repo);
 
-        // A separate working tree: edits do not leak into the primary checkout.
-        std::fs::write(path.join("only-worktree.txt"), "x").expect("write");
-        assert!(!repo.join("only-worktree.txt").exists());
-
         let name = path
             .file_name()
             .expect("worktree name")
@@ -139,5 +140,37 @@ mod tests {
             !list.contains(&name),
             "removed worktree still registered: {list}"
         );
+    }
+
+    #[test]
+    fn drop_preserves_dirty_or_attached_worktree_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        for attached in [false, true] {
+            let workspace = RunWorkspace::worktree(&repo, "main", "evidence").expect("worktree");
+            let path = workspace.path().to_path_buf();
+            if attached {
+                git(&path, &["checkout", "-b", "agent/fix/evidence"]);
+            } else {
+                std::fs::write(path.join("only-worktree.txt"), "repair evidence").expect("write");
+                assert!(!repo.join("only-worktree.txt").exists());
+            }
+            drop(workspace);
+            assert!(path.join("base.txt").is_file());
+            if !attached {
+                assert!(path.join("only-worktree.txt").is_file());
+            }
+            // These are synthetic fixtures owned by this test, not recovery.
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    path.to_str().expect("path"),
+                ],
+            );
+        }
     }
 }

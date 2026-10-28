@@ -28,8 +28,6 @@ pub enum Verdict {
     Success,
     /// At least one completed check failed.
     Failure,
-    /// Checks not finished within the budget — inconclusive, leave the PR.
-    TimedOut,
 }
 
 /// Aggregate one check-runs page. `None` = keep polling.
@@ -61,31 +59,9 @@ pub fn aggregate(total: u64, runs: &[(bool, Option<&str>)]) -> Option<Verdict> {
     None
 }
 
-/// Poll Actions workflow runs for `sha` until all complete, one fails, or the
-/// budget is spent. Uses the `Actions: read` permission (the fine-grained PAT
-/// dropdown has no "Checks" entry; check-runs 403s on private repos without
-/// it). `total_count == 0` is a transient state (Actions registers runs
-/// lazily after the PR event).
-pub async fn wait_for_ci(
-    token: &str,
-    slug: &str,
-    sha: &str,
-    timeout_secs: u64,
-) -> anyhow::Result<Verdict> {
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(verdict) = poll_ci_once(token, slug, sha).await? {
-            return Ok(verdict);
-        }
-        if start.elapsed().as_secs() >= timeout_secs {
-            return Ok(Verdict::TimedOut);
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-    }
-}
-
 /// One Actions poll. `None` means the runs are registered but not finished;
-/// callers that outlive a repair run use this instead of a blocking wait.
+/// foreground and background observers share the durable CI watch scheduler.
+/// Uses `Actions: read`; zero runs is transient while Actions registers them.
 pub async fn poll_ci_once(token: &str, slug: &str, sha: &str) -> anyhow::Result<Option<Verdict>> {
     poll_ci_once_at("https://api.github.com", token, slug, sha).await
 }
@@ -177,6 +153,10 @@ async fn poll_ci_once_pages(
 }
 
 /// Close a PR (rejected path). Needs the same token's pulls:write.
+///
+/// GitHub's close endpoint has no atomic expected-head guarantee. Even callers
+/// checking the head immediately before and after this request have a residual
+/// time-of-check/time-of-use (TOCTOU) race with pushes and merges.
 pub async fn close_pr(token: &str, slug: &str, number: u64) -> anyhow::Result<()> {
     let resp = github_http_client()?
         .patch(format!(
@@ -212,8 +192,52 @@ pub fn parse_pr_url(url: &str) -> Option<(String, u64)> {
     Some((format!("{owner}/{repo}"), number))
 }
 
-/// PR 的合并态：merged / open / closed(未合并).
-pub async fn pr_merge_state(token: &str, slug: &str, number: u64) -> anyhow::Result<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+impl PrState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Merged => "merged",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrSnapshot {
+    pub state: PrState,
+    pub head_sha: String,
+}
+
+fn parse_pr_snapshot(payload: &serde_json::Value) -> anyhow::Result<PrSnapshot> {
+    let head_sha = payload["head"]["sha"]
+        .as_str()
+        .filter(|sha| !sha.is_empty() && sha.trim() == *sha)
+        .context("PR snapshot missing or malformed head.sha")?;
+    let merged = payload["merged"]
+        .as_bool()
+        .context("PR snapshot missing or malformed merged")?;
+    let state = match (payload["state"].as_str(), merged) {
+        (Some("open"), false) => PrState::Open,
+        (Some("closed"), false) => PrState::Closed,
+        (Some("closed"), true) => PrState::Merged,
+        _ => bail!("PR snapshot has unknown or inconsistent state/merged"),
+    };
+    Ok(PrSnapshot {
+        state,
+        head_sha: head_sha.to_string(),
+    })
+}
+
+/// Read the PR lifecycle and exact head together; incomplete responses are not
+/// evidence of either an open PR or a CI failure.
+pub async fn pr_snapshot(token: &str, slug: &str, number: u64) -> anyhow::Result<PrSnapshot> {
     let resp = github_http_client()?
         .get(format!(
             "https://api.github.com/repos/{slug}/pulls/{number}"
@@ -225,17 +249,23 @@ pub async fn pr_merge_state(token: &str, slug: &str, number: u64) -> anyhow::Res
         .await
         .context("GET pulls/../{number}")?;
     let status = resp.status();
-    let payload: serde_json::Value = resp.json().await.unwrap_or_default();
+    let payload: serde_json::Value = resp.json().await.context("decode PR snapshot")?;
     if !status.is_success() {
         bail!(
             "pulls/{number} {status}: {}",
             payload["message"].as_str().unwrap_or("(no message)")
         );
     }
-    if payload["merged"].as_bool() == Some(true) {
-        return Ok("merged".to_string());
-    }
-    Ok(payload["state"].as_str().unwrap_or("unknown").to_string())
+    parse_pr_snapshot(&payload)
+}
+
+/// PR 的合并态：merged / open / closed(未合并). Compatibility for sync callers.
+pub async fn pr_merge_state(token: &str, slug: &str, number: u64) -> anyhow::Result<String> {
+    Ok(pr_snapshot(token, slug, number)
+        .await?
+        .state
+        .as_str()
+        .to_string())
 }
 
 /// Journal a terminal lifecycle event (`merged`/`rejected`) that backs the
@@ -419,6 +449,43 @@ mod tests {
     use super::SyncError;
     use super::Verdict;
 
+    #[test]
+    fn pr_snapshots_require_complete_consistent_state_and_exact_head() {
+        use super::{parse_pr_snapshot, PrSnapshot, PrState};
+        for (state, merged, expected) in [
+            ("open", false, PrState::Open),
+            ("closed", false, PrState::Closed),
+            ("closed", true, PrState::Merged),
+        ] {
+            assert_eq!(
+                parse_pr_snapshot(&serde_json::json!({
+                    "state": state, "merged": merged, "head": {"sha": "exact-head"}
+                }))
+                .expect("snapshot"),
+                PrSnapshot {
+                    state: expected,
+                    head_sha: "exact-head".into()
+                }
+            );
+        }
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({"state":"open","merged":false}),
+            serde_json::json!({"state":"open","merged":false,"head":{"sha":""}}),
+            serde_json::json!({"state":"open","merged":false,"head":{"sha":7}}),
+            serde_json::json!({"state":"open","merged":false,"head":{"sha":" x "}}),
+            serde_json::json!({"state":"open","head":{"sha":"x"}}),
+            serde_json::json!({"state":"open","merged":null,"head":{"sha":"x"}}),
+            serde_json::json!({"state":"open","merged":"false","head":{"sha":"x"}}),
+            serde_json::json!({"merged":false,"head":{"sha":"x"}}),
+            serde_json::json!({"state":"unknown","merged":false,"head":{"sha":"x"}}),
+            serde_json::json!({"state":"unknown","merged":true,"head":{"sha":"x"}}),
+            serde_json::json!({"state":"open","merged":true,"head":{"sha":"x"}}),
+        ] {
+            assert!(parse_pr_snapshot(&malformed).is_err(), "{malformed}");
+        }
+    }
+
     #[tokio::test]
     async fn pr_open_without_url_is_rejected_instead_of_staying_stuck() {
         use shanhaijing::{State, Store};
@@ -436,6 +503,7 @@ mod tests {
             stack_trace:
                 "panic: no pr\ngoroutine 1 [running]:\nexample.com/app.F()\n\t/app/a.go:1 +0x1"
                     .into(),
+            ..Default::default()
         };
         let fp = match store.report_signal(&signal, t).expect("report") {
             shanhaijing::ReportOutcome::NewIssue { fingerprint } => fingerprint,

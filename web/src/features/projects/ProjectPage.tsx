@@ -258,7 +258,10 @@ export function ProjectPage() {
         <LedgerStat label="队列" value={String(project.queued)} />
         <LedgerStat label="运行中" value={String(project.running)} />
         <LedgerStat label="PR 待合并" value={String(project.pr_open)} />
-        <LedgerStat label="今日 PR" value={`${project.prs_today}/${project.pr_limit || "—"}`} />
+        <LedgerStat
+          label="UTC 准入槽位 / 观测最大值"
+          value={`${project.pr_slots_today}/${project.pr_limit || "—"}`}
+        />
         <LedgerStat
           label="CI 红 24h"
           value={String(project.ci_red)}
@@ -267,6 +270,11 @@ export function ProjectPage() {
         <LedgerStat label="上报 24h" value={formatNumber(project.reports_24h)} />
         <LedgerStat label="tokens 24h" value={formatTokens(project.tokens_24h)} />
       </div>
+      <p className="text-caption text-text-muted">
+        UTC 今日确认 PR（创建 / 本地观测记录）：{project.prs_today}。
+        准入槽位包含在途、结果不明及已消耗；重试保留原准入日。
+        分母是 runner 上报值的观测最大值，不是中心统一硬上限；策略由创建进程解析，各进程可能不同。
+      </p>
 
       <div className="grid gap-4 sm:grid-cols-2">
         <Card>

@@ -23,9 +23,14 @@ use crate::git_ops;
 use crate::issue::{FailingCheck, Issue};
 use crate::secrets::Secrets;
 
+mod trusted;
+pub use trusted::{prepare, TrustProvenance, VerificationContext};
+pub(crate) use trusted::{prepare_workspace, seed_owner_config};
+
 #[derive(Debug, Clone)]
 pub struct CheckOutput {
     pub ok: bool,
+    pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub output: String,
 }
@@ -59,7 +64,8 @@ pub struct DiffSummary {
 
 #[derive(Debug, Clone)]
 pub struct VerificationEvidence {
-    /// `configured`, `failing_check`, or `reproducer`.
+    pub provenance: TrustProvenance,
+    /// `owner_trusted`, or legacy `configured` / `failing_check` / `reproducer`.
     pub mode: &'static str,
     pub failing_base: CheckOutput,
     pub failing_branch: CheckOutput,
@@ -75,6 +81,17 @@ impl VerificationEvidence {
     pub fn detail(&self, issue: &Issue) -> String {
         let mut out = String::new();
         out.push_str(&format!("MODE: {}\n", self.mode));
+        out.push_str(&format!(
+            "TRUST: {}; base={}; candidate_tree={}; owner_config={}; manifest={}; source={}; owner_exits={:?}/{:?}\n",
+            self.provenance.trust_level,
+            self.provenance.base_sha,
+            self.provenance.candidate_tree,
+            self.provenance.owner_config_sha256.as_deref().unwrap_or("none"),
+            self.provenance.manifest_sha256.as_deref().unwrap_or("none"),
+            self.provenance.owner_source.unwrap_or("none"),
+            self.provenance.oracle_base_exit,
+            self.provenance.oracle_candidate_exit,
+        ));
         out.push_str(&format!(
             "BASE failing_check: `{}` -> {}\n{}\n\n",
             issue.failing_check.command,
@@ -144,6 +161,44 @@ pub async fn verify(
     issue: &Issue,
     base: &str,
     secrets: &Secrets,
+    context: &VerificationContext,
+) -> anyhow::Result<VerificationEvidence> {
+    context.invalidate_verification()?;
+    context.assert_delivery_allowed()?;
+    context.assert_integrity(repo)?;
+    context.assert_candidate_sources(repo)?;
+    let base_sha = trusted::resolve_base(repo, base)?;
+    let tree = candidate_tree_for_context(repo, context)?;
+    let mut evidence = if context.is_trusted() {
+        context
+            .verify_candidate(repo, issue, &base_sha, &tree, secrets)
+            .await?
+    } else {
+        verify_legacy(
+            repo,
+            issue,
+            &base_sha,
+            secrets,
+            context.provenance(&base_sha, &tree),
+        )
+        .await?
+    };
+    context.assert_integrity(repo)?;
+    context.assert_candidate_sources(repo)?;
+    if candidate_tree_for_context(repo, context)? != tree {
+        bail!("candidate tree changed during verification");
+    }
+    evidence.provenance = context.provenance(&base_sha, &tree);
+    context.record_verified(&base_sha, &tree)?;
+    Ok(evidence)
+}
+
+async fn verify_legacy(
+    repo: &Path,
+    issue: &Issue,
+    base: &str,
+    secrets: &Secrets,
+    provenance: TrustProvenance,
 ) -> anyhow::Result<VerificationEvidence> {
     let env = crate::secrets::agent_env_allowlist();
     let worktree = BaseWorktree::create(repo, base)?;
@@ -157,6 +212,7 @@ pub async fn verify(
             failing_base.output
         );
     }
+    trusted::require_valid_check(&failing_base, "base failing_check")?;
     let failing_branch = run_check(repo, &issue.failing_check, &env, secrets).await?;
 
     let configured = issue.reproduce_check.as_ref();
@@ -171,13 +227,7 @@ pub async fn verify(
         ("failing_check", None, None)
     } else {
         let (path, bytes) = find_reproducer(repo)?;
-        let destination = base_dir.join(&path);
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        std::fs::write(&destination, &bytes)
-            .with_context(|| format!("copy reproducer to {}", destination.display()))?;
+        trusted::write_safe_file(base_dir, path.to_str().context("reproducer path")?, &bytes)?;
         let check = reproducer_check(&path);
         let base_out = run_check(base_dir, &check, &env, secrets).await?;
         let branch_out = run_check(repo, &check, &env, secrets).await?;
@@ -191,6 +241,7 @@ pub async fn verify(
             if base_out.timed_out {
                 bail!("reproduce_check timed out on base:\n{}", base_out.output);
             }
+            trusted::require_valid_check(base_out, "base reproduce_check")?;
             if base_out.ok {
                 bail!(
                     "reproduce_check passes on the base commit — it does not reproduce the bug:\n{}",
@@ -219,6 +270,7 @@ pub async fn verify(
             if base_out.timed_out {
                 bail!("reproducer timed out on base:\n{}", base_out.output);
             }
+            trusted::require_valid_check(base_out, "base reproducer")?;
             if base_out.ok {
                 bail!(
                     ".nuwa/repro.sh passes on the base commit — it does not reproduce the bug:\n{}",
@@ -263,6 +315,7 @@ pub async fn verify(
     }
 
     Ok(VerificationEvidence {
+        provenance,
         mode,
         failing_base,
         failing_branch,
@@ -373,16 +426,17 @@ async fn run_deep_checks_with_specs(
         // A command that cannot run at all (toolchain absent) is a skipped
         // baseline, not a delivery blocker: the configured failing_check still
         // has to pass on the branch.
-        let base = match run_check(base_dir, &check, env, secrets).await {
+        let base = match run_deep_check(base_dir, &check, env, secrets).await {
             Ok(output) => output,
             Err(error) => CheckOutput {
                 ok: false,
+                exit_code: None,
                 timed_out: false,
                 output: format!("unavailable: {error:#}"),
             },
         };
         let branch = if base.ok && !base.timed_out {
-            let output = run_check(repo, &check, env, secrets).await?;
+            let output = run_deep_check(repo, &check, env, secrets).await?;
             if output.timed_out {
                 bail!(
                     "deep check `{command}` timed out on the branch after {timeout_secs}s:\n{}",
@@ -408,6 +462,31 @@ async fn run_deep_checks_with_specs(
     Ok(results)
 }
 
+async fn run_deep_check(
+    dir: &Path,
+    check: &FailingCheck,
+    env: &BTreeMap<String, String>,
+    secrets: &Secrets,
+) -> anyhow::Result<CheckOutput> {
+    if check.command != "go build ./..." {
+        return run_check(dir, check, env, secrets).await;
+    }
+    // A main package otherwise writes its executable into the checkout. Keep
+    // verifier-created artifacts outside the candidate tree rather than
+    // weakening the tree-integrity assertion or ignoring arbitrary new files.
+    let output = tempfile::tempdir().context("create Go deep-check output directory")?;
+    let destination = output.path().to_str().context("Go output path encoding")?;
+    let out = git_ops::run_process(
+        "go",
+        &["build", "-o", destination, "./..."],
+        dir,
+        Duration::from_secs(check.timeout_secs.max(1)),
+        Some(env),
+    )
+    .await?;
+    Ok(check_output(out, secrets))
+}
+
 async fn run_check(
     dir: &Path,
     check: &FailingCheck,
@@ -422,12 +501,17 @@ async fn run_check(
     };
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = git_ops::run_process(program, &args, dir, timeout, Some(env)).await?;
+    Ok(check_output(out, secrets))
+}
+
+fn check_output(out: git_ops::ProcessOutput, secrets: &Secrets) -> CheckOutput {
     let combined = format!("{}{}", out.stdout, out.stderr);
-    Ok(CheckOutput {
+    CheckOutput {
         ok: out.success && !out.timed_out,
+        exit_code: out.exit_code,
         timed_out: out.timed_out,
-        output: secrets.redact(&combined),
-    })
+        output: secrets.redact(&combined).chars().take(4096).collect(),
+    }
 }
 
 fn reproducer_check(path: &Path) -> FailingCheck {
@@ -453,7 +537,8 @@ fn reproducer_path() -> PathBuf {
 
 fn find_reproducer(repo: &Path) -> anyhow::Result<(PathBuf, Vec<u8>)> {
     let path = reproducer_path();
-    let absolute = repo.join(&path);
+    let absolute = trusted::safe_file(repo, path.to_str().context("reproducer path")?)
+        .context("no reproducer exists at a safe regular-file path")?;
     let bytes = std::fs::read(&absolute).with_context(|| {
         format!(
             "failing_check passes on the base commit and no reproducer exists at {}; \
@@ -469,16 +554,14 @@ fn find_reproducer(repo: &Path) -> anyhow::Result<(PathBuf, Vec<u8>)> {
 
 fn copy_reproducer_if_present(repo: &Path, base_dir: &Path) -> anyhow::Result<()> {
     let path = reproducer_path();
-    let source = repo.join(&path);
-    if !source.exists() {
+    let relative = path.to_str().context("reproducer path")?;
+    let source = trusted::safe_destination(repo, relative)?;
+    if std::fs::symlink_metadata(&source).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
         return Ok(());
     }
-    let destination = base_dir.join(&path);
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    std::fs::copy(&source, &destination)
-        .with_context(|| format!("copy {} to {}", source.display(), destination.display()))?;
+    let source = trusted::safe_file(repo, relative)?;
+    let bytes = std::fs::read(source).context("read legacy reproducer")?;
+    trusted::write_safe_file(base_dir, relative, &bytes)?;
     Ok(())
 }
 
@@ -526,35 +609,22 @@ pub fn diff_summary(
     base: &str,
     forbidden_paths: &[String],
 ) -> anyhow::Result<DiffSummary> {
+    diff_summary_with_exclusions(repo, base, forbidden_paths, &[])
+}
+
+fn diff_summary_with_exclusions(
+    repo: &Path,
+    base: &str,
+    forbidden_paths: &[String],
+    excluded: &[String],
+) -> anyhow::Result<DiffSummary> {
     let mut summary = DiffSummary::default();
-    let scratch = tempfile::tempdir().context("create diff index directory")?;
-    let index = scratch.path().join("index");
-    let source = repo.join(git_ops::git(repo, &["rev-parse", "--git-path", "index"])?);
-    if source.exists() {
-        // Preserve staged additions (including explicitly added ignored files).
-        // Starting from HEAD instead would silently lose those paths.
-        std::fs::copy(&source, &index).context("copy delivery index")?;
-    }
-    let git = |args: &[&str]| -> anyhow::Result<Vec<u8>> {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .env("GIT_INDEX_FILE", &index)
-            .current_dir(repo)
-            .output()
-            .with_context(|| format!("git {} (diff index)", args.join(" ")))?;
-        if !out.status.success() {
-            bail!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(out.stdout)
-    };
+    let index = CandidateIndex::create(repo, excluded)?;
+    let git = |args: &[&str]| index.git(args);
     // One final tree avoids double-counting staged/unstaged changes or a staged
     // deletion followed by an untracked recreation of the same path.
-    git(&["add", "-A", "--", ":(exclude)nuwa.repo.json"])?;
-    let names = git(&[
+    let pathspecs = delivery_pathspecs(excluded);
+    let mut args = vec![
         "diff",
         "--cached",
         "--name-status",
@@ -562,8 +632,9 @@ pub fn diff_summary(
         "--find-renames",
         base,
         "--",
-        ":(exclude)nuwa.repo.json",
-    ])?;
+    ];
+    args.extend(pathspecs.iter().map(String::as_str));
+    let names = git(&args)?;
     // Parse NUL-delimited bytes before converting paths for display/matching:
     // tabs, newlines, leading spaces and non-UTF-8 bytes are not record syntax.
     let mut parts = names
@@ -594,7 +665,7 @@ pub fn diff_summary(
     }
     summary.files = files.into_values().collect();
 
-    let numstat = git(&[
+    let mut args = vec![
         "diff",
         "--cached",
         "--numstat",
@@ -602,8 +673,9 @@ pub fn diff_summary(
         "--find-renames",
         base,
         "--",
-        ":(exclude)nuwa.repo.json",
-    ])?;
+    ];
+    args.extend(pathspecs.iter().map(String::as_str));
+    let numstat = git(&args)?;
     let mut records = numstat
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty());
@@ -656,6 +728,126 @@ pub fn diff_summary(
         }
     }
     Ok(summary)
+}
+
+/// The exact staged/unstaged/untracked delivery tree, without changing the
+/// caller's index. Delivery must compare this again immediately before commit.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn candidate_tree(repo: &Path) -> anyhow::Result<String> {
+    candidate_tree_with_exclusions(repo, &[])
+}
+
+pub(crate) fn candidate_tree_for_context(
+    repo: &Path,
+    context: &VerificationContext,
+) -> anyhow::Result<String> {
+    candidate_tree_with_exclusions(repo, &context.excluded_delivery_paths())
+}
+
+fn candidate_tree_with_exclusions(repo: &Path, excluded: &[String]) -> anyhow::Result<String> {
+    let index = CandidateIndex::create(repo, excluded)?;
+    Ok(std::str::from_utf8(&index.git(&["write-tree"])?)?
+        .trim()
+        .to_string())
+}
+
+/// Retain the config pathspec contract; private oracle paths are exact, rooted
+/// literals, never globs or whole-directory exclusions.
+pub(crate) fn delivery_pathspecs(excluded: &[String]) -> Vec<String> {
+    let mut paths = vec![":(exclude)nuwa.repo.json".to_string()];
+    paths.extend(
+        excluded
+            .iter()
+            .filter(|path| path.as_str() != "nuwa.repo.json")
+            .map(|path| format!(":(top,exclude,literal){path}")),
+    );
+    paths
+}
+
+pub(crate) fn delivery_add_args(repo: &Path, excluded: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut args = vec!["add".into(), "-A".into(), "--".into()];
+    args.push(":(exclude)nuwa.repo.json".into());
+    // Git treats an exact negative pathspec beneath an ignored directory as an
+    // explicit request to add that directory and fails. Already-ignored seeds
+    // need no add exclusion; the reset below still removes any staged copy.
+    for path in excluded
+        .iter()
+        .filter(|path| path.as_str() != "nuwa.repo.json")
+    {
+        let status = std::process::Command::new("git")
+            .args(["check-ignore", "--no-index", "-q", "--", path])
+            .current_dir(repo)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .context("check owner seed ignore status")?;
+        match status.code() {
+            Some(0) => {}
+            Some(1) => args.push(format!(":(top,exclude,literal){path}")),
+            _ => bail!("cannot determine owner seed ignore status"),
+        }
+    }
+    Ok(args)
+}
+
+pub(crate) fn delivery_reset_args(excluded: &[String]) -> Vec<String> {
+    let mut args = vec!["reset".into(), "-q".into(), "HEAD".into(), "--".into()];
+    args.push("nuwa.repo.json".into());
+    args.extend(
+        excluded
+            .iter()
+            .filter(|path| path.as_str() != "nuwa.repo.json")
+            .map(|path| format!(":(top,literal){path}")),
+    );
+    args
+}
+
+struct CandidateIndex<'a> {
+    repo: &'a Path,
+    _scratch: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl<'a> CandidateIndex<'a> {
+    fn create(repo: &'a Path, excluded: &[String]) -> anyhow::Result<Self> {
+        let scratch = tempfile::tempdir().context("create candidate index directory")?;
+        let path = scratch.path().join("index");
+        let source = repo.join(git_ops::git(repo, &["rev-parse", "--git-path", "index"])?);
+        if source.exists() {
+            std::fs::copy(&source, &path).context("copy delivery index")?;
+        }
+        let index = Self {
+            repo,
+            _scratch: scratch,
+            path,
+        };
+        if !index.path.exists() {
+            index.git(&["read-tree", "HEAD"])?;
+        }
+        let add = delivery_add_args(repo, excluded)?;
+        index.git(&add.iter().map(String::as_str).collect::<Vec<_>>())?;
+        // Even already staged private owner inputs are not delivery changes.
+        let reset = delivery_reset_args(excluded);
+        index.git(&reset.iter().map(String::as_str).collect::<Vec<_>>())?;
+        Ok(index)
+    }
+
+    fn git(&self, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .env("GIT_INDEX_FILE", &self.path)
+            .current_dir(self.repo)
+            .output()
+            .context("git candidate index")?;
+        if !out.status.success() {
+            bail!(
+                "git candidate index {} failed (status {})",
+                args.first().unwrap_or(&"operation"),
+                out.status
+            );
+        }
+        Ok(out.stdout)
+    }
 }
 
 fn compile_forbidden(
@@ -720,6 +912,17 @@ fn is_ci_path(path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::issue::FailingCheck;
+
+    // Legacy compatibility fixtures intentionally have no owner configuration.
+    async fn verify(
+        repo: &Path,
+        issue: &Issue,
+        base: &str,
+        secrets: &Secrets,
+    ) -> anyhow::Result<VerificationEvidence> {
+        let context = prepare(repo, base, None, secrets).await?;
+        super::verify(repo, issue, base, secrets, &context).await
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
@@ -802,6 +1005,7 @@ mod tests {
             .await
             .expect("verify");
         assert_eq!(evidence.mode, "failing_check");
+        assert_eq!(evidence.provenance.trust_level, "legacy_untrusted");
         assert!(!evidence.failing_base.ok);
         assert!(evidence.failing_branch.ok);
     }
@@ -1103,6 +1307,36 @@ mod tests {
             ..issue("exit 0")
         };
         assert!(deep_check_specs(&python_issue, dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn go_deep_build_does_not_change_the_candidate_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(
+            repo.join("go.mod"),
+            "module example.com/deepbuild\n\ngo 1.22\n",
+        )
+        .expect("module");
+        std::fs::write(repo.join("main.go"), "package main\nfunc main() {}\n")
+            .expect("main package");
+        let tree = candidate_tree(&repo).expect("candidate before build");
+        let check = FailingCheck {
+            command: "go build ./...".into(),
+            target: None,
+            timeout_secs: 60,
+        };
+        let result = run_deep_check(
+            &repo,
+            &check,
+            &crate::secrets::agent_env_allowlist(),
+            &Secrets::default(),
+        )
+        .await
+        .expect("Go build");
+        assert!(result.ok, "{}", result.output);
+        assert_eq!(candidate_tree(&repo).expect("candidate after build"), tree);
     }
 
     #[tokio::test]

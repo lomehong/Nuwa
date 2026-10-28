@@ -27,6 +27,22 @@ fn default_max_attempts() -> u32 {
     3
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationPolicy {
+    #[default]
+    Compatibility,
+    Strict,
+}
+
+/// Owner-supplied oracle dependency closure. No agent/issue field can create it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerOracleSpec {
+    pub check: FailingCheck,
+    pub protected_inputs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoInstructions {
     /// Identity in 山海经 (`Signal.repo`). The runner refuses to work an
@@ -36,6 +52,12 @@ pub struct RepoInstructions {
     pub failing_check: FailingCheck,
     #[serde(default)]
     pub forbidden_paths: Vec<String>,
+    #[serde(default)]
+    pub denied_read_paths: Vec<String>,
+    #[serde(default)]
+    pub verification_policy: VerificationPolicy,
+    #[serde(default)]
+    pub trusted_verification: Option<OwnerOracleSpec>,
     /// Free-text repo-specific guidance appended to the runner system prompt.
     #[serde(default)]
     pub notes: String,
@@ -53,18 +75,6 @@ pub struct RepoInstructions {
     /// non-draft behaviour).
     #[serde(default)]
     pub draft_first_n: u32,
-}
-
-/// 读取工作区里的 `nuwa.repo.json`（不建立受信副本，供一次性 `nuwa fix` 使用）。
-/// 常驻 runner 走 [`TrustedInstructions::load`]，两者共享同一套解析与校验。
-pub fn load_working_tree(repo_dir: &Path) -> anyhow::Result<Option<RepoInstructions>> {
-    let path = repo_dir.join(INSTRUCTION_FILE);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let bytes =
-        std::fs::read(&path).with_context(|| format!("read instructions {}", path.display()))?;
-    parse(&bytes, &path).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +225,44 @@ impl TrustedInstructions {
         self.source
     }
 
+    /// Reparse authoritative bytes, not the public convenience fields or the
+    /// candidate config. Preparation must call this BEFORE model execution.
+    pub(crate) fn pinned_instructions(
+        &self,
+        repo: &Path,
+        base_sha: &str,
+    ) -> anyhow::Result<RepoInstructions> {
+        if std::fs::canonicalize(repo)? != std::fs::canonicalize(&self.repo_dir)? {
+            bail!("owner instructions belong to another checkout");
+        }
+        if sha256_hex(&self.bytes) != self.sha256 {
+            bail!("owner instruction digest mismatch");
+        }
+        let authoritative = match self.source {
+            TrustSource::Tracked => {
+                git_ops::git_raw(repo, &["show", &format!("{base_sha}:{INSTRUCTION_FILE}")])?
+            }
+            TrustSource::PrivateCopy => {
+                let private = self
+                    .private_path
+                    .as_ref()
+                    .context("missing private owner copy")?;
+                if std::fs::canonicalize(private)?.starts_with(std::fs::canonicalize(repo)?) {
+                    bail!("owner private authority must be outside the editable checkout");
+                }
+                std::fs::read(private)?
+            }
+        };
+        if authoritative != self.bytes {
+            bail!("owner instructions do not match the pinned authority");
+        }
+        if std::fs::canonicalize(&self.path)? != std::fs::canonicalize(repo.join(INSTRUCTION_FILE))?
+        {
+            bail!("owner instructions must be rooted at nuwa.repo.json");
+        }
+        parse(&authoritative, &self.path)
+    }
+
     fn expected_bytes(&self) -> Vec<u8> {
         if self.source == TrustSource::PrivateCopy {
             if let Some(private) = &self.private_path {
@@ -245,8 +293,60 @@ fn read_tracked(repo_dir: &Path, base: &str) -> anyhow::Result<Option<(Vec<u8>, 
 }
 
 fn parse(bytes: &[u8], path: &Path) -> anyhow::Result<RepoInstructions> {
-    serde_json::from_slice(bytes)
-        .with_context(|| format!("parse repo instructions JSON from {}", path.display()))
+    let instructions: RepoInstructions = serde_json::from_slice(bytes)
+        .with_context(|| format!("parse repo instructions JSON from {}", path.display()))?;
+    if let Some(spec) = &instructions.trusted_verification {
+        validate_owner_oracle(spec)?;
+    }
+    Ok(instructions)
+}
+
+pub fn validate_owner_oracle(spec: &OwnerOracleSpec) -> anyhow::Result<()> {
+    if spec.check.command.trim().is_empty()
+        || spec.check.command.contains('\0')
+        || spec.check.timeout_secs == 0
+    {
+        bail!("trusted oracle requires an explicit command and positive timeout");
+    }
+    if spec.protected_inputs.is_empty() {
+        bail!("trusted oracle requires explicit protected_inputs");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for path in &spec.protected_inputs {
+        validate_protected_path(path)?;
+        if !seen.insert(path.to_ascii_lowercase()) {
+            bail!("duplicate protected oracle input");
+        }
+    }
+    Ok(())
+}
+
+/// Portable literal Git-relative paths only; never globs, aliases or metadata.
+pub(crate) fn validate_protected_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty()
+        || path
+            .chars()
+            .any(|c| c.is_control() || "\\:*?[]{}\"<>|".contains(c))
+        || path.split('/').any(|part| {
+            let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.trim() != part
+                || part.ends_with('.')
+                || part.eq_ignore_ascii_case(".git")
+                || matches!(
+                    stem.as_str(),
+                    "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+                )
+                || (stem.len() == 4
+                    && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                    && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        })
+    {
+        bail!("unsafe protected/export path");
+    }
+    Ok(())
 }
 
 fn private_path(store_dir: &Path, repo_dir: &Path) -> PathBuf {
@@ -560,5 +660,56 @@ mod tests {
         assert_eq!(config.max_attempts, 3);
         assert_eq!(config.draft_first_n, 0);
         assert!(config.reproduce_check.is_none());
+        assert_eq!(
+            config.verification_policy,
+            VerificationPolicy::Compatibility
+        );
+        assert!(config.trusted_verification.is_none());
+        assert!(config.denied_read_paths.is_empty());
+    }
+
+    #[test]
+    fn owner_oracle_requires_explicit_check_and_literal_dependency_closure() {
+        for spec in [
+            serde_json::json!({"protected_inputs": ["checks/oracle.py"]}),
+            serde_json::json!({"check": {"command": "python checks/oracle.py"}}),
+            serde_json::json!({"check": {"command": "python checks/oracle.py"}, "protected_inputs": []}),
+            serde_json::json!({"check": {"command": " "}, "protected_inputs": ["checks/oracle.py"]}),
+            serde_json::json!({"check": {"command": "python checks/oracle.py", "timeout_secs": 0}, "protected_inputs": ["checks/oracle.py"]}),
+            serde_json::json!({"check": {"command": "python checks/oracle.py"}, "protected_inputs": ["checks/oracle.py", "CHECKS/ORACLE.py"]}),
+        ] {
+            let config = serde_json::json!({"repo": "x", "failing_check": {"command": "echo ok"},
+                "trusted_verification": spec});
+            assert!(parse(
+                &serde_json::to_vec(&config).expect("JSON"),
+                Path::new("synthetic.json")
+            )
+            .is_err());
+        }
+        for path in [
+            "",
+            "../oracle.py",
+            "/oracle.py",
+            "C:/oracle.py",
+            "C:oracle.py",
+            "a\\oracle.py",
+            "a//b",
+            "a/./b",
+            ".git/config",
+            "a/.GiT/config",
+            "*.py",
+            "a/[x].py",
+            "a/b.",
+            "a/b ",
+            "a/NUL.txt",
+            "a/file:stream",
+            "a/COM1.py",
+        ] {
+            assert!(
+                validate_protected_path(path).is_err(),
+                "unsafe owner path accepted"
+            );
+        }
+        assert!(validate_protected_path("checks/oracle.py").is_ok());
     }
 }

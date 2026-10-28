@@ -18,6 +18,7 @@ import {
   runnerStatusVariant,
 } from "./format";
 import { RestartRunnerButton } from "./RestartRunnerButton";
+import { ProcessConfiguration } from "../settings/ProcessConfiguration";
 import type { RunnerDto } from "./types";
 
 /** Chinese phase label for a current run; unknown values stay verbatim. */
@@ -112,7 +113,7 @@ export function RunnerCard({ runner, nowMs }: RunnerCardProps) {
 
         <dl className="grid grid-cols-2 gap-x-3 gap-y-2 text-caption">
           <div className="min-w-0">
-            <dt className="text-text-muted">Provider / 模型</dt>
+            <dt className="text-text-muted">心跳 Provider / 模型（非版本证据）</dt>
             <dd
               className="truncate font-mono text-text-secondary"
               title={`${runner.provider ?? "—"} / ${runner.model ?? "—"}`}
@@ -150,10 +151,10 @@ export function RunnerCard({ runner, nowMs }: RunnerCardProps) {
 
         <div className="space-y-1">
           <div className="flex items-center justify-between gap-2 text-caption">
-            <span className="text-text-muted">今日 PR 配额</span>
+            <span className="text-text-muted">UTC 准入槽位 / 本进程上报值</span>
             <span className="inline-flex items-center gap-1 font-mono tabular-nums text-text-secondary">
               <span>
-                {quotaPercent === null ? "未上报配额" : `${runner.prs_today}/${quotaLimit}`}
+                {`${runner.pr_slots_today}/${quotaLimit ?? "—"}`}
               </span>
               {quotaPercent !== null ? (
                 <span className="text-text-muted">{quotaPercent}%</span>
@@ -162,13 +163,21 @@ export function RunnerCard({ runner, nowMs }: RunnerCardProps) {
           </div>
           {quotaLimit !== null ? (
             <progress
-              aria-label="今日 PR 配额"
-              value={runner.prs_today}
+              aria-label="UTC 准入槽位 / 本进程上报值"
+              value={runner.pr_slots_today}
               max={quotaLimit}
               className="h-1.5 w-full accent-accent"
             />
           ) : null}
+          {quotaLimit === null ? <p className="text-caption text-text-muted">未上报准入预算</p> : null}
+          <p className="text-caption text-text-muted">
+            UTC 今日确认 PR（创建 / 本地观测记录）：{runner.prs_today}。
+            槽位含在途、结果不明及已消耗；重试保留原准入日。
+            上报值是观测，不是中心统一硬上限；策略由创建进程解析，各进程可能不同。
+          </p>
         </div>
+
+        <ProcessConfiguration process={runner.configuration} />
 
         {runner.last_error ? (
           <div className="rounded-card border border-danger/40 bg-danger/10 px-3 py-2">

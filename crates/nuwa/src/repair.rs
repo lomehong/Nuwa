@@ -47,6 +47,44 @@ pub enum ProviderKind {
     },
 }
 
+const ZAI_DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+const ZAI_DEFAULT_MODEL: &str = "glm-5.3-flash";
+
+fn zai_config(base_url: &Option<String>, model: &Option<String>) -> (String, String) {
+    (
+        base_url
+            .clone()
+            .unwrap_or_else(|| ZAI_DEFAULT_BASE_URL.into()),
+        model.clone().unwrap_or_else(|| ZAI_DEFAULT_MODEL.into()),
+    )
+}
+
+/// Actual provider/model/endpoint, without credentials or a network provider.
+/// Keep the legacy display labels (`provider_meta`) separate from this evidence.
+pub fn actual_provider_config(
+    provider: &ProviderKind,
+) -> anyhow::Result<(String, Option<String>, Option<String>)> {
+    match provider {
+        ProviderKind::Faux => {
+            let provider = FauxProvider::new(FauxScript::new());
+            let model = provider.default_model();
+            Ok((
+                "faux".into(),
+                Some(model.id.clone()),
+                Some(model.base_url.clone()),
+            ))
+        }
+        ProviderKind::Anthropic { model } => {
+            let picked = pick_anthropic_model(&anthropic_models(), model.as_deref())?;
+            Ok(("anthropic".into(), Some(picked.id), Some(picked.base_url)))
+        }
+        ProviderKind::Zai { base_url, model } => {
+            let (base, model) = zai_config(base_url, model);
+            Ok(("zai".into(), Some(model), Some(base)))
+        }
+    }
+}
+
 pub struct RepairJob {
     pub repo: PathBuf,
     pub issue: Issue,
@@ -305,12 +343,23 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
     // RPI_MAX_TURNS_PER_RUN: concurrent repairs in one process must not
     // overwrite each other's limit (A-3 pre-refactor).
 
-    let repo = std::path::absolute(&job.repo)
-        .with_context(|| format!("resolve repo {}", job.repo.display()))?;
+    let mut guards = job
+        .guards
+        .rooted_for(&job.repo)
+        .context("root repair guards")?;
+    let sessions_root = std::path::absolute(&job.sessions_dir).context("resolve session root")?;
+    guards.deny_private_path(&sessions_root)?;
+    let guards = Arc::new(guards);
+    let policy = guards.policy()?;
+    let repo = policy.root().to_path_buf();
     let repo_str = repo.to_string_lossy().into_owned();
 
     // ---- env + tool belt ----
-    let env = Arc::new(OsExecutionEnv::with_cwd(repo.clone()));
+    let runner_env = Arc::new(OsExecutionEnv::with_cwd(repo.clone()));
+    let env = Arc::new(crate::guard::local_env::LocalExecutionEnv::new(
+        Arc::clone(&runner_env),
+        policy,
+    ));
     let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
@@ -356,7 +405,8 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         .with_context(|| format!("resolve {}", sessions_dir.display()))?;
     std::fs::create_dir_all(&sessions_dir)
         .with_context(|| format!("create {}", sessions_dir.display()))?;
-    let fs: Arc<dyn rpi_tools::FileSystem> = env.clone();
+    // The runner owns transcripts, not the agent's rooted local file context.
+    let fs: Arc<dyn rpi_tools::FileSystem> = runner_env;
     let store = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
         fs,
         sessions_root: sessions_dir.to_string_lossy().into_owned(),
@@ -392,10 +442,7 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
                 .zai_key
                 .clone()
                 .context("ZAI_API_KEY not set (智谱 coding plan 的 API key)")?;
-            let base = base_url
-                .clone()
-                .unwrap_or_else(|| "https://open.bigmodel.cn/api/coding/paas/v4".to_string());
-            let model_id = model.clone().unwrap_or_else(|| "glm-5.3-flash".to_string());
+            let (base, model_id) = zai_config(base_url, model);
             let provider_id = "zai-coding-cn";
             let mut picked = rpi_ai::Model::new(
                 model_id.clone(),
@@ -421,10 +468,10 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
             let key = job.secrets.anthropic_key.clone().context(
                 "ANTHROPIC_API_KEY not set (or use --provider faux for the offline path)",
             )?;
-            let http = rpi_ai::http::build_client("https://api.anthropic.com", None, None)
+            let picked = pick_anthropic_model(&anthropic_models(), model.as_deref())?;
+            let http = rpi_ai::http::build_client(&picked.base_url, None, None)
                 .unwrap_or_else(|_| reqwest::Client::new());
             let provider = AnthropicProvider::new(Some(key), http);
-            let picked = pick_anthropic_model(&anthropic_models(), model.as_deref())?;
             (picked, vec![Arc::new(provider) as Arc<dyn Provider>])
         }
     };
@@ -453,7 +500,7 @@ pub async fn run(job: &RepairJob) -> anyhow::Result<RepairReport> {
         session,
         models: providers,
         agent_emitter: Some(emitter),
-        before_tool_call: Some(crate::guard::before_tool_hook(Arc::clone(&job.guards))),
+        before_tool_call: Some(crate::guard::before_tool_hook(guards)),
         // LLM 请求快速失败：单请求 120s（正常首 chunk 秒级）、至多重试 1 次。
         // 挂死的 provider 流不再拖住整个 run 数十分钟——失败会走验证门/
         // escalate 路径，由下一轮 claim 自然重试（Q6，2026-10-19）。
@@ -740,6 +787,49 @@ mod tests {
             weak.upgrade().is_none(),
             "cancelled drain retained its owner"
         );
+    }
+
+    #[test]
+    fn actual_provider_defaults_match_catalog_and_construction() {
+        let (name, model, base) = actual_provider_config(&ProviderKind::Anthropic { model: None })
+            .expect("anthropic defaults");
+        let catalog = anthropic_models();
+        assert_eq!(name, "anthropic");
+        assert_eq!(model.as_deref(), Some(catalog[0].id.as_str()));
+        assert_eq!(base.as_deref(), Some(catalog[0].base_url.as_str()));
+
+        let (_, model, base) = actual_provider_config(&ProviderKind::Faux).expect("faux defaults");
+        let faux = FauxProvider::new(FauxScript::new());
+        assert_eq!(model.as_deref(), Some(faux.default_model().id.as_str()));
+        assert_eq!(
+            base.as_deref(),
+            Some(faux.default_model().base_url.as_str())
+        );
+
+        let (_, model, base) = actual_provider_config(&ProviderKind::Zai {
+            base_url: None,
+            model: None,
+        })
+        .expect("zai defaults");
+        let (expected_base, expected_model) = zai_config(&None, &None);
+        assert_eq!(model, Some(expected_model));
+        assert_eq!(base, Some(expected_base));
+        let custom = ProviderKind::Zai {
+            base_url: Some("https://example.test/v4".into()),
+            model: Some("synthetic-model".into()),
+        };
+        assert_eq!(
+            actual_provider_config(&custom).expect("custom"),
+            (
+                "zai".into(),
+                Some("synthetic-model".into()),
+                Some("https://example.test/v4".into()),
+            )
+        );
+        assert!(actual_provider_config(&ProviderKind::Anthropic {
+            model: Some("not-a-catalog-model".into()),
+        })
+        .is_err());
     }
 
     #[test]

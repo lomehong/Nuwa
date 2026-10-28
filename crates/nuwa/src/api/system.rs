@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::api::common::{configured_units, run_bounded};
 use crate::api::ApiError;
+use crate::config_activation::{self, ProcessConfigDto};
 use crate::serve::AppState;
 
 #[derive(Debug, Serialize)]
@@ -27,6 +28,7 @@ pub struct SystemResponse {
     pub db_size_bytes: u64,
     pub local_mode: bool,
     pub services: Vec<ServiceState>,
+    pub configuration: ProcessConfigDto,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,9 +47,26 @@ pub async fn system(State(state): State<AppState>) -> Response {
     let started_at_ms = state.started_at_ms;
     let local_mode = state.local_mode();
     let units = configured_units(&state.serve_unit, &state.runner_units);
+    let store = std::sync::Arc::clone(&state.store);
+    let startup = std::sync::Arc::clone(&state.startup_config);
+    let env_path = state.env_path.clone();
     let now = crate::now_ms();
     match tokio::task::spawn_blocking(move || {
-        build_system(&db_path, started_at_ms, now, local_mode, units)
+        let saved = config_activation::saved_config(&store, &env_path);
+        let configuration = config_activation::project_process(
+            Some((*startup).clone()),
+            &saved,
+            "online",
+            Some(now),
+        );
+        build_system(
+            &db_path,
+            started_at_ms,
+            now,
+            local_mode,
+            units,
+            configuration,
+        )
     })
     .await
     {
@@ -70,6 +89,7 @@ fn build_system(
     now: i64,
     local_mode: bool,
     units: Vec<String>,
+    configuration: ProcessConfigDto,
 ) -> SystemResponse {
     SystemResponse {
         version: env!("CARGO_PKG_VERSION"),
@@ -81,6 +101,7 @@ fn build_system(
             .map(|metadata| metadata.len())
             .unwrap_or(0),
         local_mode,
+        configuration,
         services: units
             .into_iter()
             .map(|unit| ServiceState {
@@ -131,6 +152,14 @@ mod tests {
         let db_path = dir.path().join("s.db");
         let store = Arc::new(Store::open(&db_path).expect("open"));
         let state = AppState {
+            startup_config: Arc::new(crate::config_activation::StartupConfig::capture(
+                &store,
+                &dir.path().join("nuwa.env"),
+                "serve",
+                uuid::Uuid::new_v4().to_string(),
+                started_at_ms,
+                &std::collections::BTreeMap::new(),
+            )),
             store,
             ui_token: Arc::new(None),
             ingest_token: Arc::new(None),
@@ -206,6 +235,8 @@ mod tests {
         let size = std::fs::metadata(&db_path).expect("db metadata").len();
         assert_eq!(value["db_size_bytes"], size);
         assert_eq!(value["local_mode"], true, "no UI token means local mode");
+        assert_eq!(value["configuration"]["activation"], "unknown");
+        assert_eq!(value["configuration"]["freshness"], "online");
 
         let services = value["services"].as_array().expect("services");
         assert_eq!(services.len(), 2);

@@ -4,8 +4,9 @@
 //! secret copies from it. `setenv`/`unsetenv` concurrent with `getenv`,
 //! `environ` iteration and fork/exec is not thread-safe on glibc, and a hang
 //! there is invisible to test/step timeouts (docs/07 "CI 测试卡死"). Runtime
-//! settings changes and tests therefore update this lock-guarded store instead
-//! of the process environment.
+//! configuration is startup-only: saving settings changes neither this store
+//! nor the OS environment. Startup secret scrubbing and tests use the guarded
+//! overrides without mutating the process environment concurrently.
 
 use std::collections::BTreeMap;
 use std::sync::{OnceLock, RwLock};
@@ -64,7 +65,9 @@ pub fn vars() -> BTreeMap<String, String> {
     vars
 }
 
-/// Set one runtime value; `None` records an explicit clear.
+/// Startup/test override; never call this when saving configuration.
+/// `None` records an explicit clear.
+#[cfg(test)]
 pub fn set(key: &str, value: Option<&str>) {
     write().insert(key.to_string(), value.map(str::to_string));
 }

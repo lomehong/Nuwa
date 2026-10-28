@@ -286,6 +286,14 @@ mod tests {
         let db_path = dir.path().join("s.db");
         let store = Arc::new(shanhaijing::Store::open(&db_path).expect("open"));
         let state = AppState {
+            startup_config: Arc::new(crate::config_activation::StartupConfig::capture(
+                &store,
+                &dir.path().join("nuwa.env"),
+                "serve",
+                uuid::Uuid::new_v4().to_string(),
+                crate::now_ms(),
+                &std::collections::BTreeMap::new(),
+            )),
             store,
             ui_token: Arc::new(None),
             ingest_token: Arc::new(Some("ingest-secret".into())),
@@ -355,6 +363,7 @@ mod tests {
                 "panic: {title}\ngoroutine 1 [running]:\nexample.com/app.Fn_{}()\n\t/app/x.go:1 +0x1",
                 title.replace(' ', "_")
             ),
+            ..Default::default()
         };
         match store.report_signal(&signal, at).expect("report signal") {
             shanhaijing::ReportOutcome::NewIssue { fingerprint } => fingerprint,

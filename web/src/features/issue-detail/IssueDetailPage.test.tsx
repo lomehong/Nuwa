@@ -5,9 +5,9 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 
 import { ToastProvider } from "../../components/ui";
-import { makeIssue, makeIssueDetail, makeRun, makeTranscript, mockIssueDetail, mockTranscript, server } from "../../test/msw";
+import { makeIssue, makeIssueDetail, makeRun, makeSignalObservation, makeTranscript, mockIssueDetail, mockTranscript, server } from "../../test/msw";
 import { createTestQueryClient } from "../../test/render";
-import { formatDateTime } from "./format";
+import { formatDateTime, isoDateTime } from "./format";
 import type { IssueDetailResponse } from "./types";
 import { IssueDetailPage } from "./IssueDetailPage";
 
@@ -175,6 +175,122 @@ function useDetail(detail: IssueDetailResponse) {
 }
 
 describe("IssueDetailPage", () => {
+  it("renders the newest receipts with separate collector time, trust and text-only metadata", async () => {
+    const receivedAt = NOW - 10_000;
+    const observedAt = NOW - 30 * 60_000;
+    const environment = '<img src=x onerror="alert(1)">';
+    const release = "<b>0123456789abcdef</b>";
+    const eventId = "<script>alert('event')</script>";
+    const source = "<em>owner-import</em>";
+    useDetail({
+      ...fixtureDetail(),
+      observations: [
+        makeSignalObservation({
+          id: 42,
+          fingerprint: "fp-detail-001",
+          received_at_ms: receivedAt,
+          observed_at_ms: observedAt,
+          trusted_source: source,
+          time_status: "untrusted",
+          disposition: "delayed",
+          environment,
+          release_sha: release,
+          source_event_id: eventId,
+        }),
+        makeSignalObservation({
+          id: 41,
+          fingerprint: "fp-detail-001",
+          received_at_ms: NOW - 60_000,
+          observed_at_ms: NOW - 90_000,
+          time_status: "trusted",
+          environment: "staging",
+        }),
+      ],
+    });
+    renderDetail();
+
+    const section = await screen.findByRole("region", { name: "信号回执" });
+    expect(within(section).getByRole("heading", { level: 3, name: "信号回执" })).toBeInTheDocument();
+    expect(within(section).getByText("最近 2 条")).toBeInTheDocument();
+    const history = within(section).getByRole("region", { name: "回执记录" });
+    const rows = within(history).getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    // Collector time is older on the newest receipt; receipt order must win.
+    expect(rows[0]).toHaveTextContent("回执 #42");
+    expect(rows[1]).toHaveTextContent("回执 #41");
+    const newest = within(rows[0]);
+    expect(newest.getByText("接收时间")).toBeInTheDocument();
+    expect(newest.getByText(formatDateTime(receivedAt))).toHaveAttribute("datetime", isoDateTime(receivedAt));
+    expect(newest.getByText("采集时间")).toBeInTheDocument();
+    expect(newest.getByText(formatDateTime(observedAt))).toHaveAttribute("datetime", isoDateTime(observedAt));
+    expect(newest.getByText("来源已授信")).toBeInTheDocument();
+    expect(newest.getByText("未授信")).toHaveAttribute("title", "untrusted");
+    expect(newest.getByText("延迟上报")).toBeInTheDocument();
+    for (const [label, value] of [
+      ["环境", environment],
+      ["发布版本 SHA", release],
+      ["来源事件 ID", eventId],
+      ["授信来源", source],
+    ]) {
+      expect(newest.getByText(label)).toBeInTheDocument();
+      expect(newest.getByText(value)).toBeInTheDocument();
+    }
+    expect(within(rows[1]).getByText("来源未授信")).toBeInTheDocument();
+    expect(within(rows[1]).getByText("已授信")).toHaveAttribute("title", "trusted");
+    expect(history.querySelector("img, script, b, em")).toBeNull();
+  });
+
+  it("does not infer deployment or recovery from a merged issue with successful verification and CI", async () => {
+    useDetail({
+      ...fixtureDetail(),
+      issue: { ...fixtureIssue(), state: "merged", stuck: false },
+      observations: [makeSignalObservation({
+        fingerprint: "fp-detail-001",
+        environment: "production",
+        release_sha: "0123456789abcdef",
+        trusted_source: "owner-import",
+        observed_at_ms: NOW - 30_000,
+        time_status: "trusted",
+      })],
+      deployment_status: "unknown",
+      recovery_status: "unknown",
+    });
+    renderDetail();
+
+    const title = await screen.findByRole("heading", { level: 2, name: fixtureIssue().title });
+    expect(within(title.closest("header") as HTMLElement).getByText("已合并")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "证据" })).getByText("CI 通过")).toBeInTheDocument();
+    const history = screen.getByRole("region", { name: "信号回执" });
+    expect(within(history).getByText("production")).toBeInTheDocument();
+    expect(within(history).getByText("部署状态：未知")).toBeInTheDocument();
+    expect(within(history).getByText("恢复状态：未知")).toBeInTheDocument();
+    expect(within(history).getByText(/PR 已合并不等于已部署，也不等于运行时已恢复/)).toBeInTheDocument();
+  });
+
+  it.each(["empty", "missing"])("keeps legacy issue details usable with %s receipt history", async (history) => {
+    const detail = { ...fixtureDetail(), observations: [] };
+    server.use(
+      http.get("/api/v1/issues/:fp", () => HttpResponse.json(history === "missing" ? {
+        ...detail,
+        observations: undefined,
+        deployment_status: undefined,
+        recovery_status: undefined,
+      } : detail)),
+      mockTranscript(),
+    );
+    renderDetail();
+
+    const section = await screen.findByRole("region", { name: "信号回执" });
+    expect(within(section).getByText("最近 0 条")).toBeInTheDocument();
+    expect(within(section).getByText(/暂无信号回执；旧问题单或已过保留期/)).toBeInTheDocument();
+    expect(within(section).queryByRole("region", { name: "回执记录" })).not.toBeInTheDocument();
+    expect(within(section).getByText("部署状态：未知")).toBeInTheDocument();
+    expect(within(section).getByText("恢复状态：未知")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "时间线" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "证据" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "会话转录" })).toBeInTheDocument();
+  });
+
   it("shows the last and next continuous CI check times", async () => {
     const detail = fixtureDetail();
     useDetail(detail);

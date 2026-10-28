@@ -340,6 +340,14 @@ mod tests {
             let db_path = dir.path().join("skills.db");
             let store = Arc::new(Store::open(&db_path).expect("open"));
             let state = AppState {
+                startup_config: Arc::new(crate::config_activation::StartupConfig::capture(
+                    &store,
+                    &dir.path().join("nuwa.env"),
+                    "serve",
+                    uuid::Uuid::new_v4().to_string(),
+                    crate::now_ms(),
+                    &std::collections::BTreeMap::new(),
+                )),
                 store,
                 ui_token: Arc::new(None),
                 ingest_token: Arc::new(None),

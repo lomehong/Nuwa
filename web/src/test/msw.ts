@@ -8,6 +8,7 @@ import type {
   TrendTotals,
 } from "../features/overview/types";
 import type { IssueDetailResponse, RunDto } from "../features/issue-detail/types";
+import type { SignalObservationDto } from "../lib/api-types/SignalObservationDto";
 import type { IssueListItem, IssueListResponse } from "../features/issues/types";
 import type { ProjectSummary } from "../features/projects/types";
 import type { RunnerDto, RunnerListResponse } from "../features/runners/types";
@@ -19,6 +20,9 @@ import type {
 import type { SystemResponse } from "../features/system/types";
 import type { TranscriptResponse } from "../features/transcript/types";
 import type { MeResponse } from "../lib/auth";
+import type { ProcessConfigDto } from "../lib/api-types/ProcessConfigDto";
+import type { SavedConfigDto } from "../lib/api-types/SavedConfigDto";
+import type { StartupConfig } from "../lib/api-types/StartupConfig";
 import type { ProjectSkillsResponse, SkillDto } from "../features/skills/types";
 import type { MemoryDto, MemoryListResponse } from "../features/memory/types";
 import type {
@@ -75,6 +79,7 @@ export function makeOverview(overrides: Partial<OverviewResponse> = {}): Overvie
       error: 0,
       reports_today: 0,
       prs_today: 0,
+      pr_slots_today: 0,
     },
     ci_24h: { green: 0, red: 0, timeout: 0, pending: 0 },
     ...overrides,
@@ -201,6 +206,25 @@ export function makeRun(overrides: Partial<RunDto> = {}): RunDto {
   };
 }
 
+export function makeSignalObservation(
+  overrides: Partial<SignalObservationDto> = {},
+): SignalObservationDto {
+  return {
+    id: 1,
+    fingerprint: "fp-default",
+    received_at_ms: 1_700_000_010_000,
+    observed_at_ms: null,
+    environment: null,
+    release_sha: null,
+    source_event_id: null,
+    trusted_source: null,
+    time_status: "missing",
+    disposition: "new",
+    duplicate_of: null,
+    ...overrides,
+  };
+}
+
 export function makeIssueDetail(
   overrides: Partial<IssueDetailResponse> = {},
 ): IssueDetailResponse {
@@ -220,6 +244,9 @@ export function makeIssueDetail(
     runs: [makeRun()],
     similar: { count: 0, items: [] },
     ci_watch: null,
+    observations: [],
+    deployment_status: "unknown",
+    recovery_status: "unknown",
     ...overrides,
   };
 }
@@ -262,15 +289,78 @@ export function mockTranscript(overrides: Partial<TranscriptResponse> = {}) {
   return http.get("/api/v1/issues/:fp/transcript", () => HttpResponse.json(body));
 }
 
+export const SAVED_REVISION = "11111111-1111-4111-8111-111111111111";
+export const OLD_REVISION = "22222222-2222-4222-8222-222222222222";
+
+export function makeSavedConfig(overrides: Partial<SavedConfigDto> = {}): SavedConfigDto {
+  return {
+    env_id: "/opt/nuwa/nuwa.env",
+    revision: SAVED_REVISION,
+    state: "saved",
+    reason: null,
+    ...overrides,
+  };
+}
+
+export function makeStartupConfig(overrides: Partial<StartupConfig> = {}): StartupConfig {
+  const role = overrides.role ?? "work";
+  return {
+    format_version: 1,
+    process_instance_id: role === "serve"
+      ? "33333333-3333-4333-8333-333333333333"
+      : "44444444-4444-4444-8444-444444444444",
+    role,
+    runner_id: role === "work" ? "runner-1" : null,
+    runner_instance_id: role === "work" ? "55555555-5555-4555-8555-555555555555" : null,
+    env_id: "/opt/nuwa/nuwa.env",
+    started_at_ms: 1_700_000_000_000,
+    loaded_revision: SAVED_REVISION,
+    revision_reason: null,
+    values: role === "serve" ? {
+      NUWA_COOKIE_SECURE: { value: "auto", source: "default", reason: null },
+      NUWA_STUCK_AFTER_SECS: { value: "300", source: "default", reason: null },
+      NUWA_SERVE_UNIT: { value: "nuwa-serve", source: "file", reason: null },
+      NUWA_ENV_FILE: { value: "/opt/nuwa/nuwa.env", source: "derived", reason: null },
+    } : {
+      NUWA_INTERVAL: { value: "30", source: "file", reason: null },
+      NUWA_PROVIDER: { value: "anthropic", source: "environment", reason: null },
+      NUWA_ENV_FILE: { value: "/opt/nuwa/nuwa.env", source: "derived", reason: null },
+    },
+    ...overrides,
+  };
+}
+
+export function makeProcessConfiguration(overrides: Partial<ProcessConfigDto> = {}): ProcessConfigDto {
+  const snapshot = overrides.snapshot === undefined
+    ? makeStartupConfig({
+      role: overrides.role ?? "work",
+      ...(overrides.runner_id !== undefined ? { runner_id: overrides.runner_id } : {}),
+    })
+    : overrides.snapshot;
+  return {
+    role: snapshot?.role ?? "work",
+    runner_id: snapshot?.runner_id ?? null,
+    snapshot,
+    activation: "active",
+    freshness: "online",
+    last_seen_at_ms: Date.now(),
+    reason: null,
+    ...overrides,
+  };
+}
+
 export function makeRunner(overrides: Partial<RunnerDto> = {}): RunnerDto {
+  const now = Date.now();
+  const startedAtMs = overrides.started_at_ms ?? now - 3_600_000;
+  const heartbeatAtMs = overrides.heartbeat_at_ms ?? now;
   return {
     id: "runner-1",
     repo: "example.com/app",
     host: "host-a",
     pid: 1234,
-    started_at_ms: Date.now() - 3_600_000,
-    heartbeat_at_ms: Date.now(),
-    progress_at_ms: Date.now(),
+    started_at_ms: startedAtMs,
+    heartbeat_at_ms: heartbeatAtMs,
+    progress_at_ms: now,
     status: "idle",
     offline: false,
     current_fingerprint: null,
@@ -279,9 +369,18 @@ export function makeRunner(overrides: Partial<RunnerDto> = {}): RunnerDto {
     model: "glm-5.3-flash",
     daily_pr_limit: 5,
     prs_today: 1,
+    pr_slots_today: 1,
     repo_path: "/srv/app",
     service_unit: "nuwa-work",
     last_error: null,
+    configuration: makeProcessConfiguration({
+      freshness: overrides.offline || now - heartbeatAtMs > 90_000 ? "offline" : "online",
+      last_seen_at_ms: heartbeatAtMs,
+      snapshot: makeStartupConfig({
+        runner_id: overrides.id ?? "runner-1",
+        started_at_ms: startedAtMs,
+      }),
+    }),
     effective: {
       interval_secs: 30,
       ci_timeout_secs: 600,
@@ -333,6 +432,7 @@ export function makeProject(overrides: Partial<ProjectSummary> = {}): ProjectSum
     runners: 0,
     runners_online: 0,
     prs_today: 0,
+    pr_slots_today: 0,
     pr_limit: 0,
     ci_green: 0,
     ci_red: 0,
@@ -414,6 +514,42 @@ export function makeSettings(overrides: Partial<SettingsResponse> = {}): Setting
         help: "轮询间隔（秒）",
       }),
       settingSpec({
+        key: "NUWA_DAILY_PR_LIMIT",
+        label: "Daily PR admission slots (UTC)",
+        type: "int",
+        default: "5",
+        min: 1,
+        max: 100,
+        help: "每仓库 UTC 准入日槽位预算，包含在途、结果不明和已消耗的槽位；重试沿用原准入日。按创建进程解析的策略准入，各进程值可能不同，并非中心统一硬上限。",
+      }),
+      settingSpec({
+        key: "NUWA_MAX_TOKENS",
+        label: "Per-repair token delivery gate",
+        type: "int",
+        default: "1500000",
+        min: 1,
+        max: 100_000_000,
+        help: "单次修复的交付门：修复后按 token 用量检查是否允许交付，不会实时中断模型调用，也不是 provider 的硬上限。",
+      }),
+      settingSpec({
+        key: "NUWA_DAILY_TOKEN_LIMIT",
+        label: "Daily token admission / delivery budget",
+        type: "int",
+        default: "5000000",
+        min: 1,
+        max: 1_000_000_000,
+        help: "每仓库 UTC 每日预算：准入及交付前检查已记录用量，失败尝试也计入；并发或在途消耗可能超出预算，不是运行时或 provider 硬上限。按创建进程解析的策略检查，各进程值可能不同。",
+      }),
+      settingSpec({
+        key: "NUWA_MONTHLY_TOKEN_LIMIT",
+        label: "Rolling 30-day token admission / delivery budget",
+        type: "int",
+        default: "50000000",
+        min: 1,
+        max: 10_000_000_000,
+        help: "每仓库滚动 30 天预算（非自然月）：准入及交付前检查已记录用量，失败尝试也计入；并发或在途消耗可能超出预算，不是运行时或 provider 硬上限。按创建进程解析的策略检查，各进程值可能不同。",
+      }),
+      settingSpec({
         key: "NUWA_SERVE_UNIT",
         label: "Serve unit",
         group: "service",
@@ -461,6 +597,10 @@ export function makeSettings(overrides: Partial<SettingsResponse> = {}): Setting
       },
       NUWA_PROVIDER: { value: "anthropic", source: "env" },
       NUWA_INTERVAL: { value: "30", source: "env" },
+      NUWA_DAILY_PR_LIMIT: { value: "5", source: "default" },
+      NUWA_MAX_TOKENS: { value: "1500000", source: "default" },
+      NUWA_DAILY_TOKEN_LIMIT: { value: "5000000", source: "default" },
+      NUWA_MONTHLY_TOKEN_LIMIT: { value: "50000000", source: "default" },
       NUWA_SERVE_UNIT: { value: "nuwa-serve", source: "env" },
       NUWA_COOKIE_SECURE: { value: "auto", source: "default" },
       NUWA_STUCK_AFTER_SECS: { value: "300", source: "default" },
@@ -470,6 +610,11 @@ export function makeSettings(overrides: Partial<SettingsResponse> = {}): Setting
     env_exists: true,
     env_permissions: "600",
     needs_migration: false,
+    saved: makeSavedConfig(),
+    processes: [
+      makeProcessConfiguration({ role: "serve" }),
+      makeProcessConfiguration(),
+    ],
     restart_pending: false,
     effective_diff: {
       NUWA_INTERVAL: { file: "30", runtime: "60", source: "file" },
@@ -501,6 +646,7 @@ export function makeSystem(overrides: Partial<SystemResponse> = {}): SystemRespo
     db_path: "/opt/nuwa/shanhaijing.db",
     db_size_bytes: 45_056,
     local_mode: false,
+    configuration: makeProcessConfiguration({ role: "serve" }),
     services: [
       { unit: "nuwa-serve", active: "active" },
       { unit: "nuwa-work", active: "n/a" },
@@ -584,6 +730,10 @@ export function makeMemory(overrides: Partial<MemoryDto> = {}): MemoryDto {
     files: 1,
     recorded_at_ms: 1_700_000_000_000,
     disabled: false,
+    evidence_valid: true,
+    verification_source: "local_verification",
+    revoked_at_ms: null,
+    revocation_reason: null,
     ...overrides,
   };
 }

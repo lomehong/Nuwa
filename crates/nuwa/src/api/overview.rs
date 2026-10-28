@@ -102,7 +102,11 @@ pub struct Health {
     pub standing_down: usize,
     pub error: usize,
     pub reports_today: u64,
+    /// Historical PR creation/local observation metric, not admission usage.
     pub prs_today: u64,
+    /// UTC admission-day slots, including in-flight/ambiguous work, in the
+    /// same scope as `prs_today` (runner repos unless `repo` is explicit).
+    pub pr_slots_today: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -297,6 +301,7 @@ fn build_health(
         error: 0,
         reports_today: store.reports_on_repo(&shanhaijing::utc_day(now), repo)?,
         prs_today: 0,
+        pr_slots_today: 0,
     };
     for runner in &runners {
         if !runner_is_online(runner.heartbeat_at, now) {
@@ -315,17 +320,14 @@ fn build_health(
         }
     }
     let day_start = now - now.rem_euclid(DAY_MS);
-    health.prs_today = match repo {
-        Some(repo) => store.prs_opened_since(repo, day_start)?,
-        None => {
-            let repos: BTreeSet<&str> = runners.iter().map(|runner| runner.repo.as_str()).collect();
-            let mut total = 0;
-            for repo in repos {
-                total += store.prs_opened_since(repo, day_start)?;
-            }
-            total
-        }
+    let repos: BTreeSet<&str> = match repo {
+        Some(repo) => [repo].into_iter().collect(),
+        None => runners.iter().map(|runner| runner.repo.as_str()).collect(),
     };
+    for repo in repos {
+        health.prs_today += store.prs_opened_since(repo, day_start)?;
+        health.pr_slots_today += store.pr_slots_used(repo, day_start)?;
+    }
     Ok(health)
 }
 
@@ -362,6 +364,59 @@ mod tests {
     }
 
     #[test]
+    fn health_counts_repo_slots_once_and_keeps_pr_creation_separate() {
+        let store = Store::open(":memory:").expect("store");
+        let now = DAY_MS + 1_000;
+        let claim = store
+            .claim_delivery(
+                &shanhaijing::DeliveryStart {
+                    id: "pending".into(),
+                    run_id: None,
+                    fingerprint: "pending-fp".into(),
+                    repo: "app/alpha".into(),
+                    branch: "agent/fix/pending".into(),
+                    base: "main".into(),
+                    head_sha: "pending-sha".into(),
+                    now,
+                },
+                "owner",
+                DAY_MS,
+            )
+            .expect("claim")
+            .expect("owned");
+        assert!(store
+            .reserve_pr_slot_owned(&claim, 5, now)
+            .expect("reserve"));
+        for id in ["first", "second"] {
+            store
+                .upsert_runner(&shanhaijing::RunnerUpsert {
+                    id: id.into(),
+                    repo: "app/alpha".into(),
+                    host: "host".into(),
+                    pid: None,
+                    started_at: now,
+                    heartbeat_at: now,
+                    status: "idle".into(),
+                    provider: None,
+                    model: None,
+                    daily_pr_limit: Some(5),
+                    repo_path: None,
+                    service_unit: None,
+                    config_json: "{}".into(),
+                })
+                .expect("runner");
+        }
+        let runners = store.list_runners().expect("runners");
+        for repo in [None, Some("app/alpha")] {
+            let health = build_health(&store, &runners, repo, now).expect("health");
+            assert_eq!(health.pr_slots_today, 1);
+            assert_eq!(health.prs_today, 0, "no PR creation evidence");
+        }
+        let other = build_health(&store, &runners, Some("app/other"), now).expect("other repo");
+        assert_eq!(other.pr_slots_today, 0);
+    }
+
+    #[test]
     fn stuck_attention_uses_the_owner_runner_interval() {
         use shanhaijing::{ReportOutcome, RunStart, RunnerUpsert, Signal, State};
 
@@ -382,6 +437,7 @@ mod tests {
                         message: None,
                         log_window: Vec::new(),
                         stack_trace: format!("panic: {title}"),
+                        ..Default::default()
                     },
                     stale,
                 )

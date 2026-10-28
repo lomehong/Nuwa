@@ -4,10 +4,14 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { resetConnectivity } from "../../lib/connectivity";
 import {
+  makeProcessConfiguration,
   makeRunner,
+  makeStartupConfig,
   mockMe,
   mockOverviewResources,
   mockRunners,
+  OLD_REVISION,
+  SAVED_REVISION,
   server,
 } from "../../test/msw";
 import { renderApp } from "../../test/render";
@@ -29,7 +33,7 @@ describe("RunnersPage", () => {
         current_fingerprint: "fp-1",
         phase: "repair",
       }),
-      makeRunner({ id: "runner-b", status: "standing_down", prs_today: 5, daily_pr_limit: 5 }),
+      makeRunner({ id: "runner-b", status: "standing_down", pr_slots_today: 5, prs_today: 2, daily_pr_limit: 5 }),
       makeRunner({ id: "runner-c", status: "error", last_error: "provider 401", offline: true }),
     ]);
 
@@ -60,6 +64,10 @@ describe("RunnersPage", () => {
     const cardB = screen.getByTestId("runner-card-runner-b");
     expect(within(cardB).getByText("配额待命")).toBeInTheDocument();
     expect(within(cardB).getByText("5/5")).toBeInTheDocument();
+    expect(within(cardB).getByText("100%")).toBeInTheDocument();
+    expect(within(cardB).getByRole("progressbar", { name: "UTC 准入槽位 / 本进程上报值" })).toHaveAttribute("value", "5");
+    expect(within(cardB).getByText(/UTC 今日确认 PR（创建 \/ 本地观测记录）：2/)).toBeInTheDocument();
+    expect(within(cardB).getByText(/不是中心统一硬上限/)).toHaveTextContent("各进程可能不同");
     expect(within(cardB).getByText("队列为空")).toBeInTheDocument();
 
     const cardC = screen.getByTestId("runner-card-runner-c");
@@ -84,18 +92,84 @@ describe("RunnersPage", () => {
     expect(screen.getByTestId("runner-summary-online")).toHaveTextContent(/在线\s*1\/2/);
   });
 
-  it("shows only the missing-quota text when no limit is reported", async () => {
+  it("shows mixed revisions and unknown startup data without conflating activation and liveness", async () => {
     signedIn([
-      makeRunner({ id: "runner-no-quota", daily_pr_limit: null, prs_today: 3 }),
+      makeRunner({
+        id: "current",
+        offline: true,
+        configuration: makeProcessConfiguration({
+          freshness: "offline",
+          snapshot: makeStartupConfig({ runner_id: "current" }),
+        }),
+      }),
+      makeRunner({
+        id: "old",
+        configuration: makeProcessConfiguration({
+          activation: "stale",
+          snapshot: makeStartupConfig({
+            runner_id: "old",
+            process_instance_id: "66666666-6666-4666-8666-666666666666",
+            loaded_revision: OLD_REVISION,
+            values: { NUWA_INTERVAL: { value: "77", source: "file", reason: null } },
+          }),
+        }),
+      }),
+      makeRunner({
+        id: "legacy",
+        effective: { ...makeRunner().effective, interval_secs: 30 },
+        configuration: makeProcessConfiguration({
+          runner_id: "legacy",
+          snapshot: null,
+          activation: "unknown",
+          reason: "startup_snapshot_unavailable",
+        }),
+      }),
+    ]);
+    renderApp("/runners");
+    const current = await screen.findByRole("region", { name: "work / current 配置" });
+    expect(within(current).getByText("配置状态：已加载保存版本（active）")).toBeInTheDocument();
+    expect(within(current).getByText("上报状态：离线（offline）")).toBeInTheDocument();
+    expect(within(current).getByText(SAVED_REVISION)).toBeInTheDocument();
+    const old = screen.getByRole("region", { name: "work / old 配置" });
+    expect(within(old).getByText("配置状态：旧版本（stale）")).toBeInTheDocument();
+    expect(within(old).getByText("上报状态：在线（online）")).toBeInTheDocument();
+    expect(within(old).getByText(OLD_REVISION)).toBeInTheDocument();
+    fireEvent.click(within(old).getByText("启动时实际配置与来源"));
+    expect(within(old).getByText("77 · 来源：文件（file）")).toBeInTheDocument();
+    const legacy = screen.getByRole("region", { name: "work / legacy 配置" });
+    expect(within(legacy).getByText(/未知（unknown），不能确认已生效/)).toBeInTheDocument();
+    expect(within(legacy).getByText(/缺少启动快照/)).toBeInTheDocument();
+    expect(within(legacy).queryByText(/来源：/)).not.toBeInTheDocument();
+  });
+
+  it("keeps slot usage visible without inventing an unreported limit", async () => {
+    signedIn([
+      makeRunner({ id: "runner-no-quota", daily_pr_limit: null, pr_slots_today: 4, prs_today: 3 }),
     ]);
 
     renderApp("/runners");
 
     const card = await screen.findByTestId("runner-card-runner-no-quota");
-    expect(within(card).getByText("未上报配额")).toBeInTheDocument();
+    expect(within(card).getByText("未上报准入预算")).toBeInTheDocument();
+    expect(within(card).getByText("4/—")).toBeInTheDocument();
     expect(
-      screen.queryByRole("progressbar", { name: "今日 PR 配额" }),
+      within(card).queryByRole("progressbar", { name: "UTC 准入槽位 / 本进程上报值" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows different process observations against the same repo-wide slot count", async () => {
+    signedIn([
+      makeRunner({ id: "low", pr_slots_today: 4, prs_today: 1, daily_pr_limit: 5 }),
+      makeRunner({ id: "high", pr_slots_today: 4, prs_today: 1, daily_pr_limit: 10 }),
+    ]);
+    renderApp("/runners");
+    const low = within(await screen.findByTestId("runner-card-low"));
+    const high = within(screen.getByTestId("runner-card-high"));
+    expect(low.getByText("4/5")).toBeInTheDocument();
+    expect(low.getByText("80%")).toBeInTheDocument();
+    expect(high.getByText("4/10")).toBeInTheDocument();
+    expect(high.getByText("40%")).toBeInTheDocument();
+    expect(high.getByText(/策略由创建进程解析/)).toBeInTheDocument();
   });
 
   it("shows a start command when no runner has registered", async () => {

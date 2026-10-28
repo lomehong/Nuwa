@@ -3,6 +3,7 @@ mod benchmark;
 mod check;
 mod ci;
 mod ci_watch;
+mod config_activation;
 mod deliver;
 mod env_store;
 mod git_ops;
@@ -10,6 +11,7 @@ mod guard;
 mod instructions;
 mod issue;
 mod pipeline;
+mod quota;
 mod repair;
 mod secrets;
 mod serve;
@@ -22,7 +24,7 @@ mod web;
 mod webhook;
 mod workspace;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +38,7 @@ pub type Shared = (Arc<shanhaijing::Store>, Arc<Option<String>>);
 struct Cli {
     issue_path: PathBuf,
     repo: PathBuf,
+    db: PathBuf,
     sessions_dir: PathBuf,
     provider: repair::ProviderKind,
     max_turns: u32,
@@ -49,6 +52,7 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<Cli> {
     let mut cli = Cli {
         issue_path: PathBuf::new(),
         repo: PathBuf::new(),
+        db: PathBuf::from("shanhaijing.db"),
         sessions_dir: PathBuf::from("spike/sessions"),
         provider: repair::ProviderKind::Anthropic { model: None },
         max_turns: 30,
@@ -64,6 +68,7 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<Cli> {
         match flag.as_str() {
             "--issue" => cli.issue_path = PathBuf::from(value("--issue")?),
             "--repo" => cli.repo = PathBuf::from(value("--repo")?),
+            "--db" => cli.db = PathBuf::from(value("--db")?),
             "--sessions" => cli.sessions_dir = PathBuf::from(value("--sessions")?),
             "--provider" => match value("--provider")?.as_str() {
                 "anthropic" => cli.provider = repair::ProviderKind::Anthropic { model: None },
@@ -127,19 +132,21 @@ fn main() -> anyhow::Result<()> {
 async fn run_command() -> anyhow::Result<()> {
     let mut argv = std::env::args().skip(1);
     match argv.next().as_deref() {
-        Some("fix") => run_fix().await,
+        // Heap-pin command futures so verifier/repair state does not accumulate
+        // in the dispatch frame on Windows' smaller main-thread stack.
+        Some("fix") => Box::pin(run_fix()).await,
         Some("ingest") => run_ingest(argv.collect()),
-        Some("work") => run_work(argv.collect()).await,
-        Some("serve") => serve::run_serve(argv.collect()).await,
+        Some("work") => Box::pin(run_work(argv.collect())).await,
+        Some("serve") => Box::pin(serve::run_serve(argv.collect())).await,
         Some("status") => run_status(argv.collect()),
-        Some("sync") => run_sync(argv.collect()).await,
+        Some("sync") => Box::pin(run_sync(argv.collect())).await,
         Some("reopen") => run_reopen(argv.collect()),
         Some("ignore") => run_ignore(argv.collect()),
-        Some("check") => check::run(argv.collect()).await,
-        Some("benchmark") => benchmark::run(argv.collect()).await,
+        Some("check") => Box::pin(check::run(argv.collect())).await,
+        Some("benchmark") => Box::pin(benchmark::run(argv.collect())).await,
         Some("migrate-env") => run_migrate_env(argv.collect()),
         other => bail!(
-            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>]\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--runner-id <id>] [--service-unit <unit>] [--pool N] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp> [--reason <text>]   (owner reviewed an escalation)\n            nuwa ignore --db <path> --fingerprint <fp> [--reason <text>]   (owner mute / not a bug)\n            nuwa check --instructions <path> [--repo <path>] [--base main] [--json]   (preflight a repo config)\n            nuwa benchmark [run] [--db <path>] [--provider faux|zai|anthropic] [--model <id>] [--scenario <name,...>] [--max-turns N] [--json]   (repair benchmark; `benchmark list` prints scenarios)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
+            "usage: nuwa fix --issue <path> --repo <path> [--provider anthropic|faux] [--model <id>] [--max-turns N] [--push] [--pr] [--no-deliver]\n            nuwa ingest --signal <path> [--db <path>] [--trust-observations <source-id>]\n              --trust-observations: owner attests imported observation times and exact environment/release relations are verified; never inferred from JSON or HTTP authentication\n            nuwa work --db <path> --instructions <path> [--provider anthropic|faux] [--runner-id <id>] [--service-unit <unit>] [--pool N] [--push] [--pr] [--loop --interval N]\n            nuwa serve --db <path> [--listen 127.0.0.1:7321]   (HTTP ingest for 青鸟 HTTPSink)\n            nuwa status [--db <path>]\n            nuwa sync --db <path>   (pr_open 问题单与 GitHub 对账：merged→merged, closed→rejected)\n            nuwa reopen --db <path> --fingerprint <fp> [--reason <text>]   (owner reviewed an escalation)\n            nuwa ignore --db <path> --fingerprint <fp> [--reason <text>]   (owner mute / not a bug)\n            nuwa check --instructions <path> [--repo <path>] [--base main] [--json]   (preflight a repo config)\n            nuwa benchmark [run] [--db <path>] [--provider faux|zai|anthropic] [--model <id>] [--scenario <name,...>] [--max-turns N] [--json]   (repair benchmark; `benchmark list` prints scenarios)\n            nuwa migrate-env [--env-file <path>]   (deploy-time env key migration)\n        (got {other:?})"
         ),
     }
 }
@@ -149,16 +156,54 @@ async fn run_command() -> anyhow::Result<()> {
 pub(crate) fn parse_signals(raw: &str) -> anyhow::Result<Vec<shanhaijing::Signal>> {
     match serde_json::from_str::<shanhaijing::Signal>(raw) {
         Ok(signal) => Ok(vec![signal]),
-        Err(first_error) => raw
+        Err(_) => raw
             .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|line| {
-                serde_json::from_str(line).with_context(|| {
-                    format!("not a Signal object ({first_error}) and line is not JSONL: {line:.80}")
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str(line).map_err(|_| {
+                    // Serde errors can include invalid field values. Never
+                    // reflect collector metadata in CLI or HTTP errors.
+                    anyhow::anyhow!("invalid Signal JSON/JSONL at line {}", index + 1)
                 })
             })
             .collect(),
     }
+}
+
+/// Preflight the whole batch before any receipts are committed. Store remains
+/// authoritative (including source/event conflicts discovered during writes).
+pub(crate) fn validate_observations(
+    signals: &[shanhaijing::Signal],
+    source: Option<&str>,
+) -> shanhaijing::ShanResult<()> {
+    let fields = signals.iter().flat_map(|signal| {
+        [
+            (
+                signal.environment.as_deref(),
+                shanhaijing::MAX_ENVIRONMENT_BYTES,
+            ),
+            (
+                signal.release_sha.as_deref(),
+                shanhaijing::MAX_RELEASE_SHA_BYTES,
+            ),
+            (
+                signal.source_event_id.as_deref(),
+                shanhaijing::MAX_SOURCE_EVENT_ID_BYTES,
+            ),
+        ]
+    });
+    for (value, max) in fields.chain(std::iter::once((
+        source,
+        shanhaijing::MAX_TRUSTED_SOURCE_BYTES,
+    ))) {
+        if value.is_some_and(|value| {
+            value.trim().is_empty() || value.len() > max || value.chars().any(char::is_control)
+        }) {
+            return Err(shanhaijing::ShanError::InvalidObservation);
+        }
+    }
+    Ok(())
 }
 
 /// Owner-reviewed reopen: escalated → new, cooldown cleared so the runner can
@@ -244,9 +289,12 @@ fn run_migrate_env(args: Vec<String>) -> anyhow::Result<()> {
 
 /// 山海经 ingest — the collector-facing entry (`nuwa ingest --signal s.json`).
 /// Fingerprint + dedup + cooldown decision happens here, per docs/07 A-1.
+/// Only an owner's explicit `--trust-observations <source-id>` attests that
+/// imported times and the exact environment/release relation were verified.
 fn run_ingest(args: Vec<String>) -> anyhow::Result<()> {
     let mut signal_path = None;
     let mut db_path = std::path::PathBuf::from("shanhaijing.db");
+    let mut trusted_source = None;
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -256,6 +304,12 @@ fn run_ingest(args: Vec<String>) -> anyhow::Result<()> {
                 ))
             }
             "--db" => db_path = std::path::PathBuf::from(it.next().context("--db needs a value")?),
+            "--trust-observations" => {
+                trusted_source = Some(
+                    it.next()
+                        .context("--trust-observations needs a source-id")?,
+                );
+            }
             other => bail!("unknown ingest flag {other}"),
         }
     }
@@ -270,8 +324,16 @@ fn run_ingest(args: Vec<String>) -> anyhow::Result<()> {
     if signals.is_empty() {
         bail!("no signals in {}", signal_path.display());
     }
-    for signal in &signals {
-        println!("{}", report_one(&store, signal, now)?);
+    validate_observations(&signals, trusted_source.as_deref())?;
+    for (index, signal) in signals.iter().enumerate() {
+        let line = report_one_with_source(&store, signal, now, trusted_source.as_deref())
+            .with_context(|| {
+                format!(
+                    "ingest stopped after {index}/{} signals; earlier receipts remain committed",
+                    signals.len()
+                )
+            })?;
+        println!("{line}");
     }
     if let Some(issue) = store.ready_issue(now)? {
         println!(
@@ -282,13 +344,24 @@ fn run_ingest(args: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One report → the human/HTTP response line.
+/// Untrusted report → the human/HTTP response line. Authentication and JSON
+/// fields never attest observation authority.
 pub(crate) fn report_one(
     store: &shanhaijing::Store,
     signal: &shanhaijing::Signal,
     now: i64,
 ) -> anyhow::Result<String> {
-    let line = match store.report_signal(signal, now)? {
+    report_one_with_source(store, signal, now, None)
+}
+
+/// Owner-attested import path; `source` must come from CLI intent, not JSON.
+fn report_one_with_source(
+    store: &shanhaijing::Store,
+    signal: &shanhaijing::Signal,
+    now: i64,
+    source: Option<&str>,
+) -> anyhow::Result<String> {
+    let line = match store.report_signal_with_source(signal, now, source)? {
         shanhaijing::ReportOutcome::NewIssue { fingerprint } => {
             format!("new issue  : {fingerprint} — ready for pickup")
         }
@@ -317,6 +390,20 @@ pub(crate) fn report_one(
         } => {
             format!("REGRESSION : {fingerprint} reopened (occurrences={occurrences})")
         }
+        shanhaijing::ReportOutcome::Delayed {
+            fingerprint,
+            occurrences,
+        } => {
+            format!(
+                "delayed    : {fingerprint} — terminal state unchanged (occurrences={occurrences})"
+            )
+        }
+        shanhaijing::ReportOutcome::Duplicate {
+            fingerprint,
+            occurrences,
+        } => {
+            format!("duplicate  : {fingerprint} (occurrences={occurrences})")
+        }
     };
     Ok(line)
 }
@@ -335,35 +422,62 @@ fn absolute_sessions_dir(path: PathBuf) -> anyhow::Result<PathBuf> {
 /// escalates the issue (docs/07 A-1 回炉升级). `--loop` keeps polling
 /// (serial runner; the concurrent pool is A-3's remaining half).
 async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
+    let environment = env_store::vars();
+    let process_instance_id = uuid::Uuid::new_v4().to_string();
+    let started_at_ms = now_ms();
     webhook::init_from_env();
+    run_work_with_environment(
+        args,
+        environment,
+        process_instance_id,
+        started_at_ms,
+        Arc::new(secrets::Secrets::load()),
+    )
+    .await
+}
+
+/// Injectable startup inputs keep runtime evidence tests off the host's config
+/// and credentials. Production captures the environment exactly once above.
+async fn run_work_with_environment(
+    args: Vec<String>,
+    environment: BTreeMap<String, String>,
+    process_instance_id: String,
+    started_at_ms: i64,
+    secrets: Arc<secrets::Secrets>,
+) -> anyhow::Result<()> {
     // env 默认（设置页写入 nuwa.env）→ CLI 显式 flag 覆盖。
     let mut db_path = std::path::PathBuf::from("shanhaijing.db");
     let mut instructions_path = None;
     let mut sessions_dir = PathBuf::from("spike/sessions");
     let mut provider_given: Option<repair::ProviderKind> = None;
-    let mut max_turns: u32 = env_d("NUWA_MAX_TURNS", "30").parse().unwrap_or(30);
+    let (mut max_turns, turns_source) = startup_number(&environment, "NUWA_MAX_TURNS", 30_u32);
     let mut push = false;
     let mut create_pr = false;
     let mut loop_run = false;
-    let mut interval_secs: u64 = env_d("NUWA_INTERVAL", "30").parse().unwrap_or(30);
-    let mut pool: u32 = env_d("NUWA_POOL", "1").parse().unwrap_or(1);
-    let mut daily_pr_limit: u64 = env_d("NUWA_DAILY_PR_LIMIT", "5").parse().unwrap_or(5);
-    let mut max_tokens: u64 = env_d("NUWA_MAX_TOKENS", "1500000")
-        .parse()
-        .unwrap_or(1_500_000);
-    let mut daily_token_limit: u64 = env_d("NUWA_DAILY_TOKEN_LIMIT", "5000000")
-        .parse()
-        .unwrap_or(5_000_000);
-    let mut monthly_token_limit: u64 = env_d("NUWA_MONTHLY_TOKEN_LIMIT", "50000000")
-        .parse()
-        .unwrap_or(50_000_000);
-    let mut ci_timeout_secs: u64 = env_d("NUWA_CI_TIMEOUT", "600").parse().unwrap_or(600);
-    let mut runner_id_given: Option<String> = env_opt("NUWA_RUNNER_ID");
-    let mut service_unit = env_opt("NUWA_SERVICE_UNIT").unwrap_or_else(|| "nuwa-work".to_string());
-    let event_retention_days =
-        crate::serve::retention_days_from_env(env_opt("NUWA_EVENT_RETENTION_DAYS").as_deref());
+    let (mut interval_secs, interval_source) =
+        startup_number(&environment, "NUWA_INTERVAL", 30_u64);
+    let (mut pool, pool_source) = startup_number(&environment, "NUWA_POOL", 1_u32);
+    let (mut daily_pr_limit, pr_source) =
+        startup_number(&environment, "NUWA_DAILY_PR_LIMIT", 5_u64);
+    let (mut max_tokens, tokens_source) =
+        startup_number(&environment, "NUWA_MAX_TOKENS", 1_500_000_u64);
+    let (mut daily_token_limit, daily_source) =
+        startup_number(&environment, "NUWA_DAILY_TOKEN_LIMIT", 5_000_000_u64);
+    let (mut monthly_token_limit, monthly_source) =
+        startup_number(&environment, "NUWA_MONTHLY_TOKEN_LIMIT", 50_000_000_u64);
+    let (mut ci_timeout_secs, ci_source) = startup_number(&environment, "NUWA_CI_TIMEOUT", 600_u64);
+    let mut runner_id_given = startup_env_opt(&environment, "NUWA_RUNNER_ID");
+    let mut service_unit = startup_env_opt(&environment, "NUWA_SERVICE_UNIT")
+        .unwrap_or_else(|| "nuwa-work".to_string());
+    let event_retention_days = crate::serve::retention_days_from_env(
+        environment
+            .get("NUWA_EVENT_RETENTION_DAYS")
+            .map(String::as_str),
+    );
+    let mut cli_flags = BTreeSet::new();
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
+        cli_flags.insert(flag.clone());
         let mut value = |name: &str| {
             it.next()
                 .with_context(|| format!("missing value for {name}"))
@@ -424,8 +538,8 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     if !(1..=16).contains(&pool) {
         bail!("--pool must be between 1 and 16");
     }
-    let secrets = Arc::new(secrets::Secrets::load());
-    let provider = provider_given.unwrap_or_else(env_provider_default);
+    let cli_provider = provider_given.is_some();
+    let provider = provider_given.unwrap_or_else(|| provider_from_environment(&environment));
     let instructions_path = instructions_path.context("--instructions <path> is required")?;
     // One absolute root drives both the pre-repair `runs.session_dir` write
     // (`work_once`) and the harness session dir (`RepairJob`).
@@ -435,6 +549,108 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         shanhaijing::Store::open(&db_path)
             .with_context(|| format!("open db {}", db_path.display()))?,
     );
+    let env_path = startup_env_path(&environment);
+    // One proof before any worker is spawned; never re-read the env file in
+    // run_runner, including when a worker has to wait for its lease.
+    let mut startup_config = config_activation::StartupConfig::capture(
+        &store,
+        &env_path,
+        "work",
+        process_instance_id,
+        started_at_ms,
+        &environment,
+    );
+    for (key, flag, value, source) in [
+        (
+            "NUWA_MAX_TURNS",
+            "--max-turns",
+            max_turns.to_string(),
+            turns_source,
+        ),
+        (
+            "NUWA_INTERVAL",
+            "--interval",
+            interval_secs.to_string(),
+            interval_source,
+        ),
+        ("NUWA_POOL", "--pool", pool.to_string(), pool_source),
+        (
+            "NUWA_DAILY_PR_LIMIT",
+            "--daily-pr-limit",
+            daily_pr_limit.to_string(),
+            pr_source,
+        ),
+        (
+            "NUWA_MAX_TOKENS",
+            "--max-tokens",
+            max_tokens.to_string(),
+            tokens_source,
+        ),
+        (
+            "NUWA_DAILY_TOKEN_LIMIT",
+            "--daily-token-limit",
+            daily_token_limit.to_string(),
+            daily_source,
+        ),
+        (
+            "NUWA_MONTHLY_TOKEN_LIMIT",
+            "--monthly-token-limit",
+            monthly_token_limit.to_string(),
+            monthly_source,
+        ),
+        (
+            "NUWA_CI_TIMEOUT",
+            "--ci-timeout",
+            ci_timeout_secs.to_string(),
+            ci_source,
+        ),
+    ] {
+        set_startup_effective(
+            &mut startup_config,
+            key,
+            Some(value),
+            if cli_flags.contains(flag) {
+                "cli"
+            } else {
+                source
+            },
+        );
+    }
+    set_startup_effective(
+        &mut startup_config,
+        "NUWA_SERVICE_UNIT",
+        Some(service_unit.clone()),
+        if cli_flags.contains("--service-unit") {
+            "cli"
+        } else if startup_env_opt(&environment, "NUWA_SERVICE_UNIT").is_some() {
+            "environment"
+        } else {
+            "default"
+        },
+    );
+    set_startup_effective(
+        &mut startup_config,
+        "NUWA_ENV_FILE",
+        Some(env_path.to_string_lossy().into_owned()),
+        if environment.contains_key("NUWA_ENV_FILE") {
+            "environment"
+        } else {
+            "default"
+        },
+    );
+    let public_url = startup_env_opt(&environment, "NUWA_PUBLIC_BASE_URL");
+    let public_source = if public_url.is_some() {
+        "environment"
+    } else {
+        "default"
+    };
+    set_startup_effective(
+        &mut startup_config,
+        "NUWA_PUBLIC_BASE_URL",
+        public_url,
+        public_source,
+    );
+    record_startup_provider(&mut startup_config, &provider, cli_provider, &environment);
     let repo_dir = instructions_path
         .parent()
         .map(Path::to_path_buf)
@@ -459,9 +675,27 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         );
     }
 
+    let runner_source = if cli_flags.contains("--runner-id") {
+        "cli"
+    } else if runner_id_given.is_some() {
+        "environment"
+    } else {
+        "derived"
+    };
+    let host = environment
+        .get("HOSTNAME")
+        .or_else(|| environment.get("COMPUTERNAME"))
+        .cloned()
+        .unwrap_or_else(|| "host".into());
     let runner_id = runner_id_given
         .map(|id| sanitize_runner_id(&id))
-        .unwrap_or_else(|| default_runner_id(&repo_config.repo));
+        .unwrap_or_else(|| default_runner_id(&repo_config.repo, &host));
+    set_startup_effective(
+        &mut startup_config,
+        "NUWA_RUNNER_ID",
+        Some(runner_id.clone()),
+        runner_source,
+    );
     let leases = Arc::new(std::sync::Mutex::new(Vec::new()));
     let shared_repo = Arc::new(tokio::sync::Mutex::new(()));
     #[cfg(unix)]
@@ -469,6 +703,8 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
     if pool == 1 {
         return run_runner(RunnerRun {
             store,
+            startup_config,
+            host,
             trusted,
             repo_dir: repo_dir.clone(),
             config_root: repo_dir,
@@ -542,6 +778,8 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
         };
         specs.push(RunnerRun {
             store: Arc::clone(&store),
+            startup_config: startup_config.clone(),
+            host: host.clone(),
             trusted: worker_trusted,
             repo_dir: worker_repo,
             config_root: repo_dir.clone(),
@@ -589,6 +827,8 @@ async fn run_work(args: Vec<String>) -> anyhow::Result<()> {
 /// ids, checkouts, and trusted-instruction copies.
 struct RunnerRun {
     store: Arc<shanhaijing::Store>,
+    startup_config: config_activation::StartupConfig,
+    host: String,
     trusted: instructions::TrustedInstructions,
     repo_dir: PathBuf,
     config_root: PathBuf,
@@ -618,6 +858,8 @@ struct RunnerRun {
 async fn run_runner(spec: RunnerRun) -> anyhow::Result<()> {
     let RunnerRun {
         store,
+        mut startup_config,
+        host,
         mut trusted,
         repo_dir,
         config_root,
@@ -653,21 +895,30 @@ async fn run_runner(spec: RunnerRun) -> anyhow::Result<()> {
         monthly_token_limit,
     );
     let instance_id = uuid::Uuid::new_v4().to_string();
+    startup_config.runner_id = Some(runner_id.clone());
+    startup_config.runner_instance_id = Some(instance_id.clone());
+    if startup_config
+        .values
+        .get("NUWA_RUNNER_ID")
+        .and_then(|v| v.value.as_deref())
+        != Some(runner_id.as_str())
+    {
+        set_startup_effective(
+            &mut startup_config,
+            "NUWA_RUNNER_ID",
+            Some(runner_id.clone()),
+            "derived",
+        );
+    }
     // Compare checkouts by canonical path: `--repo a/../repo` and a symlinked
     // alias must not sneak two workers onto the same working tree.
-    let repo_path = std::fs::canonicalize(&repo_dir)
-        .or_else(|_| std::path::absolute(&repo_dir))
-        .unwrap_or_else(|_| repo_dir.clone())
-        .display()
-        .to_string();
+    let repo_path = pipeline::checkout_identity(&repo_dir)?;
     let make_registration = |at: i64| shanhaijing::RunnerUpsert {
         id: runner_id.clone(),
         repo: repo_config.repo.clone(),
-        host: std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "host".to_string()),
+        host: host.clone(),
         pid: Some(std::process::id() as i64),
-        started_at: at,
+        started_at: startup_config.started_at_ms,
         heartbeat_at: at,
         status: "starting".into(),
         provider: Some(provider_name.clone()),
@@ -716,12 +967,19 @@ async fn run_runner(spec: RunnerRun) -> anyhow::Result<()> {
             Err(e) => return Err(e).context("acquire runner lease"),
         }
     }
+    if let Err(error) = persist_runner_startup(&store, &startup_config, now_ms()) {
+        let _ = store.release_runner_lease(&runner_id, &instance_id);
+        return Err(error);
+    }
     leases
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push((runner_id.clone(), instance_id.clone()));
     let now = now_ms();
-    let _ = store.mark_interrupted(&runner_id, now);
+    let has_pending_delivery = !store.pending_deliveries(&repo_config.repo)?.is_empty();
+    if !has_pending_delivery {
+        store.mark_interrupted(&runner_id, now)?;
+    }
     if let Err(error) = crate::serve::prune_retention(&store, now, event_retention_days) {
         eprintln!("warning    : retention prune failed: {error}");
     }
@@ -739,7 +997,11 @@ async fn run_runner(spec: RunnerRun) -> anyhow::Result<()> {
 
     // 自愈：上一次进程崩溃/被杀留下的 `fixing` 单已无活着的 owner，claim 只领
     // `new`——不复活就永远卡死。启动时批量回 `new` 并清冷却，让本轮循环自然重领。
-    match store.revive_orphaned_fixing(now, &runner_id) {
+    match if has_pending_delivery {
+        Ok(0)
+    } else {
+        store.revive_orphaned_fixing(now, &runner_id)
+    } {
         Ok(0) => {}
         Ok(n) => println!("revive      : {n} orphaned fixing issue(s) requeued at startup"),
         Err(e) => eprintln!("warning : revive orphaned fixing failed: {e}"),
@@ -813,6 +1075,7 @@ async fn run_runner(spec: RunnerRun) -> anyhow::Result<()> {
                 monthly_token_limit,
                 ci_timeout_secs,
                 &runner_id,
+                Some(&instance_id),
                 Arc::clone(&live),
                 &secrets,
             )
@@ -1030,10 +1293,7 @@ fn sanitize_runner_id(raw: &str) -> String {
     value.chars().take(128).collect()
 }
 
-fn default_runner_id(repo: &str) -> String {
-    let host = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "host".to_string());
+fn default_runner_id(repo: &str, host: &str) -> String {
     sanitize_runner_id(&format!("{host}:{repo}"))
 }
 
@@ -1109,6 +1369,162 @@ async fn persist_run(
         let _ = store.update_run(&run_id, &update);
     })
     .await;
+}
+
+/// Final spend is not telemetry: a failed write must stop result handling.
+async fn persist_final_usage(
+    store: &Arc<shanhaijing::Store>,
+    run_id: &str,
+    mut usage: repair::RepairProgress,
+    report: Option<&repair::RepairReport>,
+) -> anyhow::Result<()> {
+    if let Some(report) = report {
+        usage.turns = usage.turns.max(report.turns);
+        usage.uncached_tokens = usage.uncached_tokens.max(report.uncached_tokens);
+        usage.cached_tokens = usage.cached_tokens.max(report.cached_tokens);
+    }
+    let update = shanhaijing::RunUpdate {
+        turns: Some(i64::from(usage.turns)),
+        tokens_uncached: Some(
+            i64::try_from(usage.uncached_tokens).context("uncached usage overflow")?,
+        ),
+        tokens_cached: Some(i64::try_from(usage.cached_tokens).context("cached usage overflow")?),
+        ..Default::default()
+    };
+    let store = Arc::clone(store);
+    let run_id = run_id.to_string();
+    tokio::task::spawn_blocking(move || store.update_run(&run_id, &update))
+        .await
+        .context("persist final usage task")?
+        .context("persist final usage")
+}
+
+fn accumulate_usage(total: &mut repair::RepairProgress, progress: repair::RepairProgress) {
+    total.turns = total.turns.max(progress.turns);
+    total.uncached_tokens = total.uncached_tokens.max(progress.uncached_tokens);
+    total.cached_tokens = total.cached_tokens.max(progress.cached_tokens);
+}
+
+async fn finish_token_gate(
+    store: &shanhaijing::Store,
+    run_id: &str,
+    fp: &str,
+    config: &instructions::RepoInstructions,
+    gate: quota::TokenGateExceeded,
+    live: &SharedLive,
+    secrets: &secrets::Secrets,
+) -> anyhow::Result<bool> {
+    let now = now_ms();
+    let detail = bounded_text(&secrets.redact(&format!("budget_exceeded: {gate}")));
+    if store
+        .pending_deliveries(&config.repo)?
+        .iter()
+        .any(|delivery| delivery.run_id.as_deref() == Some(run_id))
+    {
+        // A post-push gate must not requeue this issue or finish its run:
+        // recovery still owns the remote evidence and any PR may already exist.
+        mark_stand_down(live, now + 60_000).await;
+        live_update(live, "standing_down", Some(fp), None, Some(detail)).await;
+        return Ok(false);
+    }
+    let individual = matches!(gate, quota::TokenGateExceeded::Individual { .. });
+    let (spent, limit) = match gate {
+        quota::TokenGateExceeded::Individual { spent, limit }
+        | quota::TokenGateExceeded::Daily { spent, limit }
+        | quota::TokenGateExceeded::Monthly { spent, limit } => (spent, limit),
+    };
+    if !individual {
+        // Shared spend is not an issue fault. Keep the truthful scope/reason
+        // rather than consuming an attempt or reporting delivery failure.
+        store.release_issue(fp, &detail, now + 15 * 60_000, now)?;
+    }
+    store.finish_run(
+        run_id,
+        &shanhaijing::RunFinish {
+            finished_at: now,
+            outcome: "budget_exceeded".into(),
+            ci_verdict: None,
+            error: Some(detail.clone()),
+        },
+    )?;
+    if !individual {
+        trace::record(
+            store,
+            fp,
+            &config.repo,
+            trace::Decision {
+                stage: "budget",
+                decision: "released",
+                reason: "repository token cap exceeded; attempt not consumed",
+                details: serde_json::json!({"error": detail}),
+            },
+        );
+        mark_stand_down(live, now + 15 * 60_000).await;
+        live_update(live, "standing_down", None, None, Some(detail.clone())).await;
+        println!("budget     : {detail} — released without consuming an attempt");
+        return Ok(false);
+    }
+    live_update(live, "error", Some(fp), None, Some(detail.clone())).await;
+    let outcome = store.record_issue_failure(
+        fp,
+        now,
+        u64::from(config.max_attempts.max(1)),
+        now + 30 * 60_000,
+        &detail,
+        "runner",
+    )?;
+    let retry = outcome.disposition == shanhaijing::FailureDisposition::Retry;
+    trace::record(
+        store,
+        fp,
+        &config.repo,
+        trace::Decision {
+            stage: "budget",
+            decision: if retry { "retry_scheduled" } else { "ignored" },
+            reason: "per-issue token cap exceeded",
+            details: serde_json::json!({
+                "error": detail,
+                "spent_tokens": spent,
+                "cap_tokens": limit,
+                "attempts": outcome.attempts,
+                "max_attempts": config.max_attempts,
+            }),
+        },
+    );
+    if retry {
+        println!(
+            "budget     : {detail} — retry scheduled (attempt {}/{})",
+            outcome.attempts, config.max_attempts
+        );
+    } else {
+        emit_webhook("ignored", fp, &config.repo, detail.clone());
+        println!("budget     : {detail} — attempt cap reached, issue ignored");
+    }
+    Ok(true)
+}
+
+async fn finish_pr_quota(
+    store: &shanhaijing::Store,
+    run_id: &str,
+    fp: &str,
+    live: &SharedLive,
+) -> anyhow::Result<bool> {
+    let now = now_ms();
+    let retry_at = now + 60_000;
+    let detail = format!("pr_quota: {}", deliver::PrQuotaExceeded);
+    store.finish_run(
+        run_id,
+        &shanhaijing::RunFinish {
+            finished_at: now,
+            outcome: "pr_quota".into(),
+            ci_verdict: None,
+            error: Some(detail.clone()),
+        },
+    )?;
+    store.release_issue(fp, &detail, retry_at, now)?;
+    mark_stand_down(live, retry_at).await;
+    live_update(live, "standing_down", None, None, Some(detail)).await;
+    Ok(false)
 }
 
 /// Bound telemetry error text (~16 KiB) so a runaway command output cannot
@@ -1279,20 +1695,130 @@ fn spawn_heartbeat(
     })
 }
 
-fn record_delivery_recovery_failure(
+fn delivery_requires_recovery(
     store: &shanhaijing::Store,
-    fingerprint: &str,
+    repo: &str,
+    run_id: &str,
+    error: &anyhow::Error,
+) -> anyhow::Result<bool> {
+    if deliver::ownership_uncertain(error) {
+        return Ok(true);
+    }
+    Ok(store
+        .pending_deliveries(repo)?
+        .iter()
+        .any(|delivery| delivery.run_id.as_deref() == Some(run_id)))
+}
+
+struct RecoveryClaim<'a> {
+    store: &'a shanhaijing::Store,
+    claim: shanhaijing::DeliveryClaim,
+}
+
+impl Drop for RecoveryClaim<'_> {
+    fn drop(&mut self) {
+        // No release after uncertain/lost ownership, and no unfenced mutation.
+        if deliver::ensure_delivery_owned(self.store, &self.claim).is_ok() {
+            if let Err(error) = self.store.release_delivery_claim(&self.claim, now_ms()) {
+                eprintln!("delivery    : recovery claim release failed: {error}");
+            }
+        }
+    }
+}
+
+fn mark_recovery_ambiguous(
+    store: &shanhaijing::Store,
+    claim: &shanhaijing::DeliveryClaim,
+) -> anyhow::Result<()> {
+    deliver::ensure_delivery_owned(store, claim)?;
+    if claim.delivery.state != shanhaijing::DeliveryState::Ambiguous {
+        store.mark_delivery_owned(
+            claim,
+            shanhaijing::DeliveryState::Ambiguous,
+            None,
+            None,
+            Some("recovery inconclusive; preserving branch and issue/run evidence"),
+            now_ms(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Injectable network boundary: tests exercise the actual recovery decisions,
+/// ownership checks and transactions without credentials or GitHub requests.
+async fn reconcile_delivery_claim<F>(
+    store: &shanhaijing::Store,
+    claim: &shanhaijing::DeliveryClaim,
+    slug: &str,
     max_attempts: u64,
-    now: i64,
-) -> shanhaijing::ShanResult<shanhaijing::FailureOutcome> {
-    store.record_issue_failure(
-        fingerprint,
-        now,
-        max_attempts,
-        now + 30 * 60_000,
-        "delivery recovery: no PR found",
-        "runner",
-    )
+    lookup: impl std::future::Future<Output = anyhow::Result<Option<deliver::RecoveredPullRequest>>>,
+    delete: impl FnOnce() -> F,
+) -> anyhow::Result<bool>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let delivery = &claim.delivery;
+    let found = deliver::with_delivery_heartbeat(store, claim, lookup).await;
+    deliver::ensure_delivery_owned(store, claim)?;
+    match found {
+        Ok(Some(pr)) if pr.matches(&delivery.head_sha, &delivery.base) => {
+            let run = match delivery.run_id.as_deref() {
+                Some(id) => store.run_for(&delivery.fingerprint, id)?,
+                None => None,
+            };
+            let now = now_ms();
+            let watch = shanhaijing::CiWatchInput {
+                run_id: delivery.run_id.clone(),
+                fingerprint: delivery.fingerprint.clone(),
+                repo: delivery.repo.clone(),
+                pr_url: pr.url.clone(),
+                slug: slug.to_string(),
+                pr_number: pr.number,
+                head_sha: delivery.head_sha.clone(),
+                root_cause: run.as_ref().and_then(|run| run.root_cause.clone()),
+                change_stat: run.as_ref().and_then(|run| run.change_stat.clone()),
+                now,
+                next_check_at: now,
+                max_attempts,
+            };
+            store.complete_delivery_owned_at(
+                claim,
+                &pr.url,
+                pr.number,
+                Some(&watch),
+                pr.created_at_ms,
+                now_ms(),
+            )?;
+            Ok(true)
+        }
+        Ok(None) => {
+            // Only this claimed definitive absence permits remote deletion.
+            // The Git operation also compares the exact recorded remote SHA.
+            deliver::ensure_delivery_owned(store, claim)?;
+            if deliver::with_delivery_heartbeat(store, claim, delete())
+                .await
+                .is_err()
+            {
+                mark_recovery_ambiguous(store, claim)?;
+                return Ok(false);
+            }
+            deliver::ensure_delivery_owned(store, claim)?;
+            store.mark_delivery_owned(
+                claim,
+                shanhaijing::DeliveryState::Failed,
+                None,
+                None,
+                Some("definitive no PR; exact remote branch absent/removed; issue unchanged"),
+                now_ms(),
+            )?;
+            // Failed clears the claim: do NOT independently mutate issue/run.
+            Ok(true)
+        }
+        Ok(Some(_)) | Err(_) => {
+            mark_recovery_ambiguous(store, claim)?;
+            Ok(false)
+        }
+    }
 }
 
 /// Recover deliveries whose process died after GitHub created the PR but
@@ -1307,130 +1833,67 @@ async fn reconcile_deliveries(
     max_attempts: u64,
     secrets: &secrets::Secrets,
 ) -> anyhow::Result<usize> {
-    let pending = store.pending_deliveries(repo_id)?;
-    if pending.is_empty() {
+    // One claim per invocation: never hold an unrenewed tail of a batch.
+    let claim = store
+        .claim_pending_deliveries(
+            repo_id,
+            &format!("recovery:{}", uuid::Uuid::new_v4()),
+            now_ms(),
+            pipeline::CHECKOUT_TTL_MS,
+            1,
+        )?
+        .into_iter()
+        .next();
+    let Some(claim) = claim else {
         return Ok(0);
-    }
-    let token = secrets
-        .github_token
-        .as_deref()
-        .context("cannot reconcile deliveries without NUWA_GITHUB_TOKEN")?;
-    let origin = git_ops::git(repo_dir, &["remote", "get-url", "origin"])?;
-    let slug = deliver::parse_github_slug(&origin)
-        .with_context(|| format!("parse GitHub owner/repo from origin `{origin}`"))?;
-    let now = now_ms();
-    let mut reconciled = 0usize;
-    for delivery in pending {
-        match deliver::find_pr_by_head(
+    };
+    let owned = RecoveryClaim { store, claim };
+    let claim = &owned.claim;
+    let delivery = &claim.delivery;
+    let setup = (|| -> anyhow::Result<_> {
+        let token = secrets
+            .github_token
+            .as_deref()
+            .context("cannot reconcile deliveries without NUWA_GITHUB_TOKEN")?;
+        let origin = git_ops::git(repo_dir, &["remote", "get-url", "origin"])?;
+        let slug =
+            deliver::parse_github_slug(&origin).context("parse GitHub owner/repo from origin")?;
+        Ok((token, slug))
+    })();
+    let (token, slug) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            mark_recovery_ambiguous(store, claim)?;
+            return Err(error);
+        }
+    };
+    let reconciled = reconcile_delivery_claim(
+        store,
+        claim,
+        &slug,
+        max_attempts,
+        deliver::find_pr_by_head(
             token,
             &slug,
             &delivery.branch,
             &delivery.head_sha,
             &delivery.base,
-        )
-        .await
-        {
-            Ok(Some(recovered)) if recovered.matches(&delivery.head_sha, &delivery.base) => {
-                let adopted =
-                    store.adopt_delivered_pr(&delivery.fingerprint, &recovered.url, now)?;
-                store.mark_delivery(
-                    &delivery.id,
-                    shanhaijing::DeliveryState::PrCreated,
-                    Some(&recovered.url),
-                    Some(recovered.number),
-                    Some("recovered the exact verified PR head/base"),
-                    now,
-                )?;
-                if adopted {
-                    let run = delivery
-                        .run_id
-                        .as_deref()
-                        .and_then(|id| store.run_for(&delivery.fingerprint, id).ok().flatten());
-                    let _ = store.upsert_ci_watch(&shanhaijing::CiWatchInput {
-                        run_id: delivery.run_id.clone(),
-                        fingerprint: delivery.fingerprint.clone(),
-                        repo: delivery.repo.clone(),
-                        pr_url: recovered.url,
-                        slug: slug.clone(),
-                        pr_number: recovered.number,
-                        head_sha: delivery.head_sha.clone(),
-                        root_cause: run.as_ref().and_then(|run| run.root_cause.clone()),
-                        change_stat: run.as_ref().and_then(|run| run.change_stat.clone()),
-                        now,
-                        next_check_at: now,
-                        max_attempts,
-                    });
-                }
-                reconciled += 1;
+        ),
+        || async {
+            if !push {
+                bail!("remote cleanup disabled; retaining delivery evidence");
             }
-            Ok(Some(recovered)) => {
-                store.mark_delivery(
-                    &delivery.id,
-                    shanhaijing::DeliveryState::Ambiguous,
-                    Some(&recovered.url),
-                    Some(recovered.number),
-                    Some("recovered PR head/base differs from the verified delivery"),
-                    now,
-                )?;
-                eprintln!(
-                    "delivery    : {} recovery left ambiguous: PR #{} head/base {}/{} != verified {}/{}",
-                    delivery.fingerprint,
-                    recovered.number,
-                    recovered.head_sha,
-                    recovered.base_ref,
-                    delivery.head_sha,
-                    delivery.base
-                );
-            }
-            Ok(None) => {
-                if push {
-                    let _ = git_ops::delete_remote_branch(
-                        repo_dir,
-                        &delivery.branch,
-                        Duration::from_secs(60),
-                    )
-                    .await;
-                }
-                store.mark_delivery(
-                    &delivery.id,
-                    shanhaijing::DeliveryState::Failed,
-                    None,
-                    None,
-                    Some("recovery found no PR; branch removed"),
-                    now,
-                )?;
-                let state = store
-                    .list_issues()?
-                    .into_iter()
-                    .find(|row| row.fingerprint == delivery.fingerprint)
-                    .map(|row| row.state);
-                if matches!(state.as_deref(), Some("triggered") | Some("fixing")) {
-                    let _ = record_delivery_recovery_failure(
-                        store,
-                        &delivery.fingerprint,
-                        max_attempts,
-                        now,
-                    );
-                }
-                reconciled += 1;
-            }
-            Err(error) => {
-                store.mark_delivery(
-                    &delivery.id,
-                    shanhaijing::DeliveryState::Ambiguous,
-                    None,
-                    None,
-                    Some(&format!("head lookup failed: {error:#}")),
-                    now,
-                )?;
-                eprintln!(
-                    "delivery    : {} reconciliation inconclusive: {error:#}",
-                    delivery.fingerprint
-                );
-            }
-        }
-    }
-    Ok(reconciled)
+            git_ops::delete_remote_branch_if_matches(
+                repo_dir,
+                &delivery.branch,
+                &delivery.head_sha,
+                Duration::from_secs(60),
+            )
+            .await
+        },
+    )
+    .await?;
+    Ok(usize::from(reconciled))
 }
 
 /// Resolve the base branch from local refs. The runner only supports the
@@ -1451,33 +1914,29 @@ fn resolve_base(repo_dir: &Path) -> anyhow::Result<&'static str> {
 /// Refresh the runner's base and recover a checkout left behind by an
 /// interrupted delivery. Fetch/reset failures are environment faults: the
 /// caller stands down and retries on the next poll instead of crashing.
-async fn preflight_repo(repo_dir: &Path, fetch: bool) -> anyhow::Result<&'static str> {
+async fn preflight_repo(
+    repo_dir: &Path,
+    fetch: bool,
+    checkout: &pipeline::CheckoutLease,
+) -> anyhow::Result<&'static str> {
+    checkout.ensure()?;
+    if pipeline::checkout_identity(repo_dir)? != checkout.claim.path {
+        bail!("preflight checkout claim belongs to a different checkout");
+    }
     let base = resolve_base(repo_dir)?;
     let head = git_ops::current_branch(repo_dir)?;
-    if head == "HEAD" {
-        // Detached per-run worktree: the primary checkout owns the base
-        // branch, so never `checkout` it here. Fetch and hard-reset the
-        // worktree to the current base instead.
-        let has_origin = git_ops::git(repo_dir, &["remote", "get-url", "origin"]).is_ok();
-        if has_origin {
-            if fetch {
-                git_ops::fetch_base(repo_dir, base, Duration::from_secs(120)).await?;
-            }
-            git_ops::reset_to_base(repo_dir, base)?;
-        } else {
-            git_ops::git(repo_dir, &["reset", "--hard", base])?;
-        }
-        let _ = git_ops::git(
-            repo_dir,
-            &["clean", "-fd", "--", ":(exclude)nuwa.repo.json"],
-        );
-        return Ok(base);
+    let dirty = git_ops::git(
+        repo_dir,
+        &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
+    )?;
+    if !dirty.trim().is_empty() {
+        bail!("working tree dirty — preserving interrupted repair; manual review required");
     }
-    if head != base {
+    if head != base && head != "HEAD" {
         if head.starts_with("agent/fix/") {
-            // The runner owns this checkout. The interrupted branch keeps its
-            // commit for forensics; only the working tree is reset.
-            git_ops::git(repo_dir, &["checkout", "-f", base])?;
+            // Keep the branch/commit and never force away uncommitted evidence.
+            checkout.ensure()?;
+            git_ops::git(repo_dir, &["checkout", base])?;
             eprintln!("preflight   : recovered checkout from {head} to {base}");
         } else {
             bail!(
@@ -1488,43 +1947,39 @@ async fn preflight_repo(repo_dir: &Path, fetch: bool) -> anyhow::Result<&'static
         }
     }
 
+    let expected_tip = git_ops::git(repo_dir, &["rev-parse", "HEAD"])?;
     let has_origin = git_ops::git(repo_dir, &["remote", "get-url", "origin"]).is_ok();
     if has_origin {
         if fetch {
             git_ops::fetch_base(repo_dir, base, Duration::from_secs(120)).await?;
         }
+        checkout.ensure()?;
+        if git_ops::git(repo_dir, &["rev-parse", "HEAD"])? != expected_tip
+            || git_ops::current_branch(repo_dir)? != if head == "HEAD" { "HEAD" } else { base }
+            || !git_ops::git(
+                repo_dir,
+                &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
+            )?
+            .trim()
+            .is_empty()
+        {
+            bail!("checkout changed during preflight — refusing reset");
+        }
         git_ops::reset_to_base(repo_dir, base)?;
-    }
-
-    let dirty = git_ops::git(
-        repo_dir,
-        &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
-    )?;
-    if !dirty.trim().is_empty() {
-        eprintln!(
-            "preflight   : unclean working tree — auto-reset to {base}:\n{}",
-            dirty.trim()
-        );
-        if has_origin {
-            git_ops::reset_to_base(repo_dir, base)?;
-        } else {
-            git_ops::git(repo_dir, &["reset", "--hard", "HEAD"])?;
+    } else if head == "HEAD" {
+        checkout.ensure()?;
+        if git_ops::git(repo_dir, &["rev-parse", "HEAD"])? != expected_tip
+            || git_ops::current_branch(repo_dir)? != "HEAD"
+            || !git_ops::git(
+                repo_dir,
+                &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
+            )?
+            .trim()
+            .is_empty()
+        {
+            bail!("checkout changed during preflight — refusing reset");
         }
-        let _ = git_ops::git(
-            repo_dir,
-            &["clean", "-fd", "--", ":(exclude)nuwa.repo.json"],
-        );
-        let still = git_ops::git(
-            repo_dir,
-            &["status", "--porcelain", "--", ":(exclude)nuwa.repo.json"],
-        )?;
-        if !still.trim().is_empty() {
-            bail!(
-                "repo {} working tree still unclean after auto-reset — manual intervention required:\n{}",
-                repo_dir.display(),
-                still.trim()
-            );
-        }
+        git_ops::git(repo_dir, &["reset", "--hard", base])?;
     }
     Ok(base)
 }
@@ -1585,128 +2040,30 @@ fn cleanup_sessions(
     Ok(removed)
 }
 
-/// Remove `agent/fix/*` branches whose issue is already terminal. This keeps
-/// the deterministic branch namespace reusable after merge/reject/escalation
-/// and stops remote branches from accumulating forever.
+/// Terminal issue state alone proves neither PR absence nor a branch's tip.
+/// Leave both local and remote evidence for explicit, claimed cleanup.
 async fn cleanup_terminal_branches(
-    store: &shanhaijing::Store,
-    repo_dir: &Path,
-    push: bool,
+    _store: &shanhaijing::Store,
+    _repo_dir: &Path,
+    _push: bool,
 ) -> anyhow::Result<usize> {
-    let listing = git_ops::git(
-        repo_dir,
-        &[
-            "for-each-ref",
-            "--format=%(refname:short)",
-            "refs/heads/agent/fix/",
-        ],
-    )?;
-    // The remote branches count too. A delivery that pushed but failed to
-    // open its PR leaves a branch on GitHub with no local copy — invisible
-    // to `for-each-ref`, and it would block the next push for that
-    // fingerprint as a non-fast-forward.
-    let mut branches: Vec<String> = listing
-        .lines()
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .map(str::to_string)
-        .collect();
-    if push {
-        match git_ops::git_with_timeout(
-            repo_dir,
-            &["ls-remote", "--heads", "origin", "agent/fix/*"],
-            Duration::from_secs(60),
-        )
-        .await
-        {
-            Ok(out) if out.success => {
-                for line in out.stdout.lines() {
-                    let Some((_, refname)) = line.split_once('\t') else {
-                        continue;
-                    };
-                    let Some(short) = refname.strip_prefix("refs/heads/") else {
-                        continue;
-                    };
-                    if short.is_empty() || branches.contains(&short.to_string()) {
-                        continue;
-                    }
-                    branches.push(short.to_string());
-                }
-            }
-            Ok(out) if out.timed_out => {
-                eprintln!("cleanup     : remote branch listing timed out");
-            }
-            Ok(out) => eprintln!(
-                "cleanup     : remote branch listing failed: {}",
-                out.stderr.trim()
-            ),
-            Err(e) => eprintln!("cleanup     : remote branch listing failed: {e:#}"),
-        }
-    }
-    if branches.is_empty() {
-        return Ok(0);
-    }
-    let issues = store.list_issues()?;
-    let mut removed = 0usize;
-    for branch in branches {
-        let Some(short) = branch.strip_prefix("agent/fix/") else {
-            continue;
-        };
-        let Some(row) = issues
-            .iter()
-            .find(|row| issue::short_fingerprint(&row.fingerprint) == short)
-        else {
-            continue;
-        };
-        let terminal = matches!(
-            row.state.as_str(),
-            "merged" | "rejected" | "escalated" | "ignored"
-        );
-        // An escalated issue can still have an open PR after a manual state
-        // change; never delete that branch out from under the owner.
-        if !terminal || (row.state == "escalated" && row.pr_url.is_some()) {
-            continue;
-        }
-        if git_ops::branch_exists(repo_dir, &branch)? {
-            git_ops::delete_local_branch(repo_dir, &branch)?;
-        }
-        if push {
-            // Best effort: a stale remote branch is not a reason to fail the
-            // startup path; the next claim precheck retries it.
-            if let Err(e) =
-                git_ops::delete_remote_branch(repo_dir, &branch, Duration::from_secs(120)).await
-            {
-                eprintln!("cleanup     : could not delete remote {branch}: {e:#}");
-            }
-        }
-        removed += 1;
-    }
-    Ok(removed)
+    Ok(0)
 }
 
-/// Delete the deterministic branch left by a previous delivery for this
-/// fingerprint. Remote deletion only matters when the runner pushes.
+/// A stale name is not authority to delete either copy of a branch.
 async fn remove_stale_branch(
     repo_dir: &Path,
     fingerprint: &str,
     push: bool,
 ) -> anyhow::Result<bool> {
     let branch = format!("agent/fix/{}", issue::short_fingerprint(fingerprint));
-    let mut removed = false;
     if git_ops::branch_exists(repo_dir, &branch)? {
-        git_ops::delete_local_branch(repo_dir, &branch)?;
-        removed = true;
+        bail!("branch {branch} retained for explicit cleanup (no claimed absence/tip evidence)");
     }
-    if push {
-        // The remote copy can outlive the local one: a delivery that pushed
-        // but failed to open its PR leaves the branch on GitHub. It would
-        // block the next push for this fingerprint as a non-fast-forward.
-        if git_ops::remote_branch_exists(repo_dir, &branch, Duration::from_secs(60)).await? {
-            git_ops::delete_remote_branch(repo_dir, &branch, Duration::from_secs(120)).await?;
-            removed = true;
-        }
+    if push && git_ops::remote_branch_exists(repo_dir, &branch, Duration::from_secs(60)).await? {
+        bail!("remote branch {branch} retained for claimed recovery or explicit cleanup");
     }
-    Ok(removed)
+    Ok(false)
 }
 
 fn context_excerpt(text: &str, max_chars: usize) -> String {
@@ -1779,25 +2136,30 @@ fn build_prior_context(
     out.chars().take(4_096).collect()
 }
 
-/// 只有通过独立验证门（以及 CI 绿灯或明确的 branch-only 成功）的修复才进入
-/// 记忆；来源随内容一起保存。
+/// 明确的 branch-only 推送成功后，以独立验证门和 run ID 作为记忆来源。
 fn remember_verified_fix(
     store: &shanhaijing::Store,
     repo: &str,
     fingerprint: &str,
+    run_id: &str,
     delivered: &deliver::DeliverReport,
     root_cause: &str,
-) {
-    let _ = store.record_repair_memory(&shanhaijing::RepairMemoryEntry {
-        repo: repo.to_string(),
-        fingerprint: fingerprint.to_string(),
-        commit_sha: delivered.commit.clone(),
-        pr_url: delivered.pr_url.clone(),
-        root_cause: root_cause.to_string(),
-        change_stat: delivered.change_stat.clone(),
-        files: delivered.risk.files.len() as i64,
-        recorded_at: now_ms(),
-    });
+) -> anyhow::Result<()> {
+    store.record_verified_repair_memory(
+        &shanhaijing::RepairMemoryEntry {
+            repo: repo.to_string(),
+            fingerprint: fingerprint.to_string(),
+            commit_sha: delivered.commit.clone(),
+            pr_url: delivered.pr_url.clone(),
+            root_cause: root_cause.to_string(),
+            change_stat: delivered.change_stat.clone(),
+            files: delivered.risk.files.len() as i64,
+            recorded_at: now_ms(),
+        },
+        "local_verification",
+        run_id,
+    )?;
+    Ok(())
 }
 
 /// Test-only single-run entry: the config root and editable checkout are the
@@ -1840,6 +2202,7 @@ async fn work_once(
         monthly_token_limit,
         ci_timeout_secs,
         runner_id,
+        None,
         live,
         secrets,
     )
@@ -1868,11 +2231,72 @@ async fn work_once_in(
     monthly_token_limit: u64,
     ci_timeout_secs: u64,
     runner_id: &str,
+    instance_id: Option<&str>,
     live: SharedLive,
     secrets: &Arc<secrets::Secrets>,
 ) -> anyhow::Result<bool> {
+    let checkout = pipeline::CheckoutLease::acquire(store, repo_dir, runner_id, instance_id)?;
+    checkout
+        .during(work_once_claimed(
+            store,
+            trusted,
+            repo_dir,
+            config_root,
+            shared_repo,
+            sessions_dir,
+            provider,
+            max_turns,
+            push,
+            create_pr,
+            daily_pr_limit,
+            max_tokens,
+            daily_token_limit,
+            monthly_token_limit,
+            ci_timeout_secs,
+            runner_id,
+            live,
+            secrets,
+            &checkout,
+        ))
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn work_once_claimed(
+    store: &Arc<shanhaijing::Store>,
+    trusted: &mut instructions::TrustedInstructions,
+    repo_dir: &Path,
+    config_root: &Path,
+    shared_repo: &tokio::sync::Mutex<()>,
+    sessions_dir: PathBuf,
+    provider: repair::ProviderKind,
+    max_turns: u32,
+    push: bool,
+    create_pr: bool,
+    daily_pr_limit: u64,
+    max_tokens: u64,
+    daily_token_limit: u64,
+    monthly_token_limit: u64,
+    ci_timeout_secs: u64,
+    runner_id: &str,
+    live: SharedLive,
+    secrets: &Arc<secrets::Secrets>,
+    checkout: &pipeline::CheckoutLease,
+) -> anyhow::Result<bool> {
     let now = now_ms();
     let repo_config = &trusted.instructions;
+    // Pending evidence belongs to delivery recovery, not a fresh repair/reset.
+    if !store.pending_deliveries(&repo_config.repo)?.is_empty() {
+        live_update(
+            &live,
+            "standing_down",
+            None,
+            None,
+            Some("unfinished delivery requires reconciliation".into()),
+        )
+        .await;
+        return Ok(false);
+    }
     // 活性必须在任何早退之前可见：配额待定/预检失败都不是"进程死了"。
     store.heartbeat(now)?;
     if let Some(remaining) = stand_down_remaining(&live, now).await {
@@ -1886,10 +2310,10 @@ async fn work_once_in(
     // after the UTC window rolls over — no escalation noise for a full quota.
     if create_pr {
         let day_start = now - now.rem_euclid(86_400_000);
-        let opened = store.prs_opened_since(&repo_config.repo, day_start)?;
-        if opened >= daily_pr_limit {
+        let slots = store.pr_slots_used(&repo_config.repo, day_start)?;
+        if slots >= daily_pr_limit {
             println!(
-                "quota      : {opened}/{daily_pr_limit} PRs today for {} — standing down until the window rolls",
+                "quota      : {slots}/{daily_pr_limit} UTC PR admission slots for {} — standing down until the window rolls",
                 repo_config.repo
             );
             live_update(&live, "standing_down", None, None, None).await;
@@ -1932,7 +2356,7 @@ async fn work_once_in(
     let pickable = store.count_ready_for_repo(now, &repo_config.repo)? > 0;
     let preflight = {
         let _guard = shared_repo.lock().await;
-        preflight_repo(repo_dir, pickable).await
+        preflight_repo(repo_dir, pickable, checkout).await
     };
     let base = match preflight {
         Ok(base) => base,
@@ -2050,107 +2474,26 @@ async fn work_once_in(
     }
 
     // ---- stale branch precheck (before any LLM spend) ----
-    // A deterministic branch survives a merged/rejected delivery. If it is
-    // still present when the same fingerprint comes back, the old code only
-    // discovered that in `deliver` after burning a full repair run.
+    // Names and terminal issue states are not proof of PR absence. Retain
+    // either branch copy and stand down for claimed recovery/explicit cleanup.
     let stale_branch = format!("agent/fix/{}", issue::short_fingerprint(&fp));
-    // The remote branch counts too: a delivery that pushed but failed to open
-    // its PR leaves the branch on GitHub while the local copy is gone. The
-    // next push would be rejected as non-fast-forward, and nothing would
-    // ever clean it up.
-    let local_stale = git_ops::branch_exists(repo_dir, &stale_branch)?;
-    let remote_stale = push
-        && git_ops::remote_branch_exists(repo_dir, &stale_branch, Duration::from_secs(60))
-            .await
-            .unwrap_or(false);
-    if local_stale || remote_stale {
-        let recorded_pr = store
-            .list_issues()?
-            .into_iter()
-            .find(|row| row.fingerprint == fp)
-            .and_then(|row| row.pr_url);
-        if recorded_pr.is_some() {
-            let message = format!(
-                "branch {stale_branch} exists and the issue has a recorded PR — refusing to delete it; manual review required"
-            );
-            let _ = store.set_state_as(
-                &fp,
-                shanhaijing::State::Escalated,
-                now,
-                Some(&message),
-                "runner",
-            );
-            trace::record(
-                store,
-                &fp,
-                &repo_config.repo,
-                trace::Decision {
-                    stage: "preflight",
-                    decision: "escalated",
-                    reason: "stale branch has a recorded PR; refusing to delete it",
-                    details: serde_json::json!({"branch": stale_branch, "pr_url": recorded_pr}),
-                },
-            );
-            println!("branch     : {message}");
-            emit_webhook("escalated", &fp, &repo_config.repo, message.clone());
-            live_update(&live, "idle", None, None, Some(message)).await;
-            return Ok(true);
-        }
-        if let Err(e) = remove_stale_branch(repo_dir, &fp, push).await {
-            let message = format!(
-                "stale branch {stale_branch} could not be removed: {e:#} — escalated before starting a repair"
-            );
-            let _ = store.set_state_as(
-                &fp,
-                shanhaijing::State::Escalated,
-                now,
-                Some(&message),
-                "runner",
-            );
-            trace::record(
-                store,
-                &fp,
-                &repo_config.repo,
-                trace::Decision {
-                    stage: "preflight",
-                    decision: "escalated",
-                    reason: "stale branch removal failed",
-                    details: serde_json::json!({"branch": stale_branch, "error": secrets.redact(&format!("{e:#}"))}),
-                },
-            );
-            println!("branch     : {message}");
-            emit_webhook("escalated", &fp, &repo_config.repo, message.clone());
-            live_update(&live, "idle", None, None, Some(message)).await;
-            return Ok(true);
-        }
-        println!("branch     : removed stale {stale_branch} before repair");
+    if let Err(error) = remove_stale_branch(repo_dir, &fp, push).await {
+        let message = bounded_text(&secrets.redact(&format!(
+            "branch {stale_branch} retained; explicit cleanup required: {error:#}"
+        )));
+        let retry_at = now_ms() + 15 * 60_000;
+        store.release_issue(&fp, &message, retry_at, now_ms())?;
+        mark_stand_down(&live, retry_at).await;
+        live_update(&live, "standing_down", None, None, Some(message.clone())).await;
+        eprintln!("branch     : {message}");
+        return Ok(false);
     }
 
     let prior_context = build_prior_context(store, &repo_config.repo, &fp, secrets);
     // 问题单在 `start_run` 之前构建：确定性会话目录要在第一次生命周期写入时
     // 就已知。
-    let mut prob = pipeline::issue_from_snapshot(&snapshot, repo_config, prior_context, secrets);
-    // What will the delivery gate accept? Decided before the agent starts:
-    // when `failing_check` is already green on the base (the common
-    // production case — tests pass, the panic happens at runtime) the only
-    // way through the gate is a reproducer, and the agent has to be told.
-    // A repo that configures `reproduce_check` skips the probe entirely.
-    prob.verification_mode = if repo_config.reproduce_check.is_some() {
-        issue::VerificationMode::Configured
-    } else {
-        match verify::probe_working_tree(repo_dir, &repo_config.failing_check, secrets).await {
-            Ok(out) if out.ok => issue::VerificationMode::Reproducer,
-            Ok(_) => issue::VerificationMode::FailingCheck,
-            Err(e) => {
-                // The probe is advisory; the delivery gate re-runs it. A
-                // failed probe means "assume the check reproduces".
-                eprintln!("probe      : base check could not run: {e:#}");
-                issue::VerificationMode::FailingCheck
-            }
-        }
-    };
-    println!("verify     : mode {}", prob.verification_mode.as_str());
-    let _ = store.start_run(&shanhaijing::RunStart {
+    let prob = pipeline::issue_from_snapshot(&snapshot, repo_config, prior_context, secrets);
+    store.start_run(&shanhaijing::RunStart {
         id: run_id.clone(),
         fingerprint: fp.clone(),
         runner_id: runner_id.to_string(),
@@ -2158,7 +2501,7 @@ async fn work_once_in(
         started_at: now,
         provider: Some(provider_name.clone()),
         model: Some(model_name.clone()),
-    });
+    })?;
     live_update(&live, "working", Some(&fp), Some("claim"), None).await;
     let provider_label = pipeline::provider_label(&provider);
     println!(
@@ -2202,7 +2545,10 @@ async fn work_once_in(
     }));
     let progress_usage = Arc::clone(&final_usage);
     let progress: Option<pipeline::ProgressSink> = Some(Arc::new(move |p| {
-        *progress_usage.lock().unwrap_or_else(|e| e.into_inner()) = p;
+        accumulate_usage(
+            &mut progress_usage.lock().unwrap_or_else(|e| e.into_inner()),
+            p,
+        );
         let store = Arc::clone(&progress_store);
         let run_id = progress_run.clone();
         // Every completed turn is real progress: refresh the watchdog
@@ -2229,7 +2575,7 @@ async fn work_once_in(
     // The future in-process pool swaps this for `RunWorkspace::worktree`;
     // the single-run loop keeps editing the primary checkout.
     let workspace = workspace::RunWorkspace::direct(repo_dir);
-    let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
+    let prepared = match pipeline::prepare_repair(pipeline::RepairRequest {
         repo: config_root.to_path_buf(),
         workspace: Some(workspace.path().to_path_buf()),
         issue: prob,
@@ -2237,11 +2583,43 @@ async fn work_once_in(
         provider,
         max_turns,
         repo_config: Some(repo_config.clone()),
+        owner: Some(trusted.clone()),
+        base: Some(git_ops::git(repo_dir, &["rev-parse", "HEAD"])?),
         secrets: Arc::clone(secrets),
         progress,
         faux_script: None,
         run_id: Some(run_id.clone()),
-    })?;
+    })
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            checkout.ensure()?;
+            // Invalid owner policy/baseline is configuration, not a code bug.
+            // Release without attempts or any delivery effects.
+            let detail =
+                bounded_text(&secrets.redact(&format!("verification preparation: {error:#}")));
+            let now = now_ms();
+            let retry_at = now + 15 * 60_000;
+            store.release_issue(&fp, &detail, retry_at, now)?;
+            store.finish_run(
+                &run_id,
+                &shanhaijing::RunFinish {
+                    finished_at: now,
+                    outcome: "environment".into(),
+                    ci_verdict: None,
+                    error: Some(detail.clone()),
+                },
+            )?;
+            mark_stand_down(&live, retry_at).await;
+            live_update(&live, "standing_down", None, None, Some(detail)).await;
+            return Ok(false);
+        }
+    };
+    println!(
+        "verify     : mode {}",
+        prepared.issue().verification_mode.as_str()
+    );
     let session_dir = prepared.session_dir().to_path_buf();
     trace::record(
         store,
@@ -2273,22 +2651,7 @@ async fn work_once_in(
     .await;
     let repair_result = prepared.execute().await;
     let usage = *final_usage.lock().unwrap_or_else(|e| e.into_inner());
-    let usage_store = Arc::clone(store);
-    let usage_run = run_id.clone();
-    tokio::task::spawn_blocking(move || {
-        usage_store.update_run(
-            &usage_run,
-            &shanhaijing::RunUpdate {
-                turns: Some(i64::from(usage.turns)),
-                tokens_uncached: Some(usage.uncached_tokens as i64),
-                tokens_cached: Some(usage.cached_tokens as i64),
-                ..Default::default()
-            },
-        )
-    })
-    .await
-    .context("persist final usage task")?
-    .context("persist final usage")?;
+    persist_final_usage(store, &run_id, usage, repair_result.as_ref().ok()).await?;
     let report = match repair_result {
         Ok(r) => r,
         Err(e) => {
@@ -2301,7 +2664,7 @@ async fn work_once_in(
                 FailureClass::Environment => "environment",
                 FailureClass::Issue => "repair_failed",
             };
-            let _ = store.finish_run(
+            store.finish_run(
                 &run_id,
                 &shanhaijing::RunFinish {
                     finished_at: now_ms(),
@@ -2309,7 +2672,7 @@ async fn work_once_in(
                     ci_verdict: None,
                     error: Some(detail.clone()),
                 },
-            );
+            )?;
             match class {
                 FailureClass::ProviderTransient => {
                     // The issue is not at fault: release it for a later retry
@@ -2502,60 +2865,23 @@ async fn work_once_in(
     )
     .await;
 
-    // ---- budget gate: per-issue token ceiling ----
-    // The turn cap bounds the loop mid-run (RPI_MAX_TURNS_PER_RUN); this gate
-    // is the spend ceiling — an over-budget run never reaches delivery.
-    let spent = report.uncached_tokens + report.cached_tokens;
-    if spent > max_tokens {
-        let detail =
-            bounded_text(&secrets.redact(&format!("budget_exceeded: {spent} > {max_tokens}")));
-        let _ = store.finish_run(
-            &run_id,
-            &shanhaijing::RunFinish {
-                finished_at: now_ms(),
-                outcome: "budget_exceeded".into(),
-                ci_verdict: None,
-                error: Some(detail.clone()),
-            },
-        );
-        live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
-        let failed_at = now_ms();
-        let outcome = store.record_issue_failure(
-            &fp,
-            failed_at,
-            u64::from(repo_config.max_attempts.max(1)),
-            failed_at + 30 * 60_000,
-            &detail,
-            "runner",
-        )?;
-        let retry = outcome.disposition == shanhaijing::FailureDisposition::Retry;
-        trace::record(
-            store,
-            &fp,
-            &repo_config.repo,
-            trace::Decision {
-                stage: "budget",
-                decision: if retry { "retry_scheduled" } else { "ignored" },
-                reason: "per-issue token cap exceeded",
-                details: serde_json::json!({
-                    "spent_tokens": spent,
-                    "cap_tokens": max_tokens,
-                    "attempts": outcome.attempts,
-                    "max_attempts": repo_config.max_attempts,
-                }),
-            },
-        );
-        if retry {
-            println!(
-                "budget     : {detail} — retry scheduled (attempt {}/{})",
-                outcome.attempts, repo_config.max_attempts
-            );
-        } else {
-            emit_webhook("ignored", &fp, &repo_config.repo, detail.clone());
-            println!("budget     : {detail} — attempt cap reached, issue ignored");
+    // Final usage is durable before checking either individual or repo spend.
+    let limits = quota::DeliveryLimits {
+        daily_pr_limit,
+        max_tokens,
+        daily_token_limit,
+        monthly_token_limit,
+    };
+    if let Err(error) =
+        limits.check_tokens(store, &repo_config.repo, Some(&run_id), &report, now_ms())
+    {
+        if let Some(gate) = error.downcast_ref::<quota::TokenGateExceeded>() {
+            return finish_token_gate(store, &run_id, &fp, repo_config, *gate, &live, secrets)
+                .await;
         }
-        return Ok(true);
+        return Err(error);
     }
+    let spent = report.uncached_tokens.saturating_add(report.cached_tokens);
     println!(
         "tokens     : {spent} (per-issue cap {max_tokens}, daily cap {daily_token_limit}, monthly cap {monthly_token_limit})"
     );
@@ -2587,11 +2913,38 @@ async fn work_once_in(
         store: Some(store),
         run_id: Some(&run_id),
         repo_id: &repo_config.repo,
+        limits,
+        checkout_claim: Some(&checkout.claim),
+        verification: prepared.verification(),
     })
     .await
     {
         Ok(d) => d,
         Err(e) => {
+            // A recheck may deny delivery after another worker spent tokens.
+            // Pending remote evidence remains protected inside the gate handler.
+            if let Some(gate) = e.downcast_ref::<quota::TokenGateExceeded>() {
+                return finish_token_gate(store, &run_id, &fp, repo_config, *gate, &live, secrets)
+                    .await;
+            }
+            if e.downcast_ref::<deliver::PrQuotaExceeded>().is_some() {
+                return finish_pr_quota(store, &run_id, &fp, &live).await;
+            }
+            // Heartbeat/claim uncertainty or any durable pending intent is not
+            // a fresh issue failure. Recovery may already own or complete it.
+            if delivery_requires_recovery(store, &repo_config.repo, &run_id, &e)? {
+                live_update(
+                    &live,
+                    "standing_down",
+                    Some(&fp),
+                    None,
+                    Some(
+                        "delivery ownership/outcome uncertain; preserving recovery evidence".into(),
+                    ),
+                )
+                .await;
+                return Ok(false);
+            }
             let failed_at = now_ms();
             let detail = bounded_text(&secrets.redact(&format!("delivery_failed: {e:#}")));
             let _ = store.finish_run(
@@ -2665,64 +3018,34 @@ async fn work_once_in(
         delivered.risk.touches_tests,
         delivered.risk.touches_ci
     );
-    let pr_opened_at = delivered.pr_url.as_ref().map(|_| now_ms());
-    // 交付证据同样必须在 run 结束前落库（阻塞池执行，不占用异步 worker）。
-    persist_run(
-        store,
-        &run_id,
-        shanhaijing::RunUpdate {
-            phase: Some("ci".into()),
-            branch: Some(delivered.branch.clone()),
-            commit_sha: Some(delivered.commit.clone()),
-            pr_url: delivered.pr_url.clone(),
-            pr_opened_at,
-            verification_ok: Some(true),
-            verification_detail: Some(delivered.verification_detail.clone()),
-            change_stat: Some(delivered.change_stat.clone()),
-            session_dir: Some(report.session_dir.clone()),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    if let Err(e) = store.set_state_as(
-        &fp,
-        shanhaijing::State::PrOpen,
-        now_ms(),
-        Some(
-            delivered
-                .pr_url
-                .as_deref()
-                .unwrap_or("branch pushed, no PR"),
-        ),
-        "runner",
-    ) {
-        let detail =
-            bounded_text(&secrets.redact(&format!("delivery_failed: state update: {e:#}")));
-        let _ = store.finish_run(
+    // PR identity/state/watch were committed atomically by deliver. Only the
+    // branch-only path still needs the legacy local bookkeeping here.
+    if delivered.pr_url.is_none() {
+        persist_run(
+            store,
             &run_id,
-            &shanhaijing::RunFinish {
-                finished_at: now_ms(),
-                outcome: "delivery_failed".into(),
-                ci_verdict: None,
-                error: Some(detail.clone()),
+            shanhaijing::RunUpdate {
+                phase: Some("ci".into()),
+                branch: Some(delivered.branch.clone()),
+                commit_sha: Some(delivered.commit.clone()),
+                verification_ok: Some(true),
+                verification_detail: Some(delivered.verification_detail.clone()),
+                change_stat: Some(delivered.change_stat.clone()),
+                session_dir: Some(report.session_dir.clone()),
+                ..Default::default()
             },
-        );
-        live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
-        let failed_at = now_ms();
-        let _ = store.record_issue_failure(
+        )
+        .await;
+
+        if let Err(e) = store.set_state_as(
             &fp,
-            failed_at,
-            u64::from(repo_config.max_attempts.max(1)),
-            failed_at + 30 * 60_000,
-            &detail,
+            shanhaijing::State::PrOpen,
+            now_ms(),
+            Some("branch pushed, no PR"),
             "runner",
-        );
-        return Err(e.into());
-    }
-    if let Some(url) = &delivered.pr_url {
-        if let Err(e) = store.set_pr(&fp, url, now_ms()) {
-            let detail = bounded_text(&secrets.redact(&format!("delivery_failed: set_pr: {e:#}")));
+        ) {
+            let detail =
+                bounded_text(&secrets.redact(&format!("delivery_failed: state update: {e:#}")));
             let _ = store.finish_run(
                 &run_id,
                 &shanhaijing::RunFinish {
@@ -2733,29 +3056,20 @@ async fn work_once_in(
                 },
             );
             live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
-            emit_webhook("escalated", &fp, &repo_config.repo, detail);
+            let failed_at = now_ms();
+            let _ = store.record_issue_failure(
+                &fp,
+                failed_at,
+                u64::from(repo_config.max_attempts.max(1)),
+                failed_at + 30 * 60_000,
+                &detail,
+                "runner",
+            );
             return Err(e.into());
         }
-        emit_webhook("pr_opened", &fp, &repo_config.repo, url.clone());
     }
-    if let (Some(slug), Some(number)) = (&delivered.slug, delivered.pr_number) {
-        let _ = store.upsert_ci_watch(&shanhaijing::CiWatchInput {
-            run_id: Some(run_id.clone()),
-            fingerprint: fp.clone(),
-            repo: repo_config.repo.clone(),
-            pr_url: delivered
-                .pr_url
-                .clone()
-                .unwrap_or_else(|| format!("https://github.com/{slug}/pull/{number}")),
-            slug: slug.clone(),
-            pr_number: number,
-            head_sha: delivered.commit.clone(),
-            root_cause: Some(redacted_root_cause.clone()),
-            change_stat: Some(delivered.change_stat.clone()),
-            now: now_ms(),
-            next_check_at: now_ms(),
-            max_attempts: u64::from(repo_config.max_attempts.max(1)),
-        });
+    if let Some(url) = &delivered.pr_url {
+        emit_webhook("pr_opened", &fp, &repo_config.repo, url.clone());
     }
     trace::record(
         store,
@@ -2802,9 +3116,10 @@ async fn work_once_in(
                 store,
                 &repo_config.repo,
                 &fp,
+                &run_id,
                 &delivered,
                 &redacted_root_cause,
-            );
+            )?;
         }
         let _ = store.finish_run(
             &run_id,
@@ -2825,351 +3140,120 @@ async fn work_once_in(
         return Ok(true);
     }
 
-    // ---- CI 闸门消费（docs/03 末段）：红 → 自动关 PR + rejected；绿/超时 → 留给人工合并 ----
+    // ---- CI 闸门消费：与 serve 共用持久化 watch 的所有权和观测提交 ----
     live_update(&live, "working", Some(&fp), Some("ci"), None).await;
-    if let (Some(slug), Some(number)) = (&delivered.slug, delivered.pr_number) {
-        let token = match secrets.github_token.clone() {
-            Some(token) => token,
-            None => {
-                // PR 已开出；缺令牌不是交付失败，只是 CI 闸门不可用。仍要
-                // 关闭 run，否则它会永远停在 open 状态。
-                let detail = bounded_text("NUWA_GITHUB_TOKEN not set — cannot poll CI checks");
-                let _ = store.update_run(
-                    &run_id,
-                    &shanhaijing::RunUpdate {
-                        ci_verdict: Some("unavailable".into()),
-                        ..Default::default()
-                    },
-                );
-                let _ = store.finish_run(
-                    &run_id,
-                    &shanhaijing::RunFinish {
-                        finished_at: now_ms(),
-                        outcome: "success".into(),
-                        ci_verdict: Some("unavailable".into()),
-                        error: Some(detail.clone()),
-                    },
-                );
-                live_update(&live, "idle", None, None, Some(detail.clone())).await;
-                trace::record(
-                    store,
-                    &fp,
-                    &repo_config.repo,
-                    trace::Decision {
-                        stage: "ci",
-                        decision: "unavailable",
-                        reason: "github token missing; checks cannot be polled",
-                        details: serde_json::json!({"pr": number}),
-                    },
-                );
-                // The PR is open and the run is closed. A missing token only
-                // means the CI gate cannot be polled — it is not a runner
-                // failure, so the loop keeps running.
-                println!("ci gate    : {detail}");
-                return Ok(true);
-            }
-        };
-        println!(
-            "ci gate   : polling checks for {} (timeout {ci_timeout_secs}s)…",
-            &delivered.commit[..12.min(delivered.commit.len())]
-        );
-        let checks = ci::wait_for_ci(&token, slug, &delivered.commit, ci_timeout_secs).await;
-        match checks {
-            Ok(ci::Verdict::Success) => {
-                println!("ci gate   : all checks green — PR open, awaiting human merge");
-                let _ = store.update_run(
-                    &run_id,
-                    &shanhaijing::RunUpdate {
-                        ci_verdict: Some("success".into()),
-                        ..Default::default()
-                    },
-                );
-                let _ = store.finish_run(
-                    &run_id,
-                    &shanhaijing::RunFinish {
-                        finished_at: now_ms(),
-                        outcome: "success".into(),
-                        ci_verdict: Some("success".into()),
-                        error: None,
-                    },
-                );
-                let _ = store.record_event(
-                    &fp,
-                    now_ms(),
-                    Some(&repo_config.repo),
-                    "runner",
-                    "ci_green",
-                    &format!(
-                        "head {}",
-                        &delivered.commit[..12.min(delivered.commit.len())]
-                    ),
-                );
-                trace::record(
-                    store,
-                    &fp,
-                    &repo_config.repo,
-                    trace::Decision {
-                        stage: "ci",
-                        decision: "ci_green",
-                        reason: "all checks passed; awaiting human merge",
-                        details: serde_json::json!({
-                            "pr": number,
-                            "slug": slug,
-                            "commit": delivered.commit,
-                        }),
-                    },
-                );
-                remember_verified_fix(
-                    store,
-                    &repo_config.repo,
-                    &fp,
-                    &delivered,
-                    &redacted_root_cause,
-                );
-                if let Ok(Some(watch)) = store.ci_watch_for(&fp) {
-                    let _ = store.update_ci_watch(
-                        watch.id,
-                        shanhaijing::CiWatchState::Green,
-                        Some("green"),
-                        now_ms() + 5 * 60_000,
-                        None,
-                        true,
-                        None,
-                        now_ms(),
-                    );
-                }
-            }
-            Ok(ci::Verdict::Failure) => {
-                if let Err(e) = ci::close_pr(&token, slug, number).await {
-                    let detail = bounded_text(&format!("ci_red: close PR failed: {e:#}"));
-                    let _ = store.finish_run(
-                        &run_id,
-                        &shanhaijing::RunFinish {
-                            finished_at: now_ms(),
-                            outcome: "ci_red".into(),
-                            ci_verdict: Some("failure".into()),
-                            error: Some(detail.clone()),
-                        },
-                    );
-                    live_update(&live, "error", Some(&fp), None, Some(detail.clone())).await;
-                    // The PR could not be closed — the issue must not stay in
-                    // `pr_open` pretending the gate is still pending. Hand it
-                    // to the owner as escalated.
-                    let message = format!("ci_red: close PR failed: {e:#} — escalated");
-                    let _ = store.set_state_as(
-                        &fp,
-                        shanhaijing::State::Escalated,
-                        now_ms(),
-                        Some(&message),
-                        "runner",
-                    );
-                    emit_webhook("escalated", &fp, &repo_config.repo, message.clone());
-                    println!("ci gate    : {message}");
-                    return Ok(true);
-                }
-                let _ = store.update_run(
-                    &run_id,
-                    &shanhaijing::RunUpdate {
-                        ci_verdict: Some("failure".into()),
-                        ..Default::default()
-                    },
-                );
-                let _ = store.finish_run(
-                    &run_id,
-                    &shanhaijing::RunFinish {
-                        finished_at: now_ms(),
-                        outcome: "ci_red".into(),
-                        ci_verdict: Some("failure".into()),
-                        error: Some(bounded_text(&format!("CI red — PR #{number} closed"))),
-                    },
-                );
-                let failure = store.record_ci_rejection(
-                    &fp,
-                    delivered
-                        .pr_url
-                        .as_deref()
-                        .context("delivered PR URL missing")?,
-                    now_ms(),
-                    u64::from(repo_config.max_attempts.max(1)),
-                    now_ms() + 30 * 60_000,
-                    &format!("ci_red: PR #{number} closed without merge"),
-                    "runner",
-                )?;
-                let retry = failure.disposition == shanhaijing::FailureDisposition::Retry;
-                let _ = store.record_event(
-                    &fp,
-                    now_ms(),
-                    Some(&repo_config.repo),
-                    "runner",
-                    "ci_red",
-                    &format!(
-                        "head {} — PR #{number} closed",
-                        &delivered.commit[..12.min(delivered.commit.len())]
-                    ),
-                );
-                trace::record(
-                    store,
-                    &fp,
-                    &repo_config.repo,
-                    trace::Decision {
-                        stage: "ci",
-                        decision: if retry { "retry_scheduled" } else { "ignored" },
-                        reason: "CI failed; PR closed and the failure policy advanced",
-                        details: serde_json::json!({
-                            "pr": number,
-                            "slug": slug,
-                            "commit": delivered.commit,
-                            "attempts": failure.attempts,
-                            "max_attempts": repo_config.max_attempts,
-                        }),
-                    },
-                );
-                emit_webhook(
-                    "ci_red",
-                    &fp,
-                    &repo_config.repo,
-                    if retry {
-                        format!(
-                            "PR #{number} closed after CI failure; retry scheduled (attempt {}/{})",
-                            failure.attempts, repo_config.max_attempts
-                        )
-                    } else {
-                        format!(
-                            "PR #{number} closed after CI failure; attempt cap reached, issue ignored"
-                        )
-                    },
-                );
-                if let Ok(Some(watch)) = store.ci_watch_for(&fp) {
-                    let _ = store.update_ci_watch(
-                        watch.id,
-                        shanhaijing::CiWatchState::Red,
-                        Some("red"),
-                        now_ms() + 5 * 60_000,
-                        None,
-                        watch.memory_written,
-                        Some(now_ms()),
-                        now_ms(),
-                    );
-                }
-                let note = if retry {
-                    format!(
-                        "CI red — PR #{number} closed; retry scheduled (attempt {}/{})",
-                        failure.attempts, repo_config.max_attempts
-                    )
-                } else {
-                    format!("CI red — PR #{number} closed; attempt cap reached, issue ignored")
-                };
-                live_update(&live, "error", Some(&fp), None, Some(note.clone())).await;
-                // CI red is a business outcome: the runner keeps running even
-                // when a concurrent state change means it did not reject the issue.
-                println!("ci gate    : {note}");
-                return Ok(true);
-            }
-            Ok(ci::Verdict::TimedOut) => {
-                let _ = store.record_event(
-                    &fp,
-                    now_ms(),
-                    Some(&repo_config.repo),
-                    "runner",
-                    "ci_timeout",
-                    slug,
-                );
-                trace::record(
-                    store,
-                    &fp,
-                    &repo_config.repo,
-                    trace::Decision {
-                        stage: "ci",
-                        decision: "ci_timeout",
-                        reason: "checks unfinished inside the CI window; PR left open",
-                        details: serde_json::json!({
-                            "pr": number,
-                            "slug": slug,
-                            "timeout_secs": ci_timeout_secs,
-                        }),
-                    },
-                );
-                let _ = store.update_run(
-                    &run_id,
-                    &shanhaijing::RunUpdate {
-                        ci_verdict: Some("timeout".into()),
-                        ..Default::default()
-                    },
-                );
-                let _ = store.finish_run(
-                    &run_id,
-                    &shanhaijing::RunFinish {
-                        finished_at: now_ms(),
-                        outcome: "success".into(),
-                        ci_verdict: Some("timeout".into()),
-                        error: None,
-                    },
-                );
-                println!(
-                    "ci gate   : checks unfinished in {ci_timeout_secs}s — PR left open, check manually"
-                );
-            }
-            Err(e) => {
-                // Checks unreadable (fine-grained PAT missing Actions/Checks
-                // read on this repo): the PR stays open, the issue stays
-                // pr_open — merging remains the human decision.
-                let _ = store.update_run(
-                    &run_id,
-                    &shanhaijing::RunUpdate {
-                        ci_verdict: Some("unavailable".into()),
-                        ..Default::default()
-                    },
-                );
-                let _ = store.finish_run(
-                    &run_id,
-                    &shanhaijing::RunFinish {
-                        finished_at: now_ms(),
-                        outcome: "success".into(),
-                        ci_verdict: Some("unavailable".into()),
-                        error: None,
-                    },
-                );
-                println!(
-                    "ci gate   : checks unavailable ({e:#}) — PR left open; \
-                     grant the PAT Actions:Read-only + Contents:Read-only on this repo"
-                );
-                trace::record(
-                    store,
-                    &fp,
-                    &repo_config.repo,
-                    trace::Decision {
-                        stage: "ci",
-                        decision: "unavailable",
-                        reason: "checks could not be read; PR left open for humans",
-                        details: serde_json::json!({
-                            "pr": number,
-                            "slug": slug,
-                            "error": secrets.redact(&format!("{e:#}")),
-                        }),
-                    },
-                );
-            }
+    let observation = match (
+        &delivered.slug,
+        delivered.pr_number,
+        secrets.github_token.clone(),
+    ) {
+        (Some(slug), Some(number), Some(token)) => {
+            println!(
+                "ci gate   : observing delivered head {} (timeout {ci_timeout_secs}s)…",
+                &delivered.commit[..12.min(delivered.commit.len())]
+            );
+            ci_watch::wait_for_delivery(
+                store,
+                &ci_watch::GitHubCi::new(token),
+                slug,
+                number,
+                &delivered.commit,
+                Duration::from_secs(ci_timeout_secs),
+            )
+            .await
         }
-    } else {
-        // Defensive: a PR was requested but there is no slug/number to poll.
-        // The run still has to be closed; the PR (if any) stays open.
-        let detail = bounded_text("PR number unavailable — CI gate skipped");
-        let _ = store.update_run(
-            &run_id,
-            &shanhaijing::RunUpdate {
-                ci_verdict: Some("unavailable".into()),
-                ..Default::default()
-            },
-        );
-        let _ = store.finish_run(
-            &run_id,
-            &shanhaijing::RunFinish {
-                finished_at: now_ms(),
-                outcome: "success".into(),
-                ci_verdict: Some("unavailable".into()),
-                error: Some(detail),
-            },
-        );
+        (_, _, None) => Err(anyhow::anyhow!(
+            "NUWA_GITHUB_TOKEN not set — cannot observe CI; durable watch remains waiting"
+        )),
+        _ => Err(anyhow::anyhow!("PR number unavailable — CI gate skipped")),
+    };
+    let (outcome, decision, detail, error) = match observation {
+        Ok(Some(watch)) => {
+            let detail = match watch.state {
+                shanhaijing::CiWatchState::Green => "all checks green for delivered head".into(),
+                shanhaijing::CiWatchState::Red => format!(
+                    "CI red — {}",
+                    watch.last_error.as_deref().unwrap_or("check PR status")
+                ),
+                shanhaijing::CiWatchState::Merged => format!("PR #{} merged", watch.pr_number),
+                shanhaijing::CiWatchState::Closed => {
+                    format!("PR #{} closed without merge", watch.pr_number)
+                }
+                shanhaijing::CiWatchState::HeadChanged => format!(
+                    "PR head changed — manual follow-up required; {}",
+                    watch
+                        .last_error
+                        .as_deref()
+                        .unwrap_or("not following the replacement head")
+                ),
+                shanhaijing::CiWatchState::Expired => {
+                    "CI watch expired — manual follow-up required".into()
+                }
+                shanhaijing::CiWatchState::Pending => "CI watch remains pending".into(),
+            };
+            let detail = bounded_text(&secrets.redact(&detail));
+            let error = matches!(
+                watch.state,
+                shanhaijing::CiWatchState::Red
+                    | shanhaijing::CiWatchState::HeadChanged
+                    | shanhaijing::CiWatchState::Expired
+            )
+            .then(|| detail.clone());
+            (
+                if watch.state == shanhaijing::CiWatchState::Red {
+                    "ci_red"
+                } else {
+                    "success"
+                },
+                watch.state.as_str(),
+                detail,
+                error,
+            )
+        }
+        Ok(None) => (
+            "success",
+            "ci_timeout",
+            bounded_text(&format!(
+                "CI observation timed out after {ci_timeout_secs}s — durable watch continues"
+            )),
+            None,
+        ),
+        Err(e) => {
+            let detail = bounded_text(&secrets.redact(&format!("CI unavailable: {e:#}")));
+            ("success", "unavailable", detail.clone(), Some(detail))
+        }
+    };
+    // The owned watcher publishes the verdict atomically. Never overwrite it,
+    // including when serve observes CI while this bounded wait is unavailable.
+    store.finish_run(
+        &run_id,
+        &shanhaijing::RunFinish {
+            finished_at: now_ms(),
+            outcome: outcome.into(),
+            ci_verdict: None,
+            error,
+        },
+    )?;
+    trace::record(
+        store,
+        &fp,
+        &repo_config.repo,
+        trace::Decision {
+            stage: "ci",
+            decision,
+            reason: &detail,
+            details: serde_json::json!({
+                "pr": delivered.pr_number,
+                "slug": delivered.slug,
+                "commit": delivered.commit,
+                "timeout_secs": ci_timeout_secs,
+            }),
+        },
+    );
+    println!("ci gate   : {detail}");
+    if outcome == "ci_red" {
+        live_update(&live, "error", Some(&fp), None, Some(detail)).await;
+        return Ok(true);
     }
 
     live_update(&live, "idle", None, None, None).await;
@@ -3212,27 +3296,143 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// env 读取（空值视为未设置）；运行期改动走 `env_store`，不碰进程环境。
-fn env_d(name: &str, default: &str) -> String {
-    env_store::var(name)
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.to_string())
+fn startup_env_opt(environment: &BTreeMap<String, String>, name: &str) -> Option<String> {
+    environment
+        .get(name)
+        .filter(|value| !value.is_empty())
+        .cloned()
 }
 
+fn startup_env_path(environment: &BTreeMap<String, String>) -> PathBuf {
+    environment
+        .get("NUWA_ENV_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/opt/nuwa/nuwa.env"))
+}
+
+fn startup_number<T: std::str::FromStr>(
+    environment: &BTreeMap<String, String>,
+    key: &str,
+    default: T,
+) -> (T, &'static str) {
+    match environment.get(key).and_then(|raw| raw.parse().ok()) {
+        Some(value) => (value, "environment"),
+        None => (default, "default"),
+    }
+}
+
+/// Retain proven file provenance; normalized/clamped inputs are derived from
+/// those inputs rather than an independent environment override.
+fn set_startup_effective(
+    snapshot: &mut config_activation::StartupConfig,
+    key: &str,
+    value: Option<String>,
+    source: &str,
+) {
+    let source = if source == "environment" {
+        match snapshot.values.get(key) {
+            Some(old) if old.value != value => "derived",
+            Some(old) if old.source == "file" => "file",
+            _ => "environment",
+        }
+    } else {
+        source
+    };
+    snapshot.set_effective(key, value, source);
+}
+
+fn record_startup_provider(
+    snapshot: &mut config_activation::StartupConfig,
+    provider: &repair::ProviderKind,
+    cli_provider: bool,
+    environment: &BTreeMap<String, String>,
+) {
+    let (name, model, base) =
+        repair::actual_provider_config(provider).unwrap_or_else(|_| match provider {
+            // Retain the request, not a resolved model or an invented endpoint.
+            repair::ProviderKind::Anthropic { model } => ("anthropic".into(), model.clone(), None),
+            _ => (provider_meta(provider).0, None, None),
+        });
+    let provider_source = if cli_provider {
+        "cli"
+    } else if environment
+        .get("NUWA_PROVIDER")
+        .is_some_and(|raw| matches!(raw.as_str(), "anthropic" | "zai" | "faux"))
+    {
+        "environment"
+    } else {
+        "default"
+    };
+    let requested_source = if cli_provider { "cli" } else { "environment" };
+    let (model_source, base_source) = match provider {
+        repair::ProviderKind::Anthropic { model } => (
+            if model.is_some() {
+                requested_source
+            } else {
+                "default"
+            },
+            "default",
+        ),
+        repair::ProviderKind::Zai { model, base_url } => (
+            if model.is_some() {
+                requested_source
+            } else {
+                "default"
+            },
+            if base_url.is_some() {
+                requested_source
+            } else {
+                "default"
+            },
+        ),
+        repair::ProviderKind::Faux => ("default", "default"),
+    };
+    set_startup_effective(snapshot, "NUWA_PROVIDER", Some(name), provider_source);
+    set_startup_effective(snapshot, "NUWA_MODEL", model, model_source);
+    set_startup_effective(snapshot, "NUWA_BASE_URL", base, base_source);
+}
+
+fn persist_runner_startup(
+    store: &shanhaijing::Store,
+    snapshot: &config_activation::StartupConfig,
+    now: i64,
+) -> anyhow::Result<()> {
+    let runner_id = snapshot
+        .runner_id
+        .as_deref()
+        .context("startup runner id missing")?;
+    let instance_id = snapshot
+        .runner_instance_id
+        .as_deref()
+        .context("startup runner instance missing")?;
+    let json = serde_json::to_string(snapshot).context("serialize runner startup config")?;
+    if !store
+        .set_runner_startup_config(runner_id, instance_id, &json, now)
+        .context("persist runner startup config")?
+    {
+        bail!("runner startup config rejected: lease lost or snapshot already set");
+    }
+    Ok(())
+}
+
+/// Empty values are unset; settings saves never mutate this startup store.
 fn env_opt(name: &str) -> Option<String> {
     env_store::var(name).filter(|value| !value.is_empty())
 }
 
-/// 设置页驱动的 provider 默认值（CLI 显式 flag 优先）。
-pub(crate) fn env_provider_default() -> repair::ProviderKind {
-    match env_d("NUWA_PROVIDER", "anthropic").as_str() {
+fn provider_from_environment(environment: &BTreeMap<String, String>) -> repair::ProviderKind {
+    match environment
+        .get("NUWA_PROVIDER")
+        .map(String::as_str)
+        .unwrap_or("anthropic")
+    {
         "zai" => repair::ProviderKind::Zai {
-            base_url: env_opt("NUWA_BASE_URL"),
-            model: env_opt("NUWA_MODEL"),
+            base_url: startup_env_opt(environment, "NUWA_BASE_URL"),
+            model: startup_env_opt(environment, "NUWA_MODEL"),
         },
         "faux" => repair::ProviderKind::Faux,
         _ => repair::ProviderKind::Anthropic {
-            model: env_opt("NUWA_MODEL"),
+            model: startup_env_opt(environment, "NUWA_MODEL"),
         },
     }
 }
@@ -3285,7 +3485,36 @@ async fn run_fix() -> anyhow::Result<()> {
     if !cli.repo.join(".git").exists() {
         bail!("{} is not a git repository", cli.repo.display());
     }
+    let store = Arc::new(
+        shanhaijing::Store::open(&cli.db)
+            .with_context(|| format!("open db {}", cli.db.display()))?,
+    );
+    let owner = format!("fix:{}", uuid::Uuid::new_v4());
+    let checkout = pipeline::CheckoutLease::acquire(&store, &cli.repo, &owner, None)?;
+    checkout
+        .during(fix_with_checkout(cli, prob, secrets, &store, &checkout))
+        .await
+}
 
+async fn fix_with_checkout(
+    cli: Cli,
+    prob: issue::Issue,
+    secrets: Arc<secrets::Secrets>,
+    store: &Arc<shanhaijing::Store>,
+    checkout: &pipeline::CheckoutLease,
+) -> anyhow::Result<()> {
+    let limits = quota::DeliveryLimits::from_environment();
+    fix_with_limits(cli, prob, secrets, store, checkout, limits).await
+}
+
+async fn fix_with_limits(
+    cli: Cli,
+    prob: issue::Issue,
+    secrets: Arc<secrets::Secrets>,
+    store: &Arc<shanhaijing::Store>,
+    checkout: &pipeline::CheckoutLease,
+    limits: quota::DeliveryLimits,
+) -> anyhow::Result<()> {
     println!(
         "== Nuwa fix run ==\nissue     : {}\nrepo      : {}\nprovider  : {}\nmax turns : {}",
         prob.fingerprint,
@@ -3294,22 +3523,120 @@ async fn run_fix() -> anyhow::Result<()> {
         cli.max_turns,
     );
 
-    // 工作区若有仓库指令，其 notes 与技能白名单与常驻 runner 走同一条注入路径。
-    let repo_config = instructions::load_working_tree(&cli.repo)?;
-    let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
-        repo: cli.repo.clone(),
-        workspace: None,
-        issue: prob.clone(),
-        sessions_dir: cli.sessions_dir.clone(),
-        provider: cli.provider,
-        max_turns: cli.max_turns,
-        repo_config,
-        secrets: Arc::clone(&secrets),
-        progress: None,
-        faux_script: None,
-        run_id: None,
+    // Standalone fix adopts authoritative bytes BEFORE the model, just like
+    // work. A working-file reload after repair can never establish authority.
+    let base = git_ops::git(&cli.repo, &["rev-parse", "HEAD"])?;
+    let private_owner = tempfile::tempdir().context("standalone owner authority")?;
+    let owner = if cli.repo.join("nuwa.repo.json").exists()
+        || git_ops::git_raw(&cli.repo, &["show", &format!("{base}:nuwa.repo.json")]).is_ok()
+    {
+        Some(instructions::TrustedInstructions::load(
+            &cli.repo,
+            &cli.repo.join("nuwa.repo.json"),
+            &base,
+            private_owner.path(),
+        )?)
+    } else {
+        None
+    };
+    let repo_config = owner.as_ref().map(|owner| owner.instructions.clone());
+    let repo_id = match &repo_config {
+        Some(config) => config.repo.clone(),
+        None => {
+            let origin = git_ops::git(&cli.repo, &["remote", "get-url", "origin"]).ok();
+            origin
+                .as_deref()
+                .and_then(deliver::parse_github_slug)
+                .unwrap_or_else(|| checkout.claim.path.clone())
+        }
+    };
+    if !store.pending_deliveries(&repo_id)?.is_empty() {
+        bail!("unfinished delivery requires reconciliation before standalone repair");
+    }
+    limits.check_admission(store, &repo_id, cli.create_pr, now_ms())?;
+    checkout.ensure()?;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let (provider, model) = provider_meta(&cli.provider);
+    store.start_standalone_run(&shanhaijing::RunStart {
+        id: run_id.clone(),
+        fingerprint: prob.fingerprint.clone(),
+        runner_id: format!("fix:{run_id}"),
+        repo: repo_id.clone(),
+        started_at: now_ms(),
+        provider: Some(provider),
+        model: Some(model),
     })?;
-    let report = prepared.execute().await.context("repair run")?;
+    let final_usage = Arc::new(std::sync::Mutex::new(repair::RepairProgress {
+        turns: 0,
+        uncached_tokens: 0,
+        cached_tokens: 0,
+    }));
+    let progress_usage = Arc::clone(&final_usage);
+    let progress: pipeline::ProgressSink = Arc::new(move |progress| {
+        accumulate_usage(
+            &mut progress_usage.lock().unwrap_or_else(|e| e.into_inner()),
+            progress,
+        );
+    });
+    let repair_result = async {
+        let prepared = pipeline::prepare_repair(pipeline::RepairRequest {
+            repo: cli.repo.clone(),
+            workspace: None,
+            issue: prob,
+            sessions_dir: cli.sessions_dir.clone(),
+            provider: cli.provider,
+            max_turns: cli.max_turns,
+            repo_config,
+            owner,
+            base: Some(base),
+            secrets: Arc::clone(&secrets),
+            progress: Some(progress),
+            faux_script: None,
+            run_id: Some(run_id.clone()),
+        })
+        .await?;
+        store.update_run(
+            &run_id,
+            &shanhaijing::RunUpdate {
+                phase: Some("repair".into()),
+                session_dir: Some(prepared.session_dir().to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        )?;
+        let report = prepared.execute().await.context("repair run")?;
+        Ok::<_, anyhow::Error>((prepared, report))
+    }
+    .await;
+    let usage = *final_usage.lock().unwrap_or_else(|e| e.into_inner());
+    persist_final_usage(
+        store,
+        &run_id,
+        usage,
+        repair_result.as_ref().ok().map(|(_, report)| report),
+    )
+    .await?;
+    let (prepared, report) = match repair_result {
+        Ok(result) => result,
+        Err(error) => {
+            finish_standalone_run(store, &run_id, "repair_failed", Some(&error), &secrets)?;
+            return Err(error);
+        }
+    };
+    store
+        .update_run(
+            &run_id,
+            &shanhaijing::RunUpdate {
+                phase: Some("verify".into()),
+                harness_run_id: Some(report.run_id.clone()),
+                root_cause: Some(bounded_text(&secrets.redact(&report.root_cause_text))),
+                session_dir: Some(report.session_dir.clone()),
+                compactions: Some(i64::from(report.context.compactions)),
+                context_window: Some(report.context.model_context_window as i64),
+                messages: Some(report.context.messages as i64),
+                ..Default::default()
+            },
+        )
+        .context("persist standalone repair evidence")?;
 
     println!(
         "\nrun       : {}\nturns     : {}\ntokens    : {} (cached {})\ncontext   : window {} tokens, {} auto-compaction(s), {} messages",
@@ -3329,13 +3656,14 @@ async fn run_fix() -> anyhow::Result<()> {
     println!("root cause: {cause}");
 
     if cli.no_deliver {
+        finish_standalone_run(store, &run_id, "no_deliver", None, &secrets)?;
         println!("\n--no-deliver: stopping before the delivery gate");
         return Ok(());
     }
 
     let delivered = pipeline::deliver(pipeline::DeliveryRequest {
         repo: &cli.repo,
-        issue: &prob,
+        issue: prepared.issue(),
         report: &report,
         sessions_dir: &cli.sessions_dir,
         push: cli.push,
@@ -3343,11 +3671,58 @@ async fn run_fix() -> anyhow::Result<()> {
         public_base_url: None,
         draft: false,
         secrets: &secrets,
-        store: None,
-        run_id: None,
-        repo_id: "",
+        store: Some(store),
+        run_id: Some(&run_id),
+        repo_id: &repo_id,
+        limits,
+        checkout_claim: Some(&checkout.claim),
+        verification: prepared.verification(),
     })
-    .await?;
+    .await;
+    let delivered = match delivered {
+        Ok(delivered) => delivered,
+        Err(error) => {
+            // A successful PR completion may precede a checkout cleanup error.
+            // Never replace that durable success with a failure/quota outcome.
+            let run = store
+                .run_by_id(&run_id)?
+                .context("standalone run missing")?;
+            if run.pr_url.is_some() {
+                finish_standalone_run(store, &run_id, "delivered", None, &secrets)?;
+            } else if !delivery_requires_recovery(store, &repo_id, &run_id, &error)? {
+                let outcome = if error.downcast_ref::<quota::TokenGateExceeded>().is_some() {
+                    "budget_exceeded"
+                } else if error.downcast_ref::<deliver::PrQuotaExceeded>().is_some() {
+                    "pr_quota"
+                } else {
+                    "delivery_failed"
+                };
+                finish_standalone_run(store, &run_id, outcome, Some(&error), &secrets)?;
+            }
+            // Otherwise keep the run active alongside pending delivery evidence.
+            return Err(error);
+        }
+    };
+    let run = store
+        .run_by_id(&run_id)?
+        .context("standalone run missing")?;
+    if run.finished_at.is_none() {
+        // Local/branch-only delivery has no PR-completion transaction to record
+        // this evidence. Do not invent/overwrite GitHub's creation timestamp.
+        store.update_run(
+            &run_id,
+            &shanhaijing::RunUpdate {
+                branch: Some(delivered.branch.clone()),
+                commit_sha: Some(delivered.commit.clone()),
+                pr_url: delivered.pr_url.clone(),
+                verification_ok: Some(true),
+                verification_detail: Some(secrets.redact(&delivered.verification_detail)),
+                change_stat: Some(secrets.redact(&delivered.change_stat)),
+                ..Default::default()
+            },
+        )?;
+        finish_standalone_run(store, &run_id, "delivered", None, &secrets)?;
+    }
     println!(
         "\nbranch    : {}\nbase      : {}\ncommit    : {}\npr        : {}\nrisk      : files={} tests={} ci={}",
         delivered.branch,
@@ -3360,6 +3735,29 @@ async fn run_fix() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+fn finish_standalone_run(
+    store: &shanhaijing::Store,
+    run_id: &str,
+    outcome: &str,
+    error: Option<&anyhow::Error>,
+    secrets: &secrets::Secrets,
+) -> anyhow::Result<()> {
+    let run = store.run_by_id(run_id)?.context("standalone run missing")?;
+    if run.finished_at.is_none() {
+        store.finish_run(
+            run_id,
+            &shanhaijing::RunFinish {
+                finished_at: now_ms(),
+                outcome: outcome.into(),
+                ci_verdict: None,
+                error: error
+                    .map(|error| bounded_text(&secrets.redact(&format!("{outcome}: {error:#}")))),
+            },
+        )?;
+    }
+    Ok(())
+}
 pub const NUWA_BUILD_MARKER: &str = "MARKER-XYZ-9L";
 
 #[cfg(test)]
@@ -3367,6 +3765,626 @@ mod tests {
     use super::*;
     use crate::instructions::RepoInstructions;
     use crate::issue::FailingCheck;
+
+    fn ingest_payload() -> serde_json::Value {
+        serde_json::json!({
+            "repo": "example.com/batch5",
+            "language": "go",
+            "title": "panic: boom",
+            "stack_trace": "panic: boom\ngoroutine 1 [running]:\nexample.com/batch5.F()\n\t/app/a.go:1 +0x1"
+        })
+    }
+
+    fn observed_ingest_payload() -> serde_json::Value {
+        let mut payload = ingest_payload();
+        payload["observed_at"] = 150.into();
+        payload["environment"] = "production".into();
+        payload["release_sha"] = "A".repeat(40).into();
+        payload["source_event_id"] = "incident-1".into();
+        payload
+    }
+
+    fn ingest_file(dir: &Path, raw: &str, source: Option<&str>) -> anyhow::Result<()> {
+        let input = dir.join("signal.jsonl");
+        std::fs::write(&input, raw).expect("input");
+        let mut args = vec![
+            "--signal".into(),
+            input.display().to_string(),
+            "--db".into(),
+            dir.join("ingest.db").display().to_string(),
+        ];
+        if let Some(source) = source {
+            args.extend(["--trust-observations".into(), source.into()]);
+        }
+        run_ingest(args)
+    }
+
+    fn ingest_terminal(store: &shanhaijing::Store, fp: &str, terminal: shanhaijing::State) {
+        for state in [
+            shanhaijing::State::Triggered,
+            shanhaijing::State::Fixing,
+            shanhaijing::State::PrOpen,
+            terminal,
+        ] {
+            store.set_state(fp, state, 200, None).expect("transition");
+        }
+    }
+
+    #[test]
+    fn ingest_cli_accepts_legacy_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ingest_file(dir.path(), &ingest_payload().to_string(), None).expect("legacy ingest");
+        let store = shanhaijing::Store::open(dir.path().join("ingest.db")).expect("store");
+        let issue = store.list_issues().expect("issues").remove(0);
+        assert_eq!(issue.state, "new");
+        assert_eq!(issue.severity, "medium");
+        assert_eq!(issue.occurrences, 1);
+        let observations = store
+            .observations_for(&issue.fingerprint, 100)
+            .expect("receipts");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].time_status, "missing");
+        assert_eq!(observations[0].trusted_source, None);
+    }
+
+    #[test]
+    fn ingest_cli_persists_optional_metadata_without_trust() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ingest_file(dir.path(), &observed_ingest_payload().to_string(), None).expect("ingest");
+        let store = shanhaijing::Store::open(dir.path().join("ingest.db")).expect("store");
+        let issue = store.list_issues().expect("issues").remove(0);
+        let observations = store
+            .observations_for(&issue.fingerprint, 100)
+            .expect("receipts");
+        let observation = &observations[0];
+        assert_eq!(observation.observed_at_ms, Some(150));
+        assert_eq!(observation.environment.as_deref(), Some("production"));
+        assert_eq!(observation.release_sha, Some("a".repeat(40)));
+        assert_eq!(observation.source_event_id.as_deref(), Some("incident-1"));
+        assert_eq!(observation.time_status, "untrusted");
+        assert_eq!(observation.trusted_source, None);
+    }
+
+    #[test]
+    fn ingest_cli_explicit_trust_preserves_terminal_state_for_delayed_observation() {
+        for terminal in [shanhaijing::State::Merged, shanhaijing::State::Rejected] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            ingest_file(dir.path(), &ingest_payload().to_string(), None).expect("seed");
+            let store = shanhaijing::Store::open(dir.path().join("ingest.db")).expect("store");
+            let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
+            ingest_terminal(&store, &fp, terminal);
+            let mut payload = observed_ingest_payload();
+            ingest_file(dir.path(), &payload.to_string(), Some("owner-import"))
+                .expect("trusted import");
+            let observations = store.observations_for(&fp, 100).expect("receipts");
+            assert_eq!(observations[0].disposition, "delayed");
+            assert_eq!(observations[0].time_status, "trusted");
+            assert_eq!(
+                observations[0].trusted_source.as_deref(),
+                Some("owner-import")
+            );
+            assert_eq!(
+                store.list_issues().expect("issues")[0].state,
+                terminal.as_str()
+            );
+            payload["source_event_id"] = "incident-2".into();
+            let signal = serde_json::from_value(payload).expect("signal");
+            let line = report_one_with_source(&store, &signal, now_ms(), Some("owner-import"))
+                .expect("delayed response");
+            assert!(line.starts_with("delayed"));
+            assert!(line.contains(&fp));
+            assert!(line.contains("occurrences=3"));
+        }
+    }
+
+    #[test]
+    fn ingest_cli_duplicate_and_conflicting_event_disclose_partial_receipts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = observed_ingest_payload();
+        let mut conflict = payload.clone();
+        conflict["environment"] = "staging".into();
+        let raw = format!("{payload}\n{payload}\n{conflict}\n");
+        let error = ingest_file(dir.path(), &raw, Some("owner-import")).expect_err("conflict");
+        let message = format!("{error:#}");
+        assert!(message.contains("after 2/3 signals; earlier receipts remain committed"));
+        assert!(message.contains("invalid signal observation"));
+        assert!(!message.contains("staging"));
+        let store = shanhaijing::Store::open(dir.path().join("ingest.db")).expect("store");
+        let issue = store.list_issues().expect("issues").remove(0);
+        assert_eq!(issue.occurrences, 2);
+        let observations = store
+            .observations_for(&issue.fingerprint, 100)
+            .expect("receipts");
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].disposition, "duplicate");
+        assert_eq!(observations[0].duplicate_of, Some(observations[1].id));
+        let signal = serde_json::from_value(payload).expect("signal");
+        let line = report_one_with_source(&store, &signal, now_ms(), Some("owner-import"))
+            .expect("duplicate response");
+        assert!(line.starts_with("duplicate"));
+        assert!(line.contains(&issue.fingerprint));
+        assert!(line.contains("occurrences=3"));
+    }
+
+    #[test]
+    fn ingest_cli_forged_authority_cannot_suppress_regression_or_claim_duplicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut payload = observed_ingest_payload();
+        ingest_file(dir.path(), &payload.to_string(), Some("owner-import")).expect("seed");
+        let store = shanhaijing::Store::open(dir.path().join("ingest.db")).expect("store");
+        let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
+        ingest_terminal(&store, &fp, shanhaijing::State::Rejected);
+        payload["trusted_source"] = "owner-import".into();
+        payload["authority"] = serde_json::json!({"trusted": true, "source": "owner-import"});
+        ingest_file(dir.path(), &payload.to_string(), None).expect("untrusted import");
+        let issue = store.list_issues().expect("issues").remove(0);
+        assert_eq!(issue.state, "new");
+        assert_eq!(issue.occurrences, 2);
+        let observations = store.observations_for(&fp, 100).expect("receipts");
+        assert_eq!(observations[0].disposition, "regression");
+        assert_eq!(observations[0].time_status, "untrusted");
+        assert_eq!(observations[0].trusted_source, None);
+        assert_eq!(observations[0].duplicate_of, None);
+    }
+
+    #[test]
+    fn ingest_cli_prevalidates_all_metadata_and_source_before_committing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (field, value) in [
+            ("environment", " ".to_string()),
+            ("release_sha", "BATCH5_PRIVATE_METADATA\n".to_string()),
+            (
+                "source_event_id",
+                "x".repeat(shanhaijing::MAX_SOURCE_EVENT_ID_BYTES + 1),
+            ),
+        ] {
+            let mut bad = observed_ingest_payload();
+            bad[field] = value.into();
+            let raw = format!("{}\n{bad}", ingest_payload());
+            let error = ingest_file(dir.path(), &raw, None).expect_err("invalid metadata");
+            assert_eq!(format!("{error:#}"), "invalid signal observation");
+        }
+        for source in [
+            " ".to_string(),
+            "private\n".to_string(),
+            "x".repeat(shanhaijing::MAX_TRUSTED_SOURCE_BYTES + 1),
+        ] {
+            let error = ingest_file(dir.path(), &ingest_payload().to_string(), Some(&source))
+                .expect_err("invalid source");
+            assert_eq!(format!("{error:#}"), "invalid signal observation");
+        }
+        let store = shanhaijing::Store::open(dir.path().join("ingest.db")).expect("store");
+        assert!(store.list_issues().expect("no partial receipts").is_empty());
+        assert!(run_ingest(vec!["--trust-observations".into()]).is_err());
+    }
+
+    #[test]
+    fn ingest_parse_errors_never_reflect_payload_or_serde_values() {
+        let mut bad_type = ingest_payload();
+        bad_type["observed_at"] = "BATCH5_PRIVATE_METADATA".into();
+        for raw in [
+            "BATCH5_PRIVATE_METADATA: malformed JSON".to_string(),
+            bad_type.to_string(),
+            format!("{}\n{bad_type}", ingest_payload()),
+        ] {
+            let error = parse_signals(&raw).expect_err("invalid input");
+            let message = format!("{error:#}");
+            assert!(message.starts_with("invalid Signal JSON/JSONL at line "));
+            assert!(!message.contains("BATCH5_PRIVATE_METADATA"));
+        }
+    }
+
+    #[test]
+    fn fix_cli_uses_shared_default_journal_and_accepts_db_override() {
+        let args = || {
+            vec![
+                "--issue".into(),
+                "issue.json".into(),
+                "--repo".into(),
+                "repo".into(),
+            ]
+        };
+        assert_eq!(
+            parse_args(args()).expect("defaults").db,
+            PathBuf::from("shanhaijing.db")
+        );
+        let mut explicit = args();
+        explicit.extend(["--db".into(), "custom.db".into()]);
+        assert_eq!(
+            parse_args(explicit).expect("override").db,
+            PathBuf::from("custom.db")
+        );
+        let mut missing = args();
+        missing.push("--db".into());
+        assert!(parse_args(missing).is_err());
+    }
+
+    #[test]
+    fn standalone_checkout_is_exclusive_without_fabricating_a_runner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo");
+        let db = dir.path().join("journal.db");
+        let first = Arc::new(shanhaijing::Store::open(&db).expect("first"));
+        let second = Arc::new(shanhaijing::Store::open(&db).expect("second"));
+        let lease =
+            pipeline::CheckoutLease::acquire(&first, &repo, "fix-one", None).expect("claim");
+        assert!(first.list_runners().expect("runners").is_empty());
+        let alias = repo.join("..").join("repo");
+        assert_eq!(
+            pipeline::checkout_identity(&alias).expect("alias"),
+            lease.claim.path
+        );
+        assert!(pipeline::CheckoutLease::acquire(&second, &alias, "fix-two", None).is_err());
+        drop(lease);
+        let successor =
+            pipeline::CheckoutLease::acquire(&second, &alias, "fix-two", None).expect("released");
+        successor.ensure().expect("owned");
+        assert!(second.list_runners().expect("runners").is_empty());
+    }
+
+    #[test]
+    fn runner_checkout_requires_the_actual_live_instance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(shanhaijing::Store::open(":memory:").expect("store"));
+        let now = now_ms();
+        let runner = shanhaijing::RunnerUpsert {
+            id: "runner".into(),
+            repo: "acme/app".into(),
+            host: "test".into(),
+            pid: None,
+            started_at: now,
+            heartbeat_at: now,
+            status: "idle".into(),
+            provider: None,
+            model: None,
+            daily_pr_limit: None,
+            repo_path: Some(pipeline::checkout_identity(dir.path()).expect("identity")),
+            service_unit: None,
+            config_json: "{}".into(),
+        };
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&runner, "original", now, 60_000)
+                .expect("runner"),
+            shanhaijing::RunnerLeaseOutcome::Acquired
+        );
+        assert!(pipeline::CheckoutLease::acquire(&store, dir.path(), "runner", None).is_err());
+        assert!(
+            pipeline::CheckoutLease::acquire(&store, dir.path(), "runner", Some("other")).is_err()
+        );
+        let checkout =
+            pipeline::CheckoutLease::acquire(&store, dir.path(), "runner", Some("original"))
+                .expect("actual instance");
+        drop(checkout);
+        store
+            .release_runner_lease("runner", "original")
+            .expect("release runner");
+        assert_eq!(
+            store
+                .try_acquire_runner_lease(&runner, "successor", now_ms(), 60_000)
+                .expect("successor"),
+            shanhaijing::RunnerLeaseOutcome::Acquired
+        );
+        assert!(
+            pipeline::CheckoutLease::acquire(&store, dir.path(), "runner", Some("original"))
+                .is_err()
+        );
+        pipeline::CheckoutLease::acquire(&store, dir.path(), "runner", Some("successor"))
+            .expect("successor checkout");
+    }
+
+    fn recovery_fixture() -> (shanhaijing::Store, shanhaijing::DeliveryClaim) {
+        let store = shanhaijing::Store::open(":memory:").expect("store");
+        let now = now_ms();
+        store
+            .report_signal(
+                &shanhaijing::Signal {
+                    repo: "acme/app".into(),
+                    language: "go".into(),
+                    title: "panic".into(),
+                    severity: "high".into(),
+                    message: None,
+                    log_window: Vec::new(),
+                    stack_trace: "panic: boom\nacme/app.Foo()\n /app/foo.go:17".into(),
+                    ..Default::default()
+                },
+                now,
+            )
+            .expect("signal");
+        let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
+        store
+            .set_state(&fp, shanhaijing::State::Triggered, now, None)
+            .expect("triggered");
+        store
+            .set_state(&fp, shanhaijing::State::Fixing, now, None)
+            .expect("fixing");
+        store
+            .start_run(&shanhaijing::RunStart {
+                id: "recovery-run".into(),
+                fingerprint: fp.clone(),
+                runner_id: "original".into(),
+                repo: "acme/app".into(),
+                started_at: now,
+                provider: None,
+                model: None,
+            })
+            .expect("run");
+        let claim = store
+            .claim_delivery(
+                &shanhaijing::DeliveryStart {
+                    id: "delivery".into(),
+                    run_id: Some("recovery-run".into()),
+                    fingerprint: fp,
+                    repo: "acme/app".into(),
+                    branch: "agent/fix/test".into(),
+                    base: "main".into(),
+                    head_sha: "verified-sha".into(),
+                    now,
+                },
+                "original",
+                60_000,
+            )
+            .expect("claim")
+            .expect("owned");
+        assert!(store
+            .reserve_pr_slot_owned(&claim, 5, now)
+            .expect("reserve"));
+        (store, claim)
+    }
+
+    fn recovered_pr(head: &str, base: &str) -> deliver::RecoveredPullRequest {
+        deliver::RecoveredPullRequest {
+            url: "https://github.com/acme/app/pull/7".into(),
+            number: 7,
+            head_sha: head.into(),
+            base_ref: base.into(),
+            created_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_push_token_denial_preserves_issue_run_and_recovery_reservation() {
+        for gate in [
+            quota::TokenGateExceeded::Individual { spent: 2, limit: 1 },
+            quota::TokenGateExceeded::Daily { spent: 2, limit: 1 },
+            quota::TokenGateExceeded::Monthly { spent: 2, limit: 1 },
+        ] {
+            let (store, claim) = recovery_fixture();
+            store
+                .mark_delivery_owned(
+                    &claim,
+                    shanhaijing::DeliveryState::Pushed,
+                    None,
+                    None,
+                    Some("remote tip verified"),
+                    now_ms(),
+                )
+                .expect("pushed");
+            let before = store.list_issues().expect("issues").remove(0);
+            let config: RepoInstructions = serde_json::from_value(serde_json::json!({
+                "repo": "acme/app", "failing_check": {"command": "unused"},
+            }))
+            .expect("config");
+            let live = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
+            assert!(!finish_token_gate(
+                &store,
+                "recovery-run",
+                &before.fingerprint,
+                &config,
+                gate,
+                &live,
+                &secrets::Secrets::default(),
+            )
+            .await
+            .expect("stand down"));
+            let after = store.list_issues().expect("issues").remove(0);
+            assert_eq!(
+                serde_json::to_value(after).expect("after"),
+                serde_json::to_value(before).expect("before")
+            );
+            let run = store
+                .run_by_id("recovery-run")
+                .expect("lookup")
+                .expect("run");
+            assert!(run.finished_at.is_none());
+            assert!(run.outcome.is_none());
+            assert_eq!(
+                store.pending_deliveries("acme/app").expect("pending")[0].state,
+                shanhaijing::DeliveryState::Pushed
+            );
+            assert!(store.delivery_claim_valid(&claim, now_ms()).expect("owned"));
+            let now = now_ms();
+            assert_eq!(
+                store
+                    .pr_slots_used("acme/app", now - now.rem_euclid(86_400_000))
+                    .expect("slots"),
+                1
+            );
+            assert_eq!(live.lock().await.status, "standing_down");
+        }
+    }
+
+    #[tokio::test]
+    async fn work_pr_quota_releases_without_consuming_an_attempt() {
+        let (store, claim) = recovery_fixture();
+        store
+            .mark_delivery_owned(
+                &claim,
+                shanhaijing::DeliveryState::Failed,
+                None,
+                None,
+                Some("quota denied before push"),
+                now_ms(),
+            )
+            .expect("definitive denial");
+        let fp = claim.delivery.fingerprint.clone();
+        let live = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
+        assert!(!finish_pr_quota(&store, "recovery-run", &fp, &live)
+            .await
+            .expect("quota outcome"));
+        let issue = store.list_issues().expect("issues").remove(0);
+        assert_eq!(issue.state, "new");
+        assert_eq!(issue.attempts, 0);
+        assert!(issue.owner_runner_id.is_none());
+        assert_eq!(
+            store
+                .count_ready_for_repo(now_ms(), "acme/app")
+                .expect("cooldown"),
+            0
+        );
+        let run = store
+            .run_by_id("recovery-run")
+            .expect("lookup")
+            .expect("run");
+        assert_eq!(run.outcome.as_deref(), Some("pr_quota"));
+        assert_eq!(live.lock().await.status, "standing_down");
+    }
+
+    #[tokio::test]
+    async fn recovery_atomically_claims_and_adopts_exact_pr_once() {
+        let (store, original) = recovery_fixture();
+        let created_at = now_ms() - 86_400_000;
+        assert!(store
+            .release_delivery_claim(&original, now_ms())
+            .expect("release"));
+        let claims = store
+            .claim_pending_deliveries("acme/app", "recovery", now_ms(), 60_000, 1)
+            .expect("claim");
+        let claim = &claims[0];
+        assert!(store
+            .claim_pending_deliveries("acme/app", "competitor", now_ms(), 60_000, 1)
+            .expect("competitor")
+            .is_empty());
+        assert!(reconcile_delivery_claim(
+            &store,
+            claim,
+            "acme/app",
+            3,
+            async {
+                let mut pr = recovered_pr("verified-sha", "main");
+                pr.created_at_ms = Some(created_at);
+                Ok(Some(pr))
+            },
+            || async { panic!("exact existing PR must never trigger deletion") }
+        )
+        .await
+        .expect("adopt"));
+        let issue = &store.list_issues().expect("issues")[0];
+        assert_eq!(issue.state, "pr_open");
+        let run = store
+            .run_for(&issue.fingerprint, "recovery-run")
+            .expect("run")
+            .expect("exists");
+        assert_eq!(run.commit_sha.as_deref(), Some("verified-sha"));
+        assert_eq!(run.pr_opened_at, Some(created_at));
+        assert_eq!(
+            run.pr_url.as_deref(),
+            Some("https://github.com/acme/app/pull/7")
+        );
+        let watch = store
+            .ci_watch_for(&issue.fingerprint)
+            .expect("watch")
+            .expect("exists");
+        assert_eq!(watch.head_sha, "verified-sha");
+        assert!(store
+            .pending_deliveries("acme/app")
+            .expect("pending")
+            .is_empty());
+        assert!(reconcile_delivery_claim(
+            &store,
+            claim,
+            "acme/app",
+            3,
+            async { panic!("terminal claim cannot perform another lookup") },
+            || async { panic!("terminal claim cannot delete") }
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_unknown_mismatched_or_changed_remote_evidence() {
+        for scenario in 0..4 {
+            let (store, claim) = recovery_fixture();
+            let deleted = std::sync::atomic::AtomicBool::new(false);
+            assert!(!reconcile_delivery_claim(
+                &store,
+                &claim,
+                "acme/app",
+                3,
+                async {
+                    match scenario {
+                        0 => Err(anyhow::anyhow!("lookup unavailable")),
+                        1 => Ok(Some(recovered_pr("different-sha", "main"))),
+                        2 => Ok(Some(recovered_pr("verified-sha", "different-base"))),
+                        _ => Ok(None),
+                    }
+                },
+                || async {
+                    assert_eq!(scenario, 3, "only definitive absence can request deletion");
+                    deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    bail!("remote SHA mismatch; branch retained")
+                }
+            )
+            .await
+            .expect("inconclusive"));
+            assert_eq!(
+                deleted.load(std::sync::atomic::Ordering::SeqCst),
+                scenario == 3
+            );
+            assert_eq!(
+                store.pending_deliveries("acme/app").expect("pending")[0].state,
+                shanhaijing::DeliveryState::Ambiguous
+            );
+            let issue = &store.list_issues().expect("issues")[0];
+            assert_eq!(issue.state, "fixing");
+            assert_eq!(issue.attempts, 0);
+            assert!(store
+                .ci_watch_for(&issue.fingerprint)
+                .expect("watch")
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_lost_claim_does_not_adopt_or_delete_or_overwrite_successor() {
+        let (store, original) = recovery_fixture();
+        let successor = std::sync::Mutex::new(None);
+        assert!(reconcile_delivery_claim(
+            &store,
+            &original,
+            "acme/app",
+            3,
+            async {
+                assert!(store.release_delivery_claim(&original, now_ms())?);
+                *successor.lock().expect("lock") = store
+                    .claim_pending_deliveries("acme/app", "successor", now_ms(), 60_000, 1)?
+                    .pop();
+                Ok(Some(recovered_pr("verified-sha", "main")))
+            },
+            || async { panic!("lost ownership cannot delete") }
+        )
+        .await
+        .is_err());
+        let next = successor.lock().expect("lock").take().expect("successor");
+        deliver::ensure_delivery_owned(&store, &next).expect("successor still owns");
+        let issue = &store.list_issues().expect("issues")[0];
+        assert_eq!(issue.state, "fixing");
+        assert!(delivery_requires_recovery(
+            &store,
+            "acme/app",
+            "recovery-run",
+            &anyhow::anyhow!("transport failed")
+        )
+        .expect("preserve"));
+        assert!(store
+            .run_for(&issue.fingerprint, "recovery-run")
+            .expect("run")
+            .expect("exists")
+            .finished_at
+            .is_none());
+    }
 
     #[test]
     fn failure_classifier_separates_provider_from_issue_faults() {
@@ -3461,7 +4479,7 @@ mod tests {
 
     #[test]
     fn default_runner_id_contains_repo() {
-        let id = default_runner_id("example.com/spike-target");
+        let id = default_runner_id("example.com/spike-target", "synthetic-host");
         assert!(id.contains("example.com") || id.contains("spike-target"));
     }
 
@@ -3525,16 +4543,49 @@ mod tests {
             stack_trace:
                 "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.F()\n\t/app/a.go:1 +0x1"
                     .into(),
+            ..Default::default()
         };
         store.report_signal(&signal, now).expect("report");
-        let fp = store
-            .ready_issue(now)
-            .expect("ready")
-            .expect("issue")
-            .fingerprint;
+        let delivery = store
+            .claim_delivery(
+                &shanhaijing::DeliveryStart {
+                    id: "prior-standalone".into(),
+                    run_id: None,
+                    fingerprint: "prior-standalone".into(),
+                    repo: signal.repo.clone(),
+                    branch: "agent/fix/prior".into(),
+                    base: "main".into(),
+                    head_sha: "prior-head".into(),
+                    now,
+                },
+                "prior-owner",
+                60_000,
+            )
+            .expect("claim")
+            .expect("owned");
+        assert!(store
+            .reserve_pr_slot_owned(&delivery, 1, now)
+            .expect("admit"));
         store
-            .set_pr(&fp, "https://github.com/acme/spike/pull/1", now)
-            .expect("pr");
+            .complete_delivery_owned(
+                &delivery,
+                "https://github.com/acme/spike/pull/1",
+                1,
+                None,
+                now,
+            )
+            .expect("confirmed");
+        let day_start = now - now.rem_euclid(86_400_000);
+        assert_eq!(
+            store.pr_slots_used(&signal.repo, day_start).expect("slots"),
+            1
+        );
+        assert_eq!(
+            store
+                .prs_opened_since(&signal.repo, day_start)
+                .expect("historical metric"),
+            0
+        );
 
         let cfg = RepoInstructions {
             repo: "example.com/spike".into(),
@@ -3547,6 +4598,9 @@ mod tests {
             notes: String::new(),
             skills: Vec::new(),
             reproduce_check: None,
+            denied_read_paths: Vec::new(),
+            verification_policy: Default::default(),
+            trusted_verification: None,
             max_attempts: 3,
             draft_first_n: 0,
         };
@@ -3598,6 +4652,7 @@ mod tests {
             stack_trace:
                 "panic: boom\ngoroutine 1 [running]:\nexample.com/other.F()\n\t/app/a.go:1 +0x1"
                     .into(),
+            ..Default::default()
         };
         store.report_signal(&signal, now).expect("report");
 
@@ -3629,6 +4684,9 @@ mod tests {
             notes: String::new(),
             skills: Vec::new(),
             reproduce_check: None,
+            denied_read_paths: Vec::new(),
+            verification_policy: Default::default(),
+            trusted_verification: None,
             max_attempts: 3,
             draft_first_n: 0,
         };
@@ -3713,6 +4771,14 @@ mod tests {
             "repo": cfg.repo, "failing_check": check(&cfg.failing_check),
             "reproduce_check": cfg.reproduce_check.as_ref().map(check),
             "forbidden_paths": cfg.forbidden_paths, "notes": cfg.notes, "skills": cfg.skills,
+            "denied_read_paths": cfg.denied_read_paths,
+            "verification_policy": match cfg.verification_policy {
+                instructions::VerificationPolicy::Compatibility => "compatibility",
+                instructions::VerificationPolicy::Strict => "strict",
+            },
+            "trusted_verification": cfg.trusted_verification.as_ref().map(|spec| serde_json::json!({
+                "check": check(&spec.check), "protected_inputs": spec.protected_inputs,
+            })),
             "max_attempts": cfg.max_attempts, "draft_first_n": cfg.draft_first_n,
         });
         let path = repo.join("nuwa.repo.json");
@@ -3721,7 +4787,7 @@ mod tests {
             repo,
             &path,
             "main",
-            &repo.join(".git/test-trusted"),
+            &repo.parent().expect("fixture parent").join("test-trusted"),
         )
         .expect("trusted test instructions")
     }
@@ -3731,6 +4797,469 @@ mod tests {
             "if exist fixed.marker (exit 0) else (exit 1)".to_string()
         } else {
             "test -f fixed.marker".to_string()
+        }
+    }
+
+    fn quota_work_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<shanhaijing::Store>,
+        RepoInstructions,
+    ) {
+        let dir = tempfile::tempdir().expect("fixture");
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo);
+        std::fs::write(repo.join("calc.go"),
+            "package main\nfunc Average(xs []float64) float64 {\nvar sum float64\nfor i := 0; i <= len(xs); i++ {\nsum += xs[i]\n}\nreturn sum / float64(len(xs))\n}\n"
+        ).expect("source");
+        git(&repo, &["add", "calc.go"]);
+        git(&repo, &["commit", "-m", "seed faux repair"]);
+        let config: RepoInstructions = serde_json::from_value(serde_json::json!({
+            "repo": "example.com/quota-work", "failing_check": {"command": fixed_loop_check()},
+        }))
+        .expect("config");
+        let store = Arc::new(shanhaijing::Store::open(":memory:").expect("store"));
+        store.report_signal(&shanhaijing::Signal {
+            repo: config.repo.clone(), language: "go".into(), title: "panic in Average".into(),
+            severity: "high".into(),
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/quota-work.Average()\n\t/app/calc.go:17 +0x1".into(),
+            ..Default::default()
+        }, now_ms()).expect("signal");
+        (dir, repo, store, config)
+    }
+
+    fn standalone_cli_fixture(
+        max_turns: u32,
+        no_deliver: bool,
+    ) -> (
+        tempfile::TempDir,
+        Cli,
+        issue::Issue,
+        Arc<shanhaijing::Store>,
+        String,
+    ) {
+        let (dir, repo, store, config) = quota_work_fixture();
+        test_trusted_instructions(&repo, &config);
+        let snapshot = store.ready_issue(now_ms()).expect("ready").expect("issue");
+        let prob = pipeline::issue_from_snapshot(
+            &snapshot,
+            &config,
+            String::new(),
+            &secrets::Secrets::default(),
+        );
+        let cli = Cli {
+            issue_path: dir.path().join("unused.json"),
+            db: dir.path().join("unused.db"),
+            sessions_dir: dir.path().join("cli-sessions"),
+            repo,
+            provider: repair::ProviderKind::Faux,
+            max_turns,
+            push: false,
+            create_pr: false,
+            no_deliver,
+        };
+        (dir, cli, prob, store, config.repo)
+    }
+
+    async fn run_standalone_fixture(
+        cli: Cli,
+        prob: issue::Issue,
+        store: &Arc<shanhaijing::Store>,
+        limits: quota::DeliveryLimits,
+    ) -> anyhow::Result<()> {
+        let checkout = pipeline::CheckoutLease::acquire(store, &cli.repo, "cli-test", None)?;
+        checkout
+            .during(fix_with_limits(
+                cli,
+                prob,
+                Arc::new(secrets::Secrets::default()),
+                store,
+                &checkout,
+                limits,
+            ))
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standalone_cli_persists_failed_usage_without_claiming_known_issue() {
+        let (_dir, cli, prob, store, repo) = standalone_cli_fixture(1, true);
+        store
+            .start_run(&shanhaijing::RunStart {
+                id: "existing-owner".into(),
+                fingerprint: prob.fingerprint.clone(),
+                runner_id: "existing-runner".into(),
+                repo: repo.clone(),
+                started_at: now_ms(),
+                provider: None,
+                model: None,
+            })
+            .expect("existing claim");
+        let before = store.list_issues().expect("before").remove(0);
+        let error =
+            run_standalone_fixture(cli, prob.clone(), &store, quota::DeliveryLimits::default())
+                .await
+                .expect_err("one faux turn fails");
+        let run = store
+            .runs_for(&prob.fingerprint, 10)
+            .expect("runs")
+            .into_iter()
+            .find(|run| run.runner_id.starts_with("fix:"))
+            .expect("CLI run");
+        assert!(
+            uuid::Uuid::parse_str(&run.id).is_ok(),
+            "real standalone UUID"
+        );
+        assert_eq!(run.repo, repo);
+        assert_eq!(run.provider.as_deref(), Some("faux"));
+        assert_eq!(run.model.as_deref(), Some("faux"));
+        assert_eq!(run.outcome.as_deref(), Some("repair_failed"));
+        assert!(run
+            .error
+            .as_deref()
+            .expect("real reason")
+            .contains(&format!("{error:#}")));
+        assert_eq!(run.turns, 1);
+        assert!(run.tokens_uncached > 0);
+        assert_eq!(
+            store.tokens_used_since(Some(&repo), 0).expect("spent"),
+            (run.tokens_uncached + run.tokens_cached) as u64
+        );
+        let after = store.list_issues().expect("after").remove(0);
+        assert_eq!(
+            serde_json::to_value(after).expect("after"),
+            serde_json::to_value(before).expect("before")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standalone_cli_keeps_usage_for_no_deliver_token_denial_and_local_delivery() {
+        for outcome in ["no_deliver", "budget_exceeded", "delivered"] {
+            let (_dir, cli, prob, store, repo) = standalone_cli_fixture(5, outcome == "no_deliver");
+            let result = run_standalone_fixture(
+                cli,
+                prob.clone(),
+                &store,
+                quota::DeliveryLimits {
+                    daily_pr_limit: 0, // Branch-only/no-deliver runs need no PR slot.
+                    max_tokens: if outcome == "budget_exceeded" {
+                        0
+                    } else {
+                        u64::MAX
+                    },
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(result.is_ok(), outcome != "budget_exceeded", "{result:?}");
+            let run = store
+                .latest_run(&prob.fingerprint)
+                .expect("latest")
+                .expect("run");
+            assert_eq!(run.outcome.as_deref(), Some(outcome));
+            assert!(run.tokens_uncached > 0);
+            assert_eq!(
+                store.tokens_used_since(Some(&repo), 0).expect("spent once"),
+                (run.tokens_uncached + run.tokens_cached) as u64
+            );
+            let issue = store.list_issues().expect("issues").remove(0);
+            assert_eq!(issue.state, "new");
+            assert_eq!(issue.attempts, 0);
+            assert!(issue.owner_runner_id.is_none());
+            if outcome == "delivered" {
+                assert!(run.branch.is_some());
+                assert!(run.commit_sha.is_some());
+                assert_eq!(run.verification_ok, Some(true));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_cli_rejects_exhausted_quotas_before_model_preparation() {
+        for scope in ["daily", "monthly", "pr"] {
+            let (_dir, mut cli, prob, store, repo) = standalone_cli_fixture(5, false);
+            let mut limits = quota::DeliveryLimits::default();
+            if scope == "pr" {
+                cli.create_pr = true;
+                limits.daily_pr_limit = 1;
+                let now = now_ms();
+                let claim = store
+                    .claim_delivery(
+                        &shanhaijing::DeliveryStart {
+                            id: "prior-pr".into(),
+                            run_id: None,
+                            fingerprint: prob.fingerprint.clone(),
+                            repo: repo.clone(),
+                            branch: "agent/fix/prior".into(),
+                            base: "main".into(),
+                            head_sha: "prior-sha".into(),
+                            now,
+                        },
+                        "prior",
+                        60_000,
+                    )
+                    .expect("claim")
+                    .expect("owned");
+                assert!(store
+                    .reserve_pr_slot_owned(&claim, 1, now)
+                    .expect("reserve"));
+                store
+                    .complete_delivery_owned(
+                        &claim,
+                        "https://github.com/acme/app/pull/1",
+                        1,
+                        None,
+                        now,
+                    )
+                    .expect("confirmed canonical slot without a run");
+            } else {
+                store
+                    .start_standalone_run(&shanhaijing::RunStart {
+                        id: "prior-failure".into(),
+                        fingerprint: "not-an-issue".into(),
+                        runner_id: "cli".into(),
+                        repo: repo.clone(),
+                        started_at: now_ms(),
+                        provider: None,
+                        model: None,
+                    })
+                    .expect("prior run");
+                store
+                    .update_run(
+                        "prior-failure",
+                        &shanhaijing::RunUpdate {
+                            tokens_uncached: Some(30),
+                            tokens_cached: Some(20),
+                            ..Default::default()
+                        },
+                    )
+                    .expect("usage");
+                store
+                    .finish_run(
+                        "prior-failure",
+                        &shanhaijing::RunFinish {
+                            finished_at: now_ms(),
+                            outcome: "repair_failed".into(),
+                            ci_verdict: None,
+                            error: None,
+                        },
+                    )
+                    .expect("failed usage counts");
+                if scope == "daily" {
+                    limits.daily_token_limit = 50;
+                } else {
+                    limits.monthly_token_limit = 50;
+                }
+            }
+            let before = store.list_issues().expect("before");
+            let sessions = cli.sessions_dir.clone();
+            let error = run_standalone_fixture(cli, prob.clone(), &store, limits)
+                .await
+                .expect_err("exact threshold is exhausted before spending");
+            if scope == "pr" {
+                assert!(error.downcast_ref::<deliver::PrQuotaExceeded>().is_some());
+            } else {
+                assert!(format!("{error:#}").contains(scope));
+            }
+            assert!(!sessions.exists(), "model preparation never started");
+            assert!(store
+                .runs_for(&prob.fingerprint, 10)
+                .expect("no new run")
+                .is_empty());
+            assert_eq!(
+                serde_json::to_value(store.list_issues().expect("after")).expect("after"),
+                serde_json::to_value(before).expect("before")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_token_gate_releases_faux_work_after_initial_admission() {
+        for monthly in [false, true] {
+            let (dir, repo, store, config) = quota_work_fixture();
+            let original = git_output(&repo, &["rev-parse", "HEAD"]);
+            assert_eq!(
+                store
+                    .tokens_used_since(Some(&config.repo), 0)
+                    .expect("unspent"),
+                0
+            );
+            let live = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
+            let worked = work_once(
+                &store,
+                &mut test_trusted_instructions(&repo, &config),
+                &repo,
+                dir.path().join("sessions"),
+                repair::ProviderKind::Faux,
+                5,
+                false,
+                false,
+                5,
+                1_000_000,
+                if monthly { 5_000_000 } else { 1 },
+                if monthly { 1 } else { 50_000_000 },
+                600,
+                "quota-test",
+                Arc::clone(&live),
+                &Arc::new(secrets::Secrets::default()),
+            )
+            .await
+            .expect("work");
+            assert!(!worked, "aggregate quota denial stands down");
+            let issue = store.list_issues().expect("issues").remove(0);
+            assert_eq!(issue.state, "new");
+            assert_eq!(issue.attempts, 0, "aggregate spend is not an issue fault");
+            let run = store
+                .latest_run(&issue.fingerprint)
+                .expect("latest")
+                .expect("run");
+            assert_eq!(run.outcome.as_deref(), Some("budget_exceeded"));
+            assert_eq!(run.turns, 3, "real faux repair reached the final gate");
+            assert!(run.tokens_uncached + run.tokens_cached > 1);
+            assert!(run
+                .error
+                .as_deref()
+                .expect("truthful reason")
+                .contains(if monthly { "monthly" } else { "daily" }));
+            assert_eq!(
+                store
+                    .tokens_used_since(Some(&config.repo), 0)
+                    .expect("spend"),
+                (run.tokens_uncached + run.tokens_cached) as u64
+            );
+            assert!(
+                repo.join("fixed.marker").exists(),
+                "repair actually executed"
+            );
+            assert_eq!(git_output(&repo, &["rev-parse", "HEAD"]), original);
+            assert_eq!(git_output(&repo, &["branch", "--list", "agent/fix/*"]), "");
+            assert_eq!(live.lock().await.status, "standing_down");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_faux_work_persists_usage_before_classifying_result() {
+        let (dir, repo, store, config) = quota_work_fixture();
+        work_once(
+            &store,
+            &mut test_trusted_instructions(&repo, &config),
+            &repo,
+            dir.path().join("sessions"),
+            repair::ProviderKind::Faux,
+            1,
+            false,
+            false,
+            5,
+            1_000_000,
+            5_000_000,
+            50_000_000,
+            600,
+            "quota-test",
+            Arc::new(tokio::sync::Mutex::new(RunnerLive::new())),
+            &Arc::new(secrets::Secrets::default()),
+        )
+        .await
+        .expect("failed repair is a business outcome");
+        let issue = store.list_issues().expect("issues").remove(0);
+        let run = store
+            .latest_run(&issue.fingerprint)
+            .expect("latest")
+            .expect("run");
+        assert_eq!(run.outcome.as_deref(), Some("repair_failed"));
+        assert_eq!(run.turns, 1);
+        assert!(
+            run.tokens_uncached > 0,
+            "the failed turn still consumed tokens"
+        );
+        assert_eq!(
+            store
+                .tokens_used_since(Some(&config.repo), 0)
+                .expect("spend"),
+            (run.tokens_uncached + run.tokens_cached) as u64
+        );
+        assert_eq!(issue.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn final_usage_persistence_is_monotone_and_never_ignores_write_failure() {
+        let (_dir, _repo, store, config) = quota_work_fixture();
+        let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
+        store
+            .start_run(&shanhaijing::RunStart {
+                id: "usage".into(),
+                fingerprint: fp.clone(),
+                runner_id: "test".into(),
+                repo: config.repo,
+                started_at: now_ms(),
+                provider: None,
+                model: None,
+            })
+            .expect("run");
+        let report = repair::RepairReport {
+            run_id: "harness".into(),
+            root_cause_text: String::new(),
+            turns: 2,
+            uncached_tokens: 20,
+            cached_tokens: 50,
+            session_dir: String::new(),
+            context: Default::default(),
+        };
+        let mut progress = repair::RepairProgress {
+            turns: 3,
+            uncached_tokens: 100,
+            cached_tokens: 30,
+        };
+        accumulate_usage(
+            &mut progress,
+            repair::RepairProgress {
+                turns: 1,
+                uncached_tokens: 1,
+                cached_tokens: 40,
+            },
+        );
+        assert_eq!(
+            (
+                progress.turns,
+                progress.uncached_tokens,
+                progress.cached_tokens
+            ),
+            (3, 100, 40)
+        );
+        persist_final_usage(&store, "usage", progress, Some(&report))
+            .await
+            .expect("final usage");
+        persist_final_usage(
+            &store,
+            "usage",
+            repair::RepairProgress {
+                turns: 1,
+                uncached_tokens: 1,
+                cached_tokens: 1,
+            },
+            None,
+        )
+        .await
+        .expect("late lower snapshot");
+        let run = store.run_for(&fp, "usage").expect("lookup").expect("run");
+        assert_eq!(
+            (run.turns, run.tokens_uncached, run.tokens_cached),
+            (3, 100, 50)
+        );
+        store
+            .finish_run(
+                "usage",
+                &shanhaijing::RunFinish {
+                    finished_at: now_ms(),
+                    outcome: "repair_failed".into(),
+                    ci_verdict: None,
+                    error: None,
+                },
+            )
+            .expect("finish");
+        for id in ["usage", "missing"] {
+            let error = persist_final_usage(&store, id, progress, None)
+                .await
+                .expect_err("write fails");
+            assert!(format!("{error:#}").contains("persist final usage"));
         }
     }
 
@@ -3745,17 +5274,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_owner_configuration_fault_releases_work_without_consuming_an_attempt() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo);
+        let config: RepoInstructions = serde_json::from_value(serde_json::json!({
+            "repo": "example.com/strict", "failing_check": {"command": "echo ok"},
+            "verification_policy": "strict",
+        }))
+        .expect("config");
+        let mut trusted = test_trusted_instructions(&repo, &config);
+        let store = Arc::new(shanhaijing::Store::open(":memory:").expect("store"));
+        store.report_signal(&shanhaijing::Signal {
+            repo: config.repo.clone(), language: "go".into(), title: "panic".into(),
+            severity: "high".into(), message: None, log_window: Vec::new(),
+            stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/strict.F()\n\t/app/f.go:1 +0x1".into(),
+            ..Default::default()
+        }, now_ms()).expect("signal");
+        let tip = git_output(&repo, &["rev-parse", "HEAD"]);
+        let live = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
+        let worked = work_once(
+            &store,
+            &mut trusted,
+            &repo,
+            dir.path().join("sessions"),
+            repair::ProviderKind::Faux,
+            1,
+            false,
+            false,
+            10,
+            100_000,
+            1_000_000,
+            1_000_000,
+            1,
+            "strict-test",
+            live,
+            &Arc::new(secrets::Secrets::default()),
+        )
+        .await
+        .expect("configuration stand-down");
+        assert!(!worked);
+        let rows = store.list_issues().expect("issues");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].attempts, 0);
+        assert_eq!(rows[0].state, "new");
+        assert_eq!(git_output(&repo, &["rev-parse", "HEAD"]), tip);
+        assert!(
+            git_output(&repo, &["for-each-ref", "refs/heads/agent/fix/"])
+                .trim()
+                .is_empty()
+        );
+        assert!(
+            !dir.path().join("sessions").exists(),
+            "no model/session writes"
+        );
+    }
+
+    #[tokio::test]
     async fn preflight_recovers_from_agent_branch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().join("repo");
         init_git_repo(&repo);
         git(&repo, &["checkout", "-b", "agent/fix/abc"]);
 
-        let base = preflight_repo(&repo, true).await.expect("preflight");
+        let store = Arc::new(shanhaijing::Store::open(":memory:").expect("store"));
+        let checkout =
+            pipeline::CheckoutLease::acquire(&store, &repo, "test", None).expect("checkout");
+        let base = checkout
+            .during(preflight_repo(&repo, true, &checkout))
+            .await
+            .expect("preflight");
         assert_eq!(base, "main");
         assert_eq!(
             git_output(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
             "main"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_preserves_dirty_or_unowned_checkout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo);
+        git(&repo, &["checkout", "-b", "agent/fix/evidence"]);
+        std::fs::write(repo.join("evidence.txt"), "interrupted repair").expect("evidence");
+        let store = Arc::new(shanhaijing::Store::open(":memory:").expect("store"));
+        let checkout =
+            pipeline::CheckoutLease::acquire(&store, &repo, "test", None).expect("claim");
+        assert!(preflight_repo(&repo, false, &checkout).await.is_err());
+        assert!(store
+            .release_checkout_claim(&checkout.claim, now_ms())
+            .expect("release"));
+        assert!(preflight_repo(&repo, false, &checkout).await.is_err());
+        assert_eq!(
+            git_ops::current_branch(&repo).expect("branch"),
+            "agent/fix/evidence"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("evidence.txt")).expect("preserved"),
+            "interrupted repair"
         );
     }
 
@@ -3793,7 +5410,13 @@ mod tests {
         git(&other, &["commit", "-m", "second"]);
         git(&other, &["push", "origin", "main"]);
 
-        preflight_repo(&work, true).await.expect("preflight");
+        let store = Arc::new(shanhaijing::Store::open(":memory:").expect("store"));
+        let checkout =
+            pipeline::CheckoutLease::acquire(&store, &work, "test", None).expect("checkout");
+        checkout
+            .during(preflight_repo(&work, true, &checkout))
+            .await
+            .expect("preflight");
         assert!(
             work.join("g.txt").exists(),
             "preflight must fetch origin/main"
@@ -3869,6 +5492,7 @@ mod tests {
                     message: None,
                     log_window: Vec::new(),
                     stack_trace: "panic: bounds\nexample.com/app.F()\n /app/a.go:1".into(),
+                    ..Default::default()
                 },
                 now_ms(),
             )
@@ -3926,6 +5550,9 @@ mod tests {
             notes: String::new(),
             skills: Vec::new(),
             reproduce_check: None,
+            denied_read_paths: Vec::new(),
+            verification_policy: Default::default(),
+            trusted_verification: None,
             max_attempts: 3,
             draft_first_n: 0,
         };
@@ -3940,6 +5567,7 @@ mod tests {
                     message: None,
                     log_window: Vec::new(),
                     stack_trace: "failure at calculate".into(),
+                    ..Default::default()
                 },
                 now_ms(),
             )
@@ -3998,6 +5626,7 @@ mod tests {
                 stack_trace: format!(
                     "panic: {title}\ngoroutine 1 [running]:\nexample.com/spike.F{i}()\n\t/app/a.go:1 +0x1"
                 ),
+                ..Default::default()
             };
             store.report_signal(&signal, now).expect("report");
             let fp = store
@@ -4037,7 +5666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_terminal_branches_removes_only_terminal() {
+    async fn cleanup_terminal_branches_retains_without_claimed_tip_evidence() {
         use shanhaijing::State;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4062,6 +5691,7 @@ mod tests {
                 stack_trace: format!(
                     "panic: cleanup {i}\ngoroutine 1 [running]:\nexample.com/spike.F{i}()\n\t/app/a.go:1 +0x1"
                 ),
+                ..Default::default()
             };
             store.report_signal(&signal, now).expect("report");
             let fp = store
@@ -4118,25 +5748,24 @@ mod tests {
         let removed = cleanup_terminal_branches(&store, &repo, false)
             .await
             .expect("cleanup");
-        assert_eq!(removed, 3, "only terminal branches are removed");
+        assert_eq!(removed, 0, "terminal state is not deletion authority");
         for (branch, target) in states {
             let exists = git_ops::branch_exists(&repo, &branch).expect("exists");
-            assert_eq!(exists, target == "new", "{branch} ({target})");
+            assert!(exists, "{branch} ({target}) must be preserved");
         }
     }
 
     #[tokio::test]
-    async fn remove_stale_branch_deletes_local_branch() {
+    async fn remove_stale_branch_retains_unclaimed_local_branch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().join("repo");
         init_git_repo(&repo);
         git(&repo, &["branch", "agent/fix/fp"]);
         assert!(git_ops::branch_exists(&repo, "agent/fix/fp").expect("exists"));
-        let removed = remove_stale_branch(&repo, "fp", false)
+        remove_stale_branch(&repo, "fp", false)
             .await
-            .expect("remove");
-        assert!(removed);
-        assert!(!git_ops::branch_exists(&repo, "agent/fix/fp").expect("gone"));
+            .expect_err("unclaimed branch retained");
+        assert!(git_ops::branch_exists(&repo, "agent/fix/fp").expect("preserved"));
     }
 
     // The harness calls `block_in_place`, which panics on the default
@@ -4182,6 +5811,7 @@ mod tests {
             message: None,
             log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+            ..Default::default()
         };
         store.report_signal(&signal, now).expect("report");
 
@@ -4196,6 +5826,9 @@ mod tests {
             notes: String::new(),
             skills: Vec::new(),
             reproduce_check: None,
+            denied_read_paths: Vec::new(),
+            verification_policy: Default::default(),
+            trusted_verification: None,
             max_attempts: 3,
             draft_first_n: 0,
         };
@@ -4299,6 +5932,7 @@ mod tests {
             message: None,
             log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+            ..Default::default()
         };
         store.report_signal(&signal, now).expect("report");
         let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
@@ -4313,12 +5947,16 @@ mod tests {
             notes: String::new(),
             skills: Vec::new(),
             reproduce_check: None,
+            denied_read_paths: Vec::new(),
+            verification_policy: Default::default(),
+            trusted_verification: None,
             max_attempts: 2,
             draft_first_n: 0,
         };
         let live: SharedLive = Arc::new(tokio::sync::Mutex::new(RunnerLive::new()));
 
-        for expected in ["new", "ignored"] {
+        let original = std::fs::read(repo.join("calc.go")).expect("original fixture");
+        for (step, expected) in ["new", "new", "ignored"].into_iter().enumerate() {
             work_once(
                 &store,
                 &mut test_trusted_instructions(&repo, &cfg),
@@ -4341,43 +5979,61 @@ mod tests {
             .expect("work");
             let issue = store.list_issues().expect("issues").pop().expect("issue");
             assert_eq!(issue.state, expected);
+            if step == 1 {
+                // The dirty retry must preserve the first attempt, not silently
+                // clean it up or consume the second attempt. Simulate an owner
+                // saving the evidence and restoring this synthetic checkout.
+                assert_eq!(store.attempts_for(&fp).expect("attempts"), 1);
+                assert!(std::fs::read_to_string(repo.join("calc.go"))
+                    .expect("preserved repair")
+                    .contains("i < len(xs)"));
+                std::fs::rename(repo.join("fixed.marker"), dir.path().join("saved.marker"))
+                    .expect("save evidence outside checkout");
+                std::fs::write(repo.join("calc.go"), &original).expect("owner restores fixture");
+            }
             store
                 .set_cooldown(&fp, 0)
                 .expect("retry immediately in test");
         }
         assert_eq!(store.attempts_for(&fp).expect("attempts"), 2);
+        assert!(dir.path().join("saved.marker").is_file());
     }
 
-    #[test]
-    fn failure_recovery_without_pr_consumes_an_attempt() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = shanhaijing::Store::open(dir.path().join("s.db")).expect("open");
-        let now = now_ms();
-        store
-            .report_signal(
-                &shanhaijing::Signal {
-                    repo: "example.com/spike".into(),
-                    language: "go".into(),
-                    title: "panic in Average".into(),
-                    severity: "high".into(),
-                    message: None,
-                    log_window: Vec::new(),
-                    stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
-                },
-                now,
-            )
-            .expect("report");
-        let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
-        store
-            .set_state(&fp, shanhaijing::State::Triggered, now, None)
-            .expect("triggered");
-
-        record_delivery_recovery_failure(&store, &fp, 2, now).expect("failure outcome");
-
+    #[tokio::test]
+    async fn failure_recovery_without_pr_leaves_issue_and_run_unchanged() {
+        let (store, claim) = recovery_fixture();
+        let deleted = std::sync::atomic::AtomicBool::new(false);
+        assert!(reconcile_delivery_claim(
+            &store,
+            &claim,
+            "acme/app",
+            2,
+            async { Ok(None) },
+            || async {
+                deliver::ensure_delivery_owned(&store, &claim)?;
+                deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        )
+        .await
+        .expect("failed delivery recorded"));
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!store
+            .delivery_claim_valid(&claim, now_ms())
+            .expect("terminal clears claim"));
+        assert!(store
+            .pending_deliveries("acme/app")
+            .expect("pending")
+            .is_empty());
         let issue = store.list_issues().expect("issues").pop().expect("issue");
-        assert_eq!(issue.state, "new");
-        assert_eq!(issue.attempts, 1);
-        assert!(store.ready_issue(now).expect("cooldown").is_none());
+        assert_eq!(issue.state, "fixing");
+        assert_eq!(issue.attempts, 0);
+        let run = store
+            .run_for(&issue.fingerprint, "recovery-run")
+            .expect("run")
+            .expect("exists");
+        assert!(run.finished_at.is_none());
+        assert!(run.pr_url.is_none());
     }
 
     #[tokio::test]
@@ -4395,6 +6051,7 @@ mod tests {
             message: None,
             log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+            ..Default::default()
         };
         store.report_signal(&signal, now).expect("report");
         let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
@@ -4413,6 +6070,9 @@ mod tests {
             notes: String::new(),
             skills: Vec::new(),
             reproduce_check: None,
+            denied_read_paths: Vec::new(),
+            verification_policy: Default::default(),
+            trusted_verification: None,
             max_attempts: 3,
             draft_first_n: 0,
         };
@@ -4463,6 +6123,7 @@ mod tests {
             message: None,
             log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+            ..Default::default()
         };
         store.report_signal(&signal, now).expect("report");
         let fp = store.list_issues().expect("issues")[0].fingerprint.clone();
@@ -4505,28 +6166,36 @@ mod tests {
             .expect("reopen");
 
         store
-            .record_repair_memory(&shanhaijing::RepairMemoryEntry {
-                repo: "example.com/spike".into(),
-                fingerprint: "other-fp".into(),
-                commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
-                pr_url: Some("https://github.com/acme/spike/pull/7".into()),
-                root_cause: "ROOT CAUSE: nil map guard".into(),
-                change_stat: " calc.go | 2 +-".into(),
-                files: 1,
-                recorded_at: now,
-            })
+            .record_verified_repair_memory(
+                &shanhaijing::RepairMemoryEntry {
+                    repo: "example.com/spike".into(),
+                    fingerprint: "other-fp".into(),
+                    commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                    pr_url: Some("https://github.com/acme/spike/pull/7".into()),
+                    root_cause: "ROOT CAUSE: nil map guard".into(),
+                    change_stat: " calc.go | 2 +-".into(),
+                    files: 1,
+                    recorded_at: now,
+                },
+                "local_verification",
+                "other-memory-run",
+            )
             .expect("memory");
         store
-            .record_repair_memory(&shanhaijing::RepairMemoryEntry {
-                repo: "example.com/spike".into(),
-                fingerprint: fp.clone(),
-                commit_sha: "feedface".into(),
-                pr_url: None,
-                root_cause: "ROOT CAUSE: current issue memory must be excluded".into(),
-                change_stat: String::new(),
-                files: 1,
-                recorded_at: now,
-            })
+            .record_verified_repair_memory(
+                &shanhaijing::RepairMemoryEntry {
+                    repo: "example.com/spike".into(),
+                    fingerprint: fp.clone(),
+                    commit_sha: "feedface".into(),
+                    pr_url: None,
+                    root_cause: "ROOT CAUSE: current issue memory must be excluded".into(),
+                    change_stat: String::new(),
+                    files: 1,
+                    recorded_at: now,
+                },
+                "local_verification",
+                "current-memory-run",
+            )
             .expect("current memory");
 
         let context = build_prior_context(
@@ -4551,7 +6220,31 @@ mod tests {
         assert!(context.contains("verification gate failed"), "{context}");
     }
 
-    // Process-level evidence: `run_work` itself must register the runner,
+    fn work_test_environment(dir: &Path) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "NUWA_ENV_FILE".into(),
+                dir.join("nuwa.env").display().to_string(),
+            ),
+            ("HOSTNAME".into(), "synthetic-host".into()),
+        ])
+    }
+
+    async fn run_test_work(
+        args: Vec<String>,
+        environment: BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
+        run_work_with_environment(
+            args,
+            environment,
+            uuid::Uuid::new_v4().to_string(),
+            now_ms(),
+            Arc::new(secrets::Secrets::default()),
+        )
+        .await
+    }
+
+    // Process-level evidence: the `run_work` engine must register the runner,
     // record the finished run, and reset a crashed in-flight run at startup.
     // The faux test above bypasses all of that by calling `work_once` directly.
     #[tokio::test(flavor = "multi_thread")]
@@ -4607,6 +6300,7 @@ mod tests {
             message: None,
             log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+            ..Default::default()
         };
         let sig_b = shanhaijing::Signal {
             title: "panic in Pipeline".into(),
@@ -4649,18 +6343,90 @@ mod tests {
                 "5".to_string(),
                 "--max-tokens".to_string(),
                 "1000000".to_string(),
+                "--service-unit".to_string(),
+                "nuwa-synthetic-work".to_string(),
+                "--daily-pr-limit".to_string(),
+                "7".to_string(),
+                "--daily-token-limit".to_string(),
+                "7000000".to_string(),
+                "--monthly-token-limit".to_string(),
+                "70000000".to_string(),
+                "--ci-timeout".to_string(),
+                "45".to_string(),
             ]
         };
 
-        run_work(args(&db, &repo, &sessions))
-            .await
-            .expect("first run");
+        run_test_work(
+            args(&db, &repo, &sessions),
+            work_test_environment(dir.path()),
+        )
+        .await
+        .expect("first run");
 
         let store = Store::open(&db).expect("reopen");
         let runners = store.list_runners().expect("runners");
         assert!(
             runners.iter().any(|r| r.id == "test:runner"),
             "runner must be registered"
+        );
+        let row = runners
+            .iter()
+            .find(|r| r.id == "test:runner")
+            .expect("runner");
+        let startup_json = row
+            .startup_config_json
+            .as_deref()
+            .expect("startup evidence");
+        let startup: config_activation::StartupConfig =
+            serde_json::from_str(startup_json).expect("snapshot");
+        assert_eq!(startup.runner_id.as_deref(), Some("test:runner"));
+        assert_eq!(startup.started_at_ms, row.started_at);
+        assert!(uuid::Uuid::parse_str(&startup.process_instance_id).is_ok());
+        assert!(startup.runner_instance_id.is_some());
+        for (key, expected) in [
+            ("NUWA_PROVIDER", "faux"),
+            ("NUWA_RUNNER_ID", "test:runner"),
+            ("NUWA_MAX_TURNS", "5"),
+            ("NUWA_INTERVAL", "5"),
+            ("NUWA_MAX_TOKENS", "1000000"),
+            ("NUWA_SERVICE_UNIT", "nuwa-synthetic-work"),
+            ("NUWA_DAILY_PR_LIMIT", "7"),
+            ("NUWA_DAILY_TOKEN_LIMIT", "7000000"),
+            ("NUWA_MONTHLY_TOKEN_LIMIT", "70000000"),
+            ("NUWA_CI_TIMEOUT", "45"),
+        ] {
+            assert_eq!(
+                startup.values[key].value.as_deref(),
+                Some(expected),
+                "{key}"
+            );
+            assert_eq!(startup.values[key].source, "cli", "{key}");
+        }
+        let (_, model, base) =
+            repair::actual_provider_config(&repair::ProviderKind::Faux).expect("faux");
+        let base = base.map(|base| reqwest::Url::parse(&base).expect("base URL").to_string());
+        assert_eq!(startup.values["NUWA_MODEL"].value, model);
+        assert_eq!(startup.values["NUWA_BASE_URL"].value, base);
+        assert_eq!(startup.values["NUWA_MODEL"].source, "default");
+        std::fs::write(dir.path().join("nuwa.env"), "NUWA_MAX_TURNS=99\n").expect("changed config");
+        store
+            .heartbeat_runner(
+                "test:runner",
+                &shanhaijing::RunnerHeartbeat {
+                    heartbeat_at: now_ms(),
+                    status: "idle".into(),
+                    current_fingerprint: None,
+                    phase: None,
+                    config_json: Some("{\"max_turns\":99}".into()),
+                    last_error: None,
+                },
+            )
+            .expect("heartbeat after config refresh");
+        assert_eq!(
+            store.list_runners().expect("runners")[0]
+                .startup_config_json
+                .as_deref(),
+            Some(startup_json)
         );
         let run_a = store.latest_run(&fp_a).expect("latest a").expect("run a");
         assert_eq!(run_a.outcome.as_deref(), Some("success"));
@@ -4694,14 +6460,230 @@ mod tests {
             .expect("open run");
         drop(store);
 
-        run_work(args(&db, &repo, &sessions))
-            .await
-            .expect("second run");
+        run_test_work(
+            args(&db, &repo, &sessions),
+            work_test_environment(dir.path()),
+        )
+        .await
+        .expect("second run");
 
         let store = Store::open(&db).expect("reopen2");
         let run_b = store.latest_run(&fp_b).expect("latest b").expect("run b");
         assert_eq!(run_b.outcome.as_deref(), Some("interrupted"));
         assert!(run_b.finished_at.is_some());
+        let restarted: config_activation::StartupConfig = serde_json::from_str(
+            store.list_runners().expect("runners")[0]
+                .startup_config_json
+                .as_deref()
+                .expect("new startup"),
+        )
+        .expect("snapshot");
+        assert_ne!(restarted.process_instance_id, startup.process_instance_id);
+        assert_ne!(restarted.runner_instance_id, startup.runner_instance_id);
+    }
+
+    #[test]
+    fn work_startup_preserves_unknown_anthropic_model_requests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = shanhaijing::Store::open(dir.path().join("startup.db")).expect("store");
+        let mut environment = work_test_environment(dir.path());
+        environment.insert("NUWA_PROVIDER".into(), "anthropic".into());
+        environment.insert(
+            "NUWA_MODEL".into(),
+            "unknown-environment-anthropic-model".into(),
+        );
+        let env_path = startup_env_path(&environment);
+        for (cli_provider, requested, source) in [
+            (true, "unknown-cli-anthropic-model", "cli"),
+            (false, "unknown-environment-anthropic-model", "environment"),
+        ] {
+            let provider = if cli_provider {
+                repair::ProviderKind::Anthropic {
+                    model: Some(requested.into()),
+                }
+            } else {
+                provider_from_environment(&environment)
+            };
+            assert!(repair::actual_provider_config(&provider).is_err());
+            let mut snapshot = config_activation::StartupConfig::capture(
+                &store,
+                &env_path,
+                "work",
+                uuid::Uuid::new_v4().to_string(),
+                now_ms(),
+                &environment,
+            );
+            record_startup_provider(&mut snapshot, &provider, cli_provider, &environment);
+            let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
+            let restored = serde_json::from_str(&json).expect("restore snapshot");
+            let saved = config_activation::saved_config(&store, &env_path);
+            let snapshot =
+                config_activation::project_process(Some(restored), &saved, "online", None)
+                    .snapshot
+                    .expect("unknown model request remains valid snapshot evidence");
+            assert_eq!(
+                snapshot.values["NUWA_PROVIDER"].value.as_deref(),
+                Some("anthropic")
+            );
+            assert_eq!(snapshot.values["NUWA_PROVIDER"].source, source);
+            assert_eq!(
+                snapshot.values["NUWA_MODEL"].value.as_deref(),
+                Some(requested)
+            );
+            assert_eq!(snapshot.values["NUWA_MODEL"].source, source);
+            assert!(snapshot.values["NUWA_MODEL"].reason.is_none());
+            assert!(snapshot.values["NUWA_BASE_URL"].value.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn work_startup_records_actual_defaults_and_provider_specific_precedence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo");
+        std::fs::write(
+            repo.join("nuwa.repo.json"),
+            serde_json::json!({
+                "repo": "example.com/startup", "failing_check": {"command": "echo unused"},
+                "forbidden_paths": [], "notes": ""
+            })
+            .to_string(),
+        )
+        .expect("instructions");
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        let db = dir.path().join("startup.db");
+        let mut environment = work_test_environment(dir.path());
+        for (key, value) in [
+            ("NUWA_PROVIDER", "zai"),
+            ("NUWA_MODEL", "environment-model"),
+            ("NUWA_BASE_URL", "https://environment.example.test/v4"),
+            ("NUWA_MAX_TURNS", "invalid"),
+            ("NUWA_INTERVAL", ""),
+            ("NUWA_CI_TIMEOUT", "-1"),
+            ("NUWA_SERVICE_UNIT", ""),
+        ] {
+            environment.insert(key.into(), value.into());
+        }
+        let cases = [
+            (
+                vec!["--provider", "anthropic"],
+                repair::ProviderKind::Anthropic { model: None },
+                "default",
+            ),
+            (
+                vec!["--provider", "zai"],
+                repair::ProviderKind::Zai {
+                    model: None,
+                    base_url: None,
+                },
+                "default",
+            ),
+            (
+                vec!["--provider", "faux"],
+                repair::ProviderKind::Faux,
+                "default",
+            ),
+            (
+                vec![
+                    "--provider",
+                    "zai",
+                    "--model",
+                    "discarded",
+                    "--provider",
+                    "anthropic",
+                ],
+                repair::ProviderKind::Anthropic { model: None },
+                "default",
+            ),
+            (
+                vec![
+                    "--provider",
+                    "zai",
+                    "--model",
+                    "cli-model",
+                    "--base-url",
+                    "https://cli.example.test/v4",
+                ],
+                repair::ProviderKind::Zai {
+                    model: Some("cli-model".into()),
+                    base_url: Some("https://cli.example.test/v4".into()),
+                },
+                "cli",
+            ),
+            (
+                vec![],
+                provider_from_environment(&environment),
+                "environment",
+            ),
+        ];
+        for (flags, provider, model_source) in cases {
+            let mut args = vec![
+                "--db".into(),
+                db.display().to_string(),
+                "--instructions".into(),
+                repo.join("nuwa.repo.json").display().to_string(),
+                "--sessions".into(),
+                dir.path().join("sessions").display().to_string(),
+            ];
+            let provider_source = if flags.is_empty() {
+                "environment"
+            } else {
+                "cli"
+            };
+            args.extend(flags.into_iter().map(str::to_string));
+            run_test_work(args, environment.clone())
+                .await
+                .expect("empty work run");
+            let store = shanhaijing::Store::open(&db).expect("store");
+            let rows = store.list_runners().expect("runners");
+            let snapshot: config_activation::StartupConfig =
+                serde_json::from_str(rows[0].startup_config_json.as_deref().expect("startup"))
+                    .expect("snapshot");
+            let (name, model, base) =
+                repair::actual_provider_config(&provider).expect("actual provider");
+            let base = base.map(|base| reqwest::Url::parse(&base).expect("base URL").to_string());
+            assert_eq!(
+                snapshot.values["NUWA_PROVIDER"].value.as_deref(),
+                Some(name.as_str())
+            );
+            assert_eq!(snapshot.values["NUWA_PROVIDER"].source, provider_source);
+            assert_eq!(snapshot.values["NUWA_MODEL"].value, model);
+            assert_eq!(snapshot.values["NUWA_MODEL"].source, model_source);
+            assert_eq!(snapshot.values["NUWA_BASE_URL"].value, base);
+            for (key, expected) in [
+                ("NUWA_MAX_TURNS", "30"),
+                ("NUWA_INTERVAL", "30"),
+                ("NUWA_CI_TIMEOUT", "600"),
+                ("NUWA_DAILY_PR_LIMIT", "5"),
+                ("NUWA_MAX_TOKENS", "1500000"),
+                ("NUWA_DAILY_TOKEN_LIMIT", "5000000"),
+                ("NUWA_MONTHLY_TOKEN_LIMIT", "50000000"),
+                ("NUWA_SERVICE_UNIT", "nuwa-work"),
+            ] {
+                assert_eq!(
+                    snapshot.values[key].value.as_deref(),
+                    Some(expected),
+                    "{key}"
+                );
+                assert_eq!(snapshot.values[key].source, "default", "{key}");
+            }
+            let expected_id = default_runner_id("example.com/startup", "synthetic-host");
+            assert_eq!(snapshot.runner_id.as_deref(), Some(expected_id.as_str()));
+            assert_eq!(snapshot.values["NUWA_RUNNER_ID"].source, "derived");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4757,6 +6739,7 @@ mod tests {
             message: None,
             log_window: Vec::new(),
             stack_trace: "panic: boom\ngoroutine 1 [running]:\nexample.com/spike.Average()\n\t/app/calc.go:17 +0x1".into(),
+            ..Default::default()
         };
         let sig_b = shanhaijing::Signal {
             title: "panic in Pipeline".into(),
@@ -4773,38 +6756,74 @@ mod tests {
             .map(|issue| issue.fingerprint)
             .collect();
         assert_eq!(fingerprints.len(), 2);
+        let mut environment = work_test_environment(dir.path());
+        for (key, value) in [
+            ("NUWA_PROVIDER", "faux"),
+            ("NUWA_RUNNER_ID", "test:runner"),
+            ("NUWA_POOL", "2"),
+            ("NUWA_INTERVAL", "5"),
+            ("NUWA_MAX_TURNS", "5"),
+            ("NUWA_MAX_TOKENS", "1000000"),
+        ] {
+            environment.insert(key.into(), value.into());
+        }
+        let revision = uuid::Uuid::new_v4().to_string();
+        environment.insert(config_activation::REVISION_KEY.into(), revision.clone());
+        let env_path = dir.path().join("nuwa.env");
+        let mut saved_environment = environment.clone();
+        // The path is a read-only startup input, not a managed env-file key.
+        saved_environment.remove("NUWA_ENV_FILE");
+        std::fs::write(&env_path, settings::render_env(&saved_environment)).expect("saved env");
+        let env_id = config_activation::env_identity(&env_path).expect("env identity");
+        store
+            .with_config_save(&env_id, |tx| tx.record_saved(&revision, now, &[]))
+            .expect("saved revision");
         drop(store);
 
-        run_work(vec![
-            "--db".into(),
-            db.display().to_string(),
-            "--instructions".into(),
-            repo.join("nuwa.repo.json").display().to_string(),
-            "--sessions".into(),
-            sessions.display().to_string(),
-            "--provider".into(),
-            "faux".into(),
-            "--runner-id".into(),
-            "test:runner".into(),
-            "--pool".into(),
-            "2".into(),
-            "--interval".into(),
-            "5".into(),
-            "--max-turns".into(),
-            "5".into(),
-            "--max-tokens".into(),
-            "1000000".into(),
-        ])
+        run_test_work(
+            vec![
+                "--db".into(),
+                db.display().to_string(),
+                "--instructions".into(),
+                repo.join("nuwa.repo.json").display().to_string(),
+                "--sessions".into(),
+                sessions.display().to_string(),
+            ],
+            environment,
+        )
         .await
         .expect("pool run");
 
         let store = Store::open(&db).expect("reopen");
-        let ids: std::collections::BTreeSet<String> = store
-            .list_runners()
-            .expect("runners")
-            .into_iter()
-            .map(|runner| runner.id)
+        let runners = store.list_runners().expect("runners");
+        let snapshots: Vec<config_activation::StartupConfig> = runners
+            .iter()
+            .map(|runner| {
+                serde_json::from_str(runner.startup_config_json.as_deref().expect("startup"))
+                    .expect("snapshot")
+            })
             .collect();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots[0].process_instance_id,
+            snapshots[1].process_instance_id
+        );
+        assert_eq!(snapshots[0].started_at_ms, snapshots[1].started_at_ms);
+        assert_eq!(
+            snapshots[0].loaded_revision.as_deref(),
+            Some(revision.as_str())
+        );
+        assert_eq!(snapshots[0].loaded_revision, snapshots[1].loaded_revision);
+        assert_eq!(snapshots[0].revision_reason, snapshots[1].revision_reason);
+        assert_ne!(snapshots[0].runner_id, snapshots[1].runner_id);
+        assert_ne!(
+            snapshots[0].runner_instance_id,
+            snapshots[1].runner_instance_id
+        );
+        for snapshot in &snapshots {
+            assert_eq!(snapshot.values["NUWA_RUNNER_ID"].value, snapshot.runner_id);
+        }
+        let ids: BTreeSet<String> = runners.into_iter().map(|runner| runner.id).collect();
         assert!(ids.contains("test:runner"), "{ids:?}");
         assert!(ids.contains("test:runner-2"), "{ids:?}");
         for fingerprint in fingerprints {

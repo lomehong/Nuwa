@@ -25,6 +25,9 @@ use shanhaijing::{BenchmarkFinish, BenchmarkResultInput, BenchmarkRunRow, Benchm
 #[folder = "assets/benchmarks/"]
 struct BenchmarkAssets;
 
+mod batch4;
+pub use batch4::run_batch4;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Scenario {
     pub name: String,
@@ -130,6 +133,12 @@ struct RunOptions {
 
 pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let mut args = args;
+    if args.first().map(String::as_str) == Some("batch4") {
+        if args.len() != 3 || args[1] != "--output" {
+            bail!("usage: benchmark batch4 --output <new local JSON sidecar>");
+        }
+        return Box::pin(run_batch4(Path::new(&args[2]))).await;
+    }
     if matches!(
         args.first().map(String::as_str),
         Some("list") | Some("scenarios")
@@ -432,6 +441,8 @@ async fn run_one_inner(
     materialize(scenario, &repo)?;
     init_repo(&repo)?;
     let sessions = dir.path().join("sessions");
+    let delivery_store = Arc::new(shanhaijing::Store::open(":memory:")?);
+    let checkout = pipeline::CheckoutLease::acquire(&delivery_store, &repo, "benchmark", None)?;
 
     let check = scenario_check(scenario);
     let base = verify::probe_check(&repo, "main", &check, secrets)
@@ -474,12 +485,18 @@ async fn run_one_inner(
         provider: provider.clone(),
         max_turns,
         repo_config: None,
+        owner: None,
+        base: None,
         secrets: Arc::new(secrets.clone()),
         progress: None,
         faux_script,
         run_id: Some(format!("benchmark-{run_id}-{}", scenario.name)),
-    })?;
-    let report = prepared.execute().await.context("repair run")?;
+    })
+    .await?;
+    let report = checkout
+        .during(prepared.execute())
+        .await
+        .context("repair run")?;
     result.turns = i64::from(report.turns);
     result.tokens_uncached = report.uncached_tokens as i64;
     result.tokens_cached = report.cached_tokens as i64;
@@ -509,7 +526,7 @@ async fn run_one_inner(
     // that block is itself part of what the benchmark measures.
     let delivery = pipeline::deliver(pipeline::DeliveryRequest {
         repo: &repo,
-        issue: &issue,
+        issue: prepared.issue(),
         report: &report,
         sessions_dir: &sessions,
         push: false,
@@ -517,9 +534,12 @@ async fn run_one_inner(
         public_base_url: None,
         draft: false,
         secrets,
-        store: None,
+        store: Some(&delivery_store),
         run_id: None,
         repo_id: "",
+        checkout_claim: Some(&checkout.claim),
+        verification: prepared.verification(),
+        limits: Default::default(),
     })
     .await;
     match delivery {

@@ -17,10 +17,12 @@ use crate::api::common::{
 };
 use crate::api::ApiError;
 use crate::serve::AppState;
-use shanhaijing::{EventRow, IssueRow, RunRow, ShanResult, Store};
+use shanhaijing::{EventRow, IssueRow, RunRow, ShanResult, SignalObservation, Store};
 
 /// Detail timeline depth (docs/09 §9.2).
 const TIMELINE_LIMIT: u32 = 200;
+/// Receipt history is bounded independently of lifecycle events.
+const OBSERVATIONS_LIMIT: u32 = 100;
 /// Detail run history depth (docs/09 §9.2).
 const RUNS_LIMIT: u32 = 10;
 /// Detail "similar problems" cap (docs/09 §9.2).
@@ -245,6 +247,7 @@ pub struct IssueListItem {
     pub stuck: bool,
 }
 
+/// PR/CI evidence does not establish deployment or runtime health.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-export", ts(export))]
@@ -252,9 +255,48 @@ pub struct IssueDetailResponse {
     pub issue: IssueListItem,
     pub stack_sample: String,
     pub timeline: Vec<TimelineItem>,
+    pub observations: Vec<SignalObservationDto>,
+    pub deployment_status: String,
+    pub recovery_status: String,
     pub runs: Vec<RunDto>,
     pub similar: SimilarIssues,
     pub ci_watch: Option<CiWatchDto>,
+}
+
+/// Receipt metadata is evidence about one report, not deployment or recovery.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(export))]
+pub struct SignalObservationDto {
+    pub id: i64,
+    pub fingerprint: String,
+    pub received_at_ms: i64,
+    pub observed_at_ms: Option<i64>,
+    pub environment: Option<String>,
+    pub release_sha: Option<String>,
+    pub source_event_id: Option<String>,
+    pub trusted_source: Option<String>,
+    pub time_status: String,
+    pub disposition: String,
+    pub duplicate_of: Option<i64>,
+}
+
+impl From<SignalObservation> for SignalObservationDto {
+    fn from(observation: SignalObservation) -> Self {
+        Self {
+            id: observation.id,
+            fingerprint: observation.fingerprint,
+            received_at_ms: observation.received_at_ms,
+            observed_at_ms: observation.observed_at_ms,
+            environment: observation.environment,
+            release_sha: observation.release_sha,
+            source_event_id: observation.source_event_id,
+            trusted_source: observation.trusted_source,
+            time_status: observation.time_status,
+            disposition: observation.disposition,
+            duplicate_of: observation.duplicate_of,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -537,6 +579,11 @@ fn build_detail(
         .into_iter()
         .map(TimelineItem::from)
         .collect();
+    let observations = store
+        .observations_for(fingerprint, OBSERVATIONS_LIMIT)?
+        .into_iter()
+        .map(SignalObservationDto::from)
+        .collect();
     let runs = store
         .runs_for(fingerprint, RUNS_LIMIT)?
         .into_iter()
@@ -556,6 +603,11 @@ fn build_detail(
         stack_sample: snapshot.stack_sample,
         issue: IssueListItem { issue, stuck },
         timeline,
+        observations,
+        // No deployment/health evidence integration exists. Neither a merge,
+        // green CI nor a collector's release claim can fill these in.
+        deployment_status: "unknown".to_string(),
+        recovery_status: "unknown".to_string(),
         runs,
         similar: SimilarIssues {
             count: usize::try_from(similar_count).unwrap_or(usize::MAX),
@@ -601,6 +653,14 @@ mod tests {
         let db_path = dir.path().join("s.db");
         let store = Arc::new(shanhaijing::Store::open(&db_path).expect("open"));
         let state = AppState {
+            startup_config: Arc::new(crate::config_activation::StartupConfig::capture(
+                &store,
+                &dir.path().join("nuwa.env"),
+                "serve",
+                uuid::Uuid::new_v4().to_string(),
+                crate::now_ms(),
+                &std::collections::BTreeMap::new(),
+            )),
             store,
             ui_token: Arc::new(None),
             ingest_token: Arc::new(Some("ingest-secret".into())),
@@ -717,6 +777,7 @@ mod tests {
             stack_trace: format!(
                 "panic: {title} [{variant}]\ngoroutine 1 [running]:\nexample.com/{language}.Fn_{variant}()\n\t/app/{language}.go:1 +0x1"
             ),
+            ..Default::default()
         }
     }
 
@@ -1444,6 +1505,8 @@ mod tests {
         assert_eq!(issue["occurrences"].as_u64(), Some(1));
         assert_eq!(issue["pr_url"].as_str(), Some(seed.detail_pr_url.as_str()));
         assert_eq!(issue["ci_verdict"].as_str(), Some("success"));
+        assert_eq!(value["deployment_status"], "unknown");
+        assert_eq!(value["recovery_status"], "unknown");
         assert_eq!(issue["stuck"].as_bool(), Some(false));
         assert_eq!(issue["last_seen_ms"].as_i64(), Some(seed.now - 200_000));
         assert_eq!(
@@ -1542,6 +1605,138 @@ mod tests {
             !items[0].as_object().expect("item").contains_key("title"),
             "similar rows share the detail title already"
         );
+    }
+
+    #[tokio::test]
+    async fn detail_observations_preserve_metadata_and_explicit_source_trust() {
+        let (_dir, state) = test_state();
+        let now = crate::now_ms();
+        let mut envelope = serde_json::to_value(signal("receipts", APP, "go", "high", "receipt"))
+            .expect("signal JSON");
+        envelope["observed_at"] = serde_json::json!(now - 1_000);
+        envelope["environment"] = serde_json::json!("production <collector>");
+        envelope["release_sha"] = serde_json::json!("a".repeat(40));
+        envelope["source_event_id"] = serde_json::json!("event-<123>");
+        // A JSON claim must not become a caller's source attestation.
+        envelope["trusted_source"] = serde_json::json!("self-declared");
+        let receipt: shanhaijing::Signal =
+            serde_json::from_value(envelope).expect("collector JSON");
+        let fp = report(&state.store, &receipt, now);
+        state
+            .store
+            .report_signal_with_source(&receipt, now + 1, Some("owner-import"))
+            .expect("explicitly trusted receipt");
+        let trusted_id = state.store.observations_for(&fp, 1).expect("receipt")[0].id;
+        state
+            .store
+            .report_signal_with_source(&receipt, now + 2, Some("owner-import"))
+            .expect("duplicate receipt");
+        let app = build_app(state);
+
+        let response = get(&app, &format!("/api/v1/issues/{fp}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        let observations = value["observations"].as_array().expect("observations");
+        assert_eq!(observations.len(), 3);
+        for observation in observations {
+            assert!(observation["id"].as_i64().expect("numeric id") > 0);
+            assert_eq!(observation["fingerprint"], fp);
+            assert_eq!(observation["observed_at_ms"], now - 1_000);
+            assert_eq!(observation["environment"], "production <collector>");
+            assert_eq!(observation["release_sha"], "a".repeat(40));
+            assert_eq!(observation["source_event_id"], "event-<123>");
+        }
+        assert_eq!(observations[0]["received_at_ms"], now + 2);
+        assert_eq!(observations[0]["trusted_source"], "owner-import");
+        assert_eq!(observations[0]["time_status"], "trusted");
+        assert_eq!(observations[0]["disposition"], "duplicate");
+        assert_eq!(observations[0]["duplicate_of"].as_i64(), Some(trusted_id));
+        assert_eq!(observations[1]["id"].as_i64(), Some(trusted_id));
+        assert_eq!(observations[1]["received_at_ms"], now + 1);
+        assert_eq!(observations[1]["trusted_source"], "owner-import");
+        assert_eq!(observations[1]["time_status"], "trusted");
+        assert_eq!(observations[1]["disposition"], "deduped");
+        assert_eq!(observations[1]["duplicate_of"], serde_json::Value::Null);
+        assert_eq!(observations[2]["received_at_ms"], now);
+        assert_eq!(observations[2]["trusted_source"], serde_json::Value::Null);
+        assert_eq!(observations[2]["time_status"], "untrusted");
+        assert_eq!(observations[2]["disposition"], "new");
+        assert_eq!(observations[2]["duplicate_of"], serde_json::Value::Null);
+        assert_eq!(value["deployment_status"], "unknown");
+        assert_eq!(value["recovery_status"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn detail_observations_allow_missing_metadata_and_empty_legacy_history() {
+        let (_dir, state) = test_state();
+        let now = crate::now_ms();
+        let fp = report(
+            &state.store,
+            &signal("legacy receipt", APP, "go", "low", "legacy"),
+            now - shanhaijing::SIGNAL_OBSERVATIONS_RETENTION_MS - 1,
+        );
+        let app = build_app(state.clone());
+        let response = get(&app, &format!("/api/v1/issues/{fp}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        let observation = &value["observations"][0];
+        assert_eq!(observation["time_status"], "missing");
+        for field in [
+            "observed_at_ms",
+            "environment",
+            "release_sha",
+            "source_event_id",
+            "trusted_source",
+            "duplicate_of",
+        ] {
+            assert_eq!(observation[field], serde_json::Value::Null, "{field}");
+        }
+
+        // The same absence as a pre-schema13 issue: preserve the issue and
+        // never fabricate observations from its first_seen/last_seen columns.
+        state
+            .store
+            .prune(now, 90, 365, 365)
+            .expect("prune receipts");
+        let response = get(&app, &format!("/api/v1/issues/{fp}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["issue"]["fingerprint"], fp);
+        assert_eq!(value["observations"], serde_json::json!([]));
+        assert_eq!(value["deployment_status"], "unknown");
+        assert_eq!(value["recovery_status"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn detail_observations_are_capped_at_100_newest_first_and_issue_scoped() {
+        let (_dir, state) = test_state();
+        let now = crate::now_ms();
+        let receipt = signal("receipt history", APP, "go", "low", "history");
+        let fp = report(&state.store, &receipt, now);
+        for index in 1..105 {
+            state
+                .store
+                .report_signal(&receipt, now + index)
+                .expect("repeat receipt");
+        }
+        report(
+            &state.store,
+            &signal("other receipt", OTHER, "go", "low", "other"),
+            now + 200,
+        );
+        let app = build_app(state);
+
+        let response = get(&app, &format!("/api/v1/issues/{fp}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        let observations = value["observations"].as_array().expect("observations");
+        assert_eq!(observations.len(), 100);
+        assert_eq!(observations[0]["received_at_ms"], now + 104);
+        assert_eq!(observations[99]["received_at_ms"], now + 5);
+        assert!(observations.iter().all(|row| row["fingerprint"] == fp));
+        assert!(observations.windows(2).all(|pair| {
+            pair[0]["received_at_ms"].as_i64() > pair[1]["received_at_ms"].as_i64()
+        }));
     }
 
     #[tokio::test]

@@ -36,6 +36,7 @@ function projects() {
       runners: 2,
       runners_online: 1,
       prs_today: 3,
+      pr_slots_today: 4,
       pr_limit: 5,
       ci_green: 4,
       ci_red: 1,
@@ -90,6 +91,11 @@ describe("项目台账", () => {
     expect(row).toHaveTextContent("3");
     // CI 绿/红.
     expect(row).toHaveTextContent("4");
+    expect(main.getByRole("columnheader", { name: "UTC 今日确认 PR（记录）" })).toBeInTheDocument();
+    expect(main.getByRole("columnheader", { name: "UTC 准入槽位" })).toBeInTheDocument();
+    const cells = within(row!).getAllByRole("cell");
+    expect(cells[6]).toHaveTextContent(/^3$/);
+    expect(cells[7]).toHaveTextContent(/^4$/);
   });
 
   it("puts the projects in the navigation rail and marks the current one", async () => {
@@ -158,6 +164,11 @@ describe("项目工位", () => {
     expect(main.getByText("队列")).toBeInTheDocument();
     expect(main.getByText("运行中")).toBeInTheDocument();
     expect(main.getByText("tokens 24h")).toBeInTheDocument();
+    expect(main.getByText("UTC 准入槽位 / 观测最大值")).toBeInTheDocument();
+    expect(main.getByText("4/5")).toBeInTheDocument();
+    expect(main.queryByText("3/5")).not.toBeInTheDocument();
+    expect(main.getByText(/UTC 今日确认 PR（创建 \/ 本地观测记录）：3/)).toHaveTextContent("观测最大值，不是中心统一硬上限");
+    expect(main.getByText(/重试保留原准入日/)).toHaveTextContent("策略由创建进程解析，各进程可能不同");
 
     // The project's own backlog and the runner that serves it.
     expect(main.getAllByText("Ingest panics on empty batch").length).toBeGreaterThan(0);

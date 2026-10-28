@@ -6,6 +6,7 @@ import { describeError } from "../../lib/errors";
 import { formatDuration } from "../overview/format";
 import { PanelError } from "../overview/PanelChrome";
 import { SyncButton } from "../actions/SyncButton";
+import { ProcessConfiguration } from "../settings/ProcessConfiguration";
 import { RestartDialog } from "./RestartDialog";
 import { useSystemQuery } from "./queries";
 
@@ -148,6 +149,14 @@ export function SystemPage() {
 
         <div className="st-section">
           <div className="st-label">
+            <h2>serve 配置</h2>
+            <p className="st-label-desc">仅此 serve 进程的启动证据；重启 serve 不代表其他 work 已采用保存版本。</p>
+          </div>
+          <ProcessConfiguration process={data.configuration} />
+        </div>
+
+        <div className="st-section">
+          <div className="st-label">
             <h2>服务单元</h2>
             <p className="st-label-desc">重启时由 systemd 编排的 unit；同一 unit 承载的多个 runner 会一起重启。</p>
           </div>
@@ -217,6 +226,7 @@ export function SystemPage() {
               </button>
             </div>
             <p className="st-help">将重启：{unitLabel}。</p>
+            <p className="st-help">使用相同启动命令重启会保留 CLI 覆盖；修改文件不能覆盖命令行参数。</p>
           </section>
         </div>
       </div>

@@ -8,6 +8,7 @@
 
 import type { DiffDto } from "../../lib/api-types/DiffDto";
 import type { LastChangeDto } from "../../lib/api-types/LastChangeDto";
+import type { ProbeCandidate } from "../../lib/api-types/ProbeCandidate";
 import type { SettingDto as ApiSettingDto } from "../../lib/api-types/SettingDto";
 import type { SettingsResponse as ApiSettingsResponse } from "../../lib/api-types/SettingsResponse";
 
@@ -75,6 +76,7 @@ export interface SaveSettingsRequest {
 
 export interface SaveSettingsResponse {
   changed: string[];
+  /** Legacy hint only; read saved/processes after invalidation for authority. */
   restart_required: boolean;
 }
 
@@ -82,7 +84,8 @@ export type TestTarget = "github" | "llm";
 
 export interface TestSettingsRequest {
   target: TestTarget;
-  /** Unsaved candidates; omitted means "use the current environment". */
+  /** Probe the saved file, or that file plus draft overrides; never live state. */
+  candidate: ProbeCandidate;
   values?: SettingsValues;
 }
 

@@ -297,14 +297,14 @@ pub const SETTINGS_SCHEMA: &[SettingSpec] = &[
     bounded(
         spec(
             "NUWA_DAILY_PR_LIMIT",
-            "Daily PR limit",
+            "Daily PR admission slots (UTC)",
             "runner",
             "int",
             Some("5"),
             &[],
             false,
             "work",
-            "每日 PR 上限",
+            "每仓库 UTC 准入日槽位预算，包含在途、结果不明和已消耗的槽位；重试沿用原准入日。按创建进程解析的策略准入，各进程值可能不同，并非中心统一硬上限。",
         ),
         1,
         100,
@@ -327,14 +327,14 @@ pub const SETTINGS_SCHEMA: &[SettingSpec] = &[
     bounded(
         spec(
             "NUWA_MAX_TOKENS",
-            "Max tokens",
+            "Per-repair token delivery gate",
             "runner",
             "int",
             Some("1500000"),
             &[],
             false,
             "work",
-            "单问题 token 上限",
+            "单次修复的交付门：修复后按 token 用量检查是否允许交付，不会实时中断模型调用，也不是 provider 的硬上限。",
         ),
         1,
         100_000_000,
@@ -342,14 +342,14 @@ pub const SETTINGS_SCHEMA: &[SettingSpec] = &[
     bounded(
         spec(
             "NUWA_DAILY_TOKEN_LIMIT",
-            "Daily token limit",
+            "Daily token admission / delivery budget",
             "runner",
             "int",
             Some("5000000"),
             &[],
             false,
             "work",
-            "每仓库每日 token 花费上限（失败尝试也计入）",
+            "每仓库 UTC 每日预算：准入及交付前检查已记录用量，失败尝试也计入；并发或在途消耗可能超出预算，不是运行时或 provider 硬上限。按创建进程解析的策略检查，各进程值可能不同。",
         ),
         1,
         1_000_000_000,
@@ -357,14 +357,14 @@ pub const SETTINGS_SCHEMA: &[SettingSpec] = &[
     bounded(
         spec(
             "NUWA_MONTHLY_TOKEN_LIMIT",
-            "Monthly token limit",
+            "Rolling 30-day token admission / delivery budget",
             "runner",
             "int",
             Some("50000000"),
             &[],
             false,
             "work",
-            "每仓库滚动 30 天 token 花费上限",
+            "每仓库滚动 30 天预算（非自然月）：准入及交付前检查已记录用量，失败尝试也计入；并发或在途消耗可能超出预算，不是运行时或 provider 硬上限。按创建进程解析的策略检查，各进程值可能不同。",
         ),
         1,
         10_000_000_000,
@@ -531,43 +531,44 @@ pub fn migrate_env_file_at(path: &std::path::Path) -> Result<Vec<String>, String
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    let (new, changed) = normalize_known_keys(&parse_env(&text));
+    let (mut new, changed) = normalize_known_keys(&parse_env(&text));
     if changed.is_empty() {
         return Ok(changed);
     }
     // 迁移会重排文件（注释/顺序不保留）：先备份，再原子替换。
-    let backup = path.with_extension("env.bak");
-    std::fs::copy(path, &backup)
-        .map_err(|e| format!("backup {} -> {}: {e}", path.display(), backup.display()))?;
+    // A migration cannot retain proof for the pre-migration file.
+    new.remove(crate::config_activation::REVISION_KEY);
+    new.remove(&crate::config_activation::REVISION_KEY.to_ascii_lowercase());
+    backup_env_file(path)?;
     write_env_atomic(path, &render_env(&new))?;
     Ok(changed)
 }
 
-/// 原子写：Unix 先写临时文件（chmod 600）再 rename 覆盖；失败时清理临时文件。
+/// Protected same-directory temporary file, synced before atomic replacement.
+/// `persist` replaces on Windows as well as Unix; never truncate the destination.
 pub(crate) fn write_env_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // A unique temp name: two concurrent writers (or a migrate racing a
-        // PUT) must not share `nuwa.env.tmp`, where one could rename or delete
-        // the other's half-written file. The write lock in api/settings.rs
-        // serializes PUTs, but migrate-env is a separate entry point.
-        let tmp = path.with_extension(format!("env.{}.tmp", uuid::Uuid::new_v4().simple()));
-        let write = (|| -> std::io::Result<()> {
-            std::fs::write(&tmp, contents)?;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-            std::fs::rename(&tmp, path)
-        })();
-        if let Err(e) = write {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("write {}: {e}", path.display()));
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let write = (|| -> std::io::Result<()> {
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        // Private BEFORE the first credential byte is written.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temporary
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
+        temporary.write_all(contents.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
         Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents).map_err(|e| format!("write {}: {e}", path.display()))
-    }
+    })();
+    write.map_err(|_| "env_file_write_failed".to_string())
 }
 
 pub fn migrate_env_file() -> Result<Vec<String>, String> {
@@ -582,25 +583,15 @@ pub fn render_env(map: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// Copy `path` to the sibling `.bak` slot before a rewrite. A missing file is
-/// a no-op; any other failure aborts the caller, so the original is never
-/// lost by a write that could not be backed up. On Unix the copy is chmodded
-/// to 0600 (best effort) so the backup is as private as the env file itself.
+/// Back up through the protected atomic writer. An existing permissive backup
+/// is never opened/truncated with new secrets before chmod.
 pub(crate) fn backup_env_file(path: &std::path::Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let backup = path.with_extension("env.bak");
-    std::fs::copy(path, &backup)
-        .map_err(|e| format!("backup {} -> {}: {e}", path.display(), backup.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // A failed chmod must not fail the save: the copy already exists and
-        // the write is what the operator asked for.
-        let _ = std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("env_file_backup_failed".to_string()),
+    };
+    write_env_atomic(&path.with_extension("env.bak"), &text)
 }
 
 /// Rewrite `text` in place without reordering it (docs/09 §13.2):
@@ -638,9 +629,13 @@ pub(crate) fn update_env_text(text: &str, updates: &BTreeMap<String, String>) ->
         };
         let raw_key = raw_key.trim();
         let key = raw_key.to_ascii_uppercase();
-        if !ENV_KEYS.contains(&key.as_str()) {
+        if !ENV_KEYS.contains(&key.as_str()) && key != crate::config_activation::REVISION_KEY {
             out.push_str(body);
             out.push_str(ending);
+            continue;
+        }
+        if key == crate::config_activation::REVISION_KEY && written.contains(&key) {
+            // Replace even duplicate/legacy internal markers exactly once.
             continue;
         }
         if raw_key != key && present.contains(&key) {
@@ -822,6 +817,30 @@ mod tests {
         assert!(changed.is_empty());
         assert!(!path.exists());
         assert!(!path.with_extension("env.bak").exists());
+    }
+
+    #[test]
+    fn migration_invalidates_marker_only_when_it_actually_rewrites_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nuwa.env");
+        let marker = format!("NUWA_CONFIG_REVISION={}\n", uuid::Uuid::new_v4());
+        let unchanged = format!("{marker}NUWA_INTERVAL=30\n");
+        std::fs::write(&path, &unchanged).expect("file");
+        assert!(migrate_env_file_at(&path).expect("noop").is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged"),
+            unchanged
+        );
+        let legacy = format!("{marker}nuwa_interval=30\n");
+        std::fs::write(&path, &legacy).expect("legacy");
+        assert!(!migrate_env_file_at(&path).expect("migration").is_empty());
+        assert!(!std::fs::read_to_string(&path)
+            .expect("migrated")
+            .contains("NUWA_CONFIG_REVISION"));
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("env.bak")).expect("backup"),
+            legacy
+        );
     }
 
     #[test]

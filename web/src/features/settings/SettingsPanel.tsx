@@ -10,7 +10,6 @@ interface SettingsPanelProps {
   drafts: Record<string, string>;
   errors: Record<string, string>;
   latestChange: LastChangeDto | null;
-  lastSave: { changed: string[]; restartRequired: boolean } | null;
   onChange: (spec: SettingDto, raw: string) => void;
 }
 
@@ -22,14 +21,11 @@ export function SettingsPanel({
   drafts,
   errors,
   latestChange,
-  lastSave,
   onChange,
 }: SettingsPanelProps) {
-  const footerNote = lastSave
-    ? `刚刚保存 · ${lastSave.changed.length} 项${lastSave.restartRequired ? "，重启后生效" : ""}`
-    : latestChange
-      ? `最近变更 ${formatAge(latestChange.ts_ms)} · ${latestChange.actor ?? "系统"}`
-      : "本区暂无变更记录";
+  const footerNote = latestChange
+    ? `最近变更 ${formatAge(latestChange.ts_ms)} · ${latestChange.actor ?? "系统"}`
+    : "本区暂无变更记录";
 
   return (
     <section className="st-panel" aria-label={`${area.label}参数`} data-testid="settings-panel">
@@ -45,7 +41,6 @@ export function SettingsPanel({
                   key={spec.key}
                   spec={spec}
                   value={data.values[spec.key]}
-                  diff={data.effective_diff[spec.key]}
                   draft={drafts[spec.key]}
                   error={errors[spec.key]}
                   onChange={(raw) => onChange(spec, raw)}

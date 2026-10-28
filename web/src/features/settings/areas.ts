@@ -5,14 +5,12 @@
  */
 
 import type {
-  DiffDto,
   LastChangeDto,
   SettingDto,
   SettingValueDto,
   SettingsResponse,
 } from "./types";
 import { isPlainValue, isSecretValue } from "./types";
-import { formatNumber } from "../overview/format";
 
 export const SETTINGS_AREA_IDS = [
   "connection",
@@ -52,7 +50,7 @@ export const SETTINGS_AREAS: readonly SettingsAreaDef[] = [
     label: "连接",
     description: "令牌、模型提供方与端点。这些值影响修复 runner。",
     sectionTitle: "连接参数",
-    sectionDescription: "保存后先写文件；重启 runner 后生效，未重启前按运行中的值继续。",
+    sectionDescription: "保存仅写文件；重启相关 work / serve 后重新上报确认，CLI 覆盖仍优先。",
     impact: "影响 runner · 保存后需重启",
     groups: ["credentials", "model"],
     sections: [
@@ -67,7 +65,7 @@ export const SETTINGS_AREAS: readonly SettingsAreaDef[] = [
     label: "执行",
     description: "轮询、超时、预算与 runner 身份。这些值由 work 进程读取。",
     sectionTitle: "运行参数",
-    sectionDescription: "保存后先写文件；重启 work 后生效，未重启前按运行中的值继续。",
+    sectionDescription: "保存仅写文件；重启 work 后重新上报确认，CLI 覆盖仍优先。PR 按 UTC 准入日槽位计费，包含在途与结果不明，重试保留原日。单次 token 预算是修复交付门；每日 / 滚动 30 天预算在准入及交付前检查已记录用量，失败也计入，并发或在途消耗可能超额，并非运行时或 provider 硬上限。策略由创建进程解析，各进程可能不同。",
     impact: "影响 work · 保存后需重启",
     groups: ["runner"],
     sections: [
@@ -78,7 +76,7 @@ export const SETTINGS_AREAS: readonly SettingsAreaDef[] = [
       },
       {
         id: "budgets",
-        title: "配额与预算",
+        title: "准入预算与交付门",
         keys: [
           "NUWA_DAILY_PR_LIMIT",
           "NUWA_MAX_TURNS",
@@ -101,7 +99,7 @@ export const SETTINGS_AREAS: readonly SettingsAreaDef[] = [
     label: "治理",
     description: "会话、保留窗口与事件通知。这些值由 serve 进程读取。",
     sectionTitle: "治理参数",
-    sectionDescription: "保存后先写文件；重启 serve 后生效，未重启前按运行中的值继续。",
+    sectionDescription: "保存仅写文件；重启 serve 后重新上报确认，CLI 覆盖仍优先。",
     impact: "影响 serve · 保存后需重启",
     groups: ["security", "ops"],
     sections: [
@@ -131,7 +129,7 @@ export const SETTINGS_AREAS: readonly SettingsAreaDef[] = [
     label: "环境",
     description: "env 文件、服务编排与审计记录。",
     sectionTitle: "环境参数",
-    sectionDescription: "只读项直接展示；可写项保存后写入 env，重启 unit 后生效。",
+    sectionDescription: "只读项直接展示；可写项保存后写入 env，重启相关进程后重新上报确认。",
     impact: "本机 · 部分只读",
     groups: ["service", "advanced"],
     sections: [
@@ -270,16 +268,6 @@ export function specSource(value: SettingValueDto | undefined): string | null {
   return isPlainValue(value) && value.source === "env" ? "env 文件" : null;
 }
 
-export function areaRuntimeDiffs(
-  area: SettingsAreaDef,
-  schema: readonly SettingDto[],
-  diffs: Record<string, DiffDto>,
-): Array<{ spec: SettingDto; diff: DiffDto }> {
-  return areaSpecs(area, schema)
-    .filter((spec) => diffs[spec.key] !== undefined)
-    .map((spec) => ({ spec, diff: diffs[spec.key] }));
-}
-
 export function latestAreaChange(
   area: SettingsAreaDef,
   schema: readonly SettingDto[],
@@ -307,7 +295,7 @@ export function unitForSpec(spec: SettingDto): string | null {
     return "token";
   }
   if (spec.key === "NUWA_DAILY_PR_LIMIT") {
-    return "个";
+    return "槽位";
   }
   if (spec.key === "NUWA_MAX_TURNS") {
     return "turn";
@@ -332,13 +320,4 @@ export function formatSecondsShort(seconds: number): string {
     return `${seconds / 60} 分钟`;
   }
   return `${seconds} 秒`;
-}
-
-/** Display a diff value (file vs runtime) with thousands separators. */
-export function formatDiffValue(spec: SettingDto, raw: string): string {
-  if (spec.type !== "int") {
-    return raw;
-  }
-  const value = Number(raw);
-  return Number.isFinite(value) ? formatNumber(value) : raw;
 }

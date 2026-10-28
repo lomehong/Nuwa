@@ -151,19 +151,12 @@ mod windows_job {
 
 pub struct ProcessOutput {
     pub success: bool,
+    /// Absent on signals/termination; timeout is always a separate error.
+    pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
     /// True when the process was killed after exceeding its timeout.
     pub timed_out: bool,
-}
-
-impl ProcessOutput {
-    fn is_missing_ref(&self) -> bool {
-        let text = format!("{}\n{}", self.stdout, self.stderr).to_lowercase();
-        text.contains("remote ref does not exist")
-            || text.contains("couldn't find remote ref")
-            || text.contains("unknown ref")
-    }
 }
 
 /// Run one process with a hard timeout. When `env` is `Some`, the child starts
@@ -278,6 +271,7 @@ pub async fn run_process(
     };
     Ok(ProcessOutput {
         success: status.success(),
+        exit_code: status.code(),
         stdout: String::from_utf8_lossy(&out).trim().to_string(),
         stderr: String::from_utf8_lossy(&err).trim().to_string(),
         timed_out,
@@ -381,26 +375,46 @@ pub fn delete_local_branch(repo: &Path, branch: &str) -> anyhow::Result<()> {
     git(repo, &["branch", "-D", branch]).map(|_| ())
 }
 
-pub async fn delete_remote_branch(
+/// Compare-and-delete a recorded orphan, never a successor's remote ref.
+/// The explicit expected SHA makes the server reject a ref changed between
+/// lookup and push. Missing/unknown refs are not evidence of successful deletion.
+pub async fn delete_remote_branch_if_matches(
     repo: &Path,
     branch: &str,
+    expected_sha: &str,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let out = git_with_timeout(repo, &["push", "origin", "--delete", branch], timeout).await?;
-    if out.timed_out {
-        bail!("git push --delete {branch} timed out after {:?}", timeout);
+    if !branch.starts_with("agent/fix/")
+        || !matches!(expected_sha.len(), 40 | 64)
+        || !expected_sha.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        bail!("conditional branch deletion requires an agent branch and exact object ID");
     }
-    if out.success || out.is_missing_ref() {
-        return Ok(());
+    git(repo, &["check-ref-format", &format!("refs/heads/{branch}")])?;
+    let reference = format!("refs/heads/{branch}");
+    let tip = git_ok(
+        repo,
+        &["ls-remote", "--heads", "origin", &reference],
+        timeout,
+    )
+    .await?;
+    let mut lines = tip.lines();
+    let expected_line = format!("{expected_sha}\t{reference}");
+    if lines.next() != Some(expected_line.as_str()) || lines.next().is_some() {
+        bail!("remote ref is absent, changed, or uncertain; refusing orphan deletion");
     }
-    bail!(
-        "git push --delete {branch} failed: {}",
-        if out.stderr.is_empty() {
-            &out.stdout
-        } else {
-            &out.stderr
-        }
-    );
+    git_ok(
+        repo,
+        &[
+            "push",
+            &format!("--force-with-lease={reference}:{expected_sha}"),
+            "origin",
+            &format!(":{reference}"),
+        ],
+        timeout,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Does the remote already carry this branch?
@@ -768,14 +782,57 @@ mod tests {
         run(&work, &["checkout", "main"]);
 
         assert!(branch_exists(&work, "agent/fix/x").expect("exists"));
+        let tip = git(&work, &["rev-parse", "refs/heads/agent/fix/x"]).expect("tip");
         delete_local_branch(&work, "agent/fix/x").expect("delete local");
         assert!(!branch_exists(&work, "agent/fix/x").expect("gone"));
-        delete_remote_branch(&work, "agent/fix/x", Duration::from_secs(10))
+        delete_remote_branch_if_matches(&work, "agent/fix/x", &tip, Duration::from_secs(10))
             .await
             .expect("delete remote");
         let remote =
             git(&work, &["ls-remote", "--heads", "origin", "agent/fix/x"]).expect("ls-remote");
         assert!(remote.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conditional_orphan_delete_preserves_a_changed_remote_ref() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        init_repo(&repo);
+        let origin = root.path().join("origin.git");
+        run(
+            root.path(),
+            &["init", "--bare", origin.to_str().expect("path")],
+        );
+        run(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().expect("path")],
+        );
+        let branch = "agent/fix/conditional";
+        run(&repo, &["checkout", "-b", branch]);
+        run(&repo, &["push", "origin", branch]);
+        let old = git(&repo, &["rev-parse", "HEAD"]).expect("old tip");
+        commit_file(&repo, "changed.txt", "successor\n");
+        run(&repo, &["push", "origin", branch]);
+        assert!(
+            delete_remote_branch_if_matches(&repo, branch, &old, Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+        let new = git(&repo, &["rev-parse", "HEAD"]).expect("new tip");
+        assert!(git(&repo, &["ls-remote", "--heads", "origin", branch])
+            .expect("remote")
+            .starts_with(&new));
+        delete_remote_branch_if_matches(&repo, branch, &new, Duration::from_secs(10))
+            .await
+            .expect("exact orphan deleted");
+        assert!(git(&repo, &["ls-remote", "--heads", "origin", branch])
+            .expect("remote")
+            .is_empty());
+        assert!(
+            delete_remote_branch_if_matches(&repo, "main", &new, Duration::from_secs(10))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

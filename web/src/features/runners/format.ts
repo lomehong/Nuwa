@@ -52,10 +52,10 @@ export function runnerStatusVariant(runner: RunnerDto, nowMs: number): BadgeVari
   }
 }
 
-/** Daily PR usage as a whole percentage, or null when no limit is configured. */
+/** UTC admission slots relative to this process's observed limit, not a fleet cap. */
 export function runnerQuotaPercent(runner: RunnerDto): number | null {
   if (!runner.daily_pr_limit || runner.daily_pr_limit <= 0) {
     return null;
   }
-  return Math.min(100, Math.round((runner.prs_today / runner.daily_pr_limit) * 100));
+  return Math.min(100, Math.round((runner.pr_slots_today / runner.daily_pr_limit) * 100));
 }

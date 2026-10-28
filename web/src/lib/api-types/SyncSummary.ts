@@ -5,11 +5,11 @@ import type { SyncError } from "./SyncError";
  * Structured form of a `reconcile_all` result, for the Web console
  * `POST /api/v1/sync` (docs/09 §9.2). The CLI keeps printing the raw lines.
  */
-export type SyncSummary = { 
+export type SyncSummary = {
 /**
  * pr_open issues the reconciler examined (one result line each).
  */
-checked: number, merged: number, rejected: number, still_open: number, 
+checked: number, merged: number, rejected: number, still_open: number,
 /**
  * Per-issue failures (`skip`/`error` lines), plus unknown prefixes.
  */

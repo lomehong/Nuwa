@@ -31,6 +31,18 @@ function shortCommit(commit: string): string {
   return commit.length > 12 ? commit.slice(0, 12) : commit;
 }
 
+function hasValidEvidence(entry: MemoryDto): boolean {
+  return (
+    entry.evidence_valid &&
+    entry.revoked_at_ms === null &&
+    (entry.verification_source === "local_verification" || entry.verification_source === "ci_green")
+  );
+}
+
+function isPromptEligible(entry: MemoryDto): boolean {
+  return !entry.disabled && hasValidEvidence(entry);
+}
+
 function stateBadge(state: string) {
   const values = [
     "new",
@@ -67,7 +79,18 @@ function MemoryCard({
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-1.5">
                 {stateBadge(entry.state)}
-                {entry.disabled ? <Badge variant="warning">已停用</Badge> : null}
+                <Badge variant={entry.disabled ? "warning" : "neutral"}>
+                  {entry.disabled ? "已停用" : "未停用"}
+                </Badge>
+                <Badge variant={hasValidEvidence(entry) ? "success" : "warning"}>
+                  {entry.revoked_at_ms !== null
+                    ? "证据已撤销"
+                    : hasValidEvidence(entry)
+                      ? "证据有效"
+                      : entry.verification_source === "legacy_unknown"
+                        ? "证据未验证"
+                        : "证据无效"}
+                </Badge>
                 <Badge variant="info">{entry.files} 个文件</Badge>
               </div>
               <h3 className="mt-1 text-body font-medium break-words text-text">
@@ -101,6 +124,10 @@ function MemoryCard({
             </div>
           </div>
 
+          <p className="text-caption text-text-secondary">
+            {isPromptEligible(entry) ? "可用于后续提示" : "不用于后续提示"}
+          </p>
+
           <div>
             <p className="text-caption text-text-muted">根因</p>
             <pre className="mt-1 max-h-40 overflow-auto font-mono text-caption whitespace-pre-wrap text-text">
@@ -112,6 +139,7 @@ function MemoryCard({
             <div className="min-w-0">
               <p className="text-caption text-text-muted">来源</p>
               <div className="mt-1 flex flex-wrap items-center gap-2 text-caption">
+                <span>验证来源：{entry.verification_source}</span>
                 <span className="font-mono" title={entry.commit_sha}>
                   commit {shortCommit(entry.commit_sha)}
                 </span>
@@ -120,6 +148,16 @@ function MemoryCard({
                   记录于 {formatDateTime(entry.recorded_at_ms)}
                 </span>
               </div>
+              {entry.revoked_at_ms !== null ? (
+                <p className="mt-1 text-caption text-text-secondary">
+                  撤销于 {formatDateTime(entry.revoked_at_ms)}
+                </p>
+              ) : null}
+              {entry.revocation_reason ? (
+                <p className="mt-1 text-caption break-words text-text-secondary">
+                  撤销原因：{entry.revocation_reason}
+                </p>
+              ) : null}
             </div>
             <div className="min-w-0">
               <p className="text-caption text-text-muted">改动</p>
@@ -135,9 +173,9 @@ function MemoryCard({
 }
 
 /**
- * 项目修复记忆：验证门 + CI 证明过的修复经验，带 commit/PR 来源。
+ * 项目修复记忆：带验证证据与 commit/PR 来源的修复经验，包括历史及已撤销记录。
  *
- * 记忆会自动写入和注入；所有者可以停用（不再进入提示、保留证据）或删除。
+ * 仅有效且未手动停用的记忆可进入提示；启用不恢复已撤销证据。
  */
 export function ProjectMemoryPage() {
   const repo = useParams<{ repo: string }>().repo ?? "";
@@ -146,7 +184,7 @@ export function ProjectMemoryPage() {
   const toggle = useSetMemoryDisabledMutation(repo);
   const remove = useDeleteMemoryMutation(repo);
   const { toast } = useToast();
-  const [filter, setFilter] = useState<"all" | "active" | "disabled">("all");
+  const [filter, setFilter] = useState<"all" | "active" | "disabled" | "invalid">("all");
   const [search, setSearch] = useState("");
   const [pendingDelete, setPendingDelete] = useState<MemoryDto | null>(null);
 
@@ -154,8 +192,9 @@ export function ProjectMemoryPage() {
   const filtered = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return rows.filter((entry) => {
-      if (filter === "active" && entry.disabled) return false;
+      if (filter === "active" && !isPromptEligible(entry)) return false;
       if (filter === "disabled" && !entry.disabled) return false;
+      if (filter === "invalid" && hasValidEvidence(entry)) return false;
       if (!needle) return true;
       return [entry.fingerprint, entry.title, entry.root_cause, entry.change_stat]
         .join("\n")
@@ -173,8 +212,11 @@ export function ProjectMemoryPage() {
       {
         onSuccess: () => {
           toast({
-            title: entry.disabled ? "已启用记忆" : "已停用记忆",
-            description: entry.fingerprint,
+            title: entry.disabled ? "已清除手动停用" : "已停用记忆",
+            description:
+              entry.disabled && !hasValidEvidence(entry)
+                ? "仅清除手动停用；无效或已撤销的证据仍不会用于提示。"
+                : entry.fingerprint,
             variant: "success",
           });
         },
@@ -218,8 +260,9 @@ export function ProjectMemoryPage() {
             </h2>
             <p className="mt-0.5 font-mono text-caption break-all text-text-muted">{repo}</p>
             <p className="mt-1 max-w-3xl text-body-sm text-text-secondary">
-              只有通过独立验证门且 CI 绿灯（或明确 branch-only 已推送）的修复才会写入记忆。
-              记忆带 commit/PR 来源，注入下一轮修复提示；它只是参考，不是权威。
+              记忆保留验证来源与 commit/PR 证据，包括未验证的历史记录和已撤销的证据。
+              只有证据有效且未手动停用的记忆可进入后续修复提示；它只是参考，不是权威。
+              重新启用只清除手动停用，不会恢复已撤销证据，也不会让未验证的历史记录生效。
             </p>
           </div>
           <Button
@@ -242,12 +285,14 @@ export function ProjectMemoryPage() {
             <p className="mt-1 text-caption text-text-secondary">每仓最多保留 50 条</p>
           </div>
           <div>
-            <p className="text-caption text-text-muted">本页生效 / 停用</p>
+            <p className="text-caption text-text-muted">本页可用于提示 / 手动停用</p>
             <p className="mt-1 text-body font-medium text-text">
-              {rows.filter((entry) => !entry.disabled).length} /{" "}
+              {rows.filter(isPromptEligible).length} /{" "}
               {rows.filter((entry) => entry.disabled).length}
             </p>
-            <p className="mt-1 text-caption text-text-secondary">停用不会删除来源证据</p>
+            <p className="mt-1 text-caption text-text-secondary">
+              证据无效 {rows.filter((entry) => !hasValidEvidence(entry)).length} 条；停用不会删除来源证据
+            </p>
           </div>
           <div>
             <p className="text-caption text-text-muted">维护方式</p>
@@ -269,11 +314,14 @@ export function ProjectMemoryPage() {
         <Select
           label="状态"
           value={filter}
-          onChange={(event) => setFilter(event.target.value as "all" | "active" | "disabled")}
+          onChange={(event) =>
+            setFilter(event.target.value as "all" | "active" | "disabled" | "invalid")
+          }
           options={[
             { value: "all", label: "全部" },
             { value: "active", label: "生效中" },
             { value: "disabled", label: "已停用" },
+            { value: "invalid", label: "证据无效" },
           ]}
         />
         <div className="flex items-end justify-between gap-2 text-caption text-text-muted">
