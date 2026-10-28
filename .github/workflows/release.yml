@@ -19,7 +19,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.sha }}
         run: |
-          for attempt in $(seq 1 10); do
+          # 冷缓存时 CI 全量（vendored 1662+）在 runner 上需要 40-60 分钟；
+          # nextest 曾出现测试子进程树卡死（runner 沙箱）导致 CI 长时间
+          # in_progress——gate 等待预算与之匹配（60 分钟），CI 完成后按
+          # 结论立即判定（绿→发布、红→失败），不再固定 10 次假超时。
+          for attempt in $(seq 1 120); do
             body=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=20")
             state=$(printf '%s' "$body" | jq -r --arg sha "$SHA" '
               [.workflow_runs[] | select(.head_sha == $sha)] as $runs
@@ -38,7 +42,7 @@ jobs:
                 exit 1
                 ;;
             esac
-            echo "waiting for ci.yml on ${SHA} (${state}, attempt ${attempt}/10)"
+            echo "waiting for ci.yml on ${SHA} (${state}, attempt ${attempt}/120)"
             sleep 30
           done
           echo "::error::no green ci.yml run found for ${SHA}"
