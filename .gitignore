@@ -37,3 +37,11 @@ job-logs.txt
 
 # Superpowers SDD workspace (local scratch)
 /.superpowers/
+
+# 本地运行产物
+runlogs/
+logs-dl/
+runlog-full.txt
+rustj.log
+rust-job.log
+*.zip
