@@ -59,8 +59,11 @@ jobs:
         # 曾把正常冷缓存全量误杀（runner 上 GitHub 取消不响应时 job 假
         # in_progress 数小时）。挂死测试由 nextest 的 per-test 120s 硬
         # 超时兜底，job 级预算放宽到 60 分钟。
+        # -j 2：runner 上全并发时 benchmark/deliver 重型 faux 测试
+        # （go build 验证门 + git 沙箱）资源竞争挂死、runner 失联
+        # （2026-10-29 v0.21.0 run 40917442483）；-j 2 已在本地验证全过。
         timeout-minutes: 120
-        run: cargo nextest run --workspace --profile ci
+        run: cargo nextest run --workspace --profile ci -j 2
       # nextest 不跑 doctest；单独保留原有的文档测试覆盖。
       - name: doctests
         timeout-minutes: 10
