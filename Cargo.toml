@@ -69,7 +69,7 @@ rpi-ai = { path = "crates/rpi-ai", version = "0.3.24" }
 rpi-agent = { path = "crates/rpi-agent", version = "0.3.24" }
 rpi-tools = { path = "crates/rpi-tools", version = "0.3.24" }
 rpi-harness = { path = "crates/rpi-harness", version = "0.3.24" }
-shanhaijing = { path = "crates/shanhaijing", version = "0.18.0" }
+shanhaijing = { path = "crates/shanhaijing", version = "0.21.0" }
 
 # Misc additions
 sha2 = "0.10"
