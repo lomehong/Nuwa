@@ -55,14 +55,11 @@ jobs:
           tool: nextest
       - name: tests (nextest — per-test process + timeout)
         # 冷缓存时 workspace 全量（vendored 1662+）在 runner 上需要
-        # 40-120 分钟；60 分钟曾误杀正常冷缓存全量（runner 上取消不响应）。
-        timeout-minutes: 120
         # 40-120 分钟（rust-cache key 随 Cargo.lock 变化而失效）；60 分钟
         # 曾把正常冷缓存全量误杀（runner 上 GitHub 取消不响应时 job 假
         # in_progress 数小时）。挂死测试由 nextest 的 per-test 120s 硬
         # 超时兜底，job 级预算放宽到 60 分钟。
         timeout-minutes: 120
->>>>>>> 3ac2c5f (ci: rust tests job 级超时 60→120 分钟——冷缓存全量（编译+测试）撞 60 分钟墙，GitHub 取消后 runner 进程不响应致假 in_progress 数小时)
         run: cargo nextest run --workspace --profile ci
       # nextest 不跑 doctest；单独保留原有的文档测试覆盖。
       - name: doctests
