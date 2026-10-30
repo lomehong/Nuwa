@@ -218,7 +218,8 @@ pub async fn verify(
             for path in String::from_utf8_lossy(&raw)
                 .lines()
                 .filter(|line| !line.is_empty())
-                .map(|line| line.trim_start_matches(['A', 'M', 'D', 'T', 'R', 'C', 'U', 'X']))
+                // "M\tapp.py" — status letter and path are tab-separated.
+                .map(|line| line.split_once('\t').map(|(_, path)| path).unwrap_or(line))
                 .filter(|path| !path.is_empty())
             {
                 report.push_str(&format!(
