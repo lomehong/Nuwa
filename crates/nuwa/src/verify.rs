@@ -188,15 +188,46 @@ pub async fn verify(
     if let Ok(tree_now) = candidate_tree_for_context(repo, context) {
         if tree_now != tree {
             // Diagnosis aid: name exactly which paths drifted while the
-            // verification command ran, so environment-specific artifacts
-            // (interpreter caches etc.) can be identified and excluded.
-            let names = CandidateIndex::create(repo, &context.excluded_delivery_paths())
-                .and_then(|index| {
-                    index.git(&["diff-tree", "-r", "--name-status", "--no-commit-id", &tree, &tree_now])
-                })
-                .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
-                .unwrap_or_else(|_| "diff unavailable".into());
-            bail!("candidate tree changed during verification: {names}");
+            // verification command ran, with a content digest per side, so
+            // direction (lost fix vs. environment artifact) is observable.
+            let describe =
+                |index: &CandidateIndex<'_>, which: &str, at: &str, path: &str| -> String {
+                    index
+                        .git(&["cat-file", "blob", &format!("{at}:{path}")])
+                        .map(|bytes| {
+                            let head: Vec<String> = bytes
+                                .iter()
+                                .take(24)
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect();
+                            format!("{which}={} [{}, {}B]", head.join(""), at, bytes.len())
+                        })
+                        .unwrap_or_else(|_| format!("{which}=absent [{at}]"))
+                };
+            let index = CandidateIndex::create(repo, &context.excluded_delivery_paths())?;
+            let mut report = String::new();
+            let raw = index.git(&[
+                "diff-tree",
+                "-r",
+                "--no-commit-id",
+                "--name-status",
+                "--no-renames",
+                &tree,
+                &tree_now,
+            ])?;
+            for path in String::from_utf8_lossy(&raw)
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| line.trim_start_matches(['A', 'M', 'D', 'T', 'R', 'C', 'U', 'X']))
+                .filter(|path| !path.is_empty())
+            {
+                report.push_str(&format!(
+                    " [{} vs {}]",
+                    describe(&index, "snapshot", &tree, path),
+                    describe(&index, "now", &tree_now, path),
+                ));
+            }
+            bail!("candidate tree changed during verification: {report}");
         }
     }
     evidence.provenance = context.provenance(&base_sha, &tree);
