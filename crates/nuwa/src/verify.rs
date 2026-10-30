@@ -767,6 +767,17 @@ pub(crate) fn delivery_pathspecs(excluded: &[String]) -> Vec<String> {
 pub(crate) fn delivery_add_args(repo: &Path, excluded: &[String]) -> anyhow::Result<Vec<String>> {
     let mut args = vec!["add".into(), "-A".into(), "--".into()];
     args.push(":(exclude)nuwa.repo.json".into());
+    // Interpreter bytecode caches are runtime artifacts, never delivery
+    // inputs. Running the verification command (e.g. `python3 checks/…`
+    // importing a sibling module) can create or rewrite `__pycache__/*.pyc`
+    // between the two candidate-tree snapshots; on Linux a base-checkout
+    // round-trip updates the source mtime, Python recompiles the .pyc, and
+    // the tree hash changes — a false "candidate tree changed during
+    // verification" (CI own-2/own-3, 2026-10-30). Excluded from the snapshot
+    // the same way nuwa.repo.json is; tamper protection still covers every
+    // tracked/owner-seeded source file.
+    args.push(":(exclude,glob)**/__pycache__/**".into());
+    args.push(":(exclude,glob)**/*.pyc".into());
     // Git treats an exact negative pathspec beneath an ignored directory as an
     // explicit request to add that directory and fails. Already-ignored seeds
     // need no add exclusion; the reset below still removes any staged copy.
@@ -946,6 +957,53 @@ mod tests {
         std::fs::write(dir.join("base.txt"), "base\n").expect("write");
         git(dir, &["add", "."]);
         git(dir, &["commit", "-m", "init"]);
+    }
+
+    // Guardrail: interpreter bytecode caches are runtime artifacts and must
+    // never enter the candidate-tree snapshot. Reproduces the CI false
+    // "candidate tree changed during verification" (own-2/own-3, 2026-10-30):
+    // a verification command that writes `__pycache__/*.pyc` between the two
+    // snapshots must not change the tree the snapshot reports.
+    #[test]
+    fn bytecode_cache_never_enters_candidate_tree() {
+        let root = tempfile::tempdir().expect("root");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join("checks")).expect("dirs");
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.name", "test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("app.py"), "def calculate():\n    return 1\n").expect("bug");
+        std::fs::write(
+            repo.join("checks/oracle.py"),
+            "import helper\nimport sys\nsys.exit(0)\n",
+        )
+        .expect("oracle");
+        std::fs::write(repo.join("checks/helper.py"), "value = 1\n").expect("helper");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "init"]);
+
+        let tree1 = candidate_tree_with_exclusions(&repo, &[]).expect("first snapshot");
+        // Simulate the verification command: importing a sibling module makes
+        // CPython write `checks/__pycache__/helper.*.pyc` (skipped when the
+        // interpreter is told not to write bytecode, e.g. PYTHONDONTWRITEBYTECODE).
+        let ran = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
+            .arg("checks/oracle.py")
+            .current_dir(&repo)
+            .status()
+            .expect("run oracle");
+        assert!(ran.success(), "oracle must succeed");
+        let pyc_present = std::fs::read_dir(repo.join("checks/__pycache__"))
+            .map(|entries| entries.count() > 0)
+            .unwrap_or(false);
+        if !pyc_present {
+            // Interpreter declined to write bytecode; nothing to guard here.
+            return;
+        }
+        let tree2 = candidate_tree_with_exclusions(&repo, &[]).expect("second snapshot");
+        assert_eq!(
+            tree1, tree2,
+            "bytecode cache written by the verification command must not change the candidate tree"
+        );
     }
 
     fn issue(failing: &str) -> Issue {
