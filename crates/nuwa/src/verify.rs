@@ -872,18 +872,20 @@ impl<'a> CandidateIndex<'a> {
     fn create(repo: &'a Path, excluded: &[String]) -> anyhow::Result<Self> {
         let scratch = tempfile::tempdir().context("create candidate index directory")?;
         let path = scratch.path().join("index");
-        let source = repo.join(git_ops::git(repo, &["rev-parse", "--git-path", "index"])?);
-        if source.exists() {
-            std::fs::copy(&source, &path).context("copy delivery index")?;
-        }
         let index = Self {
             repo,
             _scratch: scratch,
             path,
         };
-        if !index.path.exists() {
-            index.git(&["read-tree", "HEAD"])?;
-        }
+        // Start from an empty index and re-hash the whole working tree. A
+        // copy of the caller's index makes the snapshot dependent on cached
+        // stat data: a same-size rewrite of a tracked file (e.g. the
+        // candidate fix) can be skipped as "unchanged" on the second
+        // snapshot, which resurrected the pre-fix blob and produced a false
+        // "candidate tree changed during verification" on CI
+        // (2026-10-30, runs 40984896497+). Re-hashing from scratch makes
+        // every snapshot a deterministic function of the working tree.
+        index.git(&["read-tree", "--empty"])?;
         let add = delivery_add_args(repo, excluded)?;
         index.git(&add.iter().map(String::as_str).collect::<Vec<_>>())?;
         // Even already staged private owner inputs are not delivery changes.
