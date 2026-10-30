@@ -218,8 +218,18 @@ pub async fn verify(
                 .map(|line| line.split_once('\t').map(|(_, path)| path).unwrap_or(line))
                 .filter(|path| !path.is_empty())
             {
+                // Also show what the working tree itself holds for the drifted
+                // path: if it matches the snapshot side, only `git add -A`
+                // misbehaved; if it matches `now` (or differs from both), the
+                // working tree was rewritten while the verification ran.
+                let wt = std::fs::read(repo.join(path))
+                    .map(|bytes| {
+                        let text = String::from_utf8_lossy(&bytes);
+                        format!("[{} {}B]", text.escape_debug(), bytes.len())
+                    })
+                    .unwrap_or_else(|_| "[absent]".into());
                 report.push_str(&format!(
-                    " [{} vs {}]",
+                    " [{} vs {}; worktree={wt}]",
                     describe(&index, "snapshot", &tree, path),
                     describe(&index, "now", &tree_now, path),
                 ));
