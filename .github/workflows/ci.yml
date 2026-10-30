@@ -53,29 +53,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - name: free disk space (~30GB; hosted runner 14GB 盘被全量测试写满 → runner 失联)
-        # 三个 run（全并发/ -j 2 / docs 零代码改动）都在 47m04s/46m03s 精确
-        # 死亡且日志 BlobNotFound（runner 进程已死，非 job 超时）：磁盘渐进
-        # 写满的确定性时间。全量测试的海量 git 沙箱临时目录 + debug 编译
-        # 产物 >14GB 可用空间。清预装大组件换 ~30GB。
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-            /usr/lib/jvm /usr/share/swift /opt/pipx || true
-          sudo docker image prune -af > /dev/null 2>&1 || true
-          df -h /
-      - name: tests (nextest — per-test process + timeout)
-        # 冷缓存时 workspace 全量（vendored 1662+）在 runner 上需要
-        # 40-120 分钟（rust-cache key 随 Cargo.lock 变化而失效）；60 分钟
-        # 曾把正常冷缓存全量误杀（runner 上 GitHub 取消不响应时 job 假
-        # in_progress 数小时）。挂死测试由 nextest 的 per-test 120s 硬
-        # 超时兜底，job 级预算放宽到 60 分钟。
-        # -j 2：runner 上全并发时 benchmark/deliver 重型 faux 测试
-        # （go build 验证门 + git 沙箱）资源竞争挂死、runner 失联
-        # （2026-10-29 v0.21.0 run 40917442483）；-j 2 已在本地验证全过。
-        timeout-minutes: 120
-        run: cargo nextest run --workspace --profile ci -j 2
-      # nextest 不跑 doctest；单独保留原有的文档测试覆盖。
       - name: doctests
         timeout-minutes: 10
         run: cargo test --workspace --doc
@@ -89,6 +66,56 @@ jobs:
             echo "::error::benchmark scenarios regressed:"
             jq -r '.results[] | select(.error != null or (if .expected_fixed then ((.repaired|not) or (.delivery_ok|not)) else (.repaired or .delivery_ok) end)) | "\(.scenario): expected_fixed=\(.expected_fixed) repaired=\(.repaired) delivery=\(.delivery_ok) error=\(.error)"' /tmp/bench.json
             exit 1
+          fi
+
+  # 全量 nextest 拆到两个独立 runner（matrix）。
+  # 根因（docs/07 §D，2026-10-29 四个 run 实证）：单个 hosted runner 上
+  # nextest 串行/-j 2 都在 run 开始后 ~47 分钟整 runner 失联（失败 step
+  # 为空、日志 BlobNotFound、磁盘清理无效）——每测试独立进程 + 测试内
+  # spawn 的 git/go 子进程渐进累积，触发 runner 任务/进程上限后 agent
+  # fork 失败死亡。单 runner 全量必然撞墙，拆分让每个 runner 只承担
+  # ~20 分钟测试量，远离墙。
+  rust-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [own, vendored]
+    env:
+      NUWA_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: build web console (embedded fixtures)
+        working-directory: web
+        run: npm ci && npm run build
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: free disk space (~30GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm /usr/share/swift /opt/pipx || true
+          sudo docker image prune -af > /dev/null 2>&1 || true
+          df -h /
+      - name: tests (nextest — per-test process + timeout)
+        # 挂死测试由 nextest 的 per-test 120s 硬超时兜底；预算 120 分钟
+        # 防冷缓存误杀（实际单 suite 预期 ~20 分钟，远离 47 分钟墙）。
+        timeout-minutes: 120
+        run: |
+          if [ "${{ matrix.suite }}" = "own" ]; then
+            cargo nextest run -p nuwa -p shanhaijing --profile ci -j 2
+          else
+            cargo nextest run --workspace --exclude nuwa --exclude shanhaijing --profile ci -j 2
           fi
 
   web:
