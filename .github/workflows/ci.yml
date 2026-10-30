@@ -80,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [own, vendored]
+        suite: [vendored, own-1, own-2, own-3]
     env:
       NUWA_BUILD_COMMIT: ${{ github.sha }}
     steps:
@@ -109,14 +109,20 @@ jobs:
           df -h /
       - name: tests (nextest — per-test process + timeout)
         # 挂死测试由 nextest 的 per-test 120s 硬超时兜底；预算 120 分钟
-        # 防冷缓存误杀（实际单 suite 预期 ~20 分钟，远离 47 分钟墙）。
+        # 防冷缓存误杀。own 再按 hash 分 3 区（每 runner ~15 分钟），远离
+        # 进程耗尽墙（vendored 纯单元单 runner 已实证可全量跑完）。
         timeout-minutes: 120
         run: |
-          if [ "${{ matrix.suite }}" = "own" ]; then
-            cargo nextest run -p nuwa -p shanhaijing --profile ci -j 2
-          else
-            cargo nextest run --workspace --exclude nuwa --exclude shanhaijing --profile ci -j 2
-          fi
+          case "${{ matrix.suite }}" in
+            vendored)
+              cargo nextest run --workspace --exclude nuwa --exclude shanhaijing --profile ci -j 2 ;;
+            own-1)
+              cargo nextest run -p nuwa -p shanhaijing --profile ci -j 2 --partition hash:1/3 ;;
+            own-2)
+              cargo nextest run -p nuwa -p shanhaijing --profile ci -j 2 --partition hash:2/3 ;;
+            own-3)
+              cargo nextest run -p nuwa -p shanhaijing --profile ci -j 2 --partition hash:3/3 ;;
+          esac
 
   web:
     runs-on: ubuntu-latest
