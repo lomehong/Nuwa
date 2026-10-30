@@ -185,8 +185,19 @@ pub async fn verify(
     };
     context.assert_integrity(repo)?;
     context.assert_candidate_sources(repo)?;
-    if candidate_tree_for_context(repo, context)? != tree {
-        bail!("candidate tree changed during verification");
+    if let Ok(tree_now) = candidate_tree_for_context(repo, context) {
+        if tree_now != tree {
+            // Diagnosis aid: name exactly which paths drifted while the
+            // verification command ran, so environment-specific artifacts
+            // (interpreter caches etc.) can be identified and excluded.
+            let names = CandidateIndex::create(repo, &context.excluded_delivery_paths())
+                .and_then(|index| {
+                    index.git(&["diff-tree", "-r", "--name-status", "--no-commit-id", &tree, &tree_now])
+                })
+                .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+                .unwrap_or_else(|_| "diff unavailable".into());
+            bail!("candidate tree changed during verification: {names}");
+        }
     }
     evidence.provenance = context.provenance(&base_sha, &tree);
     context.record_verified(&base_sha, &tree)?;
