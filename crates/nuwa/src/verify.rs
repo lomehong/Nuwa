@@ -195,12 +195,8 @@ pub async fn verify(
                     index
                         .git(&["cat-file", "blob", &format!("{at}:{path}")])
                         .map(|bytes| {
-                            let head: Vec<String> = bytes
-                                .iter()
-                                .take(24)
-                                .map(|byte| format!("{byte:02x}"))
-                                .collect();
-                            format!("{which}={} [{}, {}B]", head.join(""), at, bytes.len())
+                            let text = String::from_utf8_lossy(&bytes);
+                            format!("{which}=[{}] ({}B)", text.escape_debug(), bytes.len())
                         })
                         .unwrap_or_else(|_| format!("{which}=absent [{at}]"))
                 };
